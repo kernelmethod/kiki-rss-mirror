@@ -2,6 +2,7 @@ pub mod init;
 pub mod server;
 pub mod http;
 
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -24,7 +25,7 @@ pub enum Commands {
 
 impl Commands {
     /// Run the selected subcommand.
-    pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn run(&self) -> Result<()> {
         match self {
             Commands::Init {} => {
                 init::init()
@@ -40,7 +41,7 @@ impl Commands {
     }
 }
 
-pub fn main() -> Result<(), Box<dyn std::error::Error>> {
+pub fn main() -> Result<()> {
     let cli = Cli::parse();
 
     cli.command.run()

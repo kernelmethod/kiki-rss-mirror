@@ -1,7 +1,8 @@
+use anyhow::Result;
 use crate::http::USER_AGENT;
 use rss::Channel;
 
-pub async fn server() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn server() -> Result<()> {
     let client = reqwest::Client::new();
     let resp = client
         .get("https://kernelmethod.org/notes/index.xml")

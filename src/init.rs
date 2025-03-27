@@ -1,4 +1,6 @@
-pub fn init() -> Result<(), Box<dyn std::error::Error>> {
+use anyhow::Result;
+
+pub fn init() -> Result<()> {
     println!("hello, world");
     Ok(())
 }
