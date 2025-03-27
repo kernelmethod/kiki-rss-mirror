@@ -7,6 +7,12 @@ CREATE TABLE tags (
     name    VARCHAR UNIQUE NOT NULL
 );
 
+CREATE TABLE scripts (
+    id      INTEGER PRIMARY KEY,
+    lang    VARCHAR NOT NULL,
+    text    VARCHAR NOT NULL
+);
+
 CREATE TABLE feeds (
     id                      INTEGER PRIMARY KEY,
     title                   VARCHAR NOT NULL,
@@ -16,9 +22,31 @@ CREATE TABLE feeds (
     header_last_modified    VARCHAR DEFAULT ''
 );
 
--- A list of the tags that are automatically assigned to items
--- from a given feed
+-- A list of the tags that are automatically assigned to items from a given
+-- feed
 CREATE TABLE feed_tags (
-    feed_id     INTEGER,
-    tag_id      INTEGER
+    feed_id INTEGER NOT NULL,
+    tag_id  INTEGER NOT NULL,
+    FOREIGN KEY (feed_id) REFERENCES feeds (id) ON DELETE CASCADE,
+    FOREIGN KEY (tag_id) REFERENCES tags (id) ON DELETE CASCADE
+);
+
+-- A list of scripts that should run on entries retrieved for a given feed
+CREATE TABLE feed_scripts (
+    feed_id INTEGER NOT NULL,
+    script_id INTEGER NOT NULL,
+    FOREIGN KEY (feed_id) REFERENCES feeds (id) ON DELETE CASCADE,
+    FOREIGN KEY (tag_id) REFERENCES scripts (id) ON DELETE CASCADE
+);
+
+CREATE TABLE entries (
+    id              INTEGER PRIMARY KEY,
+    feed_id         INTEGER NOT NULL,
+    published_at    DATETIME NOT NULL,
+    title           VARCHAR NOT NULL,
+    url             VARCHAR NOT NULL,
+    author          VARCHAR,
+    content         VARCHAR,
+
+    FOREIGN KEY (feed_id) REFERENCES feeds (id) ON DELETE CASCADE
 );
