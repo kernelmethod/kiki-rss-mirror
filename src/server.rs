@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::http::USER_AGENT;
+use anyhow::Result;
 use rss::Channel;
 
 pub async fn server() -> Result<()> {

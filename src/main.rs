@@ -1,6 +1,6 @@
+pub mod http;
 pub mod init;
 pub mod server;
-pub mod http;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -20,23 +20,19 @@ pub enum Commands {
     Server {},
 
     /// Sets up a new Kiki database and configuration files
-    Init {}
+    Init {},
 }
 
 impl Commands {
     /// Run the selected subcommand.
     pub fn run(&self) -> Result<()> {
         match self {
-            Commands::Init {} => {
-                init::init()
-            }
-            Commands::Server {} => {
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(server::server())
-            }
+            Commands::Init {} => init::init(),
+            Commands::Server {} => tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(server::server()),
         }
     }
 }
