@@ -10,3 +10,6 @@ reqwest = "0.12.15"
 rss = "2.0.12"
 rusqlite = { version = "0.34.0", features = ["bundled"] }
 tokio = { version = ">=1.40,<1.45", features = ["full"] }
+
+[dev-dependencies]
+itertools = "0.14.0"

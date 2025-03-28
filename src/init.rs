@@ -56,10 +56,11 @@ pub fn init_database(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use anyhow::Result;
+    use itertools::Itertools;
 
-    #[derive(Debug)]
-    struct SchemaInfo {
-        version: String,
+    #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    struct QueryStringResult {
+        text: String,
     }
 
     #[test]
@@ -69,17 +70,41 @@ mod tests {
 
         init_database(&conn)?;
 
+        // Check that tables were all correctly constructed
+        let mut stmt = conn.prepare("SELECT tbl_name FROM sqlite_master")?;
+        let tables = stmt
+            .query_map([], |row| Ok(QueryStringResult { text: row.get(0)? }))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .unique()
+            .sorted()
+            .map(|r| r.text)
+            .collect::<Vec<_>>();
+
+        let expected_tables = [
+            "schema_version",
+            "tags",
+            "scripts",
+            "feeds",
+            "feed_tags",
+            "feed_scripts",
+            "entries",
+            "entry_tags",
+        ]
+        .into_iter()
+        .map(|s| String::from(s))
+        .sorted()
+        .collect::<Vec<_>>();
+
+        assert_eq!(tables, expected_tables);
+
         // Check that schema information was set correctly
         let mut stmt = conn.prepare("SELECT version FROM schema_version")?;
         let schema_info = stmt
-            .query_row([], |row| {
-                Ok(SchemaInfo {
-                    version: row.get(0)?,
-                })
-            })
+            .query_row([], |row| Ok(QueryStringResult { text: row.get(0)? }))
             .with_context(|| "Could not retrieve version information from schema_version")?;
 
-        assert_eq!(schema_info.version, SCHEMA_VERSION);
+        assert_eq!(schema_info.text, SCHEMA_VERSION);
 
         Ok(())
     }
