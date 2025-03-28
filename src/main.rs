@@ -1,5 +1,6 @@
 pub mod http;
 pub mod init;
+pub mod migrate;
 pub mod serve;
 
 use anyhow::Result;
@@ -16,11 +17,14 @@ pub struct Cli {
 /// Subcommands that are available for Kiki.
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Sets up a new Kiki database and configuration files
+    Init(init::InitArgs),
+
     /// Starts the Kiki server
     Serve(serve::ServeArgs),
 
-    /// Sets up a new Kiki database and configuration files
-    Init(init::InitArgs),
+    /// Migrate the Kiki database schema to the latest version
+    Migrate(migrate::MigrateArgs),
 }
 
 impl Commands {
@@ -28,6 +32,7 @@ impl Commands {
     pub fn run(&self) -> Result<()> {
         match self {
             Commands::Init(args) => args.run(),
+            Commands::Migrate(args) => args.run(),
             Commands::Serve(args) => args.run(),
         }
     }
