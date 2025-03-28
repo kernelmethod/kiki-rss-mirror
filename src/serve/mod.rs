@@ -1,4 +1,5 @@
 mod fetcher;
+mod routes;
 mod server;
 
 use anyhow::{Context, Result};
