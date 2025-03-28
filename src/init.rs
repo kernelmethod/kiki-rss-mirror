@@ -1,7 +1,6 @@
 use crate::db::ConnectionBuilder;
 use anyhow::{bail, Context, Result};
 use clap::Args;
-use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 

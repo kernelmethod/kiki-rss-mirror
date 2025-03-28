@@ -1,6 +1,5 @@
 use crate::db::ConnectionBuilder;
 use axum::{http::StatusCode, routing::post, Json, Router};
-use std::path::PathBuf;
 use tracing::{event, Level};
 
 pub fn create_router() -> Router {
