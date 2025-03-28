@@ -27,8 +27,8 @@ CREATE TABLE feeds (
 CREATE TABLE feed_tags (
     feed_id INTEGER NOT NULL,
     tag_id  INTEGER NOT NULL,
-    FOREIGN KEY (feed_id) REFERENCES feeds (id) ON DELETE CASCADE,
-    FOREIGN KEY (tag_id) REFERENCES tags (id) ON DELETE CASCADE
+    FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
+    FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
 );
 
 -- A list of scripts that should run on entries retrieved for a given feed
@@ -36,8 +36,8 @@ CREATE TABLE feed_scripts (
     feed_id INTEGER NOT NULL,
     script_id INTEGER NOT NULL,
 
-    FOREIGN KEY (feed_id) REFERENCES feeds (id) ON DELETE CASCADE,
-    FOREIGN KEY (tag_id) REFERENCES scripts (id) ON DELETE CASCADE
+    FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
+    FOREIGN KEY (script_id) REFERENCES scripts(id) ON DELETE CASCADE
 );
 
 CREATE TABLE entries (
@@ -49,7 +49,7 @@ CREATE TABLE entries (
     author          VARCHAR,
     content         VARCHAR,
 
-    FOREIGN KEY (feed_id) REFERENCES feeds (id) ON DELETE CASCADE
+    FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE
 );
 
 -- Table mapping entries to the tags that they belong to
@@ -57,6 +57,6 @@ CREATE TABLE entry_tags (
     entry_id    INTEGER NOT NULL,
     tag_id      INTEGER NOT NULL,
 
-    FOREIGN KEY (entry_id) REFERENCES entries (id) ON DELETE CASCADE,
-    FOREIGN KEY (tag_id) REFERENCES tags (id) ON DELETE CASCADE
+    FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE,
+    FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
 );
