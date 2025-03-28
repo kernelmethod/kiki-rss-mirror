@@ -1,43 +1,41 @@
 use crate::http::USER_AGENT;
-use axum::{
-    routing::get,
-    http::StatusCode,
-    Router
-};
 use anyhow::{Context, Result};
+use axum::{http::StatusCode, routing::get, Router};
 use clap::Args;
 use rss::Channel;
-use std::{fs, path::PathBuf};
 use std::time::Duration;
-use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
+use std::{fs, path::PathBuf};
 use tokio::net::UnixListener;
 use tokio::signal;
+use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
 #[derive(Args)]
-pub struct ServerArgs {}
+pub struct ServeArgs {}
 
-impl ServerArgs {
+impl ServeArgs {
     pub fn run(&self) -> Result<()> {
         tracing_subscriber::fmt::init();
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(self.server())
+            .block_on(self.serve())
     }
 
-    async fn server(&self) -> Result<()> {
-        let app = Router::new()
-            .route("/", get(root))
-            .layer((
-                TraceLayer::new_for_http(),
-                TimeoutLayer::new(Duration::from_secs(10))
-            ));
+    async fn serve(&self) -> Result<()> {
+        let app = Router::new().route("/", get(root)).layer((
+            TraceLayer::new_for_http(),
+            TimeoutLayer::new(Duration::from_secs(10)),
+        ));
 
         let socket_path = PathBuf::from("kiki.sock");
         if socket_path.exists() {
-            let _ = fs::remove_file(&socket_path)
-                .with_context(|| format!("Unable to delete existing socket file from {:?}", &socket_path))?;
+            let _ = fs::remove_file(&socket_path).with_context(|| {
+                format!(
+                    "Unable to delete existing socket file from {:?}",
+                    &socket_path
+                )
+            })?;
         }
 
         let listener = UnixListener::bind(&socket_path)

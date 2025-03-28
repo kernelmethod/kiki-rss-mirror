@@ -1,6 +1,6 @@
 pub mod http;
 pub mod init;
-pub mod server;
+pub mod serve;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -17,7 +17,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Starts the Kiki server
-    Server(server::ServerArgs),
+    Serve(serve::ServeArgs),
 
     /// Sets up a new Kiki database and configuration files
     Init(init::InitArgs),
@@ -28,7 +28,7 @@ impl Commands {
     pub fn run(&self) -> Result<()> {
         match self {
             Commands::Init(args) => args.run(),
-            Commands::Server(args) => args.run(),
+            Commands::Serve(args) => args.run(),
         }
     }
 }
