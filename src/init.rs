@@ -1,37 +1,54 @@
 use anyhow::{bail, Context, Result};
+use clap::Args;
 use rusqlite::Connection;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: &'static str = "1.0";
 
-/// Run the `init` subcommand for Kiki.
-pub fn init(directory: &Path, check: bool, force: bool) -> Result<()> {
-    let db_path = Path::new(directory).join("kiki.sqlite");
+#[derive(Args)]
+pub struct InitArgs {
+    /// The directory that Kiki's files should be set up in
+    directory: PathBuf,
 
-    if db_path.exists() {
-        if check {
-            // Kiki has already been configured
-            return Ok(());
+    /// Do nothing if Kiki has already been configured
+    #[arg(short, long, conflicts_with = "force")]
+    check: bool,
+
+    /// Force Kiki to overwrite existing files. This option is destructive!
+    #[arg(long, conflicts_with = "check")]
+    force: bool,
+}
+
+impl InitArgs {
+    /// Run the `init` subcommand
+    pub fn run(&self) -> Result<()> {
+        let db_path = Path::new(&self.directory).join("kiki.sqlite");
+
+        if db_path.exists() {
+            if self.check {
+                // Kiki has already been configured
+                return Ok(());
+            }
+
+            if !self.force {
+                bail!("A database has already been set up at {:#?}", &db_path);
+            }
+
+            fs::remove_file(&db_path)
+                .with_context(|| format!("Unable to delete database file at {:#?}", &db_path))?;
         }
 
-        if !force {
-            bail!("A database has already been set up at {:#?}", &db_path);
-        }
+        let conn = Connection::open(&db_path).with_context(|| {
+            format!(
+                "Unable to open connection to database at path {:#?}",
+                &db_path
+            )
+        })?;
 
-        fs::remove_file(&db_path)
-            .with_context(|| format!("Unable to delete database file at {:#?}", &db_path))?;
+        init_database(&conn)?;
+        Ok(())
     }
-
-    let conn = Connection::open(&db_path).with_context(|| {
-        format!(
-            "Unable to open connection to database at path {:#?}",
-            &db_path
-        )
-    })?;
-
-    init_database(&conn)?;
-    Ok(())
 }
 
 /// Initialize Kiki's database.
@@ -55,6 +72,7 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use itertools::Itertools;
+    use std::path::PathBuf;
     use tempdir::TempDir;
 
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -111,10 +129,29 @@ mod tests {
     /// Test the `--check` flag for `kiki init`.
     #[test]
     fn test_check() -> Result<()> {
-        let dir = TempDir::new("kiki_")?;
-        assert!(init(dir.path(), false, false).is_ok());
-        assert!(init(dir.path(), false, false).is_err());
-        assert!(init(dir.path(), true, false).is_ok());
+        let td = TempDir::new("kiki_")?;
+        let path = PathBuf::from(td.path());
+        assert!((InitArgs {
+            directory: path.clone(),
+            check: false,
+            force: false
+        })
+        .run()
+        .is_ok());
+        assert!((InitArgs {
+            directory: path.clone(),
+            check: false,
+            force: false
+        })
+        .run()
+        .is_err());
+        assert!((InitArgs {
+            directory: path.clone(),
+            check: true,
+            force: false
+        })
+        .run()
+        .is_ok());
 
         Ok(())
     }
@@ -122,10 +159,29 @@ mod tests {
     /// Test the `--force` flag for `kiki init`
     #[test]
     fn test_force() -> Result<()> {
-        let dir = TempDir::new("kiki_")?;
-        assert!(init(dir.path(), false, false).is_ok());
-        assert!(init(dir.path(), false, false).is_err());
-        assert!(init(dir.path(), false, true).is_ok());
+        let td = TempDir::new("kiki_")?;
+        let path = PathBuf::from(td.path());
+        assert!((InitArgs {
+            directory: path.clone(),
+            check: false,
+            force: false
+        })
+        .run()
+        .is_ok());
+        assert!((InitArgs {
+            directory: path.clone(),
+            check: false,
+            force: false
+        })
+        .run()
+        .is_err());
+        assert!((InitArgs {
+            directory: path.clone(),
+            check: false,
+            force: true
+        })
+        .run()
+        .is_ok());
 
         Ok(())
     }
