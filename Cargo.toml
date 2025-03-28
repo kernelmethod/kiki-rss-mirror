@@ -13,3 +13,4 @@ tokio = { version = ">=1.40,<1.45", features = ["full"] }
 
 [dev-dependencies]
 itertools = "0.14.0"
+tempdir = "0.3.7"

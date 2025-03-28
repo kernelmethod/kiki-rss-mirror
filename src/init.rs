@@ -1,12 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const SCHEMA_VERSION: &'static str = "1.0";
 
 /// Run the `init` subcommand for Kiki.
-pub fn init(directory: &PathBuf, check: bool, force: bool) -> Result<()> {
+pub fn init(directory: &Path, check: bool, force: bool) -> Result<()> {
     let db_path = Path::new(directory).join("kiki.sqlite");
 
     if db_path.exists() {
@@ -16,9 +16,7 @@ pub fn init(directory: &PathBuf, check: bool, force: bool) -> Result<()> {
         }
 
         if !force {
-            eprintln!("A database has already been set up at {:#?}", &db_path);
-            eprintln!("Add --force to make Kiki overwrite existing files");
-            return Ok(());
+            bail!("A database has already been set up at {:#?}", &db_path);
         }
 
         fs::remove_file(&db_path)
@@ -57,6 +55,7 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use itertools::Itertools;
+    use tempdir::TempDir;
 
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     struct QueryStringResult {
@@ -105,6 +104,28 @@ mod tests {
             .with_context(|| "Could not retrieve version information from schema_version")?;
 
         assert_eq!(schema_info.text, SCHEMA_VERSION);
+
+        Ok(())
+    }
+
+    /// Test the `--check` flag for `kiki init`.
+    #[test]
+    fn test_check() -> Result<()> {
+        let dir = TempDir::new("kiki_")?;
+        assert!(init(dir.path(), false, false).is_ok());
+        assert!(init(dir.path(), false, false).is_err());
+        assert!(init(dir.path(), true, false).is_ok());
+
+        Ok(())
+    }
+
+    /// Test the `--force` flag for `kiki init`
+    #[test]
+    fn test_force() -> Result<()> {
+        let dir = TempDir::new("kiki_")?;
+        assert!(init(dir.path(), false, false).is_ok());
+        assert!(init(dir.path(), false, false).is_err());
+        assert!(init(dir.path(), false, true).is_ok());
 
         Ok(())
     }
