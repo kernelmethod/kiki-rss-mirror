@@ -1,12 +1,14 @@
+use crate::serve::fetcher::FetchManagerCommand;
 use anyhow::{Context, Result};
 use axum::{http::StatusCode, routing::get, Router};
 use std::{fs, path::PathBuf, time::Duration};
-use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tokio::net::UnixListener;
 use tokio::signal;
+use tokio::sync::mpsc;
+use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
 /// Parent function for the server threads.
-pub async fn server() -> Result<()> {
+pub async fn server(_tx: mpsc::Sender<FetchManagerCommand>) -> Result<()> {
     let app = Router::new().route("/", get(root)).layer((
         TraceLayer::new_for_http(),
         TimeoutLayer::new(Duration::from_secs(10)),
