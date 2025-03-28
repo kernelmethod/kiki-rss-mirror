@@ -4,6 +4,7 @@ use std::{fs, path::PathBuf};
 use tokio::net::UnixListener;
 use tokio::signal;
 use tokio::sync::mpsc;
+use tracing::{span, Level};
 
 /// Parent function for the server threads.
 pub async fn server(_tx: mpsc::Sender<FetchManagerCommand>) -> Result<()> {
@@ -22,6 +23,7 @@ pub async fn server(_tx: mpsc::Sender<FetchManagerCommand>) -> Result<()> {
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Unable to bind to Unix socket at {:?}", &socket_path))?;
 
+    span!(Level::TRACE, "web-worker");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(socket_path.clone()))
         .await

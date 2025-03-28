@@ -56,6 +56,10 @@ impl<'a> ConnectionBuilder<'a> {
                     _ => bail!("unreachable code"),
                 };
 
+                if !self.create && !path.exists() {
+                    bail!(format!("trying to establish connection to database at {:?} that doesn't exist; you may need to call `create()`", path))
+                }
+
                 Connection::open_with_flags(path, self.flags).with_context(|| {
                     format!("unable to open connection to database at {:?}", path)
                 })?
