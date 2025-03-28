@@ -23,7 +23,7 @@ pub struct InitArgs {
 impl InitArgs {
     /// Run the `init` subcommand
     pub fn run(&self) -> Result<()> {
-        let db_path = Path::new(&self.directory).join("kiki.sqlite");
+        let db_path = Path::new(&self.directory).join("kiki.db");
 
         if db_path.exists() {
             if self.check {
