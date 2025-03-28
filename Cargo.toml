@@ -5,11 +5,14 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.97"
+axum = "0.8.1"
 clap = { version = "4.5.34", features = ["cargo", "derive"] }
 reqwest = "0.12.15"
 rss = "2.0.12"
 rusqlite = { version = "0.34.0", features = ["bundled"] }
 tokio = { version = ">=1.40,<1.45", features = ["full"] }
+tower-http = { version = "0.6.2", features = ["trace", "timeout"] }
+tracing-subscriber = "0.3.19"
 
 [dev-dependencies]
 itertools = "0.14.0"

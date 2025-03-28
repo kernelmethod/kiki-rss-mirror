@@ -17,7 +17,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Starts the Kiki server
-    Server {},
+    Server(server::ServerArgs),
 
     /// Sets up a new Kiki database and configuration files
     Init(init::InitArgs),
@@ -28,11 +28,7 @@ impl Commands {
     pub fn run(&self) -> Result<()> {
         match self {
             Commands::Init(args) => args.run(),
-            Commands::Server {} => tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(server::server()),
+            Commands::Server(args) => args.run(),
         }
     }
 }
