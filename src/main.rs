@@ -4,6 +4,9 @@ pub mod init;
 pub mod migrate;
 pub mod serve;
 
+#[cfg(test)]
+pub mod test;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
