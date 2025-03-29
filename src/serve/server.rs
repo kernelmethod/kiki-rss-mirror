@@ -1,14 +1,27 @@
 use crate::serve::{fetcher::FetchManagerCommand, routes};
 use anyhow::{Context, Result};
-use std::{fs, path::PathBuf};
+use axum::Router;
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::UnixListener;
 use tokio::signal;
 use tokio::sync::mpsc;
+use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::{span, Level};
 
+pub struct AppState {
+    pub fetcher_tx: mpsc::Sender<FetchManagerCommand>,
+}
+
 /// Parent function for the server threads.
-pub async fn server(_tx: mpsc::Sender<FetchManagerCommand>) -> Result<()> {
-    let app = routes::create_router();
+pub async fn server(tx: mpsc::Sender<FetchManagerCommand>) -> Result<()> {
+    let shared_state = Arc::new(AppState { fetcher_tx: tx });
+    let app = Router::new()
+        .nest("/feed", routes::feed::create_router())
+        .with_state(shared_state)
+        .layer((
+            TraceLayer::new_for_http(),
+            TimeoutLayer::new(Duration::from_secs(10)),
+        ));
 
     let socket_path = PathBuf::from("kiki.sock");
     if socket_path.exists() {

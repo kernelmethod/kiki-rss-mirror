@@ -1,8 +1,10 @@
 use crate::db::ConnectionBuilder;
-use axum::{http::StatusCode, routing::post, Json, Router};
+use crate::serve::server::AppState;
+use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use std::sync::Arc;
 use tracing::{event, Level};
 
-pub fn create_router() -> Router {
+pub fn create_router() -> Router<Arc<AppState>> {
     Router::new().route("/", post(add_feed))
 }
 
@@ -15,7 +17,7 @@ struct AddFeedResult {
 
 /// Route handler for adding a new feed to Kiki.
 #[axum::debug_handler]
-async fn add_feed() -> (StatusCode, Json<AddFeedResult>) {
+async fn add_feed(State(_state): State<Arc<AppState>>) -> (StatusCode, Json<AddFeedResult>) {
     // Add a new feed instance to the database
     let builder = ConnectionBuilder::default().read_write();
     let conn = match builder.build() {
