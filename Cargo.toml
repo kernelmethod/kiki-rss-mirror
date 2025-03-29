@@ -7,6 +7,8 @@ edition = "2021"
 anyhow = "1.0.97"
 axum = { version = "0.8.1", features = ["macros"] }
 clap = { version = "4.5.34", features = ["cargo", "derive"] }
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.27.0"
 reqwest = "0.12.15"
 rss = "2.0.12"
 rusqlite = { version = "0.34.0", features = ["bundled"] }

@@ -1,6 +1,7 @@
 use crate::serve::{fetcher::FetchManagerCommand, routes};
 use anyhow::{Context, Result};
 use axum::Router;
+use r2d2_sqlite::SqliteConnectionManager;
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::UnixListener;
 use tokio::signal;
@@ -10,11 +11,18 @@ use tracing::{span, Level};
 
 pub struct AppState {
     pub fetcher_tx: mpsc::Sender<FetchManagerCommand>,
+    pub conn_pool: r2d2::Pool<SqliteConnectionManager>,
 }
 
 /// Parent function for the server threads.
-pub async fn server(tx: mpsc::Sender<FetchManagerCommand>) -> Result<()> {
-    let shared_state = Arc::new(AppState { fetcher_tx: tx });
+pub async fn server(
+    tx: mpsc::Sender<FetchManagerCommand>,
+    pool: r2d2::Pool<SqliteConnectionManager>,
+) -> Result<()> {
+    let shared_state = Arc::new(AppState {
+        fetcher_tx: tx,
+        conn_pool: pool
+    });
     let app = Router::new()
         .nest("/feed", routes::feed::create_router())
         .with_state(shared_state)

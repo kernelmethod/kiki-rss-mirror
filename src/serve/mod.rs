@@ -4,7 +4,9 @@ mod server;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use std::sync::atomic;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::OpenFlags;
+use std::{path::PathBuf, sync::atomic};
 use tokio::sync::mpsc;
 
 #[derive(Args)]
@@ -13,6 +15,15 @@ pub struct ServeArgs {}
 impl ServeArgs {
     pub fn run(&self) -> Result<()> {
         tracing_subscriber::fmt::init();
+
+        // Create a pool of connections that can be shared between all of
+        // the threads that we spawn.
+        let path = PathBuf::from("./kiki.db");
+        let manager = SqliteConnectionManager::file(&path)
+            .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
+        let pool = r2d2::Pool::new(manager)
+            .with_context(|| format!("Unable to open connection pool to database at {:?}", path))?;
 
         // We create two separate runtimes, one for the feed-fetchers and
         // one for the web service workers.
@@ -42,9 +53,9 @@ impl ServeArgs {
         // to the feed fetchers
         let (tx, rx) = mpsc::channel(1024);
 
-        fetcher_runtime.spawn(fetcher::manager(rx));
+        fetcher_runtime.spawn(fetcher::manager(rx, pool.clone()));
         server_runtime
-            .block_on(async { server::server(tx.clone()).await })
+            .block_on(async { server::server(tx.clone(), pool.clone()).await })
             .with_context(|| "Failed to spawn server tasks")?;
 
         Ok(())

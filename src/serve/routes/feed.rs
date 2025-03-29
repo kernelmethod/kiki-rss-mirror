@@ -1,4 +1,3 @@
-use crate::db::ConnectionBuilder;
 use crate::serve::server::AppState;
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use std::sync::Arc;
@@ -17,18 +16,9 @@ struct AddFeedResult {
 
 /// Route handler for adding a new feed to Kiki.
 #[axum::debug_handler]
-async fn add_feed(State(_state): State<Arc<AppState>>) -> (StatusCode, Json<AddFeedResult>) {
+async fn add_feed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<AddFeedResult>) {
     // Add a new feed instance to the database
-    let builder = ConnectionBuilder::default().read_write();
-    let conn = match builder.build() {
-        Ok(c) => c,
-        Err(e) => {
-            event!(Level::ERROR, "unable to open database connection: {:?}", e);
-            let result = AddFeedResult { id: 0 };
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(result));
-        }
-    };
-
+    let conn = state.conn_pool.get().unwrap();
     let mut stmt = match conn.prepare("INSERT INTO feeds (title, url) VALUES (?1, ?2) RETURNING id")
     {
         Ok(s) => s,
