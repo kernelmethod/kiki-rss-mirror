@@ -2,7 +2,7 @@ use crate::serve::server::AppState;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use std::sync::Arc;
@@ -11,8 +11,14 @@ use tracing::{event, Level};
 
 pub fn create_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/", post(add_feed))
-        .route("/{*id}", get(get_feed))
+        .route("/", get(list_feeds).post(add_feed))
+        .route("/{*id}", get(get_feed).delete(delete_feed))
+}
+
+/// Route handler for listing all of the available feeds.
+#[axum::debug_handler]
+async fn list_feeds(State(_state): State<Arc<AppState>>) -> (StatusCode, &'static str) {
+    (StatusCode::OK, "")
 }
 
 struct AddFeedQueryResult(i64);
@@ -22,7 +28,7 @@ struct AddFeedResponse {
     id: i64,
 }
 
-/// Route handler for adding a new feed to Kiki.
+/// Route handler for adding a new feed.
 #[axum::debug_handler]
 async fn add_feed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<AddFeedResponse>) {
     // Add a new feed instance to the database
@@ -82,6 +88,15 @@ async fn add_feed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<AddFe
 /// Route handler for fetching a single feed's information.
 #[axum::debug_handler]
 async fn get_feed(
+    State(_state): State<Arc<AppState>>,
+    Path(_id): Path<u64>,
+) -> (StatusCode, &'static str) {
+    (StatusCode::OK, "")
+}
+
+/// Route handler for deleting a feed.
+#[axum::debug_handler]
+async fn delete_feed(
     State(_state): State<Arc<AppState>>,
     Path(_id): Path<u64>,
 ) -> (StatusCode, &'static str) {
