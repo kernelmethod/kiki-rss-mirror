@@ -1,9 +1,9 @@
+pub mod cli;
 pub mod db;
+pub mod fetcher;
 pub mod http;
-pub mod init;
-pub mod migrate;
 pub mod routes;
-pub mod serve;
+pub mod server;
 
 #[cfg(test)]
 pub mod test;
@@ -23,13 +23,13 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Sets up a new Kiki database and configuration files
-    Init(init::InitArgs),
+    Init(cli::init::InitArgs),
 
     /// Starts the Kiki server
-    Serve(serve::ServeArgs),
+    Serve(cli::serve::ServeArgs),
 
     /// Migrate the Kiki database schema to the latest version
-    Migrate(migrate::MigrateArgs),
+    Migrate(cli::migrate::MigrateArgs),
 }
 
 impl Commands {

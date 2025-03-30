@@ -1,4 +1,4 @@
-use crate::serve::server::AppState;
+use crate::server::AppState;
 use axum::{
     extract::{Path, State},
     http::StatusCode,

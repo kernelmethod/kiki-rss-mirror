@@ -1,4 +1,4 @@
-use crate::{routes, serve::fetcher::FetchManagerCommand};
+use crate::{routes, fetcher::FetchManagerCommand};
 use anyhow::{Context, Result};
 use axum::Router;
 use r2d2_sqlite::SqliteConnectionManager;

@@ -1,6 +1,4 @@
-mod fetcher;
-pub mod server;
-
+use crate::{fetcher, server};
 use anyhow::{Context, Result};
 use clap::Args;
 use r2d2_sqlite::SqliteConnectionManager;

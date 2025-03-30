@@ -1,4 +1,4 @@
-use crate::serve::server::AppState;
+use crate::server::AppState;
 use axum::{extract::State, http::StatusCode, Json};
 use tokio::task;
 use tracing::{event, Level};

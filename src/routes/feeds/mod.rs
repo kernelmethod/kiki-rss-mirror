@@ -8,7 +8,7 @@ use delete_feed::delete_feed;
 use get_feed::get_feed;
 use list_feeds::list_feeds;
 
-use crate::serve::server::AppState;
+use crate::server::AppState;
 use axum::{routing::get, Router};
 
 pub fn create_router() -> Router<AppState> {

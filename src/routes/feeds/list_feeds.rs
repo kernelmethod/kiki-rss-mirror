@@ -1,4 +1,4 @@
-use crate::serve::server::AppState;
+use crate::server::AppState;
 use axum::{extract::State, http::StatusCode};
 
 /// Route handler for listing all of the available feeds.
