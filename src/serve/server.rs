@@ -14,10 +14,12 @@ use tokio::sync::mpsc;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::{span, Level};
 
-pub struct AppState {
+pub struct SharedAppState {
     pub fetcher_tx: mpsc::Sender<FetchManagerCommand>,
     pub conn_pool: r2d2::Pool<SqliteConnectionManager>,
 }
+
+pub type AppState = Arc<SharedAppState>;
 
 /// Parent function for the server threads.
 pub async fn server(
@@ -25,7 +27,7 @@ pub async fn server(
     tx: mpsc::Sender<FetchManagerCommand>,
     pool: r2d2::Pool<SqliteConnectionManager>,
 ) -> Result<()> {
-    let shared_state = Arc::new(AppState {
+    let shared_state = Arc::new(SharedAppState {
         fetcher_tx: tx,
         conn_pool: pool,
     });

@@ -9,13 +9,9 @@ use get_feed::get_feed;
 use list_feeds::list_feeds;
 
 use crate::serve::server::AppState;
-use axum::{
-    routing::get,
-    Router,
-};
-use std::sync::Arc;
+use axum::{routing::get, Router};
 
-pub fn create_router() -> Router<Arc<AppState>> {
+pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_feeds).post(add_feed))
         .route("/{*id}", get(get_feed).delete(delete_feed))

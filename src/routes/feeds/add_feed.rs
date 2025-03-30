@@ -1,6 +1,5 @@
 use crate::serve::server::AppState;
 use axum::{extract::State, http::StatusCode, Json};
-use std::sync::Arc;
 use tokio::task;
 use tracing::{event, Level};
 
@@ -13,7 +12,7 @@ pub struct AddFeedResponse {
 
 /// Route handler for adding a new feed.
 #[axum::debug_handler]
-pub async fn add_feed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<AddFeedResponse>) {
+pub async fn add_feed(State(state): State<AppState>) -> (StatusCode, Json<AddFeedResponse>) {
     // Add a new feed instance to the database
     let conn = state.conn_pool.get().unwrap();
 
