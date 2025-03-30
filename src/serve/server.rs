@@ -30,7 +30,7 @@ pub async fn server(
         conn_pool: pool,
     });
     let app = Router::new()
-        .nest("/feed", routes::feed::create_router())
+        .nest("/feeds", routes::feed::create_router())
         .with_state(shared_state)
         .layer((
             TraceLayer::new_for_http(),

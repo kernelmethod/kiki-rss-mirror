@@ -1,23 +1,30 @@
 use crate::serve::server::AppState;
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
 use std::sync::Arc;
 use tokio::task;
 use tracing::{event, Level};
 
 pub fn create_router() -> Router<Arc<AppState>> {
-    Router::new().route("/", post(add_feed))
+    Router::new()
+        .route("/", post(add_feed))
+        .route("/{*id}", get(get_feed))
 }
 
 struct AddFeedQueryResult(i64);
 
 #[derive(serde::Serialize)]
-struct AddFeedResult {
+struct AddFeedResponse {
     id: i64,
 }
 
 /// Route handler for adding a new feed to Kiki.
 #[axum::debug_handler]
-async fn add_feed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<AddFeedResult>) {
+async fn add_feed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<AddFeedResponse>) {
     // Add a new feed instance to the database
     let conn = state.conn_pool.get().unwrap();
 
@@ -29,7 +36,7 @@ async fn add_feed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<AddFe
                 Ok(s) => s,
                 Err(e) => {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-                    let result = AddFeedResult { id: 0 };
+                    let result = AddFeedResponse { id: 0 };
                     return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(result)));
                 }
             };
@@ -45,7 +52,7 @@ async fn add_feed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<AddFe
                     "failure while adding new feed to database: {:?}",
                     e
                 );
-                let result = AddFeedResult { id: 0 };
+                let result = AddFeedResponse { id: 0 };
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(result)));
             }
         }
@@ -61,13 +68,25 @@ async fn add_feed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<AddFe
                 "error waiting for blocking thread to run SQL query: {:?}",
                 e
             );
-            let result = AddFeedResult { id: 0 };
+            let result = AddFeedResponse { id: 0 };
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(result));
         }
     };
 
     event!(Level::INFO, "created new feed");
-    let result = AddFeedResult { id };
+    let result = AddFeedResponse { id };
 
     (StatusCode::CREATED, Json(result))
 }
+
+/// Route handler for fetching a single feed's information.
+#[axum::debug_handler]
+async fn get_feed(
+    State(_state): State<Arc<AppState>>,
+    Path(_id): Path<u64>,
+) -> (StatusCode, &'static str) {
+    (StatusCode::OK, "")
+}
+
+#[cfg(test)]
+mod test {}
