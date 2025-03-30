@@ -1,6 +1,5 @@
 mod fetcher;
-mod routes;
-mod server;
+pub mod server;
 
 use anyhow::{Context, Result};
 use clap::Args;

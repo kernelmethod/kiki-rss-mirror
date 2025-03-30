@@ -2,6 +2,7 @@ pub mod db;
 pub mod http;
 pub mod init;
 pub mod migrate;
+pub mod routes;
 pub mod serve;
 
 #[cfg(test)]

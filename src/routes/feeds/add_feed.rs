@@ -1,36 +1,19 @@
 use crate::serve::server::AppState;
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    routing::get,
-    Json, Router,
-};
+use axum::{extract::State, http::StatusCode, Json};
 use std::sync::Arc;
 use tokio::task;
 use tracing::{event, Level};
 
-pub fn create_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/", get(list_feeds).post(add_feed))
-        .route("/{*id}", get(get_feed).delete(delete_feed))
-}
-
-/// Route handler for listing all of the available feeds.
-#[axum::debug_handler]
-async fn list_feeds(State(_state): State<Arc<AppState>>) -> (StatusCode, &'static str) {
-    (StatusCode::OK, "")
-}
-
 struct AddFeedQueryResult(i64);
 
 #[derive(serde::Serialize)]
-struct AddFeedResponse {
+pub struct AddFeedResponse {
     id: i64,
 }
 
 /// Route handler for adding a new feed.
 #[axum::debug_handler]
-async fn add_feed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<AddFeedResponse>) {
+pub async fn add_feed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<AddFeedResponse>) {
     // Add a new feed instance to the database
     let conn = state.conn_pool.get().unwrap();
 
@@ -84,24 +67,3 @@ async fn add_feed(State(state): State<Arc<AppState>>) -> (StatusCode, Json<AddFe
 
     (StatusCode::CREATED, Json(result))
 }
-
-/// Route handler for fetching a single feed's information.
-#[axum::debug_handler]
-async fn get_feed(
-    State(_state): State<Arc<AppState>>,
-    Path(_id): Path<u64>,
-) -> (StatusCode, &'static str) {
-    (StatusCode::OK, "")
-}
-
-/// Route handler for deleting a feed.
-#[axum::debug_handler]
-async fn delete_feed(
-    State(_state): State<Arc<AppState>>,
-    Path(_id): Path<u64>,
-) -> (StatusCode, &'static str) {
-    (StatusCode::OK, "")
-}
-
-#[cfg(test)]
-mod test {}

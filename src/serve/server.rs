@@ -1,4 +1,4 @@
-use crate::serve::{fetcher::FetchManagerCommand, routes};
+use crate::{routes, serve::fetcher::FetchManagerCommand};
 use anyhow::{Context, Result};
 use axum::Router;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -30,7 +30,7 @@ pub async fn server(
         conn_pool: pool,
     });
     let app = Router::new()
-        .nest("/feeds", routes::feed::create_router())
+        .nest("/feeds", routes::feeds::create_router())
         .with_state(shared_state)
         .layer((
             TraceLayer::new_for_http(),
