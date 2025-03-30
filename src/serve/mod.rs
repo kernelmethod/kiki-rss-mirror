@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
-use std::{path::PathBuf, sync::atomic};
+use std::{fs, path::PathBuf, sync::atomic};
 use tokio::sync::mpsc;
 
 #[derive(Args)]
@@ -53,9 +53,20 @@ impl ServeArgs {
         // to the feed fetchers
         let (tx, rx) = mpsc::channel(1024);
 
+        // Create Unix socket for the server listener
+        let socket_path = PathBuf::from("kiki.sock");
+        if socket_path.exists() {
+            let _ = fs::remove_file(&socket_path).with_context(|| {
+                format!(
+                    "Unable to delete existing socket file from {:?}",
+                    &socket_path
+                )
+            })?;
+        }
+
         fetcher_runtime.spawn(fetcher::manager(rx, pool.clone()));
         server_runtime
-            .block_on(async { server::server(tx.clone(), pool.clone()).await })
+            .block_on(async { server::server(&socket_path, tx.clone(), pool.clone()).await })
             .with_context(|| "Failed to spawn server tasks")?;
 
         Ok(())

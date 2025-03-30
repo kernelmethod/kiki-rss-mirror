@@ -2,7 +2,12 @@ use crate::serve::{fetcher::FetchManagerCommand, routes};
 use anyhow::{Context, Result};
 use axum::Router;
 use r2d2_sqlite::SqliteConnectionManager;
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::net::UnixListener;
 use tokio::signal;
 use tokio::sync::mpsc;
@@ -16,12 +21,13 @@ pub struct AppState {
 
 /// Parent function for the server threads.
 pub async fn server(
+    socket_path: &Path,
     tx: mpsc::Sender<FetchManagerCommand>,
     pool: r2d2::Pool<SqliteConnectionManager>,
 ) -> Result<()> {
     let shared_state = Arc::new(AppState {
         fetcher_tx: tx,
-        conn_pool: pool
+        conn_pool: pool,
     });
     let app = Router::new()
         .nest("/feed", routes::feed::create_router())
@@ -31,22 +37,12 @@ pub async fn server(
             TimeoutLayer::new(Duration::from_secs(10)),
         ));
 
-    let socket_path = PathBuf::from("kiki.sock");
-    if socket_path.exists() {
-        let _ = fs::remove_file(&socket_path).with_context(|| {
-            format!(
-                "Unable to delete existing socket file from {:?}",
-                &socket_path
-            )
-        })?;
-    }
-
-    let listener = UnixListener::bind(&socket_path)
+    let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("Unable to bind to Unix socket at {:?}", &socket_path))?;
 
     span!(Level::TRACE, "web-worker");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(socket_path.clone()))
+        .with_graceful_shutdown(shutdown_signal(socket_path.into()))
         .await
         .with_context(|| "Error encountered while running server")
 }
