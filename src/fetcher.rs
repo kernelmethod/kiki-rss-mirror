@@ -3,6 +3,7 @@ use anyhow::Result;
 use r2d2_sqlite::SqliteConnectionManager;
 use rss::Channel;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 pub enum FetchManagerCommand {}
@@ -11,6 +12,7 @@ pub enum FetchManagerCommand {}
 pub async fn manager(
     _rx: mpsc::Receiver<FetchManagerCommand>,
     _pool: r2d2::Pool<SqliteConnectionManager>,
+    _token: CancellationToken,
 ) -> Result<()> {
     let client = reqwest::Client::new();
     let resp = client
@@ -20,8 +22,7 @@ pub async fn manager(
         .await?;
 
     let content = resp.bytes().await?;
-    let chan = Channel::read_from(&content[..])?;
+    let _chan = Channel::read_from(&content[..])?;
 
-    println!("{chan:#?}");
     Ok(())
 }

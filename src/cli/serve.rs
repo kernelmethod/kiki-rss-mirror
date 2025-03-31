@@ -16,9 +16,8 @@ impl ServeArgs {
             .socket_path(&socket_path)
             .build();
 
-        let handle = server.run()?;
-        let _ = handle.join();
-
-        Ok(())
+        std::thread::spawn(|| server.run())
+            .join()
+            .expect("panic in server thread")
     }
 }

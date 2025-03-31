@@ -2,7 +2,7 @@ use crate::{
     fetcher::{self, FetchManagerCommand},
     routes,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use axum::Router;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
@@ -10,12 +10,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{atomic, Arc},
-    thread::{self, JoinHandle},
     time::Duration,
 };
-use tokio::net::UnixListener;
-use tokio::signal;
-use tokio::sync::mpsc;
+use tokio::{net::UnixListener, signal, sync::mpsc};
+use tokio_util::sync::CancellationToken;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::{span, Level};
 
@@ -54,17 +52,53 @@ impl<'a> ServerBuilder<'a> {
         Server {
             db_path,
             socket_path,
+            cancel_token: CancellationToken::new(),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct ServerError {
+    fetch_error: Option<Error>,
+    web_error: Option<Error>,
+}
+
+impl Default for ServerError {
+    fn default() -> Self {
+        ServerError {
+            fetch_error: None,
+            web_error: None,
+        }
+    }
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ServerError:\n")?;
+        if let Some(e) = &self.fetch_error {
+            write!(f, "\tfetch_error={:#?}\n", e)?;
+        }
+        if let Some(e) = &self.web_error {
+            write!(f, "\tweb_error={:#?}\n", e)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ServerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
     }
 }
 
 pub struct Server {
     db_path: PathBuf,
     socket_path: PathBuf,
+    cancel_token: CancellationToken,
 }
 
 impl Server {
-    pub fn run(self) -> Result<JoinHandle<Result<()>>> {
+    pub fn run(self) -> Result<()> {
         // Create a pool of connections that can be shared between all of
         // the threads that we spawn.
         let manager = SqliteConnectionManager::file(&self.db_path)
@@ -90,8 +124,8 @@ impl Server {
                 format!("feed-fetcher-{}", id)
             })
             .build()
-            .with_context(|| "Failed to build Tokio runtime for feed fetchers")?;
-        let server_runtime = tokio::runtime::Builder::new_multi_thread()
+            .with_context(|| "failed to build Tokio runtime for feed fetchers")?;
+        let web_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name_fn(|| {
                 static ATOMIC_ID: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
@@ -99,7 +133,7 @@ impl Server {
                 format!("server-worker-{}", id)
             })
             .build()
-            .with_context(|| "Failed to build Tokio runtime for web service workers")?;
+            .with_context(|| "failed to build Tokio runtime for web service workers")?;
 
         // Create a channel so that web service workers can send tasks
         // to the feed fetchers
@@ -115,47 +149,34 @@ impl Server {
             })?;
         }
 
-        let handle = thread::spawn(move || {
-            fetcher_runtime.spawn(fetcher::manager(rx, pool.clone()));
-            server_runtime
-                .block_on(async { server(&self.socket_path, tx.clone(), pool.clone()).await })
-                .with_context(|| "Failed to spawn server tasks")?;
-            Ok(())
-        });
+        fetcher_runtime.spawn(fetcher::manager(
+            rx,
+            pool.clone(),
+            self.cancel_token.clone(),
+        ));
+        web_runtime.spawn(server(
+            self.socket_path,
+            tx.clone(),
+            pool.clone(),
+            self.cancel_token.clone(),
+        ));
+        let cancel_task = web_runtime.spawn(shutdown_signal(self.cancel_token.clone()));
 
-        Ok(handle)
+        web_runtime.block_on(cancel_task)?;
+
+        Ok(())
+    }
+
+    fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
     }
 }
 
-/// Parent function for the web worker threads.
-async fn server(
-    socket_path: &Path,
-    tx: mpsc::Sender<FetchManagerCommand>,
-    pool: r2d2::Pool<SqliteConnectionManager>,
-) -> Result<()> {
-    let shared_state = Arc::new(SharedAppState {
-        fetcher_tx: tx,
-        conn_pool: pool,
-    });
-    let app = Router::new()
-        .nest("/feeds", routes::feeds::create_router())
-        .with_state(shared_state)
-        .layer((
-            TraceLayer::new_for_http(),
-            TimeoutLayer::new(Duration::from_secs(10)),
-        ));
+async fn shutdown_signal(token: CancellationToken) {
+    let handler = || {
+        token.cancel();
+    };
 
-    let listener = UnixListener::bind(socket_path)
-        .with_context(|| format!("Unable to bind to Unix socket at {:?}", socket_path))?;
-
-    span!(Level::TRACE, "web-worker");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(socket_path.into()))
-        .await
-        .with_context(|| "Error encountered while running server")
-}
-
-async fn shutdown_signal(socket_path: PathBuf) {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -173,12 +194,75 @@ async fn shutdown_signal(socket_path: PathBuf) {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    tokio::select! {
+        _ = ctrl_c => { handler(); }
+        _ = terminate => { handler(); }
+        _ = token.cancelled() => {}
+    }
+}
+
+/// Parent function for the web worker threads.
+async fn server(
+    socket_path: PathBuf,
+    tx: mpsc::Sender<FetchManagerCommand>,
+    pool: r2d2::Pool<SqliteConnectionManager>,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    let shared_state = Arc::new(SharedAppState {
+        fetcher_tx: tx,
+        conn_pool: pool,
+    });
+    let app = Router::new()
+        .nest("/feeds", routes::feeds::create_router())
+        .with_state(shared_state)
+        .layer((
+            TraceLayer::new_for_http(),
+            TimeoutLayer::new(Duration::from_secs(10)),
+        ));
+
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("Unable to bind to Unix socket at {:?}", &socket_path))?;
+
+    span!(Level::TRACE, "web-worker");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(web_shutdown_signal(
+            socket_path.into(),
+            cancel_token.clone(),
+        ))
+        .await
+        .with_context(|| "Error encountered while running server")
+}
+
+async fn web_shutdown_signal(socket_path: PathBuf, cancel_token: CancellationToken) {
     let handler = || {
         let _ = fs::remove_file(socket_path);
     };
 
     tokio::select! {
-        _ = ctrl_c => { handler(); },
-        _ = terminate => { handler(); },
+        _ = cancel_token.cancelled() => { handler(); },
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::test::TestConfig;
+    use anyhow::Result;
+
+    /// Ensure that we can start and stop the server without a panic.
+    #[test]
+    fn test_start_stop_server() -> Result<()> {
+        let tc = TestConfig::new()?.init()?;
+        let server = ServerBuilder::new(&tc.database_path())
+            .socket_path(&tc.socket_path())
+            .build();
+
+        let token = server.cancel_token();
+        let handle = std::thread::spawn(|| server.run());
+
+        token.cancel();
+        handle.join().expect("panic in server thread")?;
+
+        Ok(())
     }
 }
