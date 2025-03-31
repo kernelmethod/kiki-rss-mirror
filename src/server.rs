@@ -167,7 +167,7 @@ impl Server {
         Ok(())
     }
 
-    fn cancel_token(&self) -> CancellationToken {
+    pub fn cancel_token(&self) -> CancellationToken {
         self.cancel_token.clone()
     }
 }
@@ -245,23 +245,18 @@ async fn web_shutdown_signal(socket_path: PathBuf, cancel_token: CancellationTok
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::test::TestConfig;
+    use crate::test::TestBuilder;
     use anyhow::Result;
 
     /// Ensure that we can start and stop the server without a panic.
     #[test]
     fn test_start_stop_server() -> Result<()> {
-        let tc = TestConfig::new()?.init()?;
-        let server = ServerBuilder::new(&tc.database_path())
-            .socket_path(&tc.socket_path())
-            .build();
-
-        let token = server.cancel_token();
-        let handle = std::thread::spawn(|| server.run());
-
-        token.cancel();
-        handle.join().expect("panic in server thread")?;
+        let tc = TestBuilder::all().build()?;
+        tc.server_token.unwrap().cancel();
+        tc.server_handle
+            .unwrap()
+            .join()
+            .expect("panic in server thread")?;
 
         Ok(())
     }
