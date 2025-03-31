@@ -3,18 +3,15 @@ use crate::{
     routes,
 };
 use anyhow::{Context, Error, Result};
-use axum::Router;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::{atomic, Arc},
-    time::Duration,
 };
 use tokio::{net::UnixListener, signal, sync::mpsc};
 use tokio_util::sync::CancellationToken;
-use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::{span, Level};
 
 pub struct SharedAppState {
@@ -212,13 +209,8 @@ async fn server(
         fetcher_tx: tx,
         conn_pool: pool,
     });
-    let app = Router::new()
-        .nest("/feeds", routes::feeds::create_router())
-        .with_state(shared_state)
-        .layer((
-            TraceLayer::new_for_http(),
-            TimeoutLayer::new(Duration::from_secs(10)),
-        ));
+    let app = routes::create_router()
+        .with_state(shared_state);
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Unable to bind to Unix socket at {:?}", &socket_path))?;
