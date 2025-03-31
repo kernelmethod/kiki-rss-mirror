@@ -33,4 +33,8 @@ impl TestConfig {
     pub fn database_path(&self) -> PathBuf {
         PathBuf::from(self.config_dir()).join("kiki.db")
     }
+
+    pub fn socket_path(&self) -> PathBuf {
+        PathBuf::from(self.config_dir()).join("kiki.sock")
+    }
 }
