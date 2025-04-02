@@ -4,21 +4,21 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0.97"
-axum = { version = "0.8.1", features = ["macros"] }
-clap = { version = "4.5.34", features = ["cargo", "derive"] }
-r2d2 = "0.8.10"
-r2d2_sqlite = "0.27.0"
-reqwest = "0.12.15"
-rss = "2.0.12"
-rusqlite = { version = "0.34.0", features = ["bundled"] }
-serde = { version = "1.0.219", features = ["serde_derive"] }
+anyhow = "1.0"
+axum = { version = "0.8", features = ["macros"] }
+clap = { version = "4.5", features = ["cargo", "derive"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.27"
+reqwest = "0.12"
+rss = "2.0"
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde = { version = "1.0", features = ["serde_derive"] }
 tokio = { version = ">=1.40,<1.45", features = ["full"] }
-tokio-util = "0.7.14"
-tower-http = { version = "0.6.2", features = ["trace", "timeout"] }
-tracing = "0.1.41"
-tracing-subscriber = "0.3.19"
+tokio-util = "0.7"
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 [dev-dependencies]
-itertools = "0.14.0"
-tempdir = "0.3.7"
+itertools = "0.14"
+tempdir = "0.3"
