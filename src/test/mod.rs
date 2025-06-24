@@ -102,6 +102,17 @@ impl TestConfig {
         Ok(self)
     }
 
+    /// Create an HTTP client to connect to the test server being run
+    /// in the background.
+    pub async fn client(&self) -> Result<reqwest::Client> {
+        let p = self.socket_path();
+        if !p.exists() {
+            bail!("HTTP server has not been started on {:?}", &p)
+        }
+
+        Ok(reqwest::Client::builder().unix_socket(p).build()?)
+    }
+
     pub fn config_dir(&self) -> &Path {
         self.td.path()
     }
