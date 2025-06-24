@@ -10,7 +10,7 @@ pub struct RootResponse<'a> {
 
 const ROOT: RootResponse = RootResponse {
     version: crate_version!(),
-    schema_version: SCHEMA_VERSION
+    schema_version: SCHEMA_VERSION,
 };
 
 /// Route handler for the root url, `/`.

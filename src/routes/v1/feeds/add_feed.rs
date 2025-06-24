@@ -41,7 +41,7 @@ pub async fn add_feed(State(state): State<AppState>) -> (StatusCode, Json<AddFee
                     e
                 );
                 let result = AddFeedResponse { id: 0 };
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(result)));
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(result)))
             }
         }
     })

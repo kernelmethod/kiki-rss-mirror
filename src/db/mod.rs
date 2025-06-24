@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: &'static str = "1.0";
+pub const SCHEMA_VERSION: &str = "1.0";
 
 enum ConnectionType<'a> {
     DefaultConnection,
@@ -27,7 +27,7 @@ impl<'a> ConnectionBuilder<'a> {
     /// Create database if it does not already exists.
     pub fn create(mut self) -> Self {
         self.create = true;
-        self.flags = self.flags | OpenFlags::SQLITE_OPEN_CREATE;
+        self.flags |= OpenFlags::SQLITE_OPEN_CREATE;
         self.read_write()
     }
 
@@ -39,8 +39,8 @@ impl<'a> ConnectionBuilder<'a> {
 
     /// Open connection in read-write mode.
     pub fn read_write(mut self) -> Self {
-        self.flags = self.flags | OpenFlags::SQLITE_OPEN_READ_WRITE;
-        self.flags = self.flags & (!OpenFlags::SQLITE_OPEN_READ_ONLY);
+        self.flags |= OpenFlags::SQLITE_OPEN_READ_WRITE;
+        self.flags &= !OpenFlags::SQLITE_OPEN_READ_ONLY;
         self
     }
 

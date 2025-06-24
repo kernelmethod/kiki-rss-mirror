@@ -54,29 +54,20 @@ impl<'a> ServerBuilder<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ServerError {
     fetch_error: Option<Error>,
     web_error: Option<Error>,
 }
 
-impl Default for ServerError {
-    fn default() -> Self {
-        ServerError {
-            fetch_error: None,
-            web_error: None,
-        }
-    }
-}
-
 impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ServerError:\n")?;
+        writeln!(f, "ServerError:")?;
         if let Some(e) = &self.fetch_error {
-            write!(f, "\tfetch_error={:#?}\n", e)?;
+            writeln!(f, "\tfetch_error={:#?}", e)?;
         }
         if let Some(e) = &self.web_error {
-            write!(f, "\tweb_error={:#?}\n", e)?;
+            writeln!(f, "\tweb_error={:#?}", e)?;
         }
         Ok(())
     }
@@ -138,7 +129,7 @@ impl Server {
 
         // Create Unix socket for the server listener
         if self.socket_path.exists() {
-            let _ = fs::remove_file(&self.socket_path).with_context(|| {
+            fs::remove_file(&self.socket_path).with_context(|| {
                 format!(
                     "Unable to delete existing socket file from {:?}",
                     &self.socket_path
@@ -209,18 +200,14 @@ async fn server(
         fetcher_tx: tx,
         conn_pool: pool,
     });
-    let app = routes::create_router()
-        .with_state(shared_state);
+    let app = routes::create_router().with_state(shared_state);
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Unable to bind to Unix socket at {:?}", &socket_path))?;
 
     span!(Level::TRACE, "web-worker");
     axum::serve(listener, app)
-        .with_graceful_shutdown(web_shutdown_signal(
-            socket_path.into(),
-            cancel_token.clone(),
-        ))
+        .with_graceful_shutdown(web_shutdown_signal(socket_path, cancel_token.clone()))
         .await
         .with_context(|| "Error encountered while running server")
 }
