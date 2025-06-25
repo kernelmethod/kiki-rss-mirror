@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use std::{
     path::{Path, PathBuf},
     thread,
+    time::{Duration, Instant},
 };
 use tempdir::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -87,6 +88,7 @@ impl TestConfig {
     }
 
     pub fn init_server(mut self) -> Result<Self> {
+        println!("starting server at {:?}", &self.socket_path());
         if let Some(_) = self.server_token {
             bail!("server has already been started");
         }
@@ -104,13 +106,22 @@ impl TestConfig {
 
     /// Create an HTTP client to connect to the test server being run
     /// in the background.
-    pub async fn client(&self) -> Result<reqwest::Client> {
+    pub fn client(&self) -> Result<reqwest::Client> {
         let p = self.socket_path();
-        if !p.exists() {
-            bail!("HTTP server has not been started on {:?}", &p)
+
+        // The server may take a little bit of time to start up.
+        // We spin and wait until it's available.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if !p.exists() {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+
+            return Ok(reqwest::Client::builder().unix_socket(p).build()?);
         }
 
-        Ok(reqwest::Client::builder().unix_socket(p).build()?)
+        bail!("HTTP server has not been started on {:?}", &p);
     }
 
     pub fn config_dir(&self) -> &Path {

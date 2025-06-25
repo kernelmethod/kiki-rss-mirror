@@ -21,12 +21,23 @@ pub async fn root(State(_state): State<AppState>) -> (StatusCode, Json<RootRespo
 
 #[cfg(test)]
 mod test {
-    use crate::test::TestBuilder;
+    use crate::{db::SCHEMA_VERSION, test::TestBuilder};
     use anyhow::Result;
+    use axum::http::StatusCode;
+    use clap::crate_version;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_get_root() -> Result<()> {
-        let _tc = TestBuilder::all().build()?;
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        let resp = client.get("http://kiki/v1/").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = resp.json::<HashMap<String, String>>().await?;
+        assert_eq!(json["version"], crate_version!());
+        assert_eq!(json["schema_version"], SCHEMA_VERSION);
 
         Ok(())
     }
