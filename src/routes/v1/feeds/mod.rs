@@ -2,11 +2,13 @@ mod add_feed;
 mod delete_feed;
 mod get_feed;
 mod list_feeds;
+mod update_feed;
 
 use add_feed::add_feed;
 use delete_feed::delete_feed;
 use get_feed::get_feed;
 use list_feeds::list_feeds;
+use update_feed::update_feed;
 
 use crate::server::AppState;
 use axum::{routing::get, Router};
@@ -14,7 +16,7 @@ use axum::{routing::get, Router};
 pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_feeds).post(add_feed))
-        .route("/{*id}", get(get_feed).delete(delete_feed))
+        .route("/{*id}", get(get_feed).delete(delete_feed).put(update_feed))
 }
 
 #[cfg(test)]
@@ -155,6 +157,89 @@ mod test {
         // Try to delete a non-existent feed
         let resp = client.delete("http://kiki/v1/feeds/999").send().await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_feed() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // Add a feed
+        let resp = client
+            .post("http://kiki/v1/feeds")
+            .json(&add_feed::AddFeedRequest {
+                title: "original title".to_string(),
+                url: "https://example.com/feed.xml".to_string(),
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let feed_id = resp.json::<add_feed::AddFeedResponse>().await?.id;
+
+        // Verify the feed exists with original values
+        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
+        assert_eq!(json.feeds.len(), 1);
+        assert_eq!(json.feeds[0].id, feed_id);
+        assert_eq!(json.feeds[0].title, "original title");
+        assert_eq!(json.feeds[0].url, "https://example.com/feed.xml");
+
+        // Update the feed
+        let resp = client
+            .put(format!("http://kiki/v1/feeds/{:?}", feed_id))
+            .json(&update_feed::UpdateFeedRequest {
+                title: Some("updated title".to_string()),
+                url: None,
+                description: Some("updated description".to_string()),
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<update_feed::UpdateFeedResponse>().await?;
+        assert_eq!(json.id, feed_id);
+        assert_eq!(json.title, "updated title");
+        assert_eq!(json.url, "https://example.com/feed.xml");
+        assert_eq!(json.description, Some("updated description".to_string()));
+
+        // Verify the feed was updated
+        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
+        assert_eq!(json.feeds.len(), 1);
+        assert_eq!(json.feeds[0].id, feed_id);
+        assert_eq!(json.feeds[0].title, "updated title");
+        assert_eq!(json.feeds[0].url, "https://example.com/feed.xml");
+        assert_eq!(
+            json.feeds[0].description,
+            Some("updated description".to_string())
+        );
+
+        // Try to update a non-existent feed
+        let resp = client
+            .put("http://kiki/v1/feeds/999")
+            .json(&update_feed::UpdateFeedRequest {
+                title: Some("non-existent title".to_string()),
+                url: None,
+                description: None,
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Try to update with no fields provided
+        let resp = client
+            .put(format!("http://kiki/v1/feeds/{:?}", feed_id))
+            .json(&update_feed::UpdateFeedRequest {
+                title: None,
+                url: None,
+                description: None,
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         Ok(())
     }
