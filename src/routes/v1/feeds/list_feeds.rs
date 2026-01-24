@@ -54,7 +54,7 @@ pub async fn list_feeds(
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
-            .query_row([], |count| Ok(count.get(0)?))?;
+            .query_row([], |count| count.get(0))?;
 
         let feeds = conn
             .prepare(

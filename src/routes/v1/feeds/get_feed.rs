@@ -80,7 +80,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
                 id,
                 message: "internal error".to_string(),
             };
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(result)).into_response();
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(result)).into_response()
         }
     }
 }

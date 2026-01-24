@@ -113,7 +113,6 @@ mod test {
 
     #[tokio::test]
     async fn test_delete_feed() -> Result<()> {
-        tracing_subscriber::fmt::init();
         let tc = TestBuilder::all().init_server().build()?;
         let client = tc.client()?;
 
