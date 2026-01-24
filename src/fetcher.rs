@@ -14,12 +14,15 @@ pub enum FetchManagerCommand {
 pub async fn manager(
     mut rx: mpsc::Receiver<FetchManagerCommand>,
     pool: r2d2::Pool<SqliteConnectionManager>,
-    _token: CancellationToken,
+    token: CancellationToken,
 ) -> Result<()> {
     let client = reqwest::Client::new();
 
     // Process commands as they come in
-    while let Some(command) = rx.recv().await {
+    while let Some(command) = tokio::select! {
+        command = rx.recv() => command,
+        _ = token.cancelled() => return Ok(()),
+    } {
         match command {
             FetchManagerCommand::RefreshFeed(feed_id) => {
                 // Get the feed URL and headers from the database
