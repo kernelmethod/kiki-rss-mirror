@@ -23,6 +23,7 @@ CREATE TABLE feeds (
     id                      INTEGER PRIMARY KEY,
 
     -- "rss" or "atom"
+    -- Should be NULL if unknown (e.g. if the feed was just created)
     syndication_format      VARCHAR,
 
     title                   VARCHAR NOT NULL,
