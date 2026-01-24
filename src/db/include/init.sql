@@ -91,7 +91,7 @@ CREATE TABLE entries (
     status_favorite INTEGER NOT NULL,
 
     FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
-    FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE SET NULL
+    FOREIGN KEY(source_id) REFERENCES entry_sources(id) ON DELETE SET NULL
 );
 CREATE INDEX idx_entry_syndication ON entries(syndication_format);
 CREATE UNIQUE INDEX idx_entry_guids ON entries(feed_id, guid);
