@@ -192,7 +192,8 @@ fn process_rss_feed(
 
     // Insert or update entries from the RSS feed
     for item in channel.items() {
-        let timestamp = item.pub_date()
+        let timestamp = item
+            .pub_date()
             .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
             .map(|d| d.timestamp())
             .unwrap_or_else(|| chrono::Utc::now().timestamp());

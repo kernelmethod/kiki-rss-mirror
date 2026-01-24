@@ -15,7 +15,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{span, Level};
 
 pub struct SharedAppState {
+    /// An [`mpsc::Sender`] instance that may be used to send commands
+    /// to workers threads used to fetch and process feeds.
     pub fetcher_tx: mpsc::Sender<FetchManagerCommand>,
+
+    /// A [`r2d2::Pool`] instance that intermediates connections to the
+    /// SQLite database.
     pub conn_pool: r2d2::Pool<SqliteConnectionManager>,
 }
 

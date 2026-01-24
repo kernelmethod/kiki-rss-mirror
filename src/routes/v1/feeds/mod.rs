@@ -1,22 +1,31 @@
 mod add_feed;
 mod delete_feed;
+mod fetch_feed;
 mod get_feed;
 mod list_feeds;
 mod update_feed;
 
 use add_feed::add_feed;
 use delete_feed::delete_feed;
+use fetch_feed::fetch_feed;
 use get_feed::get_feed;
 use list_feeds::list_feeds;
 use update_feed::update_feed;
 
 use crate::server::AppState;
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 
 pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_feeds).post(add_feed))
-        .route("/{*id}", get(get_feed).delete(delete_feed).put(update_feed))
+        .route(
+            "/id/{*id}",
+            get(get_feed).delete(delete_feed).put(update_feed),
+        )
+        .route("/fetch/{*id}", post(fetch_feed))
 }
 
 #[cfg(test)]
@@ -38,7 +47,7 @@ mod test {
         assert_eq!(json.feeds.len(), 0);
         assert_eq!(json.count, 0);
         assert_eq!(json.offset, 0);
-        let resp = client.get("http://kiki/v1/feeds/0").send().await?;
+        let resp = client.get("http://kiki/v1/feeds/id/0").send().await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let json = resp.json::<get_feed::GetFeedError>().await?;
         assert_eq!(json.id, 0);
@@ -58,7 +67,7 @@ mod test {
 
         // Now retrieve the feed from the database
         let resp = client
-            .get(format!("http://kiki/v1/feeds/{:?}", feed_id))
+            .get(format!("http://kiki/v1/feeds/id/{:?}", feed_id))
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -142,7 +151,7 @@ mod test {
 
         // Delete the feed
         let resp = client
-            .delete(format!("http://kiki/v1/feeds/{:?}", feed_id))
+            .delete(format!("http://kiki/v1/feeds/id/{:?}", feed_id))
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -155,7 +164,7 @@ mod test {
         assert_eq!(json.count, 0);
 
         // Try to delete a non-existent feed
-        let resp = client.delete("http://kiki/v1/feeds/999").send().await?;
+        let resp = client.delete("http://kiki/v1/feeds/id/999").send().await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         Ok(())
@@ -189,7 +198,7 @@ mod test {
 
         // Update the feed
         let resp = client
-            .put(format!("http://kiki/v1/feeds/{:?}", feed_id))
+            .put(format!("http://kiki/v1/feeds/id/{:?}", feed_id))
             .json(&update_feed::UpdateFeedRequest {
                 title: Some("updated title".to_string()),
                 url: None,
@@ -219,7 +228,7 @@ mod test {
 
         // Try to update a non-existent feed
         let resp = client
-            .put("http://kiki/v1/feeds/999")
+            .put("http://kiki/v1/feeds/id/999")
             .json(&update_feed::UpdateFeedRequest {
                 title: Some("non-existent title".to_string()),
                 url: None,
@@ -231,7 +240,7 @@ mod test {
 
         // Try to update with no fields provided
         let resp = client
-            .put(format!("http://kiki/v1/feeds/{:?}", feed_id))
+            .put(format!("http://kiki/v1/feeds/id/{:?}", feed_id))
             .json(&update_feed::UpdateFeedRequest {
                 title: None,
                 url: None,
@@ -240,6 +249,33 @@ mod test {
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_feed() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // Add a feed
+        let resp = client
+            .post("http://kiki/v1/feeds")
+            .json(&add_feed::AddFeedRequest {
+                title: "test feed".to_string(),
+                url: "https://example.com/feed.xml".to_string(),
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let feed_id = resp.json::<add_feed::AddFeedResponse>().await?.id;
+
+        // Test the fetch endpoint - should return 202 Accepted
+        let resp = client
+            .post(format!("http://kiki/v1/feeds/fetch/{:?}", feed_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
         Ok(())
     }
