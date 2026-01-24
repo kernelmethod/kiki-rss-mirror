@@ -12,7 +12,7 @@ use tracing::{event, Level};
 const DEFAULT_LIMIT: usize = 50;
 
 #[derive(serde::Deserialize)]
-struct ListFeedsQueryParams {
+pub struct ListFeedsQueryParams {
     pub offset: Option<usize>,
     pub limit: Option<usize>,
 }
@@ -72,11 +72,10 @@ pub async fn list_feeds(
                     description: row.get(3)?,
                     last_checked: row.get(4)?,
                 })
-            })
-            .into_iter()
+            })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(ListFeedsResponse {
+        Ok::<ListFeedsResponse, rusqlite::Error>(ListFeedsResponse {
             count,
             offset,
             limit,

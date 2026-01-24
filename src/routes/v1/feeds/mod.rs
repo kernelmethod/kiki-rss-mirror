@@ -75,6 +75,43 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_list_feeds() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // Test empty feeds list
+        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
+        assert_eq!(json.feeds.len(), 0);
+        assert_eq!(json.count, 0);
+
+        // Add a feed and test that it appears in the list
+        let resp = client
+            .post("http://kiki/v1/feeds")
+            .json(&add_feed::AddFeedRequest {
+                title: "test feed".to_string(),
+                url: "https://example.com/feed.xml".to_string(),
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let feed_id = resp.json::<add_feed::AddFeedResponse>().await?.id;
+
+        // Check that the feed appears in the list
+        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
+        assert_eq!(json.feeds.len(), 1);
+        assert_eq!(json.count, 1);
+        assert_eq!(json.feeds[0].id, feed_id);
+        assert_eq!(json.feeds[0].title, "test feed");
+        assert_eq!(json.feeds[0].url, "https://example.com/feed.xml");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_update_and_delete_feed() -> Result<()> {
         let tc = TestBuilder::all().init_server().build()?;
         let client = tc.client()?;
