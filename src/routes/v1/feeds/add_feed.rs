@@ -5,14 +5,23 @@ use tracing::{event, Level};
 
 struct AddFeedQueryResult(i64);
 
-#[derive(serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct AddFeedRequest {
+    pub title: String,
+    pub url: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
 pub struct AddFeedResponse {
-    id: i64,
+    pub id: i64,
 }
 
 /// Route handler for adding a new feed.
 #[axum::debug_handler]
-pub async fn add_feed(State(state): State<AppState>) -> (StatusCode, Json<AddFeedResponse>) {
+pub async fn add_feed(
+    State(state): State<AppState>,
+    Json(payload): Json<AddFeedRequest>,
+) -> (StatusCode, Json<AddFeedResponse>) {
     // Add a new feed instance to the database
     let conn = state.conn_pool.get().unwrap();
 
@@ -28,10 +37,9 @@ pub async fn add_feed(State(state): State<AppState>) -> (StatusCode, Json<AddFee
                     return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(result)));
                 }
             };
-        let insert_result = stmt
-            .query_row(["my feed", "https://kernelmethod.org/rss.xml"], |row| {
-                Ok(AddFeedQueryResult(row.get(0).unwrap()))
-            });
+        let insert_result = stmt.query_row([payload.title, payload.url], |row| {
+            Ok(AddFeedQueryResult(row.get(0).unwrap()))
+        });
         match insert_result {
             Ok(r) => Ok(r.0),
             Err(e) => {

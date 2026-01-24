@@ -18,4 +18,67 @@ pub fn create_router() -> Router<AppState> {
 }
 
 #[cfg(test)]
-mod test {}
+mod test {
+    use super::*;
+    use crate::test::TestBuilder;
+    use anyhow::Result;
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn test_add_feed() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // We should start off with zero feeds
+        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
+        assert_eq!(json.feeds.len(), 0);
+        assert_eq!(json.count, 0);
+        assert_eq!(json.offset, 0);
+        let resp = client.get("http://kiki/v1/feeds/0").send().await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = resp.json::<get_feed::GetFeedError>().await?;
+        assert_eq!(json.id, 0);
+        assert_eq!(json.message, "not found");
+
+        // Add a new feed to the database
+        let resp = client
+            .post("http://kiki/v1/feeds")
+            .json(&add_feed::AddFeedRequest {
+                title: "my feed".to_string(),
+                url: "https://kernelmethod.org/rss.xml".to_string(),
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let feed_id = resp.json::<add_feed::AddFeedResponse>().await?.id;
+
+        // Now retrieve the feed from the database
+        let resp = client
+            .get(format!("http://kiki/v1/feeds/{:?}", feed_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<get_feed::GetFeedResponse>().await?;
+        assert_eq!(json.id, feed_id);
+        assert_eq!(json.title, "my feed");
+        assert_eq!(json.url, "https://kernelmethod.org/rss.xml");
+        assert_eq!(json.description, None);
+        assert_eq!(json.last_checked, None);
+
+        // We should also see the feed in the list of feeds
+        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_and_delete_feed() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        Ok(())
+    }
+}
