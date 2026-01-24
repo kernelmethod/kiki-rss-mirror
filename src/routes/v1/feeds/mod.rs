@@ -20,7 +20,8 @@ use axum::{
 
 pub fn create_router() -> Router<AppState> {
     Router::new()
-        .route("/", get(list_feeds).post(add_feed))
+        .route("/", get(list_feeds))
+        .route("/create", post(add_feed))
         .route(
             "/id/{*id}",
             get(get_feed).delete(delete_feed).put(update_feed),
@@ -55,7 +56,7 @@ mod test {
 
         // Add a new feed to the database
         let resp = client
-            .post("http://kiki/v1/feeds")
+            .post("http://kiki/v1/feeds/create")
             .json(&add_feed::AddFeedRequest {
                 title: "my feed".to_string(),
                 url: "https://kernelmethod.org/rss.xml".to_string(),
@@ -99,7 +100,7 @@ mod test {
 
         // Add a feed and test that it appears in the list
         let resp = client
-            .post("http://kiki/v1/feeds")
+            .post("http://kiki/v1/feeds/create")
             .json(&add_feed::AddFeedRequest {
                 title: "test feed".to_string(),
                 url: "https://example.com/feed.xml".to_string(),
@@ -129,7 +130,7 @@ mod test {
 
         // Add a feed
         let resp = client
-            .post("http://kiki/v1/feeds")
+            .post("http://kiki/v1/feeds/create")
             .json(&add_feed::AddFeedRequest {
                 title: "test feed".to_string(),
                 url: "https://example.com/feed.xml".to_string(),
@@ -177,7 +178,7 @@ mod test {
 
         // Add a feed
         let resp = client
-            .post("http://kiki/v1/feeds")
+            .post("http://kiki/v1/feeds/create")
             .json(&add_feed::AddFeedRequest {
                 title: "original title".to_string(),
                 url: "https://example.com/feed.xml".to_string(),
@@ -260,7 +261,7 @@ mod test {
 
         // Add a feed
         let resp = client
-            .post("http://kiki/v1/feeds")
+            .post("http://kiki/v1/feeds/create")
             .json(&add_feed::AddFeedRequest {
                 title: "test feed".to_string(),
                 url: "https://example.com/feed.xml".to_string(),
