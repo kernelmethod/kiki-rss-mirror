@@ -43,12 +43,12 @@ impl Default for ListFeedsError {
 pub async fn list_feeds(
     State(state): State<AppState>,
     Query(params): Query<ListFeedsQueryParams>,
-) -> Response {
+) -> Result<Response, Response> {
     let conn = state.conn_pool.get().unwrap();
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
 
-    task::spawn_blocking(move || {
+    let result = task::spawn_blocking(move || {
         let count = conn
             .prepare("SELECT COUNT(*) FROM feeds")
             .inspect_err(|e| {
@@ -83,9 +83,19 @@ pub async fn list_feeds(
             feeds,
         })
     })
-    .await
-    .map_err(|e| {
-        let result = ListFeedsError::default();
-        Err((StatusCode::INTERNAL_SERVER_ERROR, Json(result)).into_response())
-    })
+    .await;
+
+    match result {
+        Ok(Ok(response)) => Ok(Json(response).into_response()),
+        Ok(Err(e)) => {
+            event!(Level::ERROR, "error in list_feeds: {:?}", e);
+            let error = ListFeedsError::default();
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response())
+        }
+        Err(e) => {
+            event!(Level::ERROR, "task error in list_feeds: {:?}", e);
+            let error = ListFeedsError::default();
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response())
+        }
+    }
 }
