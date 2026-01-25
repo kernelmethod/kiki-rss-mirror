@@ -68,70 +68,26 @@ pub async fn manager(
                     }
                 }
 
-                // Build the request with conditional headers if they exist
-                let mut request = client.get(&feed_url).header("User-Agent", USER_AGENT);
+                // Handle file:// URLs differently
+                let feed_content = if feed_url.starts_with("file://") {
+                    retrieve_file_feed(&feed_url, feed_id, pool.clone())
+                } else {
+                    retrieve_feed(
+                        &client,
+                        feed_id,
+                        &feed_url,
+                        header_etag.as_deref(),
+                        header_last_modified.as_deref(),
+                        pool.clone(),
+                    )
+                    .await
+                }?;
 
-                if let Some(etag) = header_etag {
-                    request = request.header("If-None-Match", etag);
-                }
-
-                if let Some(last_modified) = header_last_modified {
-                    request = request.header("If-Modified-Since", last_modified);
-                }
-
-                // Make HTTP request to fetch the feed
-                let resp = request.send().await?;
-
-                // Check if the feed was modified
-                match resp.status() {
-                    reqwest::StatusCode::NOT_MODIFIED => {
-                        info!("Feed {} was not modified since last check", feed_id);
-                        // Update last_checked timestamp in database
-                        conn.execute(
-                            "UPDATE feeds SET last_checked = datetime('now') WHERE id = ?1",
-                            [feed_id],
-                        )?;
-                        continue;
-                    }
-                    reqwest::StatusCode::OK => { /* Do nothing */ }
-                    // For other status codes, log an issue and stop processing
-                    _ => {
-                        warn!(
-                            "Received status code {} while fetching contents for feed {}",
-                            resp.status(),
-                            feed_id
-                        );
-                        continue;
-                    }
-                }
-
-                // Update the feed's headers in the database
-                let etag = resp
-                    .headers()
-                    .get("etag")
-                    .map(|h| h.to_str().unwrap_or("").to_string());
-                let last_modified = resp
-                    .headers()
-                    .get("last-modified")
-                    .map(|h| h.to_str().unwrap_or("").to_string());
-
-                let etag_value = etag.as_ref().map_or("", |s| s.as_str());
-                let last_modified_value = last_modified.as_ref().map_or("", |s| s.as_str());
-
-                {
-                    let params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                        Box::new(etag_value),
-                        Box::new(last_modified_value),
-                        Box::new(feed_id),
-                    ];
-
-                    conn.execute(
-                        "UPDATE feeds SET header_etag = ?, header_last_modified = ?, last_checked = datetime('now') WHERE id = ?",
-                        rusqlite::params_from_iter(params)
-                    )?;
-                }
-
-                let content = resp.bytes().await?;
+                let content = if let Some(content) = feed_content {
+                    content
+                } else {
+                    continue;
+                };
 
                 // Attempt to parse content as Atom, with fallback to RSS.
                 if let Ok(feed) = atom_syndication::Feed::read_from(&content[..]) {
@@ -149,6 +105,97 @@ pub async fn manager(
     }
 
     Ok(())
+}
+
+async fn retrieve_feed(
+    client: &reqwest::Client,
+    feed_id: i64,
+    feed_url: &str,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    pool: Pool<SqliteConnectionManager>,
+) -> Result<Option<Vec<u8>>> {
+    let conn = pool.get().unwrap();
+
+    // Build the request with conditional headers if they exist
+    let mut request = client.get(feed_url).header("User-Agent", USER_AGENT);
+
+    if let Some(etag) = etag {
+        request = request.header("If-None-Match", etag);
+    }
+
+    if let Some(last_modified) = last_modified {
+        request = request.header("If-Modified-Since", last_modified);
+    }
+
+    // Make HTTP request to fetch the feed
+    let resp = request.send().await?;
+
+    // Check if the feed was modified
+    match resp.status() {
+        reqwest::StatusCode::NOT_MODIFIED => {
+            info!("Feed {} was not modified since last check", feed_id);
+            // Update last_checked timestamp in database
+            conn.execute(
+                "UPDATE feeds SET last_checked = datetime('now') WHERE id = ?1",
+                [feed_id],
+            )?;
+            return Ok(None);
+        }
+        reqwest::StatusCode::OK => { /* Do nothing */ }
+        // For other status codes, log an issue and stop processing
+        _ => {
+            warn!(
+                "Received status code {} while fetching contents for feed {}",
+                resp.status(),
+                feed_id
+            );
+            return Ok(None);
+        }
+    }
+
+    // Update the feed's headers in the database
+    let etag = resp.headers().get("etag").and_then(|h| h.to_str().ok());
+    let last_modified = resp
+        .headers()
+        .get("last-modified")
+        .and_then(|h| h.to_str().ok());
+
+    {
+        let params: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(etag), Box::new(last_modified), Box::new(feed_id)];
+
+        conn.execute(
+            "UPDATE feeds SET header_etag = ?, header_last_modified = ?, last_checked = datetime('now') WHERE id = ?",
+            rusqlite::params_from_iter(params)
+        )?;
+    }
+
+    let content = resp.bytes().await?;
+    Ok(Some(content.to_vec()))
+}
+
+fn retrieve_file_feed(
+    feed_url: &str,
+    feed_id: i64,
+    pool: Pool<SqliteConnectionManager>,
+) -> Result<Option<Vec<u8>>> {
+    let conn = pool.get().unwrap();
+
+    // Extract the file path from the URL
+    let file_path = feed_url.strip_prefix("file://").unwrap_or(feed_url);
+
+    // Read the file content
+    let content = std::fs::read(file_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file_path, e))?;
+
+    // Update the last_checked timestamp in the database
+    conn.execute(
+        "UPDATE feeds SET last_checked = datetime('now') WHERE id = ?1",
+        [feed_id],
+    )?;
+
+    Ok(Some(content))
 }
 
 fn process_atom_feed(
