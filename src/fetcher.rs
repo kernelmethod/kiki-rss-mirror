@@ -28,80 +28,93 @@ pub async fn manager(
     } {
         match command {
             FetchManagerCommand::RefreshFeed(feed_id) => {
-                // Get the feed URL and headers from the database
-                let conn = pool.get().unwrap();
-                let (feed_url, header_etag, header_last_modified, last_checked): (
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                ) = conn.query_row(
-                    "SELECT url, header_etag, header_last_modified, last_checked FROM feeds WHERE id = ?1",
-                    [feed_id],
-                    |row| {
-                        let url: String = row.get(0)?;
-                        let etag: Option<String> = row.get(1)?;
-                        let last_modified: Option<String> = row.get(2)?;
-                        let last_checked: Option<String> = row.get(3)?;
-                        Ok((url, etag, last_modified, last_checked))
-                    },
-                )?;
-
-                // Check if the feed was last updated recently
-                if let Some(last_checked_str) = last_checked {
-                    if let Ok(last_checked_time) = chrono::NaiveDateTime::parse_from_str(
-                        &last_checked_str,
-                        "%Y-%m-%d %H:%M:%S",
-                    ) {
-                        let now = chrono::Utc::now();
-                        let duration_since = now.signed_duration_since(last_checked_time.and_utc());
-                        if duration_since.num_hours() < 3 {
-                            debug!(
-                                "Feed {} was last checked {} seconds ago, skipping update",
-                                feed_id,
-                                duration_since.num_seconds()
-                            );
-                            continue;
-                        }
-                    } else {
-                        warn!("Unable to parse last_checked feed time stored in database for feed {}: {}", feed_id, last_checked_str);
-                    }
-                }
-
-                // Handle file:// URLs differently
-                let feed_content = if feed_url.starts_with("file://") {
-                    retrieve_file_feed(&feed_url, feed_id, pool.clone())
-                } else {
-                    retrieve_feed(
-                        &client,
-                        feed_id,
-                        &feed_url,
-                        header_etag.as_deref(),
-                        header_last_modified.as_deref(),
-                        pool.clone(),
-                    )
-                    .await
-                }?;
-
-                let content = if let Some(content) = feed_content {
-                    content
-                } else {
-                    continue;
-                };
-
-                // Attempt to parse content as Atom, with fallback to RSS.
-                if let Ok(feed) = atom_syndication::Feed::read_from(&content[..]) {
-                    process_atom_feed(feed_id, feed, conn)?;
-                } else if let Ok(channel) = rss::Channel::read_from(&content[..]) {
-                    process_rss_feed(feed_id, channel, conn)?;
-                } else {
-                    warn!(
-                        "Feed {} ({}) was not detected as a valid RSS or XML feed",
-                        feed_id, feed_url
-                    );
-                }
+                refresh_feed(&client, feed_id, pool.clone()).await?;
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Refresh the feed corresponding to the provided `feed_id`.
+async fn refresh_feed(
+    client: &reqwest::Client,
+    feed_id: i64,
+    pool: Pool<SqliteConnectionManager>,
+) -> Result<()> {
+    // Get the feed URL and headers from the database
+    let conn = pool.get().unwrap();
+    let (feed_url, header_etag, header_last_modified, last_checked): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn.query_row(
+        "SELECT url, header_etag, header_last_modified, last_checked FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| {
+            let url: String = row.get(0)?;
+            let etag: Option<String> = row.get(1)?;
+            let last_modified: Option<String> = row.get(2)?;
+            let last_checked: Option<String> = row.get(3)?;
+            Ok((url, etag, last_modified, last_checked))
+        },
+    )?;
+
+    // Check if the feed was last updated recently
+    if let Some(last_checked_str) = last_checked {
+        if let Ok(last_checked_time) =
+            chrono::NaiveDateTime::parse_from_str(&last_checked_str, "%Y-%m-%d %H:%M:%S")
+        {
+            let now = chrono::Utc::now();
+            let duration_since = now.signed_duration_since(last_checked_time.and_utc());
+            if duration_since.num_hours() < 3 {
+                debug!(
+                    "Feed {} was last checked {} seconds ago, skipping update",
+                    feed_id,
+                    duration_since.num_seconds()
+                );
+                return Ok(());
+            }
+        } else {
+            warn!(
+                "Unable to parse last_checked feed time stored in database for feed {}: {}",
+                feed_id, last_checked_str
+            );
+        }
+    }
+
+    // Handle file:// URLs differently
+    let feed_content = if feed_url.starts_with("file://") {
+        retrieve_file_feed(&feed_url, feed_id, pool.clone())
+    } else {
+        retrieve_feed(
+            &client,
+            feed_id,
+            &feed_url,
+            header_etag.as_deref(),
+            header_last_modified.as_deref(),
+            pool.clone(),
+        )
+        .await
+    }?;
+
+    let content = if let Some(content) = feed_content {
+        content
+    } else {
+        return Ok(());
+    };
+
+    // Attempt to parse content as Atom, with fallback to RSS.
+    if let Ok(feed) = atom_syndication::Feed::read_from(&content[..]) {
+        process_atom_feed(feed_id, feed, conn)?;
+    } else if let Ok(channel) = rss::Channel::read_from(&content[..]) {
+        process_rss_feed(feed_id, channel, conn)?;
+    } else {
+        warn!(
+            "Feed {} ({}) was not detected as a valid RSS or XML feed",
+            feed_id, feed_url
+        );
     }
 
     Ok(())
@@ -137,8 +150,8 @@ async fn retrieve_feed(
             info!("Feed {} was not modified since last check", feed_id);
             // Update last_checked timestamp in database
             conn.execute(
-                "UPDATE feeds SET last_checked = datetime('now') WHERE id = ?1",
-                [feed_id],
+                "UPDATE feeds SET last_checked = ?1 WHERE id = ?2",
+                (chrono::Utc::now().timestamp(), feed_id),
             )?;
             return Ok(None);
         }
@@ -162,12 +175,10 @@ async fn retrieve_feed(
         .and_then(|h| h.to_str().ok());
 
     {
-        let params: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(etag), Box::new(last_modified), Box::new(feed_id)];
-
+        let params = (etag, last_modified, chrono::Utc::now().timestamp(), feed_id);
         conn.execute(
-            "UPDATE feeds SET header_etag = ?, header_last_modified = ?, last_checked = datetime('now') WHERE id = ?",
-            rusqlite::params_from_iter(params)
+            "UPDATE feeds SET header_etag = ?, header_last_modified = ?, last_checked = ? WHERE id = ?",
+            params,
         )?;
     }
 
@@ -191,8 +202,8 @@ fn retrieve_file_feed(
 
     // Update the last_checked timestamp in the database
     conn.execute(
-        "UPDATE feeds SET last_checked = datetime('now') WHERE id = ?1",
-        [feed_id],
+        "UPDATE feeds SET last_checked = ?1 WHERE id = ?2",
+        (chrono::Utc::now().timestamp(), feed_id),
     )?;
 
     Ok(Some(content))
