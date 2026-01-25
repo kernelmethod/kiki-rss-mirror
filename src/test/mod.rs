@@ -9,6 +9,7 @@ use std::{
 };
 use tempdir::TempDir;
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 pub struct TestBuilder {
     init_database: bool,
@@ -88,7 +89,7 @@ impl TestConfig {
     }
 
     pub fn init_server(mut self) -> Result<Self> {
-        println!("starting server at {:?}", &self.socket_path());
+        debug!("starting server at {:?}", &self.socket_path());
         if let Some(_) = self.server_token {
             bail!("server has already been started");
         }
