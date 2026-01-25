@@ -1,6 +1,8 @@
+mod delete_entry;
 mod get_entry;
 mod list_entries;
 
+use delete_entry::delete_entry;
 use get_entry::get_entry;
 use list_entries::list_entries;
 
@@ -10,7 +12,7 @@ use axum::{routing::get, Router};
 pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_entries))
-        .route("/id/{*id}", get(get_entry))
+        .route("/id/{*id}", get(get_entry).delete(delete_entry))
 }
 
 #[cfg(test)]
@@ -142,6 +144,33 @@ mod test {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let content = response.text().await?;
         assert_eq!(&content, "Entry not found");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_entry() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        populate_entries(&tc)?;
+
+        // Delete an existing entry
+        let response = client.delete("http://kiki/v1/entries/id/1").send().await?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // Verify the entry was deleted by trying to retrieve it
+        let response = client.get("http://kiki/v1/entries/id/1").send().await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(&response.text().await?, "Entry not found");
+
+        // Try to delete a non-existent entry
+        let response = client
+            .delete("http://kiki/v1/entries/id/1337")
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(&response.text().await?, "Entry not found");
 
         Ok(())
     }
