@@ -124,6 +124,13 @@ impl TestConfig {
         bail!("HTTP server has not been started on {:?}", &p);
     }
 
+    pub fn example_feed_url(&self) -> String {
+        let mut cwd = std::env::current_dir().unwrap();
+        cwd.push("test");
+        cwd.push("example.xml");
+        format!("file://{}", cwd.into_os_string().into_string().unwrap())
+    }
+
     pub fn config_dir(&self) -> &Path {
         self.td.path()
     }

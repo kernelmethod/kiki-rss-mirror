@@ -1,0 +1,1212 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel><title>kernelmethod</title><link>/notes/</link><description>Recent content on kernelmethod</description><language>en-us</language><lastBuildDate>Wed, 27 Nov 2024 00:00:00 +0000</lastBuildDate><atom:link href="/notes/index.xml" rel="self" type="application/rss+xml"/><item><title>Mapping all 13.8 gigapixels of the Caves of Qud world map</title><link>/notes/qud_worldmap/</link><pubDate>Wed, 27 Nov 2024 00:00:00 +0000</pubDate><guid>/notes/qud_worldmap/</guid><description>&lt;p>&lt;a href="https://www.cavesofqud.com">Caves of Qud&lt;/a> is a science-fantasy roguelike coming
+out on December 5th, 2024. In roguelike tradition, the majority of its maps are
+procedurally generated.&lt;/p>
+&lt;p>The world of Qud is 240 zones (&amp;ldquo;screens&amp;rdquo;) wide and 75 zones tall. Each zone is
+25 tiles tall and 80 tiles wide, and each tile is 16 pixels wide and 24 pixels
+tall. That means that the surface map from a single run of Qud comes in at a
+cozy &lt;strong>13.8 gigapixels&lt;/strong>.&lt;/p>
+&lt;p>And here&amp;rsquo;s what that map looks like in practice! Zoom in to see any part of the
+surface map from a game of Qud. (If you&amp;rsquo;re on mobile you may have to zoom in
+quite a bit first. Sorry, I&amp;rsquo;m awful at frontend dev!)&lt;/p>
+&lt;div id="map">&lt;/div>
+&lt;p>The game also has &lt;code>Int32.MaxValue&lt;/code> z-levels. For fun I&amp;rsquo;ve included a toggle to
+show the first underground level, although for the sake of brevity (and cloud
+storage costs) I must omit the other 2,147,483,645 z-levels.&lt;/p>
+&lt;p>If you want to follow along and generate a map for your own world, I&amp;rsquo;ve made all
+of my scripts (and a little proof-of-concept) available at
+&lt;a href="https://github.com/kernelmethod/Qud-WorldMap-Viewer">Qud-Worldmap-Viewer&lt;/a>.&lt;/p>
+&lt;p>Finally, if any of this looks interesting to you, check out Caves of Qud when it
+comes out next week! You can find it on Itch and Steam:&lt;/p>
+&lt;ul>
+&lt;li>&lt;a href="https://freeholdgames.itch.io/cavesofqud">Itch&lt;/a>&lt;/li>
+&lt;li>&lt;a href="https://store.steampowered.com/app/333640/Caves_of_Qud/">Steam&lt;/a>&lt;/li>
+&lt;/ul>
+
+&lt;link rel="stylesheet"
+ href="/vendor/leaflet/leaflet.min.16a17e7a88b74f1be6d2252dbf91010373580b28341dd55a08cab2799720e924.css"
+ integrity="sha256-FqF&amp;#43;eoi3Txvm0iUtv5EBA3NYCyg0HdVaCMqyeZcg6SQ=">
+&lt;script src="/vendor/leaflet/leaflet.min.31c9e769136134391444326efe453838ffaf2224f7af90cd07b09e506161c942.js"
+ integrity="sha256-McnnaRNhNDkURDJu/kU4OP&amp;#43;vIiT3r5DNB7CeUGFhyUI=">
+&lt;/script>
+&lt;link rel="stylesheet"
+ href="/css/qud_worldmap.min.8ddb956c4fc7c455b6c6cb16427caa5f0be56cc211c517218767174d7f35fd6d.css"
+ integrity="sha256-jduVbE/HxFW2xssWQnyqXwvlbMIRxRchh2cXTX81/W0=">
+&lt;script type="application/javascript"
+ src="/js/qud_worldmap.js"
+ integrity="">
+&lt;/script>
+</description></item><item><title>Short story: "Paquete Drop"</title><link>/notes/paquete_drop/</link><pubDate>Sun, 16 Jun 2024 15:13:36 -0400</pubDate><guid>/notes/paquete_drop/</guid><description>&lt;p>The following is a short story I submitted for DEF CON 32&amp;rsquo;s Creative Writing
+Short Story Contest.&lt;/p>
+&lt;p>&lt;strong>Update 2024-07-10:&lt;/strong> this story &lt;a href="https://forum.defcon.org/node/250286">won first
+place&lt;/a> in the Creative Writing Contest!
+Major thanks to the contest organizers for running it this year, and for the
+judges who took the time to read all of the stories that were submitted.&lt;/p>
+&lt;hr>
+&lt;div class="short-story">
+ &lt;h1>Paquete Drop&lt;/h1>
+ &lt;p>DEF CON 323 had gone well so far. Modulo one incident in which a young pod jockey&amp;rsquo;s &amp;ldquo;prank&amp;rdquo; nearly asphyxiated everyone in the Ethical Cloning Village, the conference was running smoothly.&lt;/p>
+&lt;p>Smoothly for everyone except Norodi. She had a problem: as a representative for the asteroid 65 Cybele, and as an operator for PaqNet, she was expected to pursue her home&amp;rsquo;s best interests at the conference. She was expected to connect with other operators to help put the precarious future of the Cybelian internet on the right path. So far, she had chosen to honor this responsibility by running around the villages and getting trashed every night.&lt;/p>
+&lt;p>But it was the last day of DEF CON, and Norodi was determined to make something out of her trip. So she headed over to the hall hosting the PaqNet Operators&amp;rsquo; Meetup. On the way to the meetup, Norodi bumped into Kacy, a friend and fellow operator hailing from Enceladus. She nudged Norodi. &amp;ldquo;Hey you. Where have you been for the last few days?&amp;rdquo;&lt;/p>
+&lt;p>Norodi was too hung over to figure out a convincing cover story, so she simply responded with &amp;ldquo;I&amp;rsquo;ve been wasting my time doing everything except what I was supposed to do.&amp;rdquo;&lt;/p>
+&lt;p>Kacy laughed. &amp;ldquo;Then let&amp;rsquo;s fix that, shall we?&amp;rdquo;&lt;/p>
+&lt;p>The year&amp;rsquo;s meetup began, as it always did, with a summary of the network&amp;rsquo;s accomplishments over the previous year. Thirty-two new nodes had joined the network, bringing the total number of nodes to one hundred and sixteen. Most nodes were averaging fifty petabits of data exchanged with their peers per day, and the longest path in the network &amp;ndash; the largest amount of time it could take an update from any space platform&amp;rsquo;s, lunar colony&amp;rsquo;s, or asteroid outpost&amp;rsquo;s intranet to propagate across PaqNet &amp;ndash; had been reduced to five days. This last point drew a polite round of applause from the audience.&lt;/p>
+&lt;p>Kacy and Norodi spent the day bouncing between talks. One talk discussed operations research for paquete optimization. Another covered paquete security, basic opsec for node technicians, and secure tape encryption. The day ended with a keynote from Kelli Adachi, one of the original founders of PaqNet. After a long introduction listing Kelli&amp;rsquo;s achievements and contributions to the PaqNet community, she stepped up to the podium and began speaking.&lt;/p>
+&lt;p>&amp;ldquo;It&amp;rsquo;s always been difficult to get internet half a billion miles from Earth. Before PaqNet, the internet that you &lt;em>did&lt;/em> get was also shit.&lt;/p>
+&lt;p>&amp;ldquo;We started PaqNet as an experiment between Europa and Callisto, before we gained our independence. In those days, the only internet you got was out of a VOCorp uplink, and it was awful. The standard uplink costed hundreds of thousands of credits, it could only be fixed up by an approved technician, and the corporation had a view into every single packet sent into the ether. And at first, there was nothing we could do. The only group with the infrastructure to stand up an interplanetary internet was VOCorp.&lt;/p>
+&lt;p>&amp;ldquo;Thanks to all of your contributions, PaqNet has become the de facto means of attaining internet for billions of people across the Solar System. More than that, it has liberated &amp;ndash;&amp;rdquo;&lt;/p>
+&lt;p>A conference goon sped into the room and pulled Kelli aside, followed by some of the meetups&amp;rsquo; organizers. They spoke in hushed tones to one another, and Kelli&amp;rsquo;s expression morphed from her usual confidence to shock, followed by dismay. Norodi glanced over at Kacy, who gave her an uncertain shrug in response.&lt;/p>
+&lt;p>A few minutes passed before Kelli finally took the podium again.&lt;/p>
+&lt;p>&amp;ldquo;I&amp;hellip; I&amp;rsquo;m sorry for the interruption, everyone. This is a terrible time to deliver this news, but you should know as well: we just found out that VOCorp has purchased Earth&amp;rsquo;s PaqNet node.&amp;rdquo;&lt;/p>
+&lt;hr>
+&lt;p>The Earth node had faced financial difficulties for a while. Compared to other nodes, paquetes sent from Earth face more atmospheric drag on the ascent and higher gravity, which meant greater fuel expenses. The node served one billion people on the surface of the planet, and &amp;ndash; crucially &amp;ndash; processed more traffic than every other node combined.&lt;/p>
+&lt;p>All of these factors made the node a vulnerable target, and a valuable one.&lt;/p>
+&lt;p>&lt;em>We should have seen this coming,&lt;/em> Kacy thought. &lt;em>We should have; perhaps we did. Either way, we did nothing about it.&lt;/em>&lt;/p>
+&lt;p>At the end of DEF CON, Kacy said her goodbyes to Norodi. &amp;ldquo;Before you go,&amp;rdquo; Kacy said, &amp;ldquo;take this. It&amp;rsquo;s got my long-term public key on it.&amp;rdquo;&lt;/p>
+&lt;p>She lifted a thumb drive out of her pocket and pressed it into Norodi&amp;rsquo;s palm. The two friends hugged, and parted ways.&lt;/p>
+&lt;p>If VOCorp had control over the Earth node, then it could see whatever traffic was passing through the node. Even if that traffic was encrypted, they would have means of telling where data was being sent to and from. They could identify the Enceladus node. They could identify Kacy. She had to get back before that happened.&lt;/p>
+&lt;p>She searched for the fastest ride she could get back to Enceladus. There weren&amp;rsquo;t any civilian shuttles making their way over to Saturn any time soon, and even if there were, it was too dangerous. Kacy couldn&amp;rsquo;t risk going through customs on Enceladus; she wasn&amp;rsquo;t supposed to be off-planet in the first place, especially for an underground hacker conference. Instead, Kacy hitched a ride from Europa, and from there she rode a paquete the rest of the way to Enceladus.&lt;/p>
+&lt;p>Most paquetes are purpose-built space vessels, designed to carry crates with dozens of petabytes&amp;rsquo; worth of magnetic tapes from Point A to Point B. The paquete that Kacy had boarded had been expanded to include a tiny bathroom, a cupboard with a day&amp;rsquo;s worth of food, and bunks to accommodate four passengers; spartan accommodations for those who had no other means of travel. After a seemingly interminable flight cramped into a small box, the paquete started to shudder, and klaxons blared above Kacy&amp;rsquo;s head. They were beginning to decelerate as they closed in on Enceladus.&lt;/p>
+&lt;p>Kacy held tight to the railings of her bunk, preparing just in case the paquete exploded on its descent. PaqNet was, nominally, completely legal &amp;ndash; and indeed, it operated freely and openly on the inner planets. But the charter that granted VOCorp its mandate over the outer Solar System allowed it to control all communications coming into or out of its stations. Whereas a VOCorp uplink was allowed to scan client traffic and report people for &amp;ldquo;subversion of VOCorp or VOCorp-affiliated entities&amp;rdquo; (in the words of the standard worker&amp;rsquo;s contract), PaqNet traffic was encrypted between nodes and allowed to carry whatever content users felt like. So VOCorp considered it a threat, and on the occasion that they were able to identify a paquete entering of their stations, they shot it down.&lt;/p>
+&lt;p>Kacy hoped that this wasn&amp;rsquo;t one of those occasions.&lt;/p>
+&lt;hr>
+&lt;p>Norodi arrived at 65 Cybele and rode the tram back into the inner city. The tram had a good view overlooking the asteroid, and as it headed into town Norodi could still pick out the signs saying &amp;ldquo;WELCOME TO VOCORP - 65 CYBELE STATION&amp;rdquo;. Most of these signs had been torn down by the workers&amp;rsquo; union years ago, when VOCorp was forced to abandon its administrative hold over the asteroid. 65 Cybele was lucky; many stations were still under corporate rule.&lt;/p>
+&lt;p>Like Enceladus Station. Her mind flitted towards Kacy; Norodi hoped that she had returned home safely.&lt;/p>
+&lt;p>Norodi hopped off the tram at the second-to-last stop. She crossed two rows of taco stands and walked through a small arts and crafts market. At the last block before her apartment, she passed by Cleo&amp;rsquo;s Scavenge and Repair. The titular Cleo was sitting in his workshop, typing furiously at his terminal. In spite of his wild hair and disheveled clothing, Cleo kept a tidy space; all surfaces were cleaned regularly, all chips and wires and bits and bobs stored in carefully-labeled drawers. On this particular occasion, Cleo had an additional visitor in his pristine workshop: a large, black tube, scratched from top to bottom. Paint was peeling off to reveal discolored metals underneath, and two fins protruded from each side, each hoisting a shattered solar panel.&lt;/p>
+&lt;p>Cleo perked up and flashed a big, goofy grin at Norodi as she passed by. &amp;ldquo;Heya Norodi, how was DEF CON?&amp;rdquo;&lt;/p>
+&lt;p>She winced. &amp;ldquo;It was alright, until the end. You heard about what happened?&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Yeah.&amp;rdquo; He sighed. &amp;ldquo;I still remember when this place was a corporate stronghold. We fought like hell, like hell. I gotta give it to those bastards, they still gotta lotta moxie to be keeping up with their schemes after so many years. I&amp;rsquo;m glad there&amp;rsquo;s kids like you to carry the torch and continue our side of the fight.&amp;rdquo;&lt;/p>
+&lt;p>Norodi shrugged. &amp;ldquo;I don&amp;rsquo;t think that running an underground sneakernet takes half as much courage as you think, but thanks.&amp;rdquo; She decided to change the topic. &amp;ldquo;What do you have back there?&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Ah, this old hunka scrap?&amp;rdquo; he asked, jabbing a thumb towards the tube. &amp;ldquo;That&amp;rsquo;s an old Earth satellite. Used ta be that folks would shoot these up into orbit an use them as relays to send packets ta one another. Still a bunch of these floating &amp;lsquo;round Earth today. Pretty ancient tech, eh?&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;How&amp;rsquo;d you get it?&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Fell off the back of a ship,&amp;rdquo; Cleo said. He gave Norodi a sly wink.&lt;/p>
+&lt;p>Norodi smirked. &amp;ldquo;Looks like fun. You pulled anything valuable off it yet?&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Nah, it&amp;rsquo;s a huge time-waste. Spent a week tryna crack it and when I did, I found out that most of the storage degraded years ago. Shame. Antennas still work though, as do mosta the internal components, I just gotta find someone ta pawn it off on.&amp;rdquo; Cleo&amp;rsquo;s eyes narrowed. &amp;ldquo;You in the market for an antique satellite?&amp;rdquo;&lt;/p>
+&lt;p>Norodi laughed. &amp;ldquo;I don&amp;rsquo;t think so, but thanks. See you around, Cleo.&amp;rdquo;&lt;/p>
+&lt;p>He waved Norodi off and set back to work at his terminal. When Norodi returned to her apartment, the first thing she did was hop on her computer to see whether any messages had arrived from Kacy. She was relieved to see the message at the top of her inbox:&lt;/p>
+&lt;p>&amp;ldquo;&amp;lt;kacy (Enceladus)&amp;gt; Hey. I got back alright. Miss ya already -K&amp;rdquo;&lt;/p>
+&lt;hr>
+&lt;p>Several weeks passed after DEF CON, and a problem was starting to form before Kacy. She didn&amp;rsquo;t know quite what the problem was yet, although she had a general sense of its size and shape.&lt;/p>
+&lt;p>Her problem started with the disappearance of a node technician.&lt;/p>
+&lt;p>In a PaqNet router, each node technician is tasked with two responsibilities: pulling tapes off of paquetes, and putting them back on. Each paquete carries hundreds of tapes, and each tape carries hundreds of terabytes of PaqNet updates &amp;ndash; large media files, encrypted chat messages, forum threads, news, books, posts &amp;ndash; anything that a PaqNet user might feasibly wish to upload to the internet. When a paquete arrives at the Enceladus router, each tape is carried off of the paquete and loaded into a reader, where its contents are used to synchronize the state of the Enceladus intranet with the PaqNet at large. Once a node receives enough updates from its peers &amp;ndash; and enough new content uploaded from its own intranet &amp;ndash; it is responsible for passing along updates to other nodes. And so it goes, with the daily rhythm of a node tech converging towards a cycle of unloading tapes from paquetes, reading them in, loading new tapes onto paquetes, and sending them off.&lt;/p>
+&lt;p>One evening, a tech left work and didn&amp;rsquo;t return the following morning. Or the morning after.&lt;/p>
+&lt;p>This alone was cause enough for concern, but there were other signs that something was amiss. Scheduled paquetes were failing to arrive, and the ones that did contained more corrupted data. Each tape that went through the Enceladus router was scanned for malicious content, but none of them ever raised any flags.&lt;/p>
+&lt;p>Kacy was not yet aware that in a storage closet just a hundred meters outside of the router, locked in the darkness, a device had turned on. She was not yet aware that for the last several days it had been issuing its silent report to a VOCorp carrier ship that was now in transit to Enceladus. She was not yet aware of the danger that she was in.&lt;/p>
+&lt;hr>
+&lt;p>Probably the most irritating part of VOCorp&amp;rsquo;s incursion into PaqNet, in Norodi&amp;rsquo;s opinion, was their introduction of VOCorp Integrated Advertising (TM) into updates sent from Earth paquetes. Norodi spent an hour or two each day scouring instances of&lt;/p>
+&lt;pre>&lt;code>BUY MARTIAN FOREIGN FILMS &amp;gt;&amp;gt;&amp;gt;HERE&amp;lt;&amp;lt;&amp;lt;
+&lt;/code>&lt;/pre>
+&lt;p>and&lt;/p>
+&lt;pre>&lt;code>paq://hottiez.prn/xzBt8g1f FIND HOTTIES IN YOUR SPACEPORT
+&lt;/code>&lt;/pre>
+&lt;p>that had been injected into various websites. This was primarily a nuisance, but occasionally something more insidious would be slipped into an update. Embedded scripts designed to phone home to some shady VOCorp affiliate, or implants precision-targeted for specific individuals&amp;rsquo; PaqNet terminals.&lt;/p>
+&lt;p>If Norodi felt unfazed by these challenges, it was because she had experienced them before. VOCorp had spent many years engaging in subterfuge against the network, intercepting paquetes, and flipping operators. The only difference now was how much more brazen it had become.&lt;/p>
+&lt;p>Norodi received a text from a tech in the 65 Cybele router that one of the tape readers was malfunctioning; the team wanted her expertise to diagnose the issue. As she left her apartment she passed Cleo once again &amp;ndash; hard at work disassembling some inscrutable device, too busy even for a passing &amp;ldquo;hello&amp;rdquo; &amp;ndash; and made her way down to the tram. Once she arrived at the router, she found the lead technician.&lt;/p>
+&lt;p>&amp;ldquo;Hey, I got a message that the reader isn&amp;rsquo;t working. What happened?&amp;rdquo;&lt;/p>
+&lt;p>The tech gave her a shrug. &amp;ldquo;We received a paquete this morning from 41 Daphne. The reader started making a funny noise while it was running through one of the tape spools, and then it stopped. I&amp;rsquo;ve been busy all day and this seemed more like your wheelhouse, so we gave you a ring.&amp;rdquo;&lt;/p>
+&lt;p>Norodi jacked into the reader&amp;rsquo;s serial port to inspect its logs. The firewall logs indicated a large number of packets blocked against several hundred devices connected to the router&amp;rsquo;s local area network. A forward proxy contained records of several failures to authenticate against different devices on the network, and ended with one successful HTTP response. The device was named &lt;code>vocup-27.rtinternal.cybele.pqn&lt;/code>.&lt;/p>
+&lt;p>&amp;ldquo;Hey, do you have any VOCorp communications equipment laying around?&amp;rdquo; Norodi asked.&lt;/p>
+&lt;p>The tech looked puzzled. &amp;ldquo;We have an old uplink lying in storage. We used to use it for emergency broadcasts, but it&amp;rsquo;s been broken for almost as long as I&amp;rsquo;ve been here.&amp;rdquo;&lt;/p>
+&lt;p>Norodi felt her stomach starting to turn. She ejected the tape from the reader and saved off a dump of the system&amp;rsquo;s memory to analyze in her homelab.&lt;/p>
+&lt;p>But before she could go home, she had to ask Cleo about his satellites.&lt;/p>
+&lt;hr>
+&lt;p>The message from Norodi arrived late at night, encrypted and sealed with the key that Kacy had given her at DEF CON. Kacy was taking a big risk by checking her inbox, but this would be her last chance before she left Enceladus.&lt;/p>
+&lt;p>&amp;ldquo;&amp;lt;norodi (65 Cybele)&amp;gt; Do not respond. Do NOT respond.&lt;/p>
+&lt;p>&amp;ldquo;I&amp;rsquo;ve identified a malware campaign that VOCorp appears to be running against PaqNet crews. VOCorp is exploiting a zero-day in the tape deserialization software to reach out to old equipment that operators still have installed in their routers and ping their command-and-control servers. The bottom line is this: they&amp;rsquo;re targeting operators now, and you&amp;rsquo;re in danger.&lt;/p>
+&lt;p>&amp;ldquo;65 Cybele got lucky &amp;ndash; all of our VOCorp equipment is broken beyond repair, and the implant crashed while trying to inject itself into a defective VOCorp uplink. You probably won&amp;rsquo;t be so fortunate. When you finish reading this, find and destroy any VOCorp equipment that may still be attached to your network. Do not wait for them to knock on your door.&lt;/p>
+&lt;p>&amp;ldquo;The current situation is untenable, but I have a plan. Meet me on Luna in one week.&amp;rdquo;&lt;/p>
+&lt;p>Oh Norodi. If only her message had come just a bit sooner.&lt;/p>
+&lt;p>Kacy hadn&amp;rsquo;t known about the zero-day, but she&amp;rsquo;d intuited the rest of the details after VOCorp had raided Enceladus&amp;rsquo;s router three days earlier. All of the technicians who were present at the time were arrested, and then forced to keep the router operational. By now VOCorp would already have started injecting a beacon into every message sent via PaqNet into the Enceladan intranet, and in Kacy&amp;rsquo;s estimation, they would roll up every remaining PaqNet operator who&amp;rsquo;d fled by the end of the week.&lt;/p>
+&lt;p>Including her. And now that Kacy had pulled data from her inbox into her local PaqNet terminal, they would know where to find her. Kacy threw the terminal into the nearest garbage disposer and broke into a sprint.&lt;/p>
+&lt;p>Kacy couldn&amp;rsquo;t ride a paquete out of Enceladus with the router compromised. She couldn&amp;rsquo;t board a passenger shuttle either; even in better times, they were under strict watch by corporate authorities. Almost all cargo shipments out of the moon had been shut down. That left Kacy with exactly one option.&lt;/p>
+&lt;p>She would need to steal a VOCorp ship.&lt;/p>
+&lt;p>Luckily, VOCorp had disavowed the classic analog interface preferred by most pilots for a purely digital flying experience. This made VOCorp ships easy to fly &amp;ndash; and easy to hack. Kacy had phished the employee credentials from several corporate security officers over the last couple of days. She found one that matched the profile that she sought: a mid-career pilot with permissions to enter and exit the Enceladan space port at will, and to fly any unreserved ship with a Type B or lower rating.&lt;/p>
+&lt;p>Kacy stopped running as she closed in on the spaceport. She walked over to a door leading in to the ship lot. The door was equipped with a badge scanner, but Kacy had come prepared. She took a blank radio-frequency card out of her backpack, wrote the pilot&amp;rsquo;s credentials to it, and swiped the card against the scanner.&lt;/p>
+&lt;p>The scanner emitted a sharp &lt;em>bzzzt&lt;/em> and flashed a red light at her. Bad identification. Kacy threw away the card and tried a different one. If the scanner didn&amp;rsquo;t accept her credentials, then her escape would be very short-lived. She pressed the second card against the scanner.&lt;/p>
+&lt;p>This time, it gave her a happy chirp and flashed green. Kacy passed through the door and headed towards the closest ship that she could find, a small passenger shuttle typically used to carry ambassadors, dignitaries, and other people of note. She entered the pilot&amp;rsquo;s username and password, and the ship&amp;rsquo;s dashboard came to life. Kacy searched the ship&amp;rsquo;s directory for its list of prerecorded destinations, and found the one she was looking for: Luna, Earth&amp;rsquo;s moon. She set the ship on autopilot and buckled into her seat.&lt;/p>
+&lt;p>She felt the acceleration push down against her when the ship&amp;rsquo;s thrusters ignited. As the ship escaped Enceladus&amp;rsquo;s gravity she felt the pressure against her lighten. She would make it.&lt;/p>
+&lt;hr>
+&lt;p>Norodi refitted a paquete with seat, a dashboard, and a pilot&amp;rsquo;s yoke to take her from 65 Cybele to Luna, where she reconnected with Kacy. After three stuffy paquete rides, four repair stations visited in search of parts, one count of sneaking past lunar customs officials, and six trips from the moon to Earth&amp;rsquo;s orbit and back, she was on her seventh and final trip. Norodi prayed in full view of the heavens that she wouldn&amp;rsquo;t be picked up by an wandering VOCorp scout before finishing her job.&lt;/p>
+&lt;p>&amp;ldquo;Norodi, I just got my last satellite working over India,&amp;rdquo; said Kacy over her microphone. &amp;ldquo;I&amp;rsquo;m finishing some repairs over here, and then I&amp;rsquo;m heading back. How are things looking on your end?&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Not great,&amp;rdquo; Norodi said, being honest. &amp;ldquo;The last two satellites I tried were totally busted.&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Keep at it. We&amp;rsquo;re at ninety-nine percent coverage.&amp;rdquo;&lt;/p>
+&lt;p>Cleo had given them a set of instructions to follow. First, they should run basic diagnostics to determine whether the satellite was functional, or whether the circuity had degraded too far from radiation. If it was still operational, then they would connect to its serial line and run Cleo&amp;rsquo;s exploit. Assuming the exploit ran successfully, the satellite would connect to their makeshift satellite network. Norodi was waiting for the second step to complete, idly watching the spinner on her display as the exploit tried to gain remote code execution on the satellite that she was connected to.&lt;/p>
+&lt;p>For his part, Cleo was finishing setting up a router on the far side of the moon. He&amp;rsquo;d spent the previous days getting in touch with PaqNet operators on the ground to prepare them for the final stage of the plan. A plan that, so far, had run smoothly. Kacy had succeeded in evading the authorities on Enceladus to reach Norodi and Cleo. They had succeeded in completing six trips in and out of Earth&amp;rsquo;s orbit. Everything was fine. Everything apart from these damned old, broken satellites.&lt;/p>
+&lt;p>Cleo had told Norodi and Kacy that because the satellites would primarily be relaying data back and forth from the moon, only a subset of them would actually need to work. Which was fortunate, as Norodi was already at the limit of her patience. If the exploit failed on the satellite that she was working on now, she thought she might start hitting it with a wrench until it worked.&lt;/p>
+&lt;p>Kacy&amp;rsquo;s voice crackled over the mic: &amp;ldquo;I&amp;rsquo;m back on my ship, and heading back towards the spaceport.&amp;rdquo;&lt;/p>
+&lt;p>Norodi said nothing. She was too focused now. &lt;em>This is it. It&amp;rsquo;ll work this time,&lt;/em> she thought to herself.&lt;/p>
+&lt;p>Finally, text splashed across her display:&lt;/p>
+&lt;pre>&lt;code>EXPLOIT SUCCESSFUL
+CONNECTING TO NETWORK...
+ACQUIRED ID SAT-0277
+CONNECTING TO ROUTER...
+CONNECTED TO RT-DARK_SIDE_OF_THE_MOON
+AWAITING UPLINK
+&lt;/code>&lt;/pre>
+&lt;p>Norodi disconnected and headed back towards her ship.&lt;/p>
+&lt;hr>
+&lt;p>Before Kacy could drive her moon rover back to the central spaceport, she would have to scuttle the ship she&amp;rsquo;d stolen. She couldn&amp;rsquo;t let anyone find out that she had been here, much less what she was up to. She identified a quiet spot in the Pacific Ocean where the ship could crash unnoticed and set the ship on autopilot.&lt;/p>
+&lt;p>In a few minutes their work would be done. In a few minutes, several hundred satellites would wake up from a century-long slumber and start relaying data to Cleo&amp;rsquo;s surreptitious router. And the router would send its first paquete out to the rest of PaqNet. The planet &amp;ndash; and everyone else &amp;ndash; would be free from VOCorp&amp;rsquo;s stranglehold.&lt;/p>
+&lt;p>First, Kacy wanted to get a drink.&lt;/p>
+&lt;p>She parked the rover outside of a service airlock. Anybody who was monitoring entry into the station would see her spacesuit &amp;ndash; stolen when she and Norodi and Cleo had first landed on the moon &amp;ndash; and assume that she had just gotten back from a maintenance run. That was her hope, in any case. Once she got through the airlock, she slipped into the spaceport and headed over to one of the bars.&lt;/p>
+&lt;p>Kacy sat down and ordered a couple of martinis for herself and for Norodi and started to reflect on the past couple of days. Where would she go next? She couldn&amp;rsquo;t return to Enceladus; by now she was a wanted fugitive. Norodi had told her that she would always have a home on Cybele 65. That seemed like a nice idea.&lt;/p>
+&lt;p>The martinis arrived, and Kacy started to take a sip, to relax in her seat, when all of a sudden some instinct in the corner of her brain noticed &lt;em>it&lt;/em>. The uncomfortable stillness in the air. The empty chairs and tables that surrounded her. The nervous bartender, peering in her direction. And then she felt a polite tap on her shoulder.&lt;/p>
+&lt;p>&amp;ldquo;Hello miss. Do you have a few minutes to chat with us?&amp;rdquo;&lt;/p>
+&lt;p>She turned around to find a couple of well-groomed men in expensive suits standing behind her. One of them folded his arms, and Kacy saw the briefest flash of a pistol from inside his sports coat.&lt;/p>
+&lt;p>She pushed past both of them and ran. She ran back towards the airlock. She&amp;rsquo;d warn Norodi. She&amp;rsquo;d find another way off the moon. Another way to 65 Cybele. She just had to escape those men.&lt;/p>
+&lt;p>The last thing Kacy remembered was the butt of a rifle slamming into her chin.&lt;/p>
+&lt;hr>
+&lt;p>Back on her ship, Norodi tapped her mic. &amp;ldquo;Cleo, how are you doing?&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Mighty well, seems like,&amp;rdquo; Cleo said. &amp;ldquo;Me an&amp;rsquo; my team just got the connection from yer last satellite. We &amp;lsquo;ave one hundred percent coverage over the planet now.&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Excellent,&amp;rdquo; Norodi said, relieved. She was sick of the spacewalks. &amp;ldquo;I&amp;rsquo;ll see you soon.&amp;rdquo; Norodi switched channels over to Kacy. &amp;ldquo;I&amp;rsquo;m finished over here, I&amp;rsquo;m headed back to Luna. Let me know when you&amp;rsquo;ve landed.&amp;rdquo;&lt;/p>
+&lt;p>She aligned the ship&amp;rsquo;s trajectory with the moon and engaged her thrusters. As she approached the moon, two dots appeared on the horizon. Ships emblazoned with the VOCorp logo. One of the ships automatically connected itself to the ship&amp;rsquo;s intercom and its mechanical voice came in over the ship&amp;rsquo;s speakers. &amp;ldquo;NORODI OLERUD OF 65 CYBELE &amp;ndash; YOU ARE UNDER ARREST. STOP IMMEDIATELY AND PREPARE TO BE BOARDED.&amp;rdquo;&lt;/p>
+&lt;p>&lt;em>This can&amp;rsquo;t be how it ends. This can&amp;rsquo;t. It can&amp;rsquo;t.&lt;/em> Norodi spiraled into a panic. She had everything on the ship&amp;rsquo;s computers &amp;ndash; Cleo&amp;rsquo;s exploit, an inventory of all of the satellites they had gained access to. Everything. She couldn&amp;rsquo;t let them take the ship.&lt;/p>
+&lt;p>She floored it.&lt;/p>
+&lt;p>The moon came into full view. Klaxons blared over Norodi&amp;rsquo;s head. &lt;em>You&amp;rsquo;re going to die&lt;/em>, they told her. She kept accelerating anyways. A missile sailed past and rocked the ship. &amp;ldquo;CEASE IMMEDIATELY&amp;rdquo;, the voice boomed. She pushed the pedal even harder. She started to see Luna&amp;rsquo;s texture. Its ridges. Individual rocks.&lt;/p>
+&lt;p>She ejected.&lt;/p>
+&lt;p>The world spun around Norodi. She didn&amp;rsquo;t hear the ship as it slammed into Luna, only saw a bright light, followed by a million million fragments of metal and plastic and rock scattering themselves into space. The world continued to spin; Earth, moon, and stars locked in some frenetic dance as her vision blurred. And she fell, fell for what seemed like a lifetime, pulled into the moon&amp;rsquo;s gentle embrace until she was a thousand feet, a hundred feet, ten feet above the surface.&lt;/p>
+&lt;p>Her chair engaged mini-thrusters and stopped the descent at the last moment. Norodi couldn&amp;rsquo;t stand up, couldn&amp;rsquo;t run. Two gruff pairs of hands pulled her out of her chair and hauled her into the back of a rover. They zip tied her and locked the doors, and then the rover started to move. The homogeneous landscape of the moon rolled underneath her, while the sparkling cloud of debris left by her ship receded into the horizon. Hours passed.&lt;/p>
+&lt;p>The rover stopped, and the hands pulled Norodi out of her cage in the back of the rover and back onto the surface. She could see now that they had arrived at a nondescript building tucked into the wall of a crater. The people who had seized her dragged her inside the building and ordered her to take off her suit. She did. Then they walked her down an aisle, past windows peering into dark rooms. At one point she passed a room with a bloody mess of a woman, slumped across the floor. It was Kacy.&lt;/p>
+&lt;p>&amp;ldquo;Kacy! Kacy!&amp;rdquo; Norodi screamed. She screamed and screamed until all she could hear was ringing in her ears. Kacy didn&amp;rsquo;t respond.&lt;/p>
+&lt;hr>
+&lt;p>Kacy awoke with the taste of copper in her mouth. She was in a concrete room, dimly lit, her hands and feet bound together. The two men that had approached Kacy at the bar entered the room, and the questions began.&lt;/p>
+&lt;p>&amp;ldquo;How did you find out about the implant?&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Who have you told?&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Why are you out here?&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Where were you running to?&amp;rdquo;&lt;/p>
+&lt;p>Neither of the men asked Kacy about Cleo or paquetes or satellites or a mysterious PaqNet router that had suddenly appeared on the other side of the moon. &lt;em>They don&amp;rsquo;t know,&lt;/em> Kacy thought to herself. She repeated it to herself over and over again, a mantra, or perhaps a prayer. &lt;em>They don&amp;rsquo;t know. They don&amp;rsquo;t know. They don&amp;rsquo;t know.&lt;/em>&lt;/p>
+&lt;p>The men beat Kacy for hours. She said nothing.&lt;/p>
+&lt;p>Eventually they left her alone. Kacy&amp;rsquo;s body was wracked with pain from head to toe. She watched idly as her own blood dripped onto the ground and dried. Eventually one of the men reentered the room, and knelt in front of her.&lt;/p>
+&lt;p>&amp;ldquo;We saw the message between you and your friend before you left Enceladus. We know you know about the implant.&amp;rdquo;&lt;/p>
+&lt;p>Kacy didn&amp;rsquo;t respond. He still wasn&amp;rsquo;t asking about satellites.&lt;/p>
+&lt;p>&amp;ldquo;It doesn&amp;rsquo;t matter now,&amp;rdquo; he said, a thin smile across his lips. &amp;ldquo;Your friend notified everyone else before she left 65 Cybele. She sent them a sample of the implant, and details about the zero-day. Now some jackass has written some detections for the implant, and another jackass has written a patch for the tape deserialization software, and everybody&amp;rsquo;s getting their detections set up and their devices patched. She did a good job. We&amp;rsquo;re burnt.&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Serves you right,&amp;rdquo; Kacy said.&lt;/p>
+&lt;p>The man shrugged. &amp;ldquo;That cost us a few million credits, but this company is worth tens of trillions. We&amp;rsquo;re worth more than most governments.&amp;rdquo; He leaned in. &amp;ldquo;We&amp;rsquo;ll manage.&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;We&amp;rsquo;ll stop you again. It doesn&amp;rsquo;t matter what you throw at us. For every one of you there&amp;rsquo;s five of us, working in the dark.&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;You know, if it wasn&amp;rsquo;t us, it&amp;rsquo;d be someone else. Someone a lot nastier, a lot meaner. Somebody who wouldn&amp;rsquo;t think twice about throwing you and your pal out of the airlock.&amp;rdquo; The man stood up. &amp;ldquo;But we&amp;rsquo;re nice, and truthfully, there really isn&amp;rsquo;t much you can do for us anymore. So you&amp;rsquo;re coming back with us to Enceladus to face trial for unapproved abandonment of your assigned station, for the theft of a VOCorp ship, and for subversion of the state in the service an illegal interplanetary communications platform. And your friend is going back to her asteroid, where she will be barred from transiting through any VOCorp-owned spaceport for the rest of her life.&amp;rdquo;&lt;/p>
+&lt;p>He cut the zip ties around Kacy&amp;rsquo;s hands and feet and opened the door to exit the room, gesturing towards her. Kacy picked herself up off the ground, and limped through the exit.&lt;/p>
+&lt;p>It was a long ride back to the spaceport. Kacy sat in the back of the vehicle, unbound and alone. The guards that were driving hadn&amp;rsquo;t even bothered to lock the back door. It&amp;rsquo;s not like she could escape; without a suit, she would die in seconds if she exited the vehicle. And there was nowhere left for her to escape in any case.&lt;/p>
+&lt;p>Kacy caught one last glimpse of Norodi at the spaceport. She was being escorted onto the boarding ramp of a shuttle going back to Enceladus, when a group of armed guards entered the loading bay. Norodi &amp;ndash; as battered and bruised as she was &amp;ndash; stood in between them. As Kacy ascended the ramp, she shot one last look at Norodi. Though beaten and pained, Norodi could make out a clear expression in her face, in the burning intensity with which Kacy was staring. Kacy knew that they&amp;rsquo;d won.&lt;/p>
+&lt;hr>
+&lt;p>Norodi never spoke a word about the satellite network. When she was dropped off at 65 Cybele, she was informed that she would never again be allowed to step onto VOCorp property, but was otherwise free to go.&lt;/p>
+&lt;p>Norodi rode the tram back to the inner city of 65 Cybele once more. She gazed out the window, across the rock, to the Cybelian PaqNet router. She saw a paquete fly out of the router, shimmering against the void, its thrusters faint lights as it accelerated towards its next stop. Norodi wondered at what the paquete was carrying: messages to loved ones separated by billions of miles of vacuum; missives from the lives of tens of thousands people living on a rock as it completed another journey around the sun.&lt;/p>
+&lt;p>On this trip, the old VOCorp signs looked just a little more worn than before.&lt;/p>
+&lt;p>Norodi got off at the second-to-last stop and passed the rows of taco stands and the market and turned at the last block before her apartment and hoped, hoped she would see the big, goofy grin that she had been waiting for. The garage door at Cleo&amp;rsquo;s Scavenge and Repair was raised.&lt;/p>
+&lt;p>Cleo was at his workbench, wearing his signature grin across his face. &amp;ldquo;Heya, kid.&amp;rdquo;&lt;/p>
+&lt;p>Norodi felt tears start to well up. Thoughts like &lt;em>did it work&lt;/em> and &lt;em>I didn&amp;rsquo;t tell them anything about you&lt;/em> and &lt;em>I don&amp;rsquo;t know if she&amp;rsquo;s okay, and I miss her so much&lt;/em> all passed through her head. The only words that she could think to say, though, were &amp;ldquo;I&amp;rsquo;m so glad you made it out alright.&amp;rdquo;&lt;/p>
+&lt;p>&amp;ldquo;Of course!&amp;rdquo; Cleo laughed. &amp;ldquo;I&amp;rsquo;ve been runnin&amp;rsquo; from those bastards almost as long as you&amp;rsquo;ve been alive.&amp;rdquo;&lt;/p>
+&lt;p>Norodi wiped away the tears and smiled.&lt;/p>
+&lt;p>Cleo pulled his terminal over to Norodi. The interface displayed a table with columns labeled &amp;ldquo;DEVICE&amp;rdquo;, &amp;ldquo;STATUS&amp;rdquo;, &amp;ldquo;LAST PING&amp;rdquo;, &amp;ldquo;COORDINATES&amp;rdquo;. &amp;ldquo;I ran some tests, all of yer satellites are hooked up now. The two of you did well.&amp;rdquo; He gave Norodi a bittersweet smile. &amp;ldquo;My crew on Luna has their paquetes set up, and the operators on the ground are ready to start sendin&amp;rsquo;.&amp;rdquo;&lt;/p>
+&lt;p>Norodi turned to Cleo, eyes bright. &amp;ldquo;Then let&amp;rsquo;s start receiving.&amp;rdquo;&lt;/p>
+
+&lt;/div>
+
+&lt;hr>
+&lt;p>&lt;em>&lt;strong>Author&amp;rsquo;s note:&lt;/strong> this is the longest &amp;ndash; and for that matter, almost the only
+&amp;ndash; work of fiction that I&amp;rsquo;ve written in the last decade. Thanks to the folks at
+DEF CON for hosting this writing contest.&lt;/em>&lt;/p>
+&lt;p>&lt;em>The story here is very loosely inspired by &lt;a href="https://en.wikipedia.org/wiki/El_Paquete_Semanal">El Paquete
+Semanal&lt;/a>, a sneakernet used to
+deliver internet in Cuba. If you&amp;rsquo;re interested in learning more about El
+Paquete, I highly recommend &lt;a href="https://dl.acm.org/doi/abs/10.1145/3173574.3174213">&amp;ldquo;El Paquete Semanal: The Week’s Internet in
+Havana&amp;rdquo; from ACM CHI 2018&lt;/a>.&lt;/em>&lt;/p></description></item><item><title>A short note on setting up a Linux kernel debugging environment</title><link>/notes/linux_kernel_debugging/</link><pubDate>Fri, 09 Feb 2024 00:00:00 +0000</pubDate><guid>/notes/linux_kernel_debugging/</guid><description>&lt;h2 id="a-short-note-on-setting-up-a-linux-kernel-debugging-environment">A short note on setting up a Linux kernel debugging environment&lt;/h2>
+&lt;p>This is a relatively short post on how to set up a Linux environment for kernel
+debugging using &lt;a href="https://buildroot.org/">Buildroot&lt;/a>.&lt;/p>
+&lt;p>This note overlaps a lot with &lt;a href="https://nickdesaulniers.github.io/blog/2018/10/24/booting-a-custom-linux-kernel-in-qemu-and-debugging-it-with-gdb/">this blog post by Nick
+Desaulniers&lt;/a>,
+and another &lt;a href="https://www.josehu.com/technical/2021/01/02/linux-kernel-build-debug.html">post from Guanzhou
+Hu&lt;/a>.
+Relative to both of them I&amp;rsquo;ve added a little more information around Buildroot
+configuration, but they are nonetheless good resources.&lt;/p>
+&lt;h2 id="setup">Setup&lt;/h2>
+&lt;p>To start off, you&amp;rsquo;ll want to clone the Buildroot sources:&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-bash" data-lang="bash">&lt;span style="display:flex;">&lt;span>git clone https://git.buildroot.net/buildroot
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>You&amp;rsquo;ll need to make an initial &lt;code>.config&lt;/code> file for Buildroot. For the rest of
+this note, I&amp;rsquo;m assuming that we&amp;rsquo;ll want to build our kernel as x86-64 and run it
+under QEMU, so we&amp;rsquo;ll use the following command:&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-bash" data-lang="bash">&lt;span style="display:flex;">&lt;span>make qemu_x86_64_defconfig
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>Now start the Buildroot TUI with&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-bash" data-lang="bash">&lt;span style="display:flex;">&lt;span>make menuconfig
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>If you&amp;rsquo;ve built the Linux kernel from source before, the Buildroot UI should
+feel familiar. Instead of being presented with kernel build parameters to tweak,
+you&amp;rsquo;ll have various options for how you want to configure the operating system,
+such as&lt;/p>
+&lt;ul>
+&lt;li>what version of the Linux kernel you want to use;&lt;/li>
+&lt;li>what packages should be installed by default;&lt;/li>
+&lt;li>whether login with the root user is permitted (and the root user&amp;rsquo;s default
+password);&lt;/li>
+&lt;/ul>
+&lt;p>and so on.&lt;/p>
+&lt;p>Once you&amp;rsquo;ve finished selecting the options that you want for Buildroot, you
+should save your config file (by default, to &lt;code>.config&lt;/code>) and exit. For the
+purposes of this note, I used the following configuration options:&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-bash" data-lang="bash">&lt;span style="display:flex;">&lt;span>&lt;span style="color:#75715e"># Some packages require C++ support in order to be installed&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#75715e"># -&amp;gt; Toolchain -&amp;gt; Enable C++ support&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>BR2_TOOLCHAIN_BUILDROOT_CXX&lt;span style="color:#f92672">=&lt;/span>y
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#75715e"># I like having OpenSSH installed by default as another means of getting access&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#75715e"># to the environment, but it isn&amp;#39;t strictly necessary.&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#75715e"># -&amp;gt; Target packages -&amp;gt; Networking applications -&amp;gt; openssh&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>BR2_PACKAGE_OPENSSH&lt;span style="color:#f92672">=&lt;/span>y
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>BR2_PACKAGE_OPENSSH_CLIENT&lt;span style="color:#f92672">=&lt;/span>y
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>BR2_PACKAGE_OPENSSH_SERVER&lt;span style="color:#f92672">=&lt;/span>y
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>BR2_PACKAGE_OPENSSH_KEY_UTILS&lt;span style="color:#f92672">=&lt;/span>y
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>BR2_PACKAGE_OPENSSH_SANDBOX&lt;span style="color:#f92672">=&lt;/span>y
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#75715e"># Add a post-build script for some minor SSH configuration&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#75715e"># -&amp;gt; System configuration -&amp;gt; Custom scripts to run before creating filesystem images&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>BR2_ROOTFS_POST_BUILD_SCRIPT&lt;span style="color:#f92672">=&lt;/span>&lt;span style="color:#e6db74">&amp;#34;board/qemu/x86_64/post-build.sh ./scripts/config.sh&amp;#34;&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#75715e"># Use Ext4 for the filesystem image&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#75715e"># -&amp;gt; Filesystem images -&amp;gt; ext2/3/4 root filesystem&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>BR2_TARGET_ROOTFS_EXT2_4&lt;span style="color:#f92672">=&lt;/span>y
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>BR2_TARGET_ROOTFS_EXT2_GEN&lt;span style="color:#f92672">=&lt;/span>&lt;span style="color:#ae81ff">4&lt;/span>
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>The &lt;code>./scripts/config.sh&lt;/code> shell script just contains the following:&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-sh" data-lang="sh">&lt;span style="display:flex;">&lt;span>&lt;span style="color:#75715e">#!/bin/sh
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#75715e">&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>PUBKEY&lt;span style="color:#f92672">=&lt;/span>&lt;span style="color:#e6db74">&amp;#34;...&amp;#34;&lt;/span> &lt;span style="color:#75715e"># Replace with your public key&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>OUTDIR&lt;span style="color:#f92672">=&lt;/span>output/target
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>addline&lt;span style="color:#f92672">()&lt;/span> &lt;span style="color:#f92672">{&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span> grep -qxF &lt;span style="color:#e6db74">&amp;#34;&lt;/span>$1&lt;span style="color:#e6db74">&amp;#34;&lt;/span> &lt;span style="color:#e6db74">&amp;#34;&lt;/span>$2&lt;span style="color:#e6db74">&amp;#34;&lt;/span> &lt;span style="color:#f92672">||&lt;/span> echo &lt;span style="color:#e6db74">&amp;#34;&lt;/span>$1&lt;span style="color:#e6db74">&amp;#34;&lt;/span> &amp;gt;&amp;gt; &lt;span style="color:#e6db74">&amp;#34;&lt;/span>$2&lt;span style="color:#e6db74">&amp;#34;&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#f92672">}&lt;/span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>mkdir -p &lt;span style="color:#e6db74">${&lt;/span>OUTDIR&lt;span style="color:#e6db74">}&lt;/span>/root/.ssh
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>addline &lt;span style="color:#e6db74">&amp;#34;PermitRootLogin yes&amp;#34;&lt;/span> &lt;span style="color:#e6db74">${&lt;/span>OUTDIR&lt;span style="color:#e6db74">}&lt;/span>/etc/ssh/sshd_config
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>addline &lt;span style="color:#e6db74">&amp;#34;&lt;/span>&lt;span style="color:#e6db74">${&lt;/span>PUBKEY&lt;span style="color:#e6db74">}&lt;/span>&lt;span style="color:#e6db74">&amp;#34;&lt;/span> &lt;span style="color:#e6db74">${&lt;/span>OUTDIR&lt;span style="color:#e6db74">}&lt;/span>/root/.ssh/authorized_keys
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>chmod &lt;span style="color:#ae81ff">600&lt;/span> &lt;span style="color:#e6db74">${&lt;/span>OUTDIR&lt;span style="color:#e6db74">}&lt;/span>/root/.ssh/authorized_keys
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>Once you&amp;rsquo;ve set up your configuration, you can start building the Linux
+environment with&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-bash" data-lang="bash">&lt;span style="display:flex;">&lt;span>make -j&lt;span style="color:#66d9ef">$(&lt;/span>nproc&lt;span style="color:#66d9ef">)&lt;/span>
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;h3 id="using-a-custom-kernel">Using a custom kernel&lt;/h3>
+&lt;p>If you just want to build the kernel with custom configuration parameters, you
+can run&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-bash" data-lang="bash">&lt;span style="display:flex;">&lt;span>make linux-menuconfig
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>to create a kernel build config file. Then you can add the following to your
+Buildroot config:&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-text" data-lang="text">&lt;span style="display:flex;">&lt;span>BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE=./path/to/config/file
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>If you&amp;rsquo;re experimenting with some changes to the kernel sources, however, you&amp;rsquo;ll
+need to do one of the following:&lt;/p>
+&lt;ul>
+&lt;li>Configure some &lt;a href="https://buildroot.org/downloads/manual/manual.html#_adding_project_specific_patches_and_hashes">custom kernel
+patches&lt;/a>
+via &lt;code>BR2_GLOBAL_PATCH_DIR&lt;/code> or &lt;code>BR2_LINUX_KERNEL_PATCH&lt;/code>.&lt;/li>
+&lt;li>Point to a tarball with the modified kernel source using&lt;/li>
+&lt;/ul>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-text" data-lang="text">&lt;span style="display:flex;">&lt;span>BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION=&amp;#34;file:///path/to/sources.tar.gz&amp;#34;
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;h3 id="booting-the-kernel-with-qemu">Booting the kernel with QEMU&lt;/h3>
+&lt;p>If everything has gone smoothly up to this point, your newly-built Linux system
+should now be in the &lt;code>output/images&lt;/code> directory (relative to the root of the
+Buildroot repository). You can now run your environment under QEMU with (for
+instance)&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-bash" data-lang="bash">&lt;span style="display:flex;">&lt;span>qemu-system-x86_64 &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -kernel ./output/images/bzImage &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -drive file&lt;span style="color:#f92672">=&lt;/span>./output/images/rootfs.ext4,if&lt;span style="color:#f92672">=&lt;/span>virtio,format&lt;span style="color:#f92672">=&lt;/span>raw &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -nographic &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -enable-kvm &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -cpu host &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -m 512M &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -append &lt;span style="color:#e6db74">&amp;#34;root=/dev/vda console=tty1 console=ttyS0&amp;#34;&lt;/span>
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>You should see your system booting and reach the Buildroot login prompt (by
+default the only user you can login as is &lt;code>root&lt;/code>, without any password):&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-text" data-lang="text">&lt;span style="display:flex;">&lt;span>Welcome to Buildroot
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>buildroot login: root
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span># 
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>Press &lt;code>Ctrl-a x&lt;/code> to exit.&lt;/p>
+&lt;p>If you installed OpenSSH, you should also add&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-bash" data-lang="bash">&lt;span style="display:flex;">&lt;span>-net nic,model&lt;span style="color:#f92672">=&lt;/span>virtio -net user,hostfwd&lt;span style="color:#f92672">=&lt;/span>tcp::2222-:22
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>to your command. This will forward port 22 from the virtual machine to port 2222
+on your host, making the VM accessible over SSH.&lt;/p>
+&lt;h2 id="debugging-the-kernel-with-gdb">Debugging the kernel with GDB&lt;/h2>
+&lt;p>Now that we have our VM running, we want to start using GDB to debug it. First,
+we&amp;rsquo;ll need to build the kernel to support debugging using a custom build config.
+You should run &lt;code>make linux-menuconfig&lt;/code> and set the following options:&lt;/p>
+&lt;ul>
+&lt;li>&lt;code>Kernel hacking -&amp;gt; Kernel debugging&lt;/code>&lt;/li>
+&lt;li>&lt;code>Kernel hacking -&amp;gt; Compile-time checks and compiler options -&amp;gt; Debug information&lt;/code>&lt;/li>
+&lt;li>&lt;code>Kernel hacking -&amp;gt; Compile-time checks and compiler options -&amp;gt; Provide GDB scripts for kernel debugging&lt;/code>&lt;/li>
+&lt;/ul>
+&lt;p>Alternatively, put the following in your kernel build config:&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-text" data-lang="text">&lt;span style="display:flex;">&lt;span>CONFIG_DEBUG_KERNEL=y
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>CONFIG_GDB_SCRIPTS=y
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>Run &lt;code>make&lt;/code> again to build your environment. When we run QEMU now, we&amp;rsquo;ll add the
+following to our command:&lt;/p>
+&lt;ul>
+&lt;li>&lt;code>-gdb tcp::1234&lt;/code> will open up a gdbserver on TCP port 1234.&lt;/li>
+&lt;li>The &lt;code>-S&lt;/code> flag will tell the kernel to wait before booting. This will allow us
+to attach GDB to the kernel before the boot process starts.&lt;/li>
+&lt;li>We&amp;rsquo;ll add &lt;code>nokaslr&lt;/code> to the kernel command line parameters to disable &lt;a href="https://en.wikipedia.org/wiki/Address_space_layout_randomization">address
+space layout
+randomization&lt;/a>
+in the kernel.&lt;/li>
+&lt;/ul>
+&lt;p>Your full command should now look something like this:&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-bash" data-lang="bash">&lt;span style="display:flex;">&lt;span>qemu-system-x86_64 &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -kernel ./output/images/bzImage &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -drive file&lt;span style="color:#f92672">=&lt;/span>./output/images/rootfs.ext4,if&lt;span style="color:#f92672">=&lt;/span>virtio,format&lt;span style="color:#f92672">=&lt;/span>raw &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -nographic &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -append &lt;span style="color:#e6db74">&amp;#34;nokaslr root=/dev/vda console=tty1 console=ttyS0&amp;#34;&lt;/span> &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -enable-kvm &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -cpu host &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -m 512M &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -gdb tcp::1234 &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> -S 
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>Before starting GDB, you&amp;rsquo;ll want to ensure that you&amp;rsquo;ll be able to load the
+&lt;code>vmlinux-gdb.py&lt;/code> script by adding it to your auto-load safe-path:&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-bash" data-lang="bash">&lt;span style="display:flex;">&lt;span>echo &lt;span style="color:#e6db74">&amp;#34;add-auto-load-safe-path &lt;/span>&lt;span style="color:#66d9ef">$(&lt;/span>realpath output/images/linux/vmlinux-gdb.py&lt;span style="color:#66d9ef">)&lt;/span>&lt;span style="color:#e6db74">&amp;#34;&lt;/span> &lt;span style="color:#ae81ff">\
+&lt;/span>&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>&lt;span style="color:#ae81ff">&lt;/span> &amp;gt;&amp;gt; ~/.gdbinit
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>Then run&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-bash" data-lang="bash">&lt;span style="display:flex;">&lt;span>gdb -x ./kerneldebug.gdb ./output/images/linux/vmlinux
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>where &lt;code>kerneldebug.gdb&lt;/code> contains the following:&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-text" data-lang="text">&lt;span style="display:flex;">&lt;span># Attach to QEMU
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>target remote :1234
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span># Add any breakpoints you already know you want to set here, e.g.
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>#
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span># hbreak function_1
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span># hbreak function_2
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span># ...
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>
+&lt;/span>&lt;/span>&lt;span style="display:flex;">&lt;span>hbreak start_kernel
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>If all went well, you should be able to run&lt;/p>
+&lt;div class="highlight">&lt;pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;">&lt;code class="language-text" data-lang="text">&lt;span style="display:flex;">&lt;span>(gdb) c
+&lt;/span>&lt;/span>&lt;/code>&lt;/pre>&lt;/div>&lt;p>in GDB, and then see Linux boot up in the terminal where you ran QEMU.&lt;/p>
+&lt;h2 id="additional-references">Additional references&lt;/h2>
+&lt;p>As mentioned earlier, &lt;a href="https://nickdesaulniers.github.io/blog/2018/10/24/booting-a-custom-linux-kernel-in-qemu-and-debugging-it-with-gdb/">Nick Desaulnier&amp;rsquo;s
+post&lt;/a>
+and &lt;a href="https://www.josehu.com/technical/2021/01/02/linux-kernel-build-debug.html">Guanzhou Hu&amp;rsquo;s
+post&lt;/a>
+were both helpful references for me.&lt;/p>
+&lt;p>The &lt;a href="https://buildroot.org/downloads/manual/manual.html">Buildroot user manual&lt;/a>
+is the most complete source of information on how to use Buildroot.&lt;/p>
+&lt;p>The kernel sources have &lt;a href="https://docs.kernel.org/dev-tools/gdb-kernel-debugging.html">some
+documentation&lt;/a> on
+how to debug the kernel with GDB.&lt;/p></description></item><item><title>Similarity search is better than most people give it credit for</title><link>/notes/similarity_search_with_gzip/</link><pubDate>Thu, 13 Jul 2023 16:09:27 -0400</pubDate><guid>/notes/similarity_search_with_gzip/</guid><description>&lt;h2 id="on-k-nearest-neighbors">On k-nearest neighbors&lt;/h2>
+&lt;p>If you ever read an introductory machine learning textbook or take a course on
+the subject, one of the first classification algorithms that you are likely to
+learn about is &lt;a href="https://en.wikipedia.org/wiki/K-nearest_neighbors_algorithm">k-nearest neighbors
+(kNN)&lt;/a>. The idea
+behind it is pretty straightforward: suppose that you have a dataset split into
+two different classes, and you are given a new point that you want to classify.
+To do so, you would find the \(k\) points that are closest to it, and classify
+the new point as belonging the most common class among those points.&lt;/p>
+&lt;p>kNN is a completely respectable algorithm, and still an active area of research.
+But in most ML education and discussions, kNN gets written off pretty quickly,
+because although training a kNN classifier is extremely cheap, classification
+takes (naively) \(O(Nd)\) time, where \(N\) is the size of the dataset and
+\(d\) is the dimensionality&lt;sup id="fnref:1">&lt;a href="#fn:1" class="footnote-ref" role="doc-noteref">1&lt;/a>&lt;/sup>. So it pleased me to see
+&lt;a href="https://aclanthology.org/2023.findings-acl.426/">this paper&lt;/a>, &amp;ldquo;&amp;lsquo;Low-Resource&amp;rsquo;
+Text Classification: A Parameter-Free Classification Method with Compressors&amp;rdquo;,
+making the rounds recently. The authors of this paper construct a new string
+metric, defined as&lt;/p>
+&lt;p>\[
+\begin{aligned}
+d(x,y) = \frac{C(xy) - \min{\{C(x), C(y)\}}}{\max{\{C(x), C(y)\}}}
+\end{aligned}
+\]&lt;/p>
+&lt;p>where \(C(\cdot)\) is the length of its input after compression with gzip. The
+idea, roughly, is to figure out the difference in the &lt;a href="https://en.wikipedia.org/wiki/Kolmogorov_complexity">Kolmogorov
+complexity&lt;/a> of the
+concatenated string \(xy\) from the strings \(x\) or \(y\). Since
+Kolmogorov complexity isn&amp;rsquo;t actually computable, we use a lossless compression
+algorithm as a stand-in.&lt;/p>
+&lt;p>It turns out that kNN, with this metric, is an extremely solid classifier on a
+range of tasks, even compared to many state-of-the-art
+&lt;a href="https://en.wikipedia.org/wiki/BERT_(language_model)">BERT&lt;/a>-based models. The
+authors demonstrate that it is quite competitive on the test set to most of the
+baselines it compares against, and in fact beats all of them on out-of-domain
+datasets&lt;sup id="fnref:2">&lt;a href="#fn:2" class="footnote-ref" role="doc-noteref">2&lt;/a>&lt;/sup>.&lt;/p>
+&lt;h2 id="accelerating-similarity-search">Accelerating similarity search&lt;/h2>
+&lt;p>One downside of the paper is that it never really addresses its original
+promise, which is specifically &lt;em>low-resource&lt;/em> classification. The methods that
+are presented still take \(O(Nd)\) time to execute, which for a
+reasonably-sized dataset is still much more expensive than a neural network.
+There are, however, a few different tricks that can be used to accelerate
+similarity search. &lt;a href="https://en.wikipedia.org/wiki/K-d_tree">k-d trees&lt;/a> and &lt;a href="https://en.wikipedia.org/wiki/Ball_tree">ball
+trees&lt;/a> reduce the impact of \(N\),
+while dimensionality reduction through the likes of
+&lt;a href="https://en.wikipedia.org/wiki/Principal_component_analysis">PCA&lt;/a> and
+&lt;a href="https://en.wikipedia.org/wiki/Random_projection">randomized projections&lt;/a>
+reduces the impact of \(d\).&lt;/p>
+&lt;p>My personal favorite trick in this genre is &lt;a href="https://en.wikipedia.org/wiki/Locality-sensitive_hashing">locality-sensitive
+hashing&lt;/a>, or LSH. An
+LSH family for a given similarity function is a family of randomized hash
+functions with the property that, for two inputs and a randomly-sampled hash
+function, the probability of a hash collision between those inputs increases the
+more similar they are to one another. Families of locality-sensitive hash
+functions are known to exist for a ton of different similarity functions,
+including:&lt;/p>
+&lt;ul>
+&lt;li>Cosine similarity&lt;sup id="fnref:3">&lt;a href="#fn:3" class="footnote-ref" role="doc-noteref">3&lt;/a>&lt;/sup>&lt;/li>
+&lt;li>\(\ell^p\)
+distance (in particular, Manhattan and Euclidean distance)&lt;sup id="fnref:4">&lt;a href="#fn:4" class="footnote-ref" role="doc-noteref">4&lt;/a>&lt;/sup>&lt;/li>
+&lt;li>Jaccard similarity&lt;sup id="fnref:5">&lt;a href="#fn:5" class="footnote-ref" role="doc-noteref">5&lt;/a>&lt;/sup>&lt;/li>
+&lt;li>Inner product similarity&lt;sup id="fnref:6">&lt;a href="#fn:6" class="footnote-ref" role="doc-noteref">6&lt;/a>&lt;/sup>&lt;/li>
+&lt;li>Hamming distance&lt;sup id="fnref:7">&lt;a href="#fn:7" class="footnote-ref" role="doc-noteref">7&lt;/a>&lt;/sup>&lt;/li>
+&lt;/ul>
+&lt;p>It&amp;rsquo;s also possible to use a hybrid approach to construct hash functions for
+other notions of similarity. For instance, you can use contrastive learning to
+train an embedding that maps inputs to some vector space, and then use SimHash
+to hash those vectors on their cosine similarity. You can also apply LSH even
+when your metric doesn&amp;rsquo;t have its own hash family, as long as you have another
+metric that&amp;rsquo;s correlated to the original. In that case, you&amp;rsquo;d use LSH with the
+second metric to reduce your original search space, and then run kNN with the
+original metric over the remaining points. A classic example of this is using
+Jaccard similarity with shingling as an initial, coarse-grained string
+similarity metric, and then Levenshtein distance as a fine(r)-grained metric for
+kNN.&lt;/p>
+&lt;p>The way that LSH works in practice is that you randomly generate a bunch of hash
+functions, construct a few hash tables (say, 8 tables with 16 hash functions
+each), and insert your database into each of those tables&lt;sup id="fnref:8">&lt;a href="#fn:8" class="footnote-ref" role="doc-noteref">8&lt;/a>&lt;/sup>.
+Then, to use kNN to classify a point, you would hash it with all of the hash
+functions you&amp;rsquo;ve constructed. At the end, your search space is reduced to just
+those points with which you got a hash collision in each of the tables you
+queried, and you just search against those remaining candidates.&lt;/p>
+&lt;h2 id="comparing-knn-with-other-learning-algorithms">Comparing kNN with other learning algorithms&lt;/h2>
+&lt;p>The resulting classifier that you get with kNN can be much faster and require
+less specialized hardware than what you&amp;rsquo;d get with e.g. a neural network.
+Moreover, the outputs of kNN are a lot more easily interpretable than what you&amp;rsquo;d
+get with other models; it&amp;rsquo;s easier to understand why your classifier came to a
+particular conclusion, as well as to characterize the failure conditions of your
+classifier.&lt;/p>
+&lt;p>The main downside, really, is that choosing a good similarity metric can be
+challenging for some datasets. It requires a lot more domain expertise than the
+more exotic classifiers, which are in large part plug-and-play. Choosing
+metrics that are easily compatible with LSH can be even more of a challenge, and
+if you&amp;rsquo;re at the point where you&amp;rsquo;re reaching for something like contrastive
+learning to generate an embedding where LSH would be feasible, you might
+(reasonably) want to try learning a neural net anyways.&lt;/p>
+&lt;p>But at a fundamental level, you aren&amp;rsquo;t losing anything by using kNN; kNN is, at
+least, theoretically equivalent (contingent on the choice of similarity
+function) to any other classifier in the machine learning grab-bag.&lt;/p>
+&lt;div class="footnotes" role="doc-endnotes">
+&lt;hr>
+&lt;ol>
+&lt;li id="fn:1">
+&lt;p>In fact it can be much worse than that, depending on
+your choice of metric.&amp;#160;&lt;a href="#fnref:1" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:2">
+&lt;p>See Tables 3 and 5 of the paper.&amp;#160;&lt;a href="#fnref:2" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:3">
+&lt;p>Moses S. Charikar. Similarity estimation techniques from
+rounding algorithms. In Proceedings of the Thiry-Fourth Annual ACM Symposium
+on Theory of Computing, STOC &amp;lsquo;02, page 380–388, New York, NY, USA, 2002.
+Association for Computing Machinery. 10.1145/509907.509965.&amp;#160;&lt;a href="#fnref:3" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:4">
+&lt;p>Datar, Mayur and Indyk, Piotr and Immorlica, Nicole and
+Mirrokni, Vahab. (2004). Locality-sensitive hashing scheme based on p-stable
+distributions. Proceedings of the Annual Symposium on Computational Geometry.
+10.1145/997817.997857.&amp;#160;&lt;a href="#fnref:4" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:5">
+&lt;p>Broder, A. On the resemblance and containment of
+documents. Compression and Complexity of Sequences: Proceedings, Positano,
+Amalfitan Coast, Salerno, Italy, June 11-13, 1997.
+doi:10.1109/SEQUEN.1997.666900.&amp;#160;&lt;a href="#fnref:5" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:6">
+&lt;p>Shrivastava, Anshumali, and Ping Li. &amp;ldquo;Improved
+asymmetric locality sensitive hashing (ALSH) for maximum inner product search
+(MIPS).&amp;rdquo; arXiv preprint arXiv:1410.5410 (2014).
+&lt;a href="https://arxiv.org/abs/1410.5410">https://arxiv.org/abs/1410.5410&lt;/a>&amp;#160;&lt;a href="#fnref:6" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:7">
+&lt;p>Indyk, Piotr.; Motwani, Rajeev. (1998).
+&amp;ldquo;Approximate Nearest Neighbors: Towards Removing the Curse of
+Dimensionality.&amp;rdquo;. Proceedings of 30th Symposium on Theory of Computing.&amp;#160;&lt;a href="#fnref:7" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:8">
+&lt;p>The number of hash functions/tables you construct will
+depend on what you want the cutoff probability to look like for which points
+you filter in. Each LSH family has some characterization of collision
+probability versus similarity which you can use to make this determination. For
+instance, for SimHash (the standard LSH family for cosine similarity), that
+probability for a single randomly-sampled hash function is \(1 - \theta/\pi\),
+where \(\theta = \arccos{(\text{cossim}(x,y))}\) is the angle between \(x\) and
+\(y\).&amp;#160;&lt;a href="#fnref:8" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;/ol>
+&lt;/div></description></item><item><title>Connect to UCLA's wifi so that strangers can send you malware for free</title><link>/notes/ucla_networks/</link><pubDate>Mon, 13 Feb 2023 00:00:00 +0000</pubDate><guid>/notes/ucla_networks/</guid><description>&lt;p>Here&amp;rsquo;s the TL;DR (you can also check out the &lt;a href="#faq">FAQ&lt;/a>):&lt;/p>
+&lt;blockquote>
+&lt;p>If you&amp;rsquo;re a UCLA student, faculty, or staff member, or are visiting UCLA,
+&lt;strong>you are exposing yourself to a tremendous level of risk by connecting a
+device to eduroam or ethernet&lt;sup id="fnref:1">&lt;a href="#fn:1" class="footnote-ref" role="doc-noteref">1&lt;/a>&lt;/sup>.&lt;/strong> If possible, you should
+connect to UCLA_WIFI or UCLA_WEB instead.&lt;/p>&lt;/blockquote>
+&lt;h2 id="vulnerability-scanners-on-my-ip-range-its-more-likely-than-you-think">&amp;ldquo;Vulnerability scanners, on &lt;em>my&lt;/em> IP range?&amp;rdquo; It&amp;rsquo;s more likely than you think.&lt;/h2>
+&lt;p>I transferred to UCLA&amp;rsquo;s PhD program in Electrical and Computer Engineering about
+a month ago. My first week on campus, I noticed that UCLA&amp;rsquo;s
+&lt;a href="https://en.wikipedia.org/wiki/Eduroam">eduroam&lt;/a> network was assigning my laptop
+a rather unusual IP address:&lt;/p>
+&lt;pre tabindex="0">&lt;code>@kernelmethod ➜ ~ ip addr show dev wlp0s20f3 | grep inet
+inet 131.179.58.220/23 brd 131.179.58.255 scope global dynamic wlp0s20f3
+inet 131.179.59.35/23 brd 131.179.58.255 scope global secondary dynamic noprefixroute wlp0s20f3
+&lt;/code>&lt;/pre>&lt;p>Dust off your &lt;a href="https://en.wikipedia.org/wiki/Reserved_IP_addresses">table of reserved IP
+addresses&lt;/a> and you might
+notice that &lt;code>131.179.58.220&lt;/code> and &lt;code>131.179.59.35&lt;/code> aren&amp;rsquo;t IP addresses reserved
+for LANs. In fact, &lt;code>131.179.0.0/16&lt;/code> is actually an IP range belonging to UCLA.&lt;/p>
+&lt;p>I also noticed that my firewall was suddenly dropping a &lt;em>lot&lt;/em> of traffic, from a
+bunch of random IP addresses. Lots of machines trying to hit lots of ports on my
+laptop, most of which &lt;em>definitely were not&lt;/em> on my LAN.&lt;/p>
+&lt;h3 id="under-the-hood">Under the hood&lt;/h3>
+&lt;p>It seems&lt;sup id="fnref:2">&lt;a href="#fn:2" class="footnote-ref" role="doc-noteref">2&lt;/a>&lt;/sup> that UCLA&amp;rsquo;s eduroam and ethernet assign IP addresses to
+people&amp;rsquo;s devices from the following IPv4 subnets:&lt;/p>
+&lt;ul>
+&lt;li>&lt;code>128.97.0.0/16&lt;/code>&lt;/li>
+&lt;li>&lt;code>131.179.0.0/16&lt;/code>&lt;/li>
+&lt;li>&lt;code>149.142.0.0/16&lt;/code>&lt;/li>
+&lt;li>&lt;code>164.67.0.0/16&lt;/code>&lt;/li>
+&lt;li>&lt;code>169.232.0.0/16 &lt;/code>&lt;/li>
+&lt;/ul>
+&lt;p>The normal way to assign IP addresses to devices would be to use a reserved
+range like &lt;code>10.0.0.0/8&lt;/code> or &lt;code>192.168.0.0/16&lt;/code> and then use
+&lt;a href="https://en.wikipedia.org/wiki/Network_address_translation">NAT&lt;/a> to translate
+between internal IP addresses and the outside world. In contrast, UCLA gives
+each device that connects to its network a unique address from the ranges that
+it owns.&lt;/p>
+&lt;p>This feels like a somewhat strange way to set up a network, but what do I know?
+I&amp;rsquo;m not an network admin for an organization with tens of thousands of devices
+that also happens to own several Class B networks. What UCLA is doing is a bit
+odd, but not &lt;em>necessarily&lt;/em> problematic.&lt;/p>
+&lt;p>The bigger issue is that there&amp;rsquo;s absolutely no firewall between devices on
+UCLA&amp;rsquo;s network and the outside world.&lt;/p>
+&lt;figure>&lt;img src="../../img/ucla_networks/virus_firewall.png"
+ alt="A little pixel art drawing I made of a virus standing in front of a firewall.">
+&lt;/figure>
+
+&lt;h2 id="lets-pay-shodan-a-visit">Let&amp;rsquo;s pay Shodan a visit&lt;/h2>
+&lt;p>Type in &lt;code>org:&amp;quot;University of California Los Angeles&amp;quot;&lt;/code> into
+&lt;a href="https://www.shodan.io/">Shodan&lt;/a> and you&amp;rsquo;ll immediately pull somewhere around
+15,000 - 20,000 IP addresses from devices at UCLA, most of which are on the five
+aforementioned IP ranges:&lt;/p>
+&lt;figure>&lt;img src="../../img/ucla_networks/shodan_list.webp"
+ alt="A list of the first few devices that appear on Shodan for the query org:&amp;#34;University of California Los Angeles&amp;#34;. The first few devices listed here are somebody&amp;#39;s Macbook, a Wordpress server, and a MySQL server. For this particular query, Shodan returned 18,739 results.">
+&lt;/figure>
+
+&lt;p>Not! Great!&lt;/p>
+&lt;p>There&amp;rsquo;s plenty to dig into here. As one might expect (if you&amp;rsquo;ve ever browsed
+&lt;a href="https://github.com/jakejarvis/awesome-shodan-queries">Shodan&amp;rsquo;s horror stories&lt;/a>
+before), there are dozens of internet-connected cameras, smart lightbulbs, and
+similar devices that are exposed. Among those results there are also thousands
+of personal devices. For instance, as I write this, a search for
+&lt;code>org:&amp;quot;University of California Los Angeles&amp;quot; macbook pro&lt;/code> reveals ~1,000
+Macbooks on campus (usually through an open
+&lt;a href="https://en.wikipedia.org/wiki/AirPlay">AirPlay&lt;/a> port). The query
+&lt;code>org:&amp;quot;University of California Los Angeles&amp;quot; port:62078&lt;/code> turns up over 6,000
+iPhones and iPads&lt;sup id="fnref:3">&lt;a href="#fn:3" class="footnote-ref" role="doc-noteref">3&lt;/a>&lt;/sup>.&lt;/p>
+&lt;p>Between Shodan queries and some of my own tests, it appears that all traffic
+from the outside world is permitted into UCLA&amp;rsquo;s networks. &lt;strong>This is a
+significant security risk to students, faculty, and staff connecting to eduroam
+or ethernet&lt;/strong>. A lot of devices that have a security vulnerability in some shape
+or fashion aren&amp;rsquo;t easily exploitable only because they&amp;rsquo;re protected from the
+outside world by some combination of firewalls and NAT. UCLA completely removes
+this layer of protection.&lt;/p>
+&lt;p>It&amp;rsquo;s hard to measure the downstream impacts of this exposure. In most cases,
+it&amp;rsquo;s going to be really difficult to figure out whether a device was hacked by
+being exploited remotely while exposed on UCLA&amp;rsquo;s network, or if it was hacked
+for a different reason. To give one data point, though, when I started this
+investigation I found two exposed and unauthenticated Elasticsearch instances on
+UCLA&amp;rsquo;s networks. Both had been ransomed, with their indices apparently backed up
+to a third-party server, deleted, and then replaced with the following ransom
+note.&lt;/p>
+&lt;figure>&lt;img src="../../img/ucla_networks/elasticsearch_ransom.webp"
+ alt="A screenshot of a note left on a public Elasticsearch instance on the UCLA eduroam IP range. The note starts &amp;#39;All indexs has been dropped. But we backup all indexs. The only method of recoveribing database is to pay 0.021 BTC.&amp;#39; It then gives details on how to pay the ransom to recover the lost data.">&lt;figcaption>
+ &lt;p>This does not spark joy.&lt;/p>
+ &lt;/figcaption>
+&lt;/figure>
+
+&lt;h3 id="privacy-risks">Privacy risks&lt;/h3>
+&lt;p>Beyond the security implications I&amp;rsquo;ve listed, there are also privacy issues at
+stake. Every single device that connects to eduroam is given a publicly routable
+IP address with no traffic filtering, which makes it trivial to see what kinds
+of devices people are connecting at UCLA.&lt;/p>
+&lt;p>In a lot of cases, these are devices that are most likely hooked up to the wifi
+in UCLA housing. For instance, try the following Shodan queries:&lt;/p>
+&lt;ul>
+&lt;li>&lt;code>org:&amp;quot;University of California Los Angeles&amp;quot; os:playstation&lt;/code>&lt;/li>
+&lt;li>&lt;code>org:&amp;quot;University of California Los Angeles&amp;quot; &amp;quot;bedroom&amp;quot;&lt;/code>&lt;/li>
+&lt;li>&lt;code>org:&amp;quot;University of California Los Angeles&amp;quot; &amp;quot;apple tv&amp;quot;&lt;/code>&lt;/li>
+&lt;/ul>
+&lt;p>It&amp;rsquo;s also pretty easy to find the IP addresses of lots of students&amp;rsquo; personal
+machines. Depending on what data sources you have access to, it&amp;rsquo;d be pretty
+trivial to do things like figure out what sites students are browsing to and
+even where they physically are throughout the day.&lt;/p>
+&lt;h2 id="some-speculation">Some speculation&lt;/h2>
+&lt;p>UCLA should be filtering traffic coming from the outside world.&lt;/p>
+&lt;p>That&amp;rsquo;s easier said than done, though, and I can guess at a few different reasons
+why a firewall hasn&amp;rsquo;t been set up yet. For one, UCLA&amp;rsquo;s network is &lt;em>really old&lt;/em>
+&amp;ndash; to give you a sense, the first message sent over ARPANET was between Stanford
+and UCLA. From a technical perspective, there are probably some significant
+challenges in performing any major architectural changes.&lt;/p>
+&lt;p>However, I think there are more compelling social reasons that explain why
+eduroam is such a mess. There are probably quite a few people (mostly faculty
+and staff) who benefit from the network being wide open. It is &lt;em>incredibly easy&lt;/em>
+to set up a webserver with a reserved and mostly-static IP address on eduroam.
+Browsing through Shodan, I found a few dozen labs and research projects clearly
+benefitting from this by running servers off of UCLA&amp;rsquo;s network (although a good
+portion of these haven&amp;rsquo;t been updated in several years), and there are likely
+many more servers providing access to computing resources, shared datasets, and
+so on. Some of these machines are undoubtedly running critical services &amp;ndash; for
+all I know, a firewall would cut off access to a website run by a nearly-retired
+physics professor that somehow underpins the entire UCLA course registration
+system (&lt;em>*glares at Lou&amp;rsquo;s List*&lt;/em>)&lt;sup id="fnref:4">&lt;a href="#fn:4" class="footnote-ref" role="doc-noteref">4&lt;/a>&lt;/sup>.&lt;/p>
+&lt;figure>&lt;img src="../../img/ucla_networks/louslist.png"
+ alt="A screenshot of Lou&amp;#39;s list (https://louslist.org/). The shown page is titled &amp;#39;UVa Class Schedules&amp;#39;.">&lt;figcaption>
+ &lt;p>This professor&amp;rsquo;s side project is the only thing standing between the University of Virginia and chaos.&lt;/p>
+ &lt;/figcaption>
+&lt;/figure>
+
+&lt;p>And I can sympathize. I&amp;rsquo;m hoping to help set up a compute server for my lab
+sometime this year, and UCLA&amp;rsquo;s network architecture makes it much easier to
+expose those resources to members who are off-campus and even to people at other
+institutions. On the other hand, a public network used by tens of thousands of
+students, faculty, and staff probably &lt;em>isn&amp;rsquo;t&lt;/em> the best place to run an
+experiment in figuring out how much malware people would receive in a world
+where NAT wasn&amp;rsquo;t invented. And many of the issues I&amp;rsquo;ve mentioned in this post
+would be at least partially alleviated by a firewall with a relatively generous
+allowlist.&lt;/p>
+&lt;p>While we&amp;rsquo;re on the topic of social mechanisms hampering UCLA&amp;rsquo;s security, there&amp;rsquo;s
+one other cultural issue worth mentioning here.&lt;/p>
+&lt;h3 id="stop-blaming-users-for-your-bad-security-challenge-2023-difficulty-impossible">Stop Blaming Users for Your Bad Security Challenge 2023 (Difficulty: Impossible)&lt;/h3>
+&lt;p>UCLA&amp;rsquo;s policy directory has several IT security policies on file. Here&amp;rsquo;s a
+direct quote from one of them, &lt;a href="https://web.archive.org/web/20220814214943/https://www.adminpolicies.ucla.edu/APP/Number/401">UCLA Policy 401 : Minimum Security Standards for
+Network
+Devices&lt;/a>:&lt;/p>
+&lt;blockquote>
+&lt;p>B. Responsibilities for Compliance and Enforcement&lt;/p>
+&lt;p>System Administrators&lt;/p>
+&lt;p>System Administrators shall ensure that every Device for which they are
+responsible is in compliance with the Minimum Security Standards.&lt;/p>
+&lt;p>A System Administrator may be an IT staff member whose responsibilities
+include ongoing maintenance for all Devices in a department or computer lab.
+&lt;strong>A faculty member functions as a System Administrator when his or her
+personally owned computer at home connects to the Campus Network (e.g., via
+the UCLA wireless or through the UCLA Virtual Private Network (VPN)).&lt;/strong>&lt;/p>&lt;/blockquote>
+&lt;p>&amp;ldquo;What do the Minimum Security Standards entail?&amp;rdquo;, you might ask. Well, &lt;a href="https://www.adminpolicies.ucla.edu/APP/Attachment?fileName=401-A">among
+other things&lt;/a>:&lt;/p>
+&lt;blockquote>
+&lt;ol start="3">
+&lt;li>Host-based firewall software&lt;/li>
+&lt;/ol>
+&lt;p>&lt;strong>System Administrators are responsible for ensuring that computers with
+native host-based firewall software included in the operating system have the
+firewall activated and properly configured.&lt;/strong>&lt;/p>
+&lt;p>Exceptions may be made for firewall software that compromises the usability of
+critical applications.&lt;/p>&lt;/blockquote>
+&lt;p>Hmmm. HMMMMM. Why &lt;em>the&lt;/em> &lt;em>&lt;strong>hell&lt;/strong>&lt;/em> would you expect users to implement security
+measures that even your own security team won&amp;rsquo;t deploy?&lt;/p>
+&lt;p>Looking at this and other policies, it&amp;rsquo;s pretty clear that the University of
+California&amp;rsquo;s administration has chosen to deploy victim-blaming as a core tenet
+of its security posture. None of these policies, for instance, mandate the
+deployment of defensive measures for the protection of students or faculty,
+except to the extent that university assets contain confidential information
+(e.g. student medical and financial info) that has to be protected in compliance
+with federal and California law. &lt;a href="https://web.archive.org/web/20220707224118/https://security.ucop.edu/files/documents/policies/minimum-security-standard.pdf">The policies
+do&lt;/a>,
+however, require that every &amp;ldquo;workforce member&amp;rdquo; (broadly defined to include
+anybody volunteering for UC or on UC&amp;rsquo;s payroll in any
+capacity&lt;sup id="fnref:5">&lt;a href="#fn:5" class="footnote-ref" role="doc-noteref">5&lt;/a>&lt;/sup>) is personally responsible for installing
+anti-malware, administrating a host-based firewall, backup and recovery,
+encryption, and eight other security requirements for &lt;em>any&lt;/em> device they connect
+to a UC network&lt;sup id="fnref:6">&lt;a href="#fn:6" class="footnote-ref" role="doc-noteref">6&lt;/a>&lt;/sup>.&lt;/p>
+&lt;p>So the implication seems to be that if your device gets pwned on UCLA&amp;rsquo;s network,
+then it&amp;rsquo;s &lt;em>your&lt;/em> fault, rather than an organizational failure. In their defense,
+UC is hardly the only organization to treat security like an individual burden
+rather than a communal responsibility; on the other hand, most other orgs don&amp;rsquo;t
+have hundreds of thousands of IP addresses on hand to run a network like it&amp;rsquo;s
+the Wild West.&lt;/p>
+&lt;h3 id="the-ucla-security-teams-response">The UCLA security team&amp;rsquo;s response&lt;/h3>
+&lt;p>I reached out to UCLA&amp;rsquo;s security team several weeks ago to get their perspective
+on the problems I&amp;rsquo;ve mentioned here and to alert them to the ransomed servers. I
+was initially hesitant to discuss their response in this post as&lt;/p>
+&lt;ul>
+&lt;li>I don&amp;rsquo;t think they&amp;rsquo;re really at fault here; rather, they&amp;rsquo;re stuck between
+several competing interests.&lt;/li>
+&lt;li>I don&amp;rsquo;t want to antagonize the security team of the institution that I work
+for. 🙃&lt;/li>
+&lt;/ul>
+&lt;p>I think that omitting this piece would leave out a valuable perspective,
+however. So for the sake of completeness (and in the spirit of transparency)
+I&amp;rsquo;ll briefly discuss the questions I sent and the response I received.&lt;/p>
+&lt;p>On January 23rd I sent a message to the Office of the CISO with the following
+questions. My general hope was to get a better understanding of UC&amp;rsquo;s (perceived)
+threat profile, its assessment of the risk that devices connected to eduroam
+face, and what preventative measures were being taken.&lt;/p>
+&lt;blockquote>
+&lt;p>(a) Is the Office for the CISO aware of the level of exposure that
+devices on the eduroam network are facing to the rest of the internet?&lt;/p>
+&lt;p>(b) Is the Office for the CISO aware that there are devices currently on
+these networks that are actively being exploited?&lt;/p>
+&lt;p>(c) Is the Office and/or UCLA IT actively tracking this issue, and
+planning on deploying a firewall, NAT, and/or other mitigations for this
+issue for devices connecting to the eduroam network in the near future?&lt;/p>
+&lt;p>(d) If so, when is a fix for this issue likely to be deployed?&lt;/p>&lt;/blockquote>
+&lt;p>The Office of the CISO responded:&lt;/p>
+&lt;blockquote>
+&lt;p>(a) - We are aware of the &amp;ldquo;exposure&amp;rdquo; that devices of any type sitting on
+publicly-routable IP address space present. Please do keep in mind that there
+are many different types of usage of the campus wireless networks by a variety
+of populations on campus. The ability to host an accessible resource is viewed
+as a benefit and convenience by many.&lt;/p>
+&lt;p>(b) - All Internet attached devices are at risk of exploitation. Our office
+has extensive threat detection and identification tools built to detect
+adversary behavior and take the appropriate steps to contain and remediate
+threats to campus. This includes campus-wide network threat detection and
+monitoring. You can read a little more about our efforts at
+&lt;a href="https://ociso.ucla.edu/service/threat-detection-and-identification">https://ociso.ucla.edu/service/threat-detection-and-identification&lt;/a>.&lt;/p>
+&lt;p>(c) - We constantly strive to improve the campus security posture through
+enhancements in not only technological baselines, but improved user awareness
+and training. We are on the precipice of launching a few key initiatives
+throughout the UCLA community, including our Bruin Secure program
+(&lt;a href="https://it.ucla.edu/it-ucla/key-initiatives)">https://it.ucla.edu/it-ucla/key-initiatives)&lt;/a>, which will focus on tailored
+training and awareness for all members of the UCLA community. Additional
+mitigations such as those you mentioned including firewalls and NATs will be
+reviewed as part of a larger network review discussion attached to the IT
+Transformation effort currently underway for campus
+(&lt;a href="https://it.ucla.edu/it-ucla/about-it-services/key-initiatives/it-assessment)">https://it.ucla.edu/it-ucla/about-it-services/key-initiatives/it-assessment)&lt;/a>.&lt;/p>
+&lt;p>(d) - Timelines will be developed as the projects kick-off later in 2023.&lt;/p>&lt;/blockquote>
+&lt;p>This response doesn&amp;rsquo;t actually deny the fact that the &amp;ldquo;accessible&amp;rdquo; nature of
+UCLA&amp;rsquo;s network is a major security risk that is vastly more dangerous to the
+median user than it is helpful. In general, it seems like the threat is being
+written off because (a) there are various stakeholders who would complain if the
+campus network was closed off, and (b) any networked device can, hypothetically,
+be exploited. I&amp;rsquo;m sympathetic to (if unconvinced by) the first excuse, but not
+the second. It suggests a very binary view of security that is largely ignorant
+to attackers&amp;rsquo; points of friction.&lt;/p>
+&lt;p>As for the various initiatives that are described, I can&amp;rsquo;t speak to many of them
+as there simply isn&amp;rsquo;t a lot of public information about what they look like in
+practice. &lt;a href="https://web.archive.org/web/20230214030612/https://security.ucop.edu/services/threat-detection-and-identification/fire-eye/faq.html">This
+FAQ&lt;/a>
+(which reads more like a press release) was the most information I could find on
+the Trellix&lt;sup id="fnref:7">&lt;a href="#fn:7" class="footnote-ref" role="doc-noteref">7&lt;/a>&lt;/sup> TDI appliances. There isn&amp;rsquo;t any information, for example,
+about whether these devices scan the public IP ranges (in any case, I&amp;rsquo;m
+skeptical that they provide any value to devices not owned by the university).
+There&amp;rsquo;s even less information about Bruin Secure, although the program seems to
+be in line with UC&amp;rsquo;s stance that &lt;em>you&lt;/em> are exclusively responsible for your own
+security. UCLA wants to teach its community how to avoid stepping on mines when
+it could just as easily remove the minefield.&lt;/p>
+&lt;h2 id="i-pretend-you-ask-me-questions-and-i-answer-them">I pretend you ask me questions and I answer them&lt;/h2>
+&lt;a id="faq">&lt;/a>
+
+
+&lt;span class="text-underline">
+ &lt;strong>Q: I connected to eduroam last week! Have I been
+hacked???&lt;/strong>
+&lt;/span>
+
+&lt;p>Uh, I don&amp;rsquo;t know. Probably not though.&lt;/p>
+
+&lt;span class="text-underline">
+ &lt;strong>Q: Okay, but how worried should I be?&lt;/strong>
+&lt;/span>
+
+&lt;p>That&amp;rsquo;ll depend on your &lt;a href="https://en.wikipedia.org/wiki/Threat_model">threat
+model&lt;/a>, but on balance I&amp;rsquo;d say that
+you probably shouldn&amp;rsquo;t be in full-blown panic mode. That being said, if you
+visit UCLA on a regular basis (and especially if you live on university
+property), you may want to consider taking some basic protective measures.&lt;/p>
+
+&lt;span class="text-underline">
+ &lt;strong>Q: What can I do to protect myself?&lt;/strong>
+&lt;/span>
+
+&lt;p>Unfortunately, UCLA&amp;rsquo;s current stance on network security is to leave every
+student and staff member to fend for themselves. Until that changes, you&amp;rsquo;re the
+only person who&amp;rsquo;ll be able to protect your devices.&lt;/p>
+&lt;p>The most practical recommendation I can give is this:&lt;/p>
+&lt;blockquote>
+&lt;p>&lt;strong>Don&amp;rsquo;t connect your devices to eduroam or ethernet at UCLA.&lt;/strong>&lt;/p>&lt;/blockquote>
+&lt;p>I would be especially cautious about connecting random IoT (&lt;a href="https://en.wikipedia.org/wiki/Internet_of_things">&amp;ldquo;Internet of
+Things&amp;rdquo;&lt;/a>) devices like cameras
+and printers to eduroam. There are two other networks on campus, UCLA_WEB and
+UCLA_WIFI, that you should connect to instead.&lt;/p>
+&lt;p>If you&amp;rsquo;re confident in your technical skills, you can also try setting up a
+host-based firewall on your laptop or PC. This is essentially a firewall that
+runs on your computer, rather than on a router or dedicated hardware.
+Ironically, it seems that UCLA doesn&amp;rsquo;t offer help on setting up firewalls
+(despite the fact that, in theory, faculty and staff are expected to set them up
+for devices they attach to UCLA&amp;rsquo;s network). Firewall guidance is beyond the
+scope of this post, but here are some resources you can use to get started:&lt;/p>
+&lt;ul>
+&lt;li>&lt;a href="https://learn.microsoft.com/en-us/windows/security/threat-protection/windows-firewall/best-practices-configuring">Windows&lt;/a>&lt;/li>
+&lt;li>&lt;a href="https://support.apple.com/guide/mac-help/block-connections-to-your-mac-with-a-firewall-mh34041/13.0/mac/13.0">macOS&lt;/a>&lt;/li>
+&lt;li>&lt;a href="https://wiki.archlinux.org/title/Simple_stateful_firewall">Linux&lt;/a>&lt;sup id="fnref:8">&lt;a href="#fn:8" class="footnote-ref" role="doc-noteref">8&lt;/a>&lt;/sup>&lt;/li>
+&lt;/ul>
+
+&lt;span class="text-underline">
+ &lt;strong>Q: What&amp;rsquo;s the risk if I don&amp;rsquo;t do anything?&lt;/strong>
+&lt;/span>
+
+&lt;p>In the worst case, somebody might be able to exploit a vulnerable program
+running on your machine, getting full remote access to your device and
+everything on it. While this is certainly something that could happen even if
+UCLA had a firewall in place, the lack of traffic filtering makes this
+relatively trivial for someone to exploit (if such a vulnerability exists on
+your machine).&lt;/p>
+&lt;p>The good news is that if you install software updates regularly, the risk of
+this happening (for &lt;em>most&lt;/em> people, on &lt;em>most&lt;/em> of their devices) is pretty low.
+Regardless of whether or not you install patches, however, it&amp;rsquo;s pretty much
+impossible to avoid the privacy issues I mentioned earlier.&lt;/p>
+
+&lt;span class="text-underline">
+ &lt;strong>Q: That&amp;rsquo;s helpful, thanks!&lt;/strong>
+&lt;/span>
+
+&lt;p>No problem!&lt;/p>
+
+&lt;span class="text-underline">
+ &lt;strong>Q: None of this has been helpful. Go to hell.&lt;/strong>
+&lt;/span>
+
+&lt;p>Sorry.&lt;/p>
+&lt;h2 id="stuff-that-i-didnt-think-was-worth-putting-in-the-main-body-of-this-post">Stuff that I didn&amp;rsquo;t think was worth putting in the main body of this post&lt;/h2>
+&lt;h3 id="whats-a-firewall">What&amp;rsquo;s a firewall?&lt;/h3>
+&lt;p>(You can skip this part if you&amp;rsquo;re familiar with how firewalls work.)&lt;/p>
+&lt;p>There&amp;rsquo;s a good chance that you&amp;rsquo;ve heard the term &amp;ldquo;firewall&amp;rdquo; somewhere before (as
+in &amp;ldquo;the hackers have breached the firewall!&amp;rdquo;). But if you don&amp;rsquo;t come from a
+networking or security background, you might not be familiar with what a
+firewall actually does.&lt;/p>
+&lt;p>For some background: at any given time, your phone or computer is running a
+bunch of different programs on it, and some of those may need to wait for a
+connection from another device on your network. A good example of this is a
+printer. Printers spend most of their time sitting idle, and while they&amp;rsquo;re
+waiting they listen for computers trying to connect to them.&lt;/p>
+&lt;p>Most of the time, attackers can&amp;rsquo;t access random printers on the internet for one
+of two reasons. The first is that your printer may not be publicly accessible.
+Most of the time, when you connect a device to a network, your router will use
+NAT (&lt;a href="https://en.wikipedia.org/wiki/Network_address_translation">Network Address
+Translation&lt;/a>) to
+assign your device an IP address. The end result is that your printer doesn&amp;rsquo;t
+have a public IP address that the outside world can use to communicate with it.&lt;/p>
+&lt;p>The second reason is that those printers are behind a firewall. In this context,
+a firewall is a system that limits what traffic can enter or exit a network. You
+could have a firewall rule, for instance, that blocks any connections to your
+printer from machines outside of the network.&lt;/p>
+&lt;p>Despite the existence of these mechanisms, there are still a ton of printers and
+such that are publicly exposed on the internet. If you&amp;rsquo;ve ever tried standing up
+a server, you&amp;rsquo;ll know just how much crap a publicly accessible machine receives
+from various botnets and scanners (malicious or not). It&amp;rsquo;s pretty easy for a
+system to get auto-pwned by Joe Ransomware Operator in a matter of minutes if it
+isn&amp;rsquo;t properly secured.&lt;/p>
+&lt;p>In UCLA&amp;rsquo;s case, it doesn&amp;rsquo;t use either NAT or a firewall. The former it can
+likely do without &amp;ndash; NAT isn&amp;rsquo;t really intended to be a security mechanism, and
+for orgs like UCLA that own a large swath of IP space it might not be
+particularly desirable. On the other hand, firewalls are a pretty common and
+useful security measure. But for one reason or another, UCLA doesn&amp;rsquo;t seem to
+have any firewall between students&amp;rsquo; devices and the outside world.&lt;/p>
+&lt;figure>&lt;img src="../../img/ucla_networks/wall-of-fire.jpg"
+ alt="&amp;#39;Wall of Fire&amp;#39; card from Magic The Gathering.">&lt;figcaption>
+ &lt;p>Source: Magic the Gathering / Wizards of the Coast&lt;/p>
+ &lt;/figcaption>
+&lt;/figure>
+
+&lt;hr>
+&lt;p>
+&lt;span class="text-underline">
+ &lt;em>Edited 2023-02-13:&lt;/em>
+&lt;/span>
+ &lt;em>I added a section on
+the UCLA security team&amp;rsquo;s response to my questions about eduroam.&lt;/em>&lt;/p>
+&lt;div class="footnotes" role="doc-endnotes">
+&lt;hr>
+&lt;ol>
+&lt;li id="fn:1">
+&lt;p>This post is primarily about the eduroam wifi, since that&amp;rsquo;s
+the primary way most people are going to encounter the problems I describe.
+But any device that hooks up to UCLA&amp;rsquo;s ethernet is equally exposed to the rest
+of the world.&amp;#160;&lt;a href="#fnref:1" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:2">
+&lt;p>Curiously, there appear to be some locations on campus where eduroam
+will assign a &lt;code>10.0.0.0/8&lt;/code> IP address to your machine. I&amp;rsquo;m neither familiar
+enough with UCLA&amp;rsquo;s network topology nor wifi configuration in general to speak
+to exactly where or why this is the case, but I can say that in &lt;em>most&lt;/em>
+locations that I tested, my machine was assigned an IP address from one of the
+listed ranges.&amp;#160;&lt;a href="#fnref:2" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:3">
+&lt;p>Apple uses TCP port 62078 on iPhone and iPad devices for reasons
+I don&amp;rsquo;t fully understand. To my knowledge, though, it&amp;rsquo;s a fairly easy way of
+identifying iOS / iPadOS devices from a port scan.&amp;#160;&lt;a href="#fnref:3" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:4">
+&lt;p>&lt;a href="https://louslist.org">Lou&amp;rsquo;s List&lt;/a>, run by physics professor Lou
+Bloomfield, is used by almost all of the students and faculty over at the
+University of Virginia to find and sign up for courses. Apparently the
+&lt;a href="https://devhub.virginia.edu/API">official API&lt;/a> provided by UVA for the
+university schedule is (or at least was) just a frontend to Lou&amp;rsquo;s List.&amp;#160;&lt;a href="#fnref:4" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:5">
+&lt;p>The Minimum Security Standards specifically defines a
+&amp;ldquo;workforce member&amp;rdquo; as &amp;ldquo;an employee, faculty, staff, volunteer, contractor,
+researcher, student worker, student supporting/performing research, medical
+center staff/personnel, clinician, student intern, student volunteer or
+person working for UC in any capacity or through any other augmentation to UC
+staffing levels.&amp;rdquo;&amp;#160;&lt;a href="#fnref:5" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:6">
+&lt;p>Notably, most of these &amp;ldquo;workforce members&amp;rdquo; (which include
+grad students and TAs) don&amp;rsquo;t receive a workplace machine from UC, much less an
+external HDD/SSD for backups, security keys, or similar.&amp;#160;&lt;a href="#fnref:6" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:7">
+&lt;p>(The company formerly known as FireEye.)&amp;#160;&lt;a href="#fnref:7" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;li id="fn:8">
+&lt;p>Nowadays I would recommend using
+&lt;a href="https://www.nftables.org/">nftables&lt;/a> instead of iptables (which is used by the
+linked article to the Arch Linux wiki).&amp;#160;&lt;a href="#fnref:8" class="footnote-backref" role="doc-backlink">&amp;#x21a9;&amp;#xfe0e;&lt;/a>&lt;/p>
+&lt;/li>
+&lt;/ol>
+&lt;/div></description></item><item><title>Linux Security Modules</title><link>/notes/lsm/</link><pubDate>Thu, 05 Mar 2020 00:00:00 -0700</pubDate><guid>/notes/lsm/</guid><description>&lt;p>&lt;em>Disclaimer: I threw these notes together for CU Boulder&amp;rsquo;s Collegiate Cyber Defense Competition team for spring 2020. There may be some inaccuracies, and parts of the notes are still incomplete.&lt;/em>&lt;/p>
+&lt;h2 id="intro-to-lsm">Introduction&lt;/h2>
+&lt;p>The Linux kernel has a built-in &lt;em>discretionary access control&lt;/em> (DAC) system for controlling system resources. DACs are characterized by the fact that the owner of a resource may grant somebody else access to that resource; for instance, in Linux, the owner of a file could run &lt;code>chmod +rwx myfile&lt;/code> to give every user on the system read, write, and execute permissions to the file. As a result, a process can privesc if it&amp;rsquo;s able to run commands as a user with higher permissions.&lt;/p>
+&lt;p>&lt;a href="https://en.wikipedia.org/wiki/Linux%5FSecurity%5FModules">Linux Security Modules&lt;/a> (LSM) is a framework for implementating &lt;em>mandatory access control&lt;/em> (MAC) in Linux. Under a MAC policy, users cannot modify the permissions of resources; the permissions are set in stone by the system administrator. This makes privilege escalation significantly more difficult. For instance, say an attacker manages to get a reverse shell into an Apache webserver, and is eventually able to login as root. Even as the root user, the attacker is confined by whatever permissions are granted to the webserver process, which may be extremely restrictive.&lt;/p>
+&lt;p>There are a few other general characteristics of LSMs that differentiate them from traditional Linux DAC:&lt;/p>
+&lt;ul>
+&lt;li>LSMs focus on assigning permissions to &lt;em>processes&lt;/em>, whereas the Linux DAC policy assigns permissions to users and groups.&lt;/li>
+&lt;li>LSMs are generally &amp;ldquo;deny by default&amp;rdquo;: if access to a resource isn&amp;rsquo;t explicitly granted, then it&amp;rsquo;s denied.&lt;/li>
+&lt;li>LSMs can have much more fine-grained permissions than Linux&amp;rsquo;s DAC. For instance, SELinux doesn&amp;rsquo;t just control access to files; you can define permissions over ports, syscalls, regions of memory, and more.&lt;/li>
+&lt;/ul>
+&lt;hr>
+&lt;h2 id="logging-and-auditd">Logging and auditd&lt;/h2>
+&lt;h3 id="lsm-logging-intro">Introduction&lt;/h3>
+&lt;p>&lt;code>auditd&lt;/code> is an auditing daemon that logs system events and provides various utilities for searching logs. It is extremely useful for SELinux as it can be used to record denial to various resources.&lt;/p>
+&lt;p>&lt;code>auditd&lt;/code> logs generally look something like this:&lt;/p>
+&lt;pre tabindex="0">&lt;code class="language--n" data-lang="-n">time-&amp;gt;Sun Mar 1 00:11:43 2020
+type=PROCTITLE msg=audit(1583046703.755:2547): proctitle=636174002F6574632F736861646F77
+type=SYSCALL msg=audit(1583046703.755:2547): arch=c000003e syscall=257 success=yes exit=3 a0=ffffff9c a1=7ffeef4fae7b a2=0 a3=0 items=0 ppid=11335 pid=11336 auid=4294967295 uid=33 gid=33 euid=33 suid=33 fsuid=33 egid=33 sgid=33 fsgid=33 tty=(none) ses=4294967295 comm=&amp;#34;cat&amp;#34; exe=&amp;#34;/usr/bin/cat&amp;#34; subj=system_u:system_r:httpd_t:s0 key=(null)
+type=AVC msg=audit(1583046703.755:2547): avc: denied { open } for pid=11336 comm=&amp;#34;cat&amp;#34; path=&amp;#34;/etc/shadow&amp;#34; dev=&amp;#34;sda1&amp;#34; ino=277524 scontext=system_u:system_r:httpd_t:s0 tcontext=system_u:object_r:shadow_t:s0 tclass=file permissive=1
+type=AVC msg=audit(1583046703.755:2547): avc: denied { read } for pid=11336 comm=&amp;#34;cat&amp;#34; name=&amp;#34;shadow&amp;#34; dev=&amp;#34;sda1&amp;#34; ino=277524 scontext=system_u:system_r:httpd_t:s0 tcontext=system_u:object_r:shadow_t:s0 tclass=file permissive=1
+&lt;/code>&lt;/pre>&lt;p>These logs are fairly verbose, but there are a few pieces of information that are worth looking at:&lt;/p>
+&lt;ul>
+&lt;li>&lt;code>success&lt;/code> (under &lt;code>type=SYSCALL&lt;/code>): tells us whether or not a given syscall was successful.&lt;/li>
+&lt;li>&lt;code>comm&lt;/code> and &lt;code>exe&lt;/code>: the command/executable that activated the rule.&lt;/li>
+&lt;li>&lt;code>scontext&lt;/code>: the SELinux context of the resource that triggered the rule. Here, it&amp;rsquo;s the context in which &lt;code>/usr/bin/cat&lt;/code> is run.&lt;/li>
+&lt;li>&lt;code>tcontext&lt;/code>: the SELinux context of the resource that the source was trying to access. Here, it&amp;rsquo;s the context of &lt;code>/etc/shadow&lt;/code>.&lt;/li>
+&lt;/ul>
+&lt;h3 id="auditctl-create-auditd-rules">&lt;code>auditctl&lt;/code>: create &lt;code>auditd&lt;/code> rules&lt;/h3>
+&lt;p>&lt;code>auditctl -w /etc/shadow -p rwa -k shadow_file&lt;/code>&lt;/p>
+&lt;ul>
+&lt;li>Checks for reads, writes, and attribute changes to &lt;code>/etc/shadow&lt;/code>&lt;/li>
+&lt;li>The &lt;code>-k&lt;/code> flag assigns the key &lt;code>shadow_file&lt;/code> to this rule&lt;/li>
+&lt;/ul>
+&lt;p>&lt;code>auditctl -w /usr/local/bin -p x -k cron&lt;/code>&lt;/p>
+&lt;ul>
+&lt;li>Checks for execution of binaries in the &lt;code>/usr/local/bin&lt;/code> directory&lt;/li>
+&lt;/ul>
+&lt;p>&lt;code>auditctl -a always,exit -F arch=b64 -F &amp;quot;auid&amp;gt;=1000&amp;quot; -S rename -S renameat -k rename&lt;/code>&lt;/p>
+&lt;ul>
+&lt;li>Log attempts to rename a file using the &lt;code>rename&lt;/code> or &lt;code>renameat&lt;/code> syscalls&lt;/li>
+&lt;li>Only logs attempts for users with ID greater than or equal to 1000&lt;/li>
+&lt;/ul>
+&lt;p>Note that rules created with &lt;code>auditctl&lt;/code> are lost after rebooting. If you want to make them permanent, you need to save them in &lt;code>/etc/audit/rules.d/audit.rules&lt;/code>.&lt;/p>
+&lt;p>To delete a rule, use &lt;code>-W&lt;/code> instead of &lt;code>-w&lt;/code>.&lt;/p>
+&lt;h3 id="ausearch-search-audit-logs">&lt;code>ausearch&lt;/code>: search audit logs&lt;/h3>
+&lt;p>&lt;code>ausearch -k shadow_file&lt;/code>&lt;/p>
+&lt;ul>
+&lt;li>Search for logs with the &lt;code>shadow_file&lt;/code> key&lt;/li>
+&lt;/ul>
+&lt;p>&lt;code>ausearch --start recent -k cron&lt;/code>&lt;/p>
+&lt;ul>
+&lt;li>Search for logs in the last ten minutes that are tagged with &lt;code>cron&lt;/code>&lt;/li>
+&lt;li>You can also choose &lt;code>today&lt;/code>, &lt;code>yesterday&lt;/code>, etc. instead of &lt;code>recent&lt;/code>.&lt;/li>
+&lt;li>You can specify a specific time or date too, e.g. &lt;code>--start 03/01/2020&lt;/code> or &lt;code>--start 03/01/2020 16:00:00&lt;/code>&lt;/li>
+&lt;li>There is an &lt;code>--end&lt;/code> flag that, in conjunction with &lt;code>--start&lt;/code>, allows you to specify the end of a time range.&lt;/li>
+&lt;/ul>
+&lt;p>&lt;code>ausearch -se system_u:system_r:httpd_t:s0&lt;/code>&lt;/p>
+&lt;ul>
+&lt;li>Search for all logs where either the source SELinux context or target SELinux context is &lt;code>system_u:system_r:httpd_t:s0&lt;/code>&lt;/li>
+&lt;/ul>
+&lt;p>&lt;code>ausearch -c apache2 -f /etc/shadow&lt;/code>&lt;/p>
+&lt;ul>
+&lt;li>Search for all logs triggered by the &lt;code>apache2&lt;/code> command related to the &lt;code>/etc/shadow&lt;/code> file.&lt;/li>
+&lt;li>You can use &lt;code>-x&lt;/code> instead of &lt;code>-x&lt;/code> to specify the path to the executable instead of its name.&lt;/li>
+&lt;/ul>
+&lt;h3 id="ausyscall-view-available-syscalls">&lt;code>ausyscall&lt;/code>: view available syscalls&lt;/h3>
+&lt;p>&lt;code>ausyscall --dump&lt;/code>&lt;/p>
+&lt;ul>
+&lt;li>List all linux syscalls and their numeric codes&lt;/li>
+&lt;/ul>
+&lt;p>&lt;code>ausyscall 4&lt;/code>&lt;/p>
+&lt;ul>
+&lt;li>Find the name of the syscall corresponding to the ID &lt;code>4&lt;/code>&lt;/li>
+&lt;li>Useful when reviewing &lt;code>auditd&lt;/code> logs&lt;/li>
+&lt;/ul>
+&lt;hr>
+&lt;h2 id="lsm-selinux">SELinux&lt;/h2>
+&lt;h3 id="selinux-intro">Introduction&lt;/h3>
+&lt;p>SELinux is the default LSM enhancement for RHEL, Fedora, and CentOS. It is also installed in Debian, although as of Debian 10 (Buster) it is deactivated by default, with AppArmor enabled in its place. SELinux for Ubuntu has been largely unmaintained since Ubuntu 9.10 and broken since Ubuntu 12.04. Although it is still possible to install and use SELinux via the Debian repositories (where SELinux is still maintained), it is generally recommended that you use AppArmor for Ubuntu instead.&lt;/p>
+&lt;h3 id="selinux-installation">Installation&lt;/h3>
+&lt;p>To get SELinux up and running, you probably want to install the following packages: &lt;code>selinux-basics selinux-policy-default auditd&lt;/code>. In addition, depending on your system you may need to explicitly enable SELinux. You can check whether or not SELinux has been enabled by running &lt;code>getenforce&lt;/code>; if you get the response &lt;code>Disabled&lt;/code>, then you will need to explicitly activate it. Generally, this can be done by running &lt;code>selinux-activate&lt;/code> and rebooting.&lt;/p>
+&lt;h3 id="selinux-utilities">SELinux utilities&lt;/h3>
+&lt;h4 id="getenforce-sestatus-and-seinfo-get-information-about-selinux">&lt;code>getenforce&lt;/code>, &lt;code>sestatus&lt;/code>, and &lt;code>seinfo&lt;/code>: get information about SELinux&lt;/h4>
+&lt;p>These three utilities each provide information about the current status and configuration of SELinux on your system:&lt;/p>
+&lt;ul>
+&lt;li>&lt;code>getenforce&lt;/code>: gets the current SELinux state, which can be &amp;ldquo;Disabled&amp;rdquo;, &amp;ldquo;Permissive&amp;rdquo;, or &amp;ldquo;Enforcing&amp;rdquo;.&lt;/li>
+&lt;li>&lt;code>sestatus&lt;/code>: shows the current SELinux state like &lt;code>getenforce&lt;/code>, but also provides a little more information (e.g. the name of the loaded policy).&lt;/li>
+&lt;li>&lt;code>seinfo&lt;/code>: get information about the current SELinux policy. Here are some example queries you can run with &lt;code>seinfo&lt;/code>:
+&lt;ul>
+&lt;li>&lt;code>seinfo -b&lt;/code>: show all of the available SELinux booleans, and whether they are on or off.&lt;/li>
+&lt;li>&lt;code>seinfo -x -u staff_u&lt;/code>: show the full definition of the &lt;code>staff_u&lt;/code> SELinux user. This will show you what roles are assigned to the &lt;code>staff_u&lt;/code> user.&lt;/li>
+&lt;li>&lt;code>seinfo -x -r user_r&lt;/code>: show the full definition of the &lt;code>user_r&lt;/code> SELinux role. This will show you what types are assigned to the &lt;code>user_r&lt;/code> user.&lt;/li>
+&lt;/ul>
+&lt;/li>
+&lt;/ul>
+&lt;h4 id="selinux-activate-enable-selinux">&lt;code>selinux-activate&lt;/code>: enable SELinux&lt;/h4>
+&lt;p>Sets SELinux to activate after you reboot. Your machine will reboot into whatever mode has been assigned to the &lt;code>SELINUX&lt;/code> variable in &lt;code>/etc/selinux/config&lt;/code>.&lt;/p>
+&lt;h4 id="setenforce-set-selinux-state">&lt;code>setenforce&lt;/code>: set SELinux state&lt;/h4>
+&lt;p>When SELinux is activated, you can use &lt;code>setenforce&lt;/code> to change the current SELinux mode. &lt;code>setenforce 0&lt;/code> will put SELinux in permissive mode, and &lt;code>setenforce 1&lt;/code> will put it in enforcing mode.&lt;/p>
+&lt;h4 id="sesearch-search-selinux-policies">&lt;code>sesearch&lt;/code>: search SELinux policies&lt;/h4>
+&lt;p>&lt;code>sesearch&lt;/code> allows you to search for specific rules in your SELinux policy. Here are some examples of how to use it:&lt;/p>
+&lt;ul>
+&lt;li>&lt;code>sesearch --allow -s auditd_t -t auditd_log_t&lt;/code>: search for all &lt;code>allow&lt;/code> rules with &lt;code>auditd_t&lt;/code> as their source type and &lt;code>auditd_log_t&lt;/code> as their target type.&lt;/li>
+&lt;li>&lt;code>sesearch --allow -s httpd_t -p read,write&lt;/code>: find all rules with source type &lt;code>httpd_t&lt;/code> that grant the &lt;code>read&lt;/code> and &lt;code>write&lt;/code> permissions.&lt;/li>
+&lt;li>&lt;code>sesearch --allow -s httpd_t -t auditd_log_t -ds -dt&lt;/code>: find all rules that &lt;em>exactly&lt;/em> have &lt;code>httpd_t&lt;/code> as their source type, and &lt;code>auditd_log_t&lt;/code> as their destination type. Without the &lt;code>-ds&lt;/code> and &lt;code>-dt&lt;/code> flags, &lt;code>sesearch&lt;/code> typically just matches by attribute contents.&lt;/li>
+&lt;/ul>
+&lt;h4 id="chcon-change-context-of-a-file">&lt;code>chcon&lt;/code>: change context of a file&lt;/h4>
+&lt;p>Suppose that we want to change the SELinux context of &lt;code>/var/www/html/index.html&lt;/code> to match that of the directory &lt;code>/var/www/html/&lt;/code>. Running &lt;code>ls -dZ /var/www/html&lt;/code>, we see that this directory has context &lt;code>system_u:object_r:httpd_sys_content_t&lt;/code>. To change the context of &lt;code>/var/www/html/index.html&lt;/code>, we use &lt;code>chcon&lt;/code> as follows:&lt;/p>
+&lt;pre tabindex="0">&lt;code class="language-nil" data-lang="nil"># chcon -u system_u -r object_r -t httpd_sys_content_t /var/www/html/index.html
+&lt;/code>&lt;/pre>&lt;p>But if you just want to change the type, you only have to use the &lt;code>-t&lt;/code> flag, e.g. &lt;code>chcon -t $selinux_type $target&lt;/code>&lt;/p>
+&lt;p>You can make things even easier by using the &lt;code>--reference&lt;/code> flag:&lt;/p>
+&lt;pre tabindex="0">&lt;code class="language-nil" data-lang="nil"># chcon --reference /var/www/html/ /var/www/html/index.html
+&lt;/code>&lt;/pre>&lt;p>This gives &lt;code>/var/www/html/index.html&lt;/code> the same SELinux context as the &lt;code>/var/www/html/&lt;/code> directory.&lt;/p>
+&lt;h4 id="restorecon-restore-context-of-a-file">&lt;code>restorecon&lt;/code>: restore context of a file&lt;/h4>
+&lt;p>Recursively restore context of all files in &lt;code>/var/www/html&lt;/code> to have the same context as the &lt;code>/var/www/html/&lt;/code> directory:&lt;/p>
+&lt;pre tabindex="0">&lt;code class="language-nil" data-lang="nil"># restorecon -R /var/www/html
+&lt;/code>&lt;/pre>&lt;p>You can use the &lt;code>-v&lt;/code> flag for verbose output.&lt;/p>
+&lt;h4 id="semanage-main-selinux-configuration-tool">&lt;code>semanage&lt;/code>: main SELinux configuration tool&lt;/h4>
+&lt;p>Can be used to manage SELinux settings for&lt;/p>
+&lt;ul>
+&lt;li>node&lt;/li>
+&lt;li>file context&lt;/li>
+&lt;li>booleans&lt;/li>
+&lt;li>permissive state&lt;/li>
+&lt;li>dontaudit&lt;/li>
+&lt;/ul>
+&lt;p>Unlike &lt;code>chcon&lt;/code> or &lt;code>restorecon&lt;/code>, rules set via &lt;code>semanage&lt;/code> are saved so that they become reapplied after reboot.&lt;/p>
+&lt;p>Examples:&lt;/p>
+&lt;ul>
+&lt;li>&lt;code>semanage fcontext -l&lt;/code>: List all of the SELinux policy rules around file contexts.&lt;/li>
+&lt;li>&lt;code>semanage fcontext -a -t httpd_sys_content_t &amp;quot;/foo(/.*)?&amp;quot;&lt;/code>: add the type &lt;code>httpd_sys_content_t&lt;/code> to the &lt;code>/foo&lt;/code> directory and all of its contents.&lt;/li>
+&lt;li>&lt;code>semanage fcontext -a -e /var/www/html /foo&lt;/code>: add a rule to make the context of &lt;code>/foo&lt;/code> match that of &lt;code>/var/www/html&lt;/code>. After this, you can run &lt;code>restorecon -vR /foo&lt;/code> to apply the new label to &lt;code>/foo&lt;/code>.&lt;/li>
+&lt;/ul>
+&lt;h4 id="audit2why">&lt;code>audit2why&lt;/code>&lt;/h4>
+&lt;h4 id="audit2allow-generate-selinux-policies-from-logs-of-denied-operations">&lt;code>audit2allow&lt;/code>: generate SELinux policies from logs of denied operations&lt;/h4>
+&lt;p>&lt;code>audit2allow&lt;/code> uses log files (&lt;code>/var/log/audit/audit.log&lt;/code> if &lt;code>auditd&lt;/code> is installed, and &lt;code>/var/log/messages&lt;/code> otherwise) to generate SELinux rules. It&amp;rsquo;s an extremely useful tool for fixing broken policies.&lt;/p>
+&lt;p>For example, suppose you run &lt;code>ip addr&lt;/code>, and it appears to be denied by SELinux (a situation I encountered on Debian 10). To figure out where the issue is, let&amp;rsquo;s start by reviewing the audit logs:&lt;/p>
+&lt;pre tabindex="0">&lt;code class="language-nil" data-lang="nil"># ausearch --start recent
+..
+time-&amp;gt;Wed Mar 4 21:20:21 2020
+type=AVC msg=audit(1583360421.558:1732): avc: denied { signull } for pid=305 comm=&amp;#34;systemd-journal&amp;#34; scontext=system_u:system_r:syslogd_t:s0 tcontext=system_u:system_r:NetworkManager_t:s0 tclass=process permissive=0
+&lt;/code>&lt;/pre>&lt;p>We can immediately make a few notes about the log:&lt;/p>
+&lt;ul>
+&lt;li>The source context is &lt;code>system_u:system_r:syslogd_t:s0&lt;/code>&lt;/li>
+&lt;li>The target context is &lt;code>system_u:system_r:NetworkManager_t:s0&lt;/code>&lt;/li>
+&lt;li>The command that triggered the denial was &lt;code>systemd-journal&lt;/code>&lt;/li>
+&lt;/ul>
+&lt;p>Overall, it looks like the command was denied because &lt;code>systemd-journal&lt;/code> sent &lt;code>SIGNULL&lt;/code> to a process with a different context, and SELinux blocked it. We can use &lt;code>sesearch&lt;/code> to try and see what rules are defined for &lt;code>syslogd_t&lt;/code> and &lt;code>NetworkManager_t&lt;/code>:&lt;/p>
+&lt;pre tabindex="0">&lt;code class="language-nil" data-lang="nil"># sesearch -s syslogd_t -t NetworkManager_t -A
+allow syslogd_t domain:dir { getattr ioctl lock open read search };
+allow syslogd_t domain:file { getattr ioctl lock open read };
+allow syslogd_t domain:lnk_file { getattr read };
+allow syslogd_t domain:process getattr;
+&lt;/code>&lt;/pre>&lt;p>It looks like there aren&amp;rsquo;t any rules directly related to both &lt;code>syslogd_t&lt;/code> and &lt;code>NetworkManager_t&lt;/code>. We&amp;rsquo;re going to need to add a new rule that allows processes of type &lt;code>syslogd_t&lt;/code> to send &lt;code>SIGNULL&lt;/code> to processes of type &lt;code>NetworkManager_t&lt;/code>.&lt;/p>
+&lt;p>To do this, we use the &lt;code>audit2allow&lt;/code> command. First, we use &lt;code>audit2allow&lt;/code> to give us more information about how to fix this issue:&lt;/p>
+&lt;pre tabindex="0">&lt;code class="language-nil" data-lang="nil"># sudo ausearch -se system_u:system_r:NetworkManager_t | tail -n 1 | audit2allow -w
+type=AVC msg=audit(1583407237.188:26): avc: denied { search } for pid=478 comm=&amp;#34;NetworkManager&amp;#34; name=&amp;#34;.cache&amp;#34; dev=&amp;#34;vda1&amp;#34; ino=410827 scontext=system_u:system_r:NetworkManager_t:s0 tcontext=system_u:object_r:xdg_cache_t:s0 tclass=dir permissive=1
+
+	Was caused by:
+		Missing type enforcement (TE) allow rule.
+
+		You can use audit2allow to generate a loadable module to allow this access.
+&lt;/code>&lt;/pre>&lt;p>With the &lt;code>-a&lt;/code> flag, &lt;code>audit2allow&lt;/code> will tell us what rule needs to be added in order to fix the error:&lt;/p>
+&lt;pre tabindex="0">&lt;code class="language-nil" data-lang="nil"># sudo ausearch -se system_u:system_r:NetworkManager_t | tail -n 1 | audit2allow -a
+
+
+#============= NetworkManager_t ==============
+allow NetworkManager_t xdg_cache_t:dir search;
+&lt;/code>&lt;/pre>&lt;p>(&lt;strong>Note&lt;/strong>: you can pipe in multiple logs at once in order to generate multiple SELinux rules.)&lt;/p>
+&lt;p>Finally, we create a new policy module with the rule:&lt;/p>
+&lt;p>After running &lt;code>semodule -i syslogd.pp&lt;/code> and rebooting, a new SELinux rule will be added to your policy that permits the previously forbidden action.&lt;/p>
+&lt;pre tabindex="0">&lt;code class="language-nil" data-lang="nil"># sudo ausearch -se system_u:system_r:NetworkManager_t | tail -n 1 | audit2allow -a -M syslogd
+ ************************** IMPORTANT ******************************
+To make this policy package active, execute:
+
+semodule -i syslogd.pp
+&lt;/code>&lt;/pre>&lt;h3 id="selinux-addtl-refs">Additional references&lt;/h3>
+&lt;ul>
+&lt;li>&lt;a href="https://wiki.gentoo.org/wiki/SELinux">SELinux on the Gentoo Linux wiki&lt;/a>&lt;/li>
+&lt;li>&lt;a href="https://wiki.gentoo.org/wiki/SELinux/Quick%5Fintroduction">Quick intro to SELinux&lt;/a>&lt;/li>
+&lt;li>&lt;em>The SELinux Notebook, 4th edition&lt;/em>.&lt;/li>
+&lt;li>&lt;a href="https://access.redhat.com/documentation/en-us/red%5Fhat%5Fenterprise%5Flinux/6/html/security-enhanced%5Flinux/index">The RHEL SELinux documentation&lt;/a>&lt;/li>
+&lt;/ul>
+&lt;hr>
+&lt;h2 id="apparmor">AppArmor&lt;/h2>
+&lt;h3 id="apparmor-intro">Introduction&lt;/h3>
+&lt;p>AppArmor is another Linux Security Module for implementing MAC that is enabled by default on Ubuntu and recent Debian distributions. Its chief goal is to be more user-friendly than SELinux.&lt;/p>
+&lt;p>Whereas SELinux is label-based, AppArmor is path-based: access to files and executables is based on their path in the filesystem. In addition, AppArmor rules are defined in profiles (e.g. &lt;code>/etc/apparmor.d/usr.sbin.apache2&lt;/code>), in contrast to SELinux&amp;rsquo;s concept of a system-wide policy. In order to restrict a binary, we must define a new profile for it, and then put that profile in enforcing mode.&lt;/p>
+&lt;h3 id="apparmor-installation">Installation&lt;/h3>
+&lt;p>AppArmor is enabled by default on Ubuntu since version 7.10, and on Debian since Debian 10 (Buster). However, like SELinux, AppArmor has a few packages with convenient files and utilities that you should install if you want to use it:&lt;/p>
+&lt;ul>
+&lt;li>&lt;code>apt install apparmor-profiles apparmor-easyprof apparmor-utils&lt;/code>&lt;/li>
+&lt;/ul>
+&lt;h3 id="using-apparmor">Using AppArmor&lt;/h3>
+&lt;p>In this section, we&amp;rsquo;ll create an AppArmor profile for the &lt;code>apache2&lt;/code> binary using the following steps:&lt;/p>
+&lt;ol>
+&lt;li>Create a template profile for the binary using &lt;code>aa-easyprof&lt;/code>;&lt;/li>
+&lt;li>Load that profile using &lt;code>apparmor_parser&lt;/code>;&lt;/li>
+&lt;li>Put the profile in complain mode using &lt;code>aa-complain&lt;/code>;&lt;/li>
+&lt;li>Add new AppArmor rules using &lt;code>aa-logprof&lt;/code>; and&lt;/li>
+&lt;li>Enforce the profile with &lt;code>aa-enforce&lt;/code>.&lt;/li>
+&lt;/ol>
+&lt;p>Note that you may not necessarily need to go through all of these steps, e.g. if you already have a default profile for the binary. There are also some tools that wrap a few of these steps together, such as &lt;code>aa-genprof&lt;/code>.&lt;/p>
+&lt;h4 id="1-dot-create-a-template-apache2-profile">1. Create a template &lt;code>apache2&lt;/code> profile&lt;/h4>
+&lt;p>Call &lt;code>aa-easyprof /usr/sbin/apache2 &amp;gt; /etc/apparmor.d/usr.sbin.apache2&lt;/code>. The newly created profile will be mostly empty; it may look something like this:&lt;/p>
+&lt;pre tabindex="0">&lt;code class="language-nil" data-lang="nil">/etc/apparmor.d/usr.sbin.apache2:
+
+#include &amp;lt;tunables/global&amp;gt;
+
+# No template variables specified
+
+&amp;#34;/usr/sbin/apache2&amp;#34; {
+ #include &amp;lt;abstractions/base&amp;gt;
+ # No abstractions specified
+ # No policy groups specified
+ # No read paths specified
+ # No write paths specified
+}
+&lt;/code>&lt;/pre>&lt;h4 id="2-dot-load-the-profile">2. Load the profile&lt;/h4>
+&lt;p>Now call &lt;code>apparmor_parser /etc/apparmor.d/usr.sbin.apache2&lt;/code> to read the new profile. Note that if you&amp;rsquo;ve previously loaded in &lt;code>/etc/apparmor.d/usr.sbin.apache&lt;/code>, you&amp;rsquo;ll need to reload it by adding the &lt;code>-r&lt;/code> flag.&lt;/p>
+&lt;h4 id="3-dot-put-the-profile-in-complain-mode">3. Put the profile in complain mode&lt;/h4>
+&lt;p>Put the binary in complain mode by calling &lt;code>aa-complain apache2&lt;/code>. In complain mode, AppArmor will scan log files to try to identify what capabilities the &lt;code>apache2&lt;/code> binary needs to have.&lt;/p>
+&lt;p>Visit your Apache webserver, and start trying to simulate how it would be used in real life. As you test the webserver more and more, AppArmor will get an increasingly good idea of what capabilities the server is using.&lt;/p>
+&lt;h4 id="4-dot-add-new-apparmor-rules-using-aa-logprof">4. Add new AppArmor rules using &lt;code>aa-logprof&lt;/code>&lt;/h4>
+&lt;p>After you&amp;rsquo;ve tested your webserver sufficiently, run &lt;code>aa-logprof&lt;/code>. This will read various logfiles in &lt;code>/var/log&lt;/code> to see what files the Apache webserver accessed, and what capabilities it used. &lt;code>aa-logprof&lt;/code> will then present you with a list of capabilities, which you can choose to accept, deny, ignore, and so on. Choose whichever capabilities your webserver needs; any capabilities that are not explicitly granted to the webserver will be denied.&lt;/p>
+&lt;h4 id="5-dot-enforce-the-profile">5. Enforce the profile&lt;/h4>
+&lt;p>Call &lt;code>aa-enforce apache2&lt;/code> to put the profile in enforcing mode. AppArmor is now running, and will deny capabilities not granted in &lt;code>/etc/apparmor.d/usr.sbin.apache2&lt;/code>.&lt;/p>
+&lt;h3 id="customizing-profiles">Customizing profiles&lt;/h3>
+&lt;p>It is often desirable to hand-edit your AppArmor profiles to make them a little more specific. Here are some general syntax rules for AppArmor profiles:&lt;/p>
+&lt;p>&lt;strong>Deny rules&lt;/strong>: To write a deny rule, you just write &lt;code>deny /path/to/file perms&lt;/code>.&lt;/p>
+&lt;ul>
+&lt;li>&lt;code>deny /etc/shadow rw&lt;/code>: deny read and write access to &lt;code>/etc/shadow&lt;/code>.&lt;/li>
+&lt;li>&lt;code>deny /etc/sudo x&lt;/code>: deny execute permission to &lt;code>/etc/sudo&lt;/code>.&lt;/li>
+&lt;/ul>
+&lt;p>Note that AppArmor is deny-by-default, so you don&amp;rsquo;t generally need to explicitly state every resource that you want to deny access to.&lt;/p>
+&lt;p>&lt;strong>Accept rules&lt;/strong>:&lt;/p>
+&lt;p>&lt;strong>Tunables&lt;/strong>: where possible, you should avoid using explicit paths like &lt;code>/home/&lt;/code>, and instead use tunables, which are configurable variables defined in &lt;code>/etc/apparmor.d/tunables&lt;/code>. For instance, instead of writing a rule like &lt;code>/home/*/ r&lt;/code>, you should use &lt;code>@{HOME}/ r&lt;/code>.&lt;/p>
+&lt;h3 id="debugging-apparmor">Debugging AppArmor&lt;/h3>
+&lt;h3 id="apparmor-addtl-refs">Additional references&lt;/h3>
+&lt;ul>
+&lt;li>&lt;a href="https://gitlab.com/apparmor/apparmor/-/wikis/Documentation">AppArmor documentation&lt;/a>&lt;/li>
+&lt;li>&lt;a href="https://ubuntu.com/tutorials/beginning-apparmor-profile-development">A tutorial on creating a new AppArmor profile&lt;/a>&lt;/li>
+&lt;li>You can download a high-level &lt;a href="https://ubuntu.com/engage/apparmor-intro">whitepaper&lt;/a> on AppArmor from Canonical&amp;rsquo;s site.&lt;/li>
+&lt;/ul>
+&lt;h2 id="miscellaneous-references">Miscellaneous references&lt;/h2>
+&lt;ul>
+&lt;li>The &lt;a href="https://www.kernel.org/doc/ols/2002/ols2002-pages-604-617.pdf">&lt;em>Linux Security Module Framework&lt;/em> paper&lt;/a> that first introduced LSM.&lt;/li>
+&lt;/ul></description></item></channel></rss>
