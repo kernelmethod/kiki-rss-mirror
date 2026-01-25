@@ -141,7 +141,7 @@ mod test {
         let response = client.get("http://kiki/v1/entries/id/1337").send().await?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let content = response.text().await?;
-        assert_eq!(&content, "Entry not found: 1337");
+        assert_eq!(&content, "Entry not found");
 
         Ok(())
     }

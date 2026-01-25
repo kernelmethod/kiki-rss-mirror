@@ -60,7 +60,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
             Err(_e) => {
                 let result = GetFeedError {
                     id,
-                    message: "not found".to_string(),
+                    message: "Feed not found".to_string(),
                 };
                 Err((StatusCode::NOT_FOUND, Json(result)).into_response())
             }

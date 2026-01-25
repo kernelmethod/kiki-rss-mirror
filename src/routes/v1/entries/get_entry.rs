@@ -71,11 +71,7 @@ pub async fn get_entry(
 
     match result {
         Ok(Ok(Some(entry))) => Ok((axum::http::StatusCode::OK, Json(entry)).into_response()),
-        Ok(Ok(None)) => Err((
-            axum::http::StatusCode::NOT_FOUND,
-            format!("Entry not found: {}", id),
-        )
-            .into_response()),
+        Ok(Ok(None)) => Err((axum::http::StatusCode::NOT_FOUND, "Entry not found").into_response()),
         Ok(Err(e)) => {
             event!(Level::ERROR, "error in get_entry: {:?}", e);
             Err((

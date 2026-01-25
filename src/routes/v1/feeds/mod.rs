@@ -52,7 +52,7 @@ mod test {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let json = resp.json::<get_feed::GetFeedError>().await?;
         assert_eq!(json.id, 0);
-        assert_eq!(json.message, "not found");
+        assert_eq!(json.message, "Feed not found");
 
         // Add a new feed to the database
         let resp = client
@@ -167,6 +167,8 @@ mod test {
         // Try to delete a non-existent feed
         let resp = client.delete("http://kiki/v1/feeds/id/999").send().await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let content = resp.text().await?;
+        assert_eq!(&content, "Feed not found");
 
         Ok(())
     }
@@ -238,6 +240,8 @@ mod test {
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let content = resp.text().await?;
+        assert_eq!(&content, "Feed not found");
 
         // Try to update with no fields provided
         let resp = client

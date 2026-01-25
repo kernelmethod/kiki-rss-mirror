@@ -89,7 +89,7 @@ async fn refresh_feed(
         retrieve_file_feed(&feed_url, feed_id, pool.clone())
     } else {
         retrieve_feed(
-            &client,
+            client,
             feed_id,
             &feed_url,
             header_etag.as_deref(),
