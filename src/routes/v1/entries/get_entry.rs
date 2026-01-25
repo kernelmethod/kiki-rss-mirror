@@ -5,18 +5,8 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tokio::task;
 use tracing::{event, Level};
-
-#[derive(Debug, Error, Serialize, Deserialize)]
-pub enum GetEntryError {
-    #[error("internal error")]
-    InternalError,
-
-    #[error("entry not found: {0}")]
-    NotFound(i64),
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct GetEntryResponse {
@@ -81,19 +71,26 @@ pub async fn get_entry(
 
     match result {
         Ok(Ok(Some(entry))) => Ok((axum::http::StatusCode::OK, Json(entry)).into_response()),
-        Ok(Ok(None)) => {
-            let error = GetEntryError::NotFound(id);
-            Err((axum::http::StatusCode::NOT_FOUND, Json(error)).into_response())
-        }
+        Ok(Ok(None)) => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            format!("Entry not found: {}", id),
+        )
+            .into_response()),
         Ok(Err(e)) => {
             event!(Level::ERROR, "error in get_entry: {:?}", e);
-            let error = GetEntryError::InternalError;
-            Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response())
+            Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error",
+            )
+                .into_response())
         }
         Err(e) => {
             event!(Level::ERROR, "task error in get_entry: {:?}", e);
-            let error = GetEntryError::InternalError;
-            Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response())
+            Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error",
+            )
+                .into_response())
         }
     }
 }

@@ -140,8 +140,8 @@ mod test {
         // Attempt to retrieve an entry that does not exist
         let response = client.get("http://kiki/v1/entries/id/1337").send().await?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let content = response.bytes().await?;
-        assert_eq!(&content.to_vec(), b"{\"NotFound\":1337}");
+        let content = response.text().await?;
+        assert_eq!(&content, "Entry not found: 1337");
 
         Ok(())
     }
