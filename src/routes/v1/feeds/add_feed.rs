@@ -1,3 +1,4 @@
+use crate::fetcher::FetchManagerCommand;
 use crate::server::AppState;
 use axum::{extract::State, http::StatusCode, Json};
 use tokio::task;
@@ -71,6 +72,21 @@ pub async fn add_feed(
 
     event!(Level::INFO, "created new feed");
     let result = AddFeedResponse { id };
+
+    // Issue a command to the feed-fetch workers to make them fetch
+    // the latest version of the feed.
+    if let Err(e) = state
+        .fetcher_tx
+        .send(FetchManagerCommand::RefreshFeed(id))
+        .await
+    {
+        event!(
+            Level::ERROR,
+            "failed to send fetch command for feed {}: {:?}",
+            id,
+            e
+        );
+    }
 
     (StatusCode::CREATED, Json(result))
 }
