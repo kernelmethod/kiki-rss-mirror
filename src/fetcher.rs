@@ -4,7 +4,7 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug)]
 pub enum FetchManagerCommand {
@@ -30,20 +30,43 @@ pub async fn manager(
             FetchManagerCommand::RefreshFeed(feed_id) => {
                 // Get the feed URL and headers from the database
                 let conn = pool.get().unwrap();
-                let (feed_url, header_etag, header_last_modified): (
+                let (feed_url, header_etag, header_last_modified, last_checked): (
                     String,
                     Option<String>,
                     Option<String>,
+                    Option<String>,
                 ) = conn.query_row(
-                    "SELECT url, header_etag, header_last_modified FROM feeds WHERE id = ?1",
+                    "SELECT url, header_etag, header_last_modified, last_checked FROM feeds WHERE id = ?1",
                     [feed_id],
                     |row| {
                         let url: String = row.get(0)?;
                         let etag: Option<String> = row.get(1)?;
                         let last_modified: Option<String> = row.get(2)?;
-                        Ok((url, etag, last_modified))
+                        let last_checked: Option<String> = row.get(3)?;
+                        Ok((url, etag, last_modified, last_checked))
                     },
                 )?;
+
+                // Check if the feed was last updated recently
+                if let Some(last_checked_str) = last_checked {
+                    if let Ok(last_checked_time) = chrono::NaiveDateTime::parse_from_str(
+                        &last_checked_str,
+                        "%Y-%m-%d %H:%M:%S",
+                    ) {
+                        let now = chrono::Utc::now();
+                        let duration_since = now.signed_duration_since(last_checked_time.and_utc());
+                        if duration_since.num_hours() < 3 {
+                            debug!(
+                                "Feed {} was last checked {} seconds ago, skipping update",
+                                feed_id,
+                                duration_since.num_seconds()
+                            );
+                            continue;
+                        }
+                    } else {
+                        warn!("Unable to parse last_checked feed time stored in database for feed {}: {}", feed_id, last_checked_str);
+                    }
+                }
 
                 // Build the request with conditional headers if they exist
                 let mut request = client.get(&feed_url).header("User-Agent", USER_AGENT);

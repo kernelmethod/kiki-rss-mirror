@@ -14,6 +14,7 @@ impl ServeArgs {
         let socket_path = PathBuf::from("./kiki.sock");
         let server = server::ServerBuilder::new(&db_path)
             .socket_path(&socket_path)
+            .autofetch()
             .build();
 
         std::thread::spawn(|| server.run())

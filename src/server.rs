@@ -9,10 +9,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{atomic, Arc},
+    time::Duration,
 };
 use tokio::{net::UnixListener, signal, sync::mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{span, Level};
+use tracing::{debug, span, Level};
 
 pub struct SharedAppState {
     /// An [`mpsc::Sender`] instance that may be used to send commands
@@ -29,6 +30,7 @@ pub type AppState = Arc<SharedAppState>;
 pub struct ServerBuilder<'a> {
     db_path: &'a Path,
     socket_path: Option<&'a Path>,
+    autofetch: bool,
 }
 
 impl<'a> ServerBuilder<'a> {
@@ -36,11 +38,17 @@ impl<'a> ServerBuilder<'a> {
         ServerBuilder {
             db_path,
             socket_path: None,
+            autofetch: false,
         }
     }
 
     pub fn socket_path(mut self, p: &'a Path) -> Self {
         self.socket_path = Some(p);
+        self
+    }
+
+    pub fn autofetch(mut self) -> Self {
+        self.autofetch = true;
         self
     }
 
@@ -54,6 +62,7 @@ impl<'a> ServerBuilder<'a> {
         Server {
             db_path,
             socket_path,
+            autofetch: self.autofetch,
             cancel_token: CancellationToken::new(),
         }
     }
@@ -85,8 +94,17 @@ impl std::error::Error for ServerError {
 }
 
 pub struct Server {
+    /// Path to the database used by the server.
     db_path: PathBuf,
+
+    /// Path to the Unix socket used by the server.
     socket_path: PathBuf,
+
+    /// Whether or not to automatically fetch feed contents.
+    autofetch: bool,
+
+    /// A [`CancellationToken`] used to indicate that the server should
+    /// be killed.
     cancel_token: CancellationToken,
 }
 
@@ -147,6 +165,14 @@ impl Server {
             pool.clone(),
             self.cancel_token.clone(),
         ));
+
+        if self.autofetch {
+            web_runtime.spawn(check_feeds_loop(
+                tx.clone(),
+                pool.clone(),
+                self.cancel_token.clone(),
+            ));
+        }
         web_runtime.spawn(server(
             self.socket_path,
             tx.clone(),
@@ -163,6 +189,58 @@ impl Server {
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel_token.clone()
     }
+}
+
+async fn check_feeds_loop(
+    fetcher_tx: mpsc::Sender<FetchManagerCommand>,
+    pool: r2d2::Pool<SqliteConnectionManager>,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if let Err(e) = check_feeds(&fetcher_tx, &pool) {
+                    tracing::error!("Error checking feeds: {:?}", e);
+                }
+            }
+            _ = cancel_token.cancelled() => {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn check_feeds(
+    fetcher_tx: &mpsc::Sender<FetchManagerCommand>,
+    pool: &r2d2::Pool<SqliteConnectionManager>,
+) -> Result<()> {
+    debug!("Sending RefreshFeed commands for all feeds");
+    let conn = pool.get().unwrap();
+
+    // Query all feed IDs
+    let mut stmt = conn.prepare("SELECT id FROM feeds")?;
+
+    let feed_ids = stmt.query_map([], |row| {
+        let id: i64 = row.get(0)?;
+        Ok(id)
+    })?;
+
+    // Send a RefreshFeed command for each feed
+    for feed_id in feed_ids {
+        let feed_id = feed_id?;
+        if let Err(e) = fetcher_tx.try_send(FetchManagerCommand::RefreshFeed(feed_id)) {
+            tracing::error!(
+                "Failed to send RefreshFeed command for feed {}: {:?}",
+                feed_id,
+                e
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn shutdown_signal(token: CancellationToken) {
