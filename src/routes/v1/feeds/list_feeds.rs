@@ -70,7 +70,11 @@ pub async fn list_feeds(
                     title: row.get(1)?,
                     url: row.get(2)?,
                     description: row.get(3)?,
-                    last_checked: row.get(4)?,
+                    last_checked: row.get::<usize, Option<i64>>(4)?.map(|ts| {
+                        chrono::DateTime::from_timestamp_secs(ts)
+                            .unwrap()
+                            .to_rfc3339()
+                    }),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

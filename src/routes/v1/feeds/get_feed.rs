@@ -9,12 +9,6 @@ use tokio::task;
 use tracing::{event, Level};
 
 #[derive(serde::Deserialize, serde::Serialize)]
-pub struct GetFeedError {
-    pub id: i64,
-    pub message: String,
-}
-
-#[derive(serde::Deserialize, serde::Serialize)]
 pub struct GetFeedResponse {
     pub id: i64,
     pub title: String,
@@ -38,11 +32,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
             Ok(s) => s,
             Err(e) => {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-                let result = GetFeedError {
-                    id,
-                    message: "internal error".to_string(),
-                };
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(result)).into_response());
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response());
             }
         };
         let query_result = stmt.query_row([id], |row| {
@@ -51,19 +41,14 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
                 title: row.get(1).unwrap(),
                 url: row.get(2).unwrap(),
                 description: row.get(3).unwrap(),
-                last_checked: row.get(4).unwrap(),
+                last_checked: chrono::DateTime::from_timestamp_secs(row.get(4)?)
+                    .map(|d| d.to_rfc3339()),
             };
             Ok(resp)
         });
         match query_result {
             Ok(r) => Ok((StatusCode::OK, Json(r)).into_response()),
-            Err(_e) => {
-                let result = GetFeedError {
-                    id,
-                    message: "Feed not found".to_string(),
-                };
-                Err((StatusCode::NOT_FOUND, Json(result)).into_response())
-            }
+            Err(_e) => Err((StatusCode::NOT_FOUND, "Feed not found").into_response()),
         }
     })
     .await;
@@ -76,11 +61,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
                 "error waiting for blocking thread to run SQL query: {:?}",
                 e
             );
-            let result = GetFeedError {
-                id,
-                message: "internal error".to_string(),
-            };
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(result)).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
         }
     }
 }

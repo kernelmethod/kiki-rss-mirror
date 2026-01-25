@@ -4,7 +4,7 @@ mod list_entries;
 
 use delete_entry::delete_entry;
 use get_entry::get_entry;
-use list_entries::list_entries;
+pub use list_entries::{list_entries, ListEntriesResponse};
 
 use crate::server::AppState;
 use axum::{routing::get, Router};

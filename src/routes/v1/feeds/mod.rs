@@ -32,41 +32,56 @@ pub fn create_router() -> Router<AppState> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::test::TestBuilder;
+    use crate::routes::v1::entries::ListEntriesResponse;
+    use crate::test::{TestBuilder, TestConfig};
     use anyhow::Result;
     use axum::http::StatusCode;
+    use std::time::Duration;
 
-    #[tokio::test]
-    async fn test_add_feed() -> Result<()> {
-        let tc = TestBuilder::all().init_server().build()?;
+    async fn add_example_feed(tc: &TestConfig) -> Result<i64> {
         let client = tc.client()?;
 
-        // We should start off with zero feeds
-        let resp = client.get("http://kiki/v1/feeds").send().await?;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
-        assert_eq!(json.feeds.len(), 0);
-        assert_eq!(json.count, 0);
-        assert_eq!(json.offset, 0);
-        let resp = client.get("http://kiki/v1/feeds/id/0").send().await?;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let json = resp.json::<get_feed::GetFeedError>().await?;
-        assert_eq!(json.id, 0);
-        assert_eq!(json.message, "Feed not found");
-
-        // Add a new feed to the database
+        // Add a new feed via the API
+        let url = tc.example_feed_url();
         let resp = client
             .post("http://kiki/v1/feeds/create")
             .json(&add_feed::AddFeedRequest {
                 title: "my feed".to_string(),
-                url: "https://kernelmethod.org/rss.xml".to_string(),
+                url: url.clone(),
             })
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::CREATED);
         let feed_id = resp.json::<add_feed::AddFeedResponse>().await?.id;
 
-        // Now retrieve the feed from the database
+        // Wait a short period of time for the feed to get fetched
+        std::thread::sleep(Duration::from_millis(250));
+
+        Ok(feed_id)
+    }
+
+    #[tokio::test]
+    async fn test_add_feed() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // We should start off with zero feeds and zero entries
+        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
+        assert_eq!(json.feeds.len(), 0);
+        assert_eq!(json.count, 0);
+        assert_eq!(json.offset, 0);
+        let resp = client.get("http://kiki/v1/feeds/id/1").send().await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(&resp.text().await?, "Feed not found");
+
+        let resp = client.get("http://kiki/v1/entries").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<ListEntriesResponse>().await?;
+        assert_eq!(json.count, 0);
+
+        let feed_id = add_example_feed(&tc).await?;
         let resp = client
             .get(format!("http://kiki/v1/feeds/id/{:?}", feed_id))
             .send()
@@ -75,13 +90,19 @@ mod test {
         let json = resp.json::<get_feed::GetFeedResponse>().await?;
         assert_eq!(json.id, feed_id);
         assert_eq!(json.title, "my feed");
-        assert_eq!(json.url, "https://kernelmethod.org/rss.xml");
+        assert_eq!(json.url, tc.example_feed_url());
         assert_eq!(json.description, None);
-        assert_eq!(json.last_checked, None);
+        assert!(json.last_checked.is_some());
 
         // We should also see the feed in the list of feeds
         let resp = client.get("http://kiki/v1/feeds").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
+
+        // Check that the entries from the feed were retrieved
+        let resp = client.get("http://kiki/v1/entries").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<ListEntriesResponse>().await?;
+        assert_eq!(json.count, 6);
 
         Ok(())
     }
