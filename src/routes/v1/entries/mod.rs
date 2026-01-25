@@ -1,27 +1,27 @@
+mod get_entry;
 mod list_entries;
 
+use get_entry::get_entry;
 use list_entries::list_entries;
 
 use crate::server::AppState;
 use axum::{routing::get, Router};
 
 pub fn create_router() -> Router<AppState> {
-    Router::new().route("/", get(list_entries))
+    Router::new()
+        .route("/", get(list_entries))
+        .route("/id/{*id}", get(get_entry))
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::test::TestBuilder;
+    use crate::test::{TestBuilder, TestConfig};
     use anyhow::Result;
     use axum::http::StatusCode;
     use chrono::{TimeZone, Utc};
 
-    #[tokio::test]
-    async fn test_list_entries() -> Result<()> {
-        let tc = TestBuilder::all().build()?;
-        let client = tc.client()?;
-
+    fn populate_entries(tc: &TestConfig) -> Result<()> {
         // Insert some test entries
         let conn = tc.database_conn().unwrap();
 
@@ -69,6 +69,16 @@ mod test {
             ),
         )?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_entries() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        populate_entries(&tc)?;
+
         // Call the list_entries endpoint
         let response = client.get("http://kiki/v1/entries").send().await?;
 
@@ -99,6 +109,39 @@ mod test {
             response.entries[1].published_at.as_deref(),
             Some("2026-05-16T00:00:00+00:00")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_entry() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        populate_entries(&tc)?;
+
+        // Call the get_entry endpoint
+        let response = client.get("http://kiki/v1/entries/id/1").send().await?;
+
+        // Verify the response
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response.json::<get_entry::GetEntryResponse>().await?;
+
+        assert_eq!(response.id, 1);
+        assert_eq!(response.feed_id, 1);
+        assert_eq!(response.syndication_format, "rss");
+        assert_eq!(response.guid, "rss-guid-1");
+        assert_eq!(response.title, "RSS Entry");
+        assert_eq!(response.url, "http://example.com/rss-entry");
+        assert_eq!(response.content.as_deref(), Some("RSS Content"));
+        assert_eq!(response.status_read, 0);
+        assert_eq!(response.status_favorite, 0);
+
+        // Attempt to retrieve an entry that does not exist
+        let response = client.get("http://kiki/v1/entries/id/1337").send().await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let content = response.bytes().await?;
+        assert_eq!(&content.to_vec(), b"{\"NotFound\":1337}");
 
         Ok(())
     }
