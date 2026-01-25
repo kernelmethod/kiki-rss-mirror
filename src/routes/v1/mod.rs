@@ -1,3 +1,4 @@
+mod entries;
 mod feeds;
 mod root;
 
@@ -8,4 +9,5 @@ pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/", get(root::root))
         .nest("/feeds", feeds::create_router())
+        .nest("/entries", entries::create_router())
 }

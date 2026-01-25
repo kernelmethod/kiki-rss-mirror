@@ -142,4 +142,12 @@ impl TestConfig {
     pub fn socket_path(&self) -> PathBuf {
         PathBuf::from(self.config_dir()).join("kiki.sock")
     }
+
+    pub fn database_conn(&self) -> Result<rusqlite::Connection> {
+        ConnectionBuilder::default()
+            .at_path(&self.database_path())
+            .read_write()
+            .build()
+            .with_context(|| "failed to connect to database")
+    }
 }
