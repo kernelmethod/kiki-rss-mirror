@@ -1,10 +1,11 @@
 use crate::http::USER_AGENT;
 use anyhow::Result;
+use chrono::{TimeZone, Utc};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 pub enum FetchManagerCommand {
@@ -28,7 +29,14 @@ pub async fn manager(
     } {
         match command {
             FetchManagerCommand::RefreshFeed(feed_id) => {
-                refresh_feed(&client, feed_id, pool.clone()).await?;
+                let _ = refresh_feed(&client, feed_id, pool.clone())
+                    .await
+                    .inspect_err(|e| {
+                        error!(
+                            "An error occurred while refreshing feed {}: {:?}",
+                            feed_id, e
+                        );
+                    });
             }
         }
     }
@@ -48,7 +56,7 @@ async fn refresh_feed(
         String,
         Option<String>,
         Option<String>,
-        Option<String>,
+        Option<i64>,
     ) = conn.query_row(
         "SELECT url, header_etag, header_last_modified, last_checked FROM feeds WHERE id = ?1",
         [feed_id],
@@ -56,31 +64,23 @@ async fn refresh_feed(
             let url: String = row.get(0)?;
             let etag: Option<String> = row.get(1)?;
             let last_modified: Option<String> = row.get(2)?;
-            let last_checked: Option<String> = row.get(3)?;
+            let last_checked: Option<i64> = row.get(3)?;
             Ok((url, etag, last_modified, last_checked))
         },
     )?;
 
     // Check if the feed was last updated recently
-    if let Some(last_checked_str) = last_checked {
-        if let Ok(last_checked_time) =
-            chrono::NaiveDateTime::parse_from_str(&last_checked_str, "%Y-%m-%d %H:%M:%S")
-        {
-            let now = chrono::Utc::now();
-            let duration_since = now.signed_duration_since(last_checked_time.and_utc());
-            if duration_since.num_hours() < 3 {
-                debug!(
-                    "Feed {} was last checked {} seconds ago, skipping update",
-                    feed_id,
-                    duration_since.num_seconds()
-                );
-                return Ok(());
-            }
-        } else {
-            warn!(
-                "Unable to parse last_checked feed time stored in database for feed {}: {}",
-                feed_id, last_checked_str
+    if let Some(last_checked_ts) = last_checked {
+        let last_checked_ts = Utc.timestamp_opt(last_checked_ts, 0).unwrap();
+        let now = Utc::now();
+        let duration_since = now.signed_duration_since(last_checked_ts);
+        if duration_since.num_hours() < 3 {
+            debug!(
+                "Feed {} was last checked {} seconds ago, skipping update",
+                feed_id,
+                duration_since.num_seconds()
             );
+            return Ok(());
         }
     }
 
@@ -151,7 +151,7 @@ async fn retrieve_feed(
             // Update last_checked timestamp in database
             conn.execute(
                 "UPDATE feeds SET last_checked = ?1 WHERE id = ?2",
-                (chrono::Utc::now().timestamp(), feed_id),
+                (Utc::now().timestamp(), feed_id),
             )?;
             return Ok(None);
         }
@@ -175,7 +175,7 @@ async fn retrieve_feed(
         .and_then(|h| h.to_str().ok());
 
     {
-        let params = (etag, last_modified, chrono::Utc::now().timestamp(), feed_id);
+        let params = (etag, last_modified, Utc::now().timestamp(), feed_id);
         conn.execute(
             "UPDATE feeds SET header_etag = ?, header_last_modified = ?, last_checked = ? WHERE id = ?",
             params,
@@ -203,7 +203,7 @@ fn retrieve_file_feed(
     // Update the last_checked timestamp in the database
     conn.execute(
         "UPDATE feeds SET last_checked = ?1 WHERE id = ?2",
-        (chrono::Utc::now().timestamp(), feed_id),
+        (Utc::now().timestamp(), feed_id),
     )?;
 
     Ok(Some(content))
@@ -277,7 +277,7 @@ fn process_rss_feed(
             .pub_date()
             .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
             .map(|d| d.timestamp())
-            .unwrap_or_else(|| chrono::Utc::now().timestamp());
+            .unwrap_or_else(|| Utc::now().timestamp());
         let params: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(feed_id),
             Box::new(
