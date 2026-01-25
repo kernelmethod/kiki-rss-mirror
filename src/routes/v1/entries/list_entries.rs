@@ -21,14 +21,14 @@ pub struct ListEntriesError {
     pub message: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ListEntriesResponseEntry {
     pub id: i64,
     pub feed_id: i64,
     pub source_id: Option<i64>,
     pub syndication_format: String,
     pub guid: String,
-    pub published_at: String,
+    pub published_at: Option<String>,
     pub title: String,
     pub url: String,
     pub content: Option<String>,
@@ -85,7 +85,8 @@ pub async fn list_entries(
                     source_id: row.get(2)?,
                     syndication_format: row.get(3)?,
                     guid: row.get(4)?,
-                    published_at: row.get(5)?,
+                    published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
+                        .map(|d| d.to_rfc3339()),
                     title: row.get(6)?,
                     url: row.get(7)?,
                     content: row.get(8)?,
@@ -93,7 +94,10 @@ pub async fn list_entries(
                     status_favorite: row.get(10)?,
                 })
             })?
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .inspect_err(|e| {
+                event!(Level::ERROR, "failed to create entry list: {:?}", e);
+            })?;
 
         Ok::<ListEntriesResponse, rusqlite::Error>(ListEntriesResponse {
             count,
