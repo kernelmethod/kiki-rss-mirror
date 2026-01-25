@@ -222,25 +222,21 @@ fn process_atom_feed(
 
     // Insert or update entries from the Atom feed
     for entry in feed.entries() {
-        let params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(feed_id),
-            Box::new(entry.id().to_string()),
-            Box::new(
-                entry
-                    .published()
-                    // Attempt to parse using RFC 2822 first; failing that we resort to
-                    // RFC 3339.
-                    .map(|d| d.to_utc().timestamp()),
-            ),
-            Box::new(entry.title().as_str().to_string()),
-            Box::new(entry.links().first().map(|l| l.href().to_string())),
-            Box::new(
-                entry
-                    .content()
-                    .and_then(|c| c.value())
-                    .map(|v| v.to_string()),
-            ),
-        ];
+        let params = (
+            feed_id,
+            entry.id().to_string(),
+            entry
+                .published()
+                // Attempt to parse using RFC 2822 first; failing that we resort to
+                // RFC 3339.
+                .map(|d| d.to_utc().timestamp()),
+            entry.title().as_str().to_string(),
+            entry.links().first().map(|l| l.href().to_string()),
+            entry
+                .content()
+                .and_then(|c| c.value())
+                .map(|v| v.to_string()),
+        );
 
         // Insert or update the entry in the database
         conn.execute(
@@ -253,7 +249,7 @@ fn process_atom_feed(
                 url,
                 content,
             ) VALUES (?1, 'atom', ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params_from_iter(params),
+            params,
         )?;
     }
 
@@ -278,21 +274,19 @@ fn process_rss_feed(
             .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
             .map(|d| d.timestamp())
             .unwrap_or_else(|| Utc::now().timestamp());
-        let params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(feed_id),
-            Box::new(
-                item.guid()
-                    .map(|g| g.value().to_string())
-                    .unwrap_or_else(|| {
-                        // Generate a GUID if none exists
-                        format!("rss-{}-{}", timestamp, item.title().unwrap_or("no-title"))
-                    }),
-            ),
-            Box::new(timestamp),
-            Box::new(item.title()),
-            Box::new(item.link()),
-            Box::new(item.description()),
-        ];
+        let params = (
+            feed_id,
+            item.guid()
+                .map(|g| g.value().to_string())
+                .unwrap_or_else(|| {
+                    // Generate a GUID if none exists
+                    format!("rss-{}-{}", timestamp, item.title().unwrap_or("no-title"))
+                }),
+            timestamp,
+            item.title(),
+            item.link(),
+            item.description(),
+        );
 
         // Insert or update the entry in the database
         conn.execute(
@@ -305,7 +299,7 @@ fn process_rss_feed(
                 url,
                 content
             ) VALUES (?1, 'rss', ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params_from_iter(params),
+            params,
         )?;
     }
 
