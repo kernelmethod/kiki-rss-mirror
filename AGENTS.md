@@ -14,6 +14,17 @@ cargo clippy
 cargo test
 ```
 
+## Codebase Organization
+
+Modules in the codebase are structured as follows:
+
+- `src/` - Main source code directory
+  - `main.rs` - Entry point of the application
+  - `db/` - Database-related code
+  - `routes/` - HTTP route handlers organized by API version
+  - `cli/` - Command-line interface commands
+  - `test/` - Test modules and test data
+
 ## Code Style Guidelines
 
 ### Error Handling
