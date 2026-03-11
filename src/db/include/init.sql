@@ -11,7 +11,7 @@ CREATE TABLE tags (
 
 CREATE TABLE scripts (
     id      INTEGER PRIMARY KEY,
-    lang    VARCHAR NOT NULL,
+    engine  VARCHAR NOT NULL,
     text    VARCHAR NOT NULL
 );
 
