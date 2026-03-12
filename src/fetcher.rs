@@ -54,22 +54,40 @@ async fn refresh_feed(
 ) -> Result<()> {
     // Get the feed URL and headers from the database
     let conn = pool.get()?;
-    let (feed_url, header_etag, header_last_modified, last_checked): (
+    let (feed_url, header_etag, header_last_modified, header_expires, last_checked): (
         String,
         Option<String>,
         Option<String>,
         Option<i64>,
+        Option<i64>,
     ) = conn.query_row(
-        "SELECT url, header_etag, header_last_modified, last_checked FROM feeds WHERE id = ?1",
+        "SELECT url, header_etag, header_last_modified, header_expires, last_checked FROM feeds WHERE id = ?1",
         [feed_id],
         |row| {
             let url: String = row.get(0)?;
             let etag: Option<String> = row.get(1)?;
             let last_modified: Option<String> = row.get(2)?;
-            let last_checked: Option<i64> = row.get(3)?;
-            Ok((url, etag, last_modified, last_checked))
+            let expires: Option<i64> = row.get(3)?;
+            let last_checked: Option<i64> = row.get(4)?;
+            Ok((url, etag, last_modified, expires, last_checked))
         },
     )?;
+
+    // If the server provided an Expires header, respect it: skip fetching
+    // until the declared expiry time has passed.
+    if let Some(expires_ts) = header_expires {
+        if let Some(expires_dt) = Utc.timestamp_opt(expires_ts, 0).single() {
+            let now = Utc::now();
+            if now < expires_dt {
+                debug!(
+                    "Feed {} has not yet expired (expires in {} seconds), skipping update",
+                    feed_id,
+                    expires_dt.signed_duration_since(now).num_seconds()
+                );
+                return Ok(());
+            }
+        }
+    }
 
     // Check if the feed was last updated recently
     if let Some(last_checked_ts) = last_checked {
@@ -226,10 +244,28 @@ async fn retrieve_feed(
         .get("last-modified")
         .and_then(|h| h.to_str().ok());
 
+    // Parse the Expires header into a Unix timestamp so we can skip future
+    // fetches until the declared expiry time has passed.
+    let expires: Option<i64> = resp
+        .headers()
+        .get("expires")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| {
+            chrono::DateTime::parse_from_str(s, "%a, %d %b %Y %H:%M:%S GMT")
+                .ok()
+                .map(|dt| dt.timestamp())
+        });
+
     {
-        let params = (etag, last_modified, Utc::now().timestamp(), feed_id);
+        let params = (
+            etag,
+            last_modified,
+            expires,
+            Utc::now().timestamp(),
+            feed_id,
+        );
         conn.execute(
-            "UPDATE feeds SET header_etag = ?, header_last_modified = ?, last_checked = ? WHERE id = ?",
+            "UPDATE feeds SET header_etag = ?, header_last_modified = ?, header_expires = ?, last_checked = ? WHERE id = ?",
             params,
         )?;
     }

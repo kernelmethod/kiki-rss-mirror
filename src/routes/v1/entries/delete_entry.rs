@@ -12,7 +12,11 @@ pub async fn delete_entry(
 ) -> Result<Response, Response> {
     let conn = state.conn_pool.get().map_err(|e| {
         event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal error",
+        )
+            .into_response()
     })?;
 
     let result = task::spawn_blocking(move || {

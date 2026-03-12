@@ -28,7 +28,10 @@ pub async fn add_feed(
         Ok(conn) => conn,
         Err(e) => {
             event!(Level::ERROR, "failed to get database connection: {:?}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(AddFeedResponse { id: 0 }));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AddFeedResponse { id: 0 }),
+            );
         }
     };
 

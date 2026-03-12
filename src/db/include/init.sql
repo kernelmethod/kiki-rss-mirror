@@ -31,7 +31,12 @@ CREATE TABLE feeds (
     description             VARCHAR,
     last_checked            DATETIME,
     header_etag             VARCHAR,
-    header_last_modified    VARCHAR
+    header_last_modified    VARCHAR,
+
+    -- Unix timestamp parsed from the HTTP Expires response header.
+    -- When set, the fetcher will skip refreshing the feed until this
+    -- time has passed.
+    header_expires          INTEGER
 );
 CREATE INDEX idx_feeds_syndication ON feeds(syndication_format);
 
