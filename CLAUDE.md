@@ -1,4 +1,4 @@
-# AGENTS.md
+# CLAUDE.md
 
 ## Build, Lint, and Test Commands
 
@@ -7,7 +7,8 @@
 cargo build             # Create a debug build
 cargo build --release   # Build in release mode
 
-# Linting commands
+# Formatting and linting commands
+cargo fmt
 cargo clippy
 
 # Testing commands
@@ -39,18 +40,3 @@ Modules in the codebase are structured as follows:
 - Include examples for public APIs
 - Document error cases and return values
 
-### Conventions
-- Use `tokio` for asynchronous programming
-- Follow async/await patterns for concurrent code
-- Use `axum` for HTTP routing and handlers
-- Use `serde` for serialization/deserialization
-- Use `r2d2` and `rusqlite` for database operations
-- Use `chrono` for time handling
-- Use `tracing` for logging and structured tracing
-
-### Testing
-- Write tests for all public APIs
-- Use integration tests for HTTP endpoints
-- Use unit tests for business logic
-- Use `tempdir` crate for temporary file handling in tests
-- Ensure all tests pass before committing
