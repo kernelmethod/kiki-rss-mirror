@@ -13,7 +13,10 @@ pub async fn delete_feed(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().unwrap();
+    let conn = state.conn_pool.get().map_err(|e| {
+        event!(Level::ERROR, "failed to get database connection: {:?}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?;
 
     let result = task::spawn_blocking(move || {
         let affected_rows = conn

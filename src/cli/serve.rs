@@ -19,6 +19,6 @@ impl ServeArgs {
 
         std::thread::spawn(|| server.run())
             .join()
-            .expect("panic in server thread")
+            .map_err(|_| anyhow::anyhow!("panic in server thread"))?
     }
 }

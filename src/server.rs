@@ -218,7 +218,7 @@ fn check_feeds(
     pool: &r2d2::Pool<SqliteConnectionManager>,
 ) -> Result<()> {
     debug!("Sending RefreshFeed commands for all feeds");
-    let conn = pool.get().unwrap();
+    let conn = pool.get()?;
 
     // Query all feed IDs
     let mut stmt = conn.prepare("SELECT id FROM feeds")?;
@@ -249,17 +249,22 @@ async fn shutdown_signal(token: CancellationToken) {
     };
 
     let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        if let Err(e) = signal::ctrl_c().await {
+            tracing::error!("failed to install Ctrl+C handler: {:?}", e);
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("failed to install signal handler: {:?}", e);
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]
@@ -306,6 +311,7 @@ async fn web_shutdown_signal(socket_path: PathBuf, cancel_token: CancellationTok
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod test {
     use crate::test::TestBuilder;
     use anyhow::Result;

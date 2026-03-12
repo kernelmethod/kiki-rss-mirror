@@ -1,3 +1,8 @@
+#![deny(clippy::panic)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::indexing_slicing)]
+
 pub mod cli;
 pub mod db;
 pub mod fetcher;

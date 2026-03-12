@@ -24,7 +24,13 @@ pub async fn add_feed(
     Json(payload): Json<AddFeedRequest>,
 ) -> (StatusCode, Json<AddFeedResponse>) {
     // Add a new feed instance to the database
-    let conn = state.conn_pool.get().unwrap();
+    let conn = match state.conn_pool.get() {
+        Ok(conn) => conn,
+        Err(e) => {
+            event!(Level::ERROR, "failed to get database connection: {:?}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(AddFeedResponse { id: 0 }));
+        }
+    };
 
     // The rusqlite interface is synchronous so we must run the INSERT statement
     // on a blocking thread.
@@ -39,7 +45,7 @@ pub async fn add_feed(
                 }
             };
         let insert_result = stmt.query_row([payload.title, payload.url], |row| {
-            Ok(AddFeedQueryResult(row.get(0).unwrap()))
+            Ok(AddFeedQueryResult(row.get(0)?))
         });
         match insert_result {
             Ok(r) => Ok(r.0),

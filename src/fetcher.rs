@@ -53,7 +53,7 @@ async fn refresh_feed(
     pool: Pool<SqliteConnectionManager>,
 ) -> Result<()> {
     // Get the feed URL and headers from the database
-    let conn = pool.get().unwrap();
+    let conn = pool.get()?;
     let (feed_url, header_etag, header_last_modified, last_checked): (
         String,
         Option<String>,
@@ -73,16 +73,17 @@ async fn refresh_feed(
 
     // Check if the feed was last updated recently
     if let Some(last_checked_ts) = last_checked {
-        let last_checked_ts = Utc.timestamp_opt(last_checked_ts, 0).unwrap();
-        let now = Utc::now();
-        let duration_since = now.signed_duration_since(last_checked_ts);
-        if duration_since.num_hours() < 3 {
-            debug!(
-                "Feed {} was last checked {} seconds ago, skipping update",
-                feed_id,
-                duration_since.num_seconds()
-            );
-            return Ok(());
+        if let Some(last_checked_ts) = Utc.timestamp_opt(last_checked_ts, 0).single() {
+            let now = Utc::now();
+            let duration_since = now.signed_duration_since(last_checked_ts);
+            if duration_since.num_hours() < 3 {
+                debug!(
+                    "Feed {} was last checked {} seconds ago, skipping update",
+                    feed_id,
+                    duration_since.num_seconds()
+                );
+                return Ok(());
+            }
         }
     }
 
@@ -130,7 +131,7 @@ async fn retrieve_feed(
     last_modified: Option<&str>,
     pool: Pool<SqliteConnectionManager>,
 ) -> Result<Option<Vec<u8>>> {
-    let conn = pool.get().unwrap();
+    let conn = pool.get()?;
 
     let mut current_url = feed_url.to_string();
     let mut had_permanent_redirect = false;
@@ -242,7 +243,7 @@ fn retrieve_file_feed(
     feed_id: i64,
     pool: Pool<SqliteConnectionManager>,
 ) -> Result<Option<Vec<u8>>> {
-    let conn = pool.get().unwrap();
+    let conn = pool.get()?;
 
     // Extract the file path from the URL
     let file_path = feed_url.strip_prefix("file://").unwrap_or(feed_url);

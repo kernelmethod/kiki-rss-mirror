@@ -44,7 +44,11 @@ pub async fn list_feeds(
     State(state): State<AppState>,
     Query(params): Query<ListFeedsQueryParams>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().unwrap();
+    let conn = state.conn_pool.get().map_err(|e| {
+        event!(Level::ERROR, "failed to get database connection: {:?}", e);
+        let error = ListFeedsError::default();
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response()
+    })?;
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
 
@@ -70,10 +74,8 @@ pub async fn list_feeds(
                     title: row.get(1)?,
                     url: row.get(2)?,
                     description: row.get(3)?,
-                    last_checked: row.get::<usize, Option<i64>>(4)?.map(|ts| {
-                        chrono::DateTime::from_timestamp_secs(ts)
-                            .unwrap()
-                            .to_rfc3339()
+                    last_checked: row.get::<usize, Option<i64>>(4)?.and_then(|ts| {
+                        chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
                     }),
                 })
             })?

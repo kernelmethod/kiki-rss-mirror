@@ -20,7 +20,13 @@ pub struct GetFeedResponse {
 /// Route handler for fetching a single feed's information.
 #[axum::debug_handler]
 pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
-    let conn = state.conn_pool.get().unwrap();
+    let conn = match state.conn_pool.get() {
+        Ok(conn) => conn,
+        Err(e) => {
+            event!(Level::ERROR, "failed to get database connection: {:?}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+        }
+    };
 
     // The rusqlite interface is synchronous so we must run the INSERT
     // statement on a blocking thread.
@@ -37,10 +43,10 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
         };
         let query_result = stmt.query_row([id], |row| {
             let resp = GetFeedResponse {
-                id: row.get(0).unwrap(),
-                title: row.get(1).unwrap(),
-                url: row.get(2).unwrap(),
-                description: row.get(3).unwrap(),
+                id: row.get(0)?,
+                title: row.get(1)?,
+                url: row.get(2)?,
+                description: row.get(3)?,
                 last_checked: chrono::DateTime::from_timestamp_secs(row.get(4)?)
                     .map(|d| d.to_rfc3339()),
             };

@@ -56,7 +56,14 @@ pub async fn list_entries(
     State(state): State<AppState>,
     Query(params): Query<ListEntriesQueryParams>,
 ) -> Response {
-    let conn = state.conn_pool.get().unwrap();
+    let conn = match state.conn_pool.get() {
+        Ok(conn) => conn,
+        Err(e) => {
+            event!(Level::ERROR, "failed to get database connection: {:?}", e);
+            let error = ListEntriesError::default();
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response();
+        }
+    };
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
 
