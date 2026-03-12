@@ -52,7 +52,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
             Ok(s) => s,
             Err(e) => {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response());
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
             }
         };
         let query_result = stmt.query_row([id], |row| {
@@ -67,14 +67,14 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
             Ok(resp)
         });
         match query_result {
-            Ok(r) => Ok((StatusCode::OK, Json(r)).into_response()),
-            Err(_e) => Err((StatusCode::NOT_FOUND, "Feed not found").into_response()),
+            Ok(r) => (StatusCode::OK, Json(r)).into_response(),
+            Err(_e) => (StatusCode::NOT_FOUND, "Feed not found").into_response(),
         }
     })
     .await;
 
     match task_result {
-        Ok(Ok(res)) | Ok(Err(res)) => res,
+        Ok(res) => res,
         Err(e) => {
             event!(
                 Level::ERROR,
