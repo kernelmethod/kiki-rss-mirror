@@ -20,7 +20,7 @@ reqwest = { git = "https://github.com/seanmonstar/reqwest", branch = "uds", feat
 rss = "2.0"
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1.0", features = ["serde_derive"] }
-mlua = { version = "0.10", features = ["luajit", "vendored"], optional = true }
+mlua = { version = "0.10", features = ["luajit", "vendored", "send"], optional = true }
 thiserror = "2.0.18"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }

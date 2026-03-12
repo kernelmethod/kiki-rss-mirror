@@ -12,6 +12,10 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug)]
 pub enum FetchManagerCommand {
     RefreshFeed(i64),
+    /// Clears the cached [`crate::scripting::lua::LuaScriptRunner`] for every feed,
+    /// forcing runners to be rebuilt from the database on the next refresh.
+    #[cfg(feature = "lua")]
+    ReloadScripts,
 }
 
 /// Create a manager for the fetcher tasks.
@@ -25,6 +29,11 @@ pub async fn manager(
         .user_agent(USER_AGENT)
         .build()?;
 
+    // Single script runner for all feeds, built eagerly from the current database state.
+    // Replaced wholesale when a ReloadScripts command is received.
+    #[cfg(feature = "lua")]
+    let mut runner: Option<crate::scripting::lua::LuaScriptRunner> = build_runner(&pool);
+
     // Process commands as they come in
     while let Some(command) = tokio::select! {
         command = rx.recv() => command,
@@ -32,7 +41,13 @@ pub async fn manager(
     } {
         match command {
             FetchManagerCommand::RefreshFeed(feed_id) => {
-                let _ = refresh_feed(&client, feed_id, pool.clone())
+                #[cfg(feature = "lua")]
+                let script_runner: Option<&dyn ScriptRunner> =
+                    runner.as_ref().map(|r| r as &dyn ScriptRunner);
+                #[cfg(not(feature = "lua"))]
+                let script_runner: Option<&dyn ScriptRunner> = None;
+
+                let _ = refresh_feed(&client, feed_id, pool.clone(), script_runner)
                     .await
                     .inspect_err(|e| {
                         error!(
@@ -41,10 +56,58 @@ pub async fn manager(
                         );
                     });
             }
+
+            #[cfg(feature = "lua")]
+            FetchManagerCommand::ReloadScripts => {
+                debug!("Reloading LuaScriptRunner from database");
+                runner = build_runner(&pool);
+                info!("LuaScriptRunner reloaded");
+            }
         }
     }
 
     Ok(())
+}
+
+/// Load all Lua script source texts from the database.
+#[cfg(feature = "lua")]
+fn load_all_script_sources(
+    conn: &r2d2::PooledConnection<SqliteConnectionManager>,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT text FROM scripts ORDER BY id")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Build a [`LuaScriptRunner`] from all scripts currently in the database.
+///
+/// Returns `None` and logs a warning if the runner cannot be constructed.
+#[cfg(feature = "lua")]
+fn build_runner(
+    pool: &Pool<SqliteConnectionManager>,
+) -> Option<crate::scripting::lua::LuaScriptRunner> {
+    match pool.get() {
+        Ok(conn) => match load_all_script_sources(&conn) {
+            Ok(sources) => match crate::scripting::lua::LuaScriptRunner::new(&sources) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    warn!("failed to compile Lua scripts: {}", e);
+                    None
+                }
+            },
+            Err(e) => {
+                error!("failed to load script sources from database: {}", e);
+                None
+            }
+        },
+        Err(e) => {
+            error!(
+                "failed to get DB connection while building script runner: {}",
+                e
+            );
+            None
+        }
+    }
 }
 
 /// Refresh the feed corresponding to the provided `feed_id`.
@@ -52,6 +115,7 @@ pub(crate) async fn refresh_feed(
     client: &reqwest::Client,
     feed_id: i64,
     pool: Pool<SqliteConnectionManager>,
+    script_runner: Option<&dyn ScriptRunner>,
 ) -> Result<()> {
     // Get the feed URL and headers from the database
     let conn = pool.get()?;
@@ -126,39 +190,6 @@ pub(crate) async fn refresh_feed(
     } else {
         return Ok(());
     };
-
-    // Load Lua scripts associated with this feed (only when the lua feature is enabled).
-    #[cfg(feature = "lua")]
-    let lua_runner: Option<crate::scripting::lua::LuaScriptRunner> = {
-        let sources: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT s.text FROM scripts s
-                 INNER JOIN feed_scripts fs ON fs.script_id = s.id
-                 WHERE fs.feed_id = ?1",
-            )?;
-            let rows = stmt.query_map([feed_id], |row| row.get(0))?;
-            let collected: Result<Vec<String>, _> = rows.collect();
-            collected?
-        };
-        if sources.is_empty() {
-            None
-        } else {
-            match crate::scripting::lua::LuaScriptRunner::new(&sources) {
-                Ok(runner) => Some(runner),
-                Err(e) => {
-                    warn!("failed to load scripts for feed {}: {}", feed_id, e);
-                    None
-                }
-            }
-        }
-    };
-
-    // Build a unified trait-object reference regardless of which backend is active.
-    #[cfg(feature = "lua")]
-    let script_runner: Option<&dyn ScriptRunner> =
-        lua_runner.as_ref().map(|r| r as &dyn ScriptRunner);
-    #[cfg(not(feature = "lua"))]
-    let script_runner: Option<&dyn ScriptRunner> = None;
 
     // Attempt to parse content as Atom, with fallback to RSS.
     if let Ok(feed) = atom_syndication::Feed::read_from(&content[..]) {
@@ -605,7 +636,7 @@ mod tests {
         let feed_id = conn.last_insert_rowid();
 
         conn.execute(
-            "INSERT INTO scripts (lang, text) VALUES ('lua', ?1)",
+            "INSERT INTO scripts (engine, text) VALUES ('lua', ?1)",
             [script_text],
         )?;
         let script_id = conn.last_insert_rowid();
@@ -630,7 +661,12 @@ mod tests {
         let (feed_id, client, pool) =
             setup_feed_with_script(&tc, "return function(entry) return nil end").await?;
 
-        refresh_feed(&client, feed_id, pool).await?;
+        let runner = {
+            let conn = pool.get()?;
+            let sources = load_all_script_sources(&conn)?;
+            crate::scripting::lua::LuaScriptRunner::new(&sources)?
+        };
+        refresh_feed(&client, feed_id, pool, Some(&runner as &dyn ScriptRunner)).await?;
 
         let conn = tc.database_conn()?;
         let count: i64 = conn.query_row(
@@ -653,7 +689,12 @@ mod tests {
         )
         .await?;
 
-        refresh_feed(&client, feed_id, pool).await?;
+        let runner = {
+            let conn = pool.get()?;
+            let sources = load_all_script_sources(&conn)?;
+            crate::scripting::lua::LuaScriptRunner::new(&sources)?
+        };
+        refresh_feed(&client, feed_id, pool, Some(&runner as &dyn ScriptRunner)).await?;
 
         let conn = tc.database_conn()?;
         let mut stmt = conn.prepare("SELECT title FROM entries WHERE feed_id = ?1")?;
@@ -682,7 +723,12 @@ mod tests {
         )
         .await?;
 
-        refresh_feed(&client, feed_id, pool).await?;
+        let runner = {
+            let conn = pool.get()?;
+            let sources = load_all_script_sources(&conn)?;
+            crate::scripting::lua::LuaScriptRunner::new(&sources)?
+        };
+        refresh_feed(&client, feed_id, pool, Some(&runner as &dyn ScriptRunner)).await?;
 
         let conn = tc.database_conn()?;
         let entry_count: i64 = conn.query_row(
@@ -724,14 +770,14 @@ mod tests {
 
         // Insert the filter script first so it runs first in the chain.
         conn.execute(
-            "INSERT INTO scripts (lang, text) VALUES ('lua', 'return function(entry) return nil end')",
+            "INSERT INTO scripts (engine, text) VALUES ('lua', 'return function(entry) return nil end')",
             [],
         )?;
         let filter_script_id = conn.last_insert_rowid();
 
         // Insert the tagging script second.
         conn.execute(
-            "INSERT INTO scripts (lang, text) VALUES ('lua', 'return function(entry) table.insert(entry.tags, \"should-not-appear\"); return entry end')",
+            "INSERT INTO scripts (engine, text) VALUES ('lua', 'return function(entry) table.insert(entry.tags, \"should-not-appear\"); return entry end')",
             [],
         )?;
         let tag_script_id = conn.last_insert_rowid();
@@ -750,7 +796,12 @@ mod tests {
             .build()?;
         let pool = make_pool(&tc.database_path())?;
 
-        refresh_feed(&client, feed_id, pool).await?;
+        let runner = {
+            let conn = pool.get()?;
+            let sources = load_all_script_sources(&conn)?;
+            crate::scripting::lua::LuaScriptRunner::new(&sources)?
+        };
+        refresh_feed(&client, feed_id, pool, Some(&runner as &dyn ScriptRunner)).await?;
 
         let conn = tc.database_conn()?;
         let entry_count: i64 = conn.query_row(

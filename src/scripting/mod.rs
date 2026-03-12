@@ -91,7 +91,7 @@ pub struct FeedEntry {
 /// Errors during script execution should be logged internally and the entry should pass
 /// through **unmodified** rather than being silently dropped — only unrecoverable failures
 /// should surface as `Err`.
-pub trait ScriptRunner {
+pub trait ScriptRunner: Send + Sync {
     /// Pass `entry` through the configured scripts.
     ///
     /// # Return values

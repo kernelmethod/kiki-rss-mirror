@@ -89,6 +89,10 @@ impl FromLua for FeedEntry {
 
 /// Runs a sequence of Lua scripts against feed entries.
 ///
+/// All registered scripts are applied in order to every entry, regardless of which feed
+/// the entry belongs to.  Scripts receive the entry's `feed_id` as a read-only field and
+/// can use it to selectively modify or filter entries from specific feeds.
+///
 /// # Sandboxing
 ///
 /// The Lua VM is initialised with a restricted standard library (`string`, `table`, `math`,
