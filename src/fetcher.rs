@@ -3,6 +3,7 @@ use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
+use reqwest::Url;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -19,7 +20,7 @@ pub async fn manager(
     token: CancellationToken,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
     // Process commands as they come in
@@ -130,19 +131,56 @@ async fn retrieve_feed(
 ) -> Result<Option<Vec<u8>>> {
     let conn = pool.get().unwrap();
 
-    // Build the request with conditional headers if they exist
-    let mut request = client.get(feed_url).header("User-Agent", USER_AGENT);
+    let mut current_url = feed_url.to_string();
+    let mut had_permanent_redirect = false;
+    let max_redirects = 10;
 
-    if let Some(etag) = etag {
-        request = request.header("If-None-Match", etag);
-    }
+    let resp = 'redirect: {
+        for _ in 0..=max_redirects {
+            // Only send conditional headers on the first request
+            let mut request = client.get(&current_url).header("User-Agent", USER_AGENT);
+            if current_url == feed_url {
+                if let Some(etag) = etag {
+                    request = request.header("If-None-Match", etag);
+                }
+                if let Some(last_modified) = last_modified {
+                    request = request.header("If-Modified-Since", last_modified);
+                }
+            }
 
-    if let Some(last_modified) = last_modified {
-        request = request.header("If-Modified-Since", last_modified);
-    }
+            let resp = request.send().await?;
 
-    // Make HTTP request to fetch the feed
-    let resp = request.send().await?;
+            if resp.status().is_redirection() {
+                let location = resp
+                    .headers()
+                    .get("location")
+                    .and_then(|h| h.to_str().ok())
+                    .ok_or_else(|| anyhow::anyhow!("Redirect response missing Location header"))?
+                    .to_string();
+
+                // 301 Moved Permanently and 308 Permanent Redirect both indicate a
+                // permanent move
+                if resp.status() == reqwest::StatusCode::MOVED_PERMANENTLY
+                    || resp.status() == reqwest::StatusCode::PERMANENT_REDIRECT
+                {
+                    had_permanent_redirect = true;
+                }
+
+                // Resolve the Location against the current URL to handle relative redirects
+                let base = Url::parse(&current_url)?;
+                current_url = base.join(&location)?.to_string();
+                continue;
+            }
+
+            break 'redirect resp;
+        }
+
+        warn!(
+            "Feed {} exceeded maximum redirects while fetching {}",
+            feed_id, feed_url
+        );
+        return Ok(None);
+    };
 
     // Check if the feed was modified
     match resp.status() {
@@ -165,6 +203,18 @@ async fn retrieve_feed(
             );
             return Ok(None);
         }
+    }
+
+    // If we followed a permanent redirect, update the stored URL in the database
+    if had_permanent_redirect && current_url != feed_url {
+        info!(
+            "Feed {} permanently redirected from {} to {}; updating stored URL",
+            feed_id, feed_url, current_url
+        );
+        conn.execute(
+            "UPDATE feeds SET url = ?1 WHERE id = ?2",
+            (&current_url, feed_id),
+        )?;
     }
 
     // Update the feed's headers in the database
