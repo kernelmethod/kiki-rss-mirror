@@ -21,6 +21,7 @@ pub async fn manager(
 ) -> Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .user_agent(USER_AGENT)
         .build()?;
 
     // Process commands as they come in
@@ -138,7 +139,7 @@ async fn retrieve_feed(
     let resp = 'redirect: {
         for _ in 0..=max_redirects {
             // Only send conditional headers on the first request
-            let mut request = client.get(&current_url).header("User-Agent", USER_AGENT);
+            let mut request = client.get(&current_url);
             if current_url == feed_url {
                 if let Some(etag) = etag {
                     request = request.header("If-None-Match", etag);
