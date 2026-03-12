@@ -1,0 +1,77 @@
+use utoipa::OpenApi;
+
+/// OpenAPI documentation for the kiki-rss API.
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        crate::routes::v1::root::root,
+        crate::routes::v1::health::health,
+        crate::routes::v1::feeds::add_feed::add_feed,
+        crate::routes::v1::feeds::list_feeds::list_feeds,
+        crate::routes::v1::feeds::get_feed::get_feed,
+        crate::routes::v1::feeds::update_feed::update_feed,
+        crate::routes::v1::feeds::delete_feed::delete_feed,
+        crate::routes::v1::feeds::fetch_feed::fetch_feed,
+        crate::routes::v1::feeds::fetch_all_feeds::fetch_all_feeds,
+        crate::routes::v1::feeds::feed_entries::feed_entries,
+        crate::routes::v1::feeds::export_opml::export_opml,
+        crate::routes::v1::feeds::import_opml::import_opml,
+        crate::routes::v1::entries::list_entries::list_entries,
+        crate::routes::v1::entries::get_entry::get_entry,
+        crate::routes::v1::entries::delete_entry::delete_entry,
+        crate::routes::v1::tags::list_tags::list_tags,
+        crate::routes::v1::tags::create_tag::create_tag,
+        crate::routes::v1::tags::get_tag::get_tag,
+        crate::routes::v1::tags::update_tag::update_tag,
+        crate::routes::v1::tags::delete_tag::delete_tag,
+        crate::routes::v1::tags::tag_feeds::tag_feeds,
+        crate::routes::v1::tags::tag_entries::tag_entries,
+        crate::routes::v1::tags::feed_tags::get_feed_tags,
+        crate::routes::v1::tags::feed_tags::set_feed_tags,
+        crate::routes::v1::tags::entry_tags::get_entry_tags,
+        crate::routes::v1::tags::entry_tags::set_entry_tags,
+    ),
+    components(
+        schemas(
+            crate::routes::v1::root::RootResponse,
+            crate::routes::v1::health::HealthResponse,
+            crate::routes::v1::feeds::add_feed::AddFeedRequest,
+            crate::routes::v1::feeds::add_feed::AddFeedResponse,
+            crate::routes::v1::feeds::list_feeds::ListFeedsResponse,
+            crate::routes::v1::feeds::get_feed::GetFeedResponse,
+            crate::routes::v1::feeds::update_feed::UpdateFeedRequest,
+            crate::routes::v1::feeds::update_feed::UpdateFeedResponse,
+            crate::routes::v1::feeds::fetch_all_feeds::FetchAllFeedsResponse,
+            crate::routes::v1::feeds::feed_entries::FeedEntriesResponse,
+            crate::routes::v1::feeds::import_opml::ImportOpmlResponse,
+            crate::routes::v1::entries::list_entries::ListEntriesResponseEntry,
+            crate::routes::v1::entries::list_entries::ListEntriesResponse,
+            crate::routes::v1::entries::get_entry::GetEntryResponse,
+            crate::routes::v1::tags::list_tags::TagResponse,
+            crate::routes::v1::tags::list_tags::ListTagsResponse,
+            crate::routes::v1::tags::create_tag::CreateTagRequest,
+            crate::routes::v1::tags::create_tag::CreateTagResponse,
+            crate::routes::v1::tags::get_tag::GetTagResponse,
+            crate::routes::v1::tags::update_tag::UpdateTagRequest,
+            crate::routes::v1::tags::update_tag::UpdateTagResponse,
+            crate::routes::v1::tags::feed_tags::SetFeedTagsRequest,
+            crate::routes::v1::tags::feed_tags::GetFeedTagsResponse,
+            crate::routes::v1::tags::entry_tags::SetEntryTagsRequest,
+            crate::routes::v1::tags::entry_tags::GetEntryTagsResponse,
+            crate::routes::v1::tags::tag_feeds::TagFeedsResponse,
+            crate::routes::v1::tags::tag_entries::TagEntriesResponse,
+        )
+    ),
+    tags(
+        (name = "meta", description = "Server status and version information"),
+        (name = "feeds", description = "Manage RSS/Atom feed subscriptions"),
+        (name = "entries", description = "Access and manage feed entries"),
+        (name = "tags", description = "Organize feeds and entries with tags"),
+    ),
+    info(
+        title = "kiki-rss",
+        description = "A self-hosted RSS/Atom feed aggregator API",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+)]
+pub struct ApiDoc;

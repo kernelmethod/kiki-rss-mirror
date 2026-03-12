@@ -13,13 +13,15 @@ use tracing::{event, Level};
 
 const DEFAULT_LIMIT: usize = 50;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 pub struct TagFeedsQueryParams {
+    /// Number of records to skip (default: 0).
     pub offset: Option<usize>,
+    /// Maximum number of records to return (default: 50).
     pub limit: Option<usize>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct TagFeedsResponse {
     pub feeds: Vec<GetFeedResponse>,
     pub count: usize,
@@ -37,6 +39,20 @@ enum TagFeedsTaskError {
 }
 
 /// Route handler for listing feeds associated with a tag.
+#[utoipa::path(
+    get,
+    path = "/v1/tags/id/{id}/feeds",
+    params(
+        ("id" = i64, Path, description = "Tag ID"),
+        TagFeedsQueryParams,
+    ),
+    responses(
+        (status = 200, description = "Feeds associated with the tag", body = TagFeedsResponse),
+        (status = 404, description = "Tag not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "tags"
+)]
 #[axum::debug_handler]
 pub async fn tag_feeds(
     State(state): State<AppState>,

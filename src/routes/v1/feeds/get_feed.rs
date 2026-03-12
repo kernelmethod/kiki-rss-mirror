@@ -8,16 +8,30 @@ use axum::{
 use tokio::task;
 use tracing::{event, Level};
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 pub struct GetFeedResponse {
     pub id: i64,
     pub title: String,
     pub url: String,
     pub description: Option<String>,
+    /// Last checked time in RFC3339 format.
     pub last_checked: Option<String>,
 }
 
 /// Route handler for fetching a single feed's information.
+#[utoipa::path(
+    get,
+    path = "/v1/feeds/id/{id}",
+    params(
+        ("id" = i64, Path, description = "Feed ID"),
+    ),
+    responses(
+        (status = 200, description = "Feed found", body = GetFeedResponse),
+        (status = 404, description = "Feed not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "feeds"
+)]
 #[axum::debug_handler]
 pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let conn = match state.conn_pool.get() {

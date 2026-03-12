@@ -8,13 +8,15 @@ use serde::{Deserialize, Serialize};
 use tokio::task;
 use tracing::{event, Level};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct GetEntryResponse {
     pub id: i64,
     pub feed_id: i64,
     pub source_id: Option<i64>,
+    /// Syndication format: "rss" or "atom".
     pub syndication_format: String,
     pub guid: String,
+    /// Publication time in RFC3339 format.
     pub published_at: Option<String>,
     pub title: String,
     pub url: String,
@@ -23,6 +25,20 @@ pub struct GetEntryResponse {
     pub status_favorite: i32,
 }
 
+/// Route handler for fetching a single entry by ID.
+#[utoipa::path(
+    get,
+    path = "/v1/entries/id/{id}",
+    params(
+        ("id" = i64, Path, description = "Entry ID"),
+    ),
+    responses(
+        (status = 200, description = "Entry found", body = GetEntryResponse),
+        (status = 404, description = "Entry not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "entries"
+)]
 pub async fn get_entry(
     State(state): State<AppState>,
     Path(id): Path<i64>,

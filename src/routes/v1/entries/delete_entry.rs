@@ -6,6 +6,20 @@ use axum::{
 use tokio::task;
 use tracing::{event, Level};
 
+/// Route handler for deleting an entry by ID.
+#[utoipa::path(
+    delete,
+    path = "/v1/entries/id/{id}",
+    params(
+        ("id" = i64, Path, description = "Entry ID"),
+    ),
+    responses(
+        (status = 204, description = "Entry deleted successfully"),
+        (status = 404, description = "Entry not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "entries"
+)]
 pub async fn delete_entry(
     State(state): State<AppState>,
     Path(id): Path<i64>,

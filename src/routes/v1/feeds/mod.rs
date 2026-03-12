@@ -1,13 +1,13 @@
-mod add_feed;
-mod delete_feed;
-mod export_opml;
-mod feed_entries;
-mod fetch_all_feeds;
-mod fetch_feed;
+pub mod add_feed;
+pub mod delete_feed;
+pub mod export_opml;
+pub mod feed_entries;
+pub mod fetch_all_feeds;
+pub mod fetch_feed;
 pub mod get_feed;
-mod import_opml;
-mod list_feeds;
-mod update_feed;
+pub mod import_opml;
+pub mod list_feeds;
+pub mod update_feed;
 
 use add_feed::add_feed;
 use delete_feed::delete_feed;

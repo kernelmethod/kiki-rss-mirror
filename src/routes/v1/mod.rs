@@ -1,8 +1,9 @@
-mod entries;
-mod feeds;
-mod health;
-mod root;
-mod tags;
+pub mod docs;
+pub mod entries;
+pub mod feeds;
+pub mod health;
+pub mod root;
+pub mod tags;
 
 use crate::server::AppState;
 use axum::{routing::get, Router};

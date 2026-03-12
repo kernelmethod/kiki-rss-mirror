@@ -2,7 +2,7 @@ use crate::{db::SCHEMA_VERSION, server::AppState};
 use axum::{extract::State, http::StatusCode, Json};
 use clap::crate_version;
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct RootResponse<'a> {
     version: &'a str,
     schema_version: &'a str,
@@ -14,6 +14,14 @@ const ROOT: RootResponse = RootResponse {
 };
 
 /// Route handler for the root url, `/`.
+#[utoipa::path(
+    get,
+    path = "/v1/",
+    responses(
+        (status = 200, description = "API version and schema version", body = RootResponse),
+    ),
+    tag = "meta"
+)]
 #[axum::debug_handler]
 pub async fn root(State(_state): State<AppState>) -> (StatusCode, Json<RootResponse<'static>>) {
     (StatusCode::OK, Json(ROOT))

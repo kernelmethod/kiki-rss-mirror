@@ -10,9 +10,11 @@ use tracing::{event, Level};
 
 pub const DEFAULT_LIMIT: usize = 50;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 pub struct ListEntriesQueryParams {
+    /// Number of records to skip (default: 0).
     pub offset: Option<usize>,
+    /// Maximum number of records to return (default: 50).
     pub limit: Option<usize>,
 }
 
@@ -21,13 +23,15 @@ pub struct ListEntriesError {
     pub message: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct ListEntriesResponseEntry {
     pub id: i64,
     pub feed_id: i64,
     pub source_id: Option<i64>,
+    /// Syndication format: "rss" or "atom".
     pub syndication_format: String,
     pub guid: String,
+    /// Publication time in RFC3339 format.
     pub published_at: Option<String>,
     pub title: String,
     pub url: String,
@@ -36,7 +40,7 @@ pub struct ListEntriesResponseEntry {
     pub status_favorite: i32,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct ListEntriesResponse {
     pub entries: Vec<ListEntriesResponseEntry>,
     pub count: usize,
@@ -52,6 +56,17 @@ impl Default for ListEntriesError {
     }
 }
 
+/// Route handler for listing all feed entries.
+#[utoipa::path(
+    get,
+    path = "/v1/entries",
+    params(ListEntriesQueryParams),
+    responses(
+        (status = 200, description = "List of feed entries", body = ListEntriesResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "entries"
+)]
 pub async fn list_entries(
     State(state): State<AppState>,
     Query(params): Query<ListEntriesQueryParams>,

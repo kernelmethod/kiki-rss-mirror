@@ -1,9 +1,11 @@
-mod v1;
+pub mod v1;
 
 use crate::server::AppState;
 use axum::{http::StatusCode, Router};
 use std::time::Duration;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 async fn api_fallback() -> (StatusCode, &'static str) {
     (StatusCode::NOT_FOUND, "Not Found")
@@ -12,6 +14,7 @@ async fn api_fallback() -> (StatusCode, &'static str) {
 pub fn create_router() -> Router<AppState> {
     Router::new()
         .nest("/v1/", v1::create_router())
+        .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", v1::docs::ApiDoc::openapi()))
         .fallback(api_fallback)
         .layer((
             TraceLayer::new_for_http(),

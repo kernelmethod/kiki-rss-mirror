@@ -1,6 +1,6 @@
-mod delete_entry;
-mod get_entry;
-mod list_entries;
+pub mod delete_entry;
+pub mod get_entry;
+pub mod list_entries;
 
 use delete_entry::delete_entry;
 use get_entry::get_entry;

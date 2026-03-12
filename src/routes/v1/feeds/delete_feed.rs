@@ -8,6 +8,19 @@ use tokio::task;
 use tracing::{event, Level};
 
 /// Route handler for deleting a feed.
+#[utoipa::path(
+    delete,
+    path = "/v1/feeds/id/{id}",
+    params(
+        ("id" = i64, Path, description = "Feed ID"),
+    ),
+    responses(
+        (status = 204, description = "Feed deleted successfully"),
+        (status = 404, description = "Feed not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "feeds"
+)]
 #[axum::debug_handler]
 pub async fn delete_feed(
     State(state): State<AppState>,

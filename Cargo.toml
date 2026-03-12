@@ -22,6 +22,8 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1.0", features = ["serde_derive"] }
 mlua = { version = "0.10", features = ["luajit", "vendored"], optional = true }
 thiserror = "2.0.18"
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
 tokio = { version = ">=1.40,<1.45", features = ["full"] }
 tokio-util = "0.7"
 tower-http = { version = "^0.6.5", features = ["trace", "timeout"] }

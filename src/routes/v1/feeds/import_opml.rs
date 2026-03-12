@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::task;
 use tracing::{event, Level};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ImportOpmlResponse {
     pub imported: usize,
 }
@@ -30,6 +30,18 @@ struct OpmlFeed {
 /// Accepts raw OPML XML in the request body. Parses outline elements,
 /// creates feeds and tags, and associates tags based on the OPML folder
 /// structure. Triggers a fetch for each newly imported feed.
+#[utoipa::path(
+    post,
+    path = "/v1/feeds/import",
+    request_body(content = String, content_type = "application/xml", description = "OPML XML data"),
+    responses(
+        (status = 201, description = "Feeds imported successfully", body = ImportOpmlResponse),
+        (status = 200, description = "No feeds imported (empty OPML)", body = ImportOpmlResponse),
+        (status = 400, description = "Invalid OPML format"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "feeds"
+)]
 #[axum::debug_handler]
 pub async fn import_opml(
     State(state): State<AppState>,

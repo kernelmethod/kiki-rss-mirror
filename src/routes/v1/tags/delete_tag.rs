@@ -8,6 +8,19 @@ use tokio::task;
 use tracing::{event, Level};
 
 /// Route handler for deleting a tag.
+#[utoipa::path(
+    delete,
+    path = "/v1/tags/id/{id}",
+    params(
+        ("id" = i64, Path, description = "Tag ID"),
+    ),
+    responses(
+        (status = 204, description = "Tag deleted successfully"),
+        (status = 404, description = "Tag not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "tags"
+)]
 #[axum::debug_handler]
 pub async fn delete_tag(
     State(state): State<AppState>,

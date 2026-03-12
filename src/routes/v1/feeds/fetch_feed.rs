@@ -8,6 +8,18 @@ use axum::{
 use tracing::{event, Level};
 
 /// Route handler for fetching a single feed.
+#[utoipa::path(
+    post,
+    path = "/v1/feeds/fetch/{id}",
+    params(
+        ("id" = i64, Path, description = "Feed ID"),
+    ),
+    responses(
+        (status = 202, description = "Fetch queued successfully"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "feeds"
+)]
 #[axum::debug_handler]
 pub async fn fetch_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     // Send a command to the feed fetcher workers to refresh this feed

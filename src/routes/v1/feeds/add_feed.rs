@@ -6,18 +6,28 @@ use tracing::{event, Level};
 
 struct AddFeedQueryResult(i64);
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 pub struct AddFeedRequest {
     pub title: String,
     pub url: String,
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 pub struct AddFeedResponse {
     pub id: i64,
 }
 
 /// Route handler for adding a new feed.
+#[utoipa::path(
+    post,
+    path = "/v1/feeds/create",
+    request_body = AddFeedRequest,
+    responses(
+        (status = 201, description = "Feed created successfully", body = AddFeedResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "feeds"
+)]
 #[axum::debug_handler]
 pub async fn add_feed(
     State(state): State<AppState>,

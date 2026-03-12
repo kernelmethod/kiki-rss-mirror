@@ -11,19 +11,21 @@ use tracing::{event, Level};
 
 const DEFAULT_LIMIT: usize = 50;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 pub struct ListTagsQueryParams {
+    /// Number of records to skip (default: 0).
     pub offset: Option<usize>,
+    /// Maximum number of records to return (default: 50).
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct TagResponse {
     pub id: i64,
     pub name: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct ListTagsResponse {
     pub tags: Vec<TagResponse>,
     pub count: usize,
@@ -32,6 +34,16 @@ pub struct ListTagsResponse {
 }
 
 /// Route handler for listing all tags.
+#[utoipa::path(
+    get,
+    path = "/v1/tags",
+    params(ListTagsQueryParams),
+    responses(
+        (status = 200, description = "List of tags", body = ListTagsResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "tags"
+)]
 #[axum::debug_handler]
 pub async fn list_tags(
     State(state): State<AppState>,

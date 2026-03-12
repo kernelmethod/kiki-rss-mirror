@@ -11,9 +11,11 @@ use tracing::{event, Level};
 
 const DEFAULT_LIMIT: usize = 50;
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::IntoParams)]
 pub struct ListFeedsQueryParams {
+    /// Number of records to skip (default: 0).
     pub offset: Option<usize>,
+    /// Maximum number of records to return (default: 50).
     pub limit: Option<usize>,
 }
 
@@ -22,7 +24,7 @@ pub struct ListFeedsError {
     pub message: String,
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 pub struct ListFeedsResponse {
     pub feeds: Vec<get_feed::GetFeedResponse>,
     pub count: usize,
@@ -39,6 +41,16 @@ impl Default for ListFeedsError {
 }
 
 /// Route handler for listing all of the available feeds.
+#[utoipa::path(
+    get,
+    path = "/v1/feeds",
+    params(ListFeedsQueryParams),
+    responses(
+        (status = 200, description = "List of feeds", body = ListFeedsResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "feeds"
+)]
 #[axum::debug_handler]
 pub async fn list_feeds(
     State(state): State<AppState>,

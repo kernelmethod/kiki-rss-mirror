@@ -9,13 +9,26 @@ use serde::{Deserialize, Serialize};
 use tokio::task;
 use tracing::{event, Level};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct GetTagResponse {
     pub id: i64,
     pub name: String,
 }
 
 /// Route handler for getting a single tag by ID.
+#[utoipa::path(
+    get,
+    path = "/v1/tags/id/{id}",
+    params(
+        ("id" = i64, Path, description = "Tag ID"),
+    ),
+    responses(
+        (status = 200, description = "Tag found", body = GetTagResponse),
+        (status = 404, description = "Tag not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "tags"
+)]
 #[axum::debug_handler]
 pub async fn get_tag(
     State(state): State<AppState>,

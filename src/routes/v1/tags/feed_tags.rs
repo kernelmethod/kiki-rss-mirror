@@ -12,12 +12,12 @@ use tracing::{event, Level};
 
 use super::list_tags::TagResponse;
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct SetFeedTagsRequest {
     pub tag_ids: Vec<i64>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct GetFeedTagsResponse {
     pub tags: Vec<TagResponse>,
 }
@@ -35,6 +35,19 @@ enum FeedTagsTaskError {
 }
 
 /// Route handler for getting tags associated with a feed.
+#[utoipa::path(
+    get,
+    path = "/v1/feeds/id/{id}/tags",
+    params(
+        ("id" = i64, Path, description = "Feed ID"),
+    ),
+    responses(
+        (status = 200, description = "Tags for the feed", body = GetFeedTagsResponse),
+        (status = 404, description = "Feed not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "feeds"
+)]
 #[axum::debug_handler]
 pub async fn get_feed_tags(
     State(state): State<AppState>,
@@ -95,6 +108,21 @@ pub async fn get_feed_tags(
 }
 
 /// Route handler for setting tags on a feed (replaces existing).
+#[utoipa::path(
+    put,
+    path = "/v1/feeds/id/{id}/tags",
+    params(
+        ("id" = i64, Path, description = "Feed ID"),
+    ),
+    request_body = SetFeedTagsRequest,
+    responses(
+        (status = 200, description = "Tags updated for the feed", body = GetFeedTagsResponse),
+        (status = 400, description = "One or more tag IDs not found"),
+        (status = 404, description = "Feed not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "feeds"
+)]
 #[axum::debug_handler]
 pub async fn set_feed_tags(
     State(state): State<AppState>,

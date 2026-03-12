@@ -10,12 +10,12 @@ use thiserror::Error;
 use tokio::task;
 use tracing::{event, Level};
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UpdateTagRequest {
     pub name: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UpdateTagResponse {
     pub id: i64,
     pub name: String,
@@ -34,6 +34,21 @@ enum UpdateTagTaskError {
 }
 
 /// Route handler for updating a tag (rename).
+#[utoipa::path(
+    put,
+    path = "/v1/tags/id/{id}",
+    params(
+        ("id" = i64, Path, description = "Tag ID"),
+    ),
+    request_body = UpdateTagRequest,
+    responses(
+        (status = 200, description = "Tag updated successfully", body = UpdateTagResponse),
+        (status = 404, description = "Tag not found"),
+        (status = 409, description = "Tag name already exists"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "tags"
+)]
 #[axum::debug_handler]
 pub async fn update_tag(
     State(state): State<AppState>,

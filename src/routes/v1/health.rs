@@ -9,7 +9,7 @@ use serde::Serialize;
 use tokio::task;
 use tracing::{event, Level};
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct HealthResponse {
     pub status: String,
     pub feed_count: usize,
@@ -17,6 +17,15 @@ pub struct HealthResponse {
 }
 
 /// Route handler for the health check endpoint.
+#[utoipa::path(
+    get,
+    path = "/v1/health",
+    responses(
+        (status = 200, description = "Service is healthy", body = HealthResponse),
+        (status = 503, description = "Service unavailable"),
+    ),
+    tag = "meta"
+)]
 #[axum::debug_handler]
 pub async fn health(State(state): State<AppState>) -> Result<Response, Response> {
     let conn = state.conn_pool.get().map_err(|e| {

@@ -10,12 +10,12 @@ use thiserror::Error;
 use tokio::task;
 use tracing::{event, Level};
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct CreateTagRequest {
     pub name: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct CreateTagResponse {
     pub id: i64,
     pub name: String,
@@ -31,6 +31,17 @@ enum CreateTagTaskError {
 }
 
 /// Route handler for creating a new tag.
+#[utoipa::path(
+    post,
+    path = "/v1/tags/create",
+    request_body = CreateTagRequest,
+    responses(
+        (status = 201, description = "Tag created successfully", body = CreateTagResponse),
+        (status = 409, description = "Tag already exists"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "tags"
+)]
 #[axum::debug_handler]
 pub async fn create_tag(
     State(state): State<AppState>,

@@ -21,6 +21,15 @@ struct FeedWithTags {
 ///
 /// Feeds are grouped into folders by tag. Untagged feeds appear at the
 /// top level. Feeds with multiple tags appear in each corresponding folder.
+#[utoipa::path(
+    get,
+    path = "/v1/feeds/export",
+    responses(
+        (status = 200, description = "OPML export of all feeds", content_type = "application/xml"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "feeds"
+)]
 #[axum::debug_handler]
 pub async fn export_opml(State(state): State<AppState>) -> Result<Response, Response> {
     let conn = state.conn_pool.get().map_err(|e| {

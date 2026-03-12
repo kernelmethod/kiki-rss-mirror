@@ -10,12 +10,21 @@ use serde::Serialize;
 use tokio::task;
 use tracing::{event, Level};
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct FetchAllFeedsResponse {
     pub queued: usize,
 }
 
 /// Route handler for triggering a refresh of all feeds.
+#[utoipa::path(
+    post,
+    path = "/v1/feeds/fetch",
+    responses(
+        (status = 202, description = "All feeds queued for refresh", body = FetchAllFeedsResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "feeds"
+)]
 #[axum::debug_handler]
 pub async fn fetch_all_feeds(State(state): State<AppState>) -> Result<Response, Response> {
     let conn = state.conn_pool.get().map_err(|e| {

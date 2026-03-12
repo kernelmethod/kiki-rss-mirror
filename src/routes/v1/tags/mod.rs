@@ -1,12 +1,12 @@
-mod create_tag;
-mod delete_tag;
+pub mod create_tag;
+pub mod delete_tag;
 pub mod entry_tags;
 pub mod feed_tags;
-mod get_tag;
+pub mod get_tag;
 pub mod list_tags;
-mod tag_entries;
-mod tag_feeds;
-mod update_tag;
+pub mod tag_entries;
+pub mod tag_feeds;
+pub mod update_tag;
 
 use create_tag::create_tag;
 use delete_tag::delete_tag;

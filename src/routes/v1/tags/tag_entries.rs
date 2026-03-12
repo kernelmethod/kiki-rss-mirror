@@ -13,13 +13,15 @@ use tracing::{event, Level};
 
 const DEFAULT_LIMIT: usize = 50;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 pub struct TagEntriesQueryParams {
+    /// Number of records to skip (default: 0).
     pub offset: Option<usize>,
+    /// Maximum number of records to return (default: 50).
     pub limit: Option<usize>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct TagEntriesResponse {
     pub entries: Vec<ListEntriesResponseEntry>,
     pub count: usize,
@@ -37,6 +39,20 @@ enum TagEntriesTaskError {
 }
 
 /// Route handler for listing entries associated with a tag.
+#[utoipa::path(
+    get,
+    path = "/v1/tags/id/{id}/entries",
+    params(
+        ("id" = i64, Path, description = "Tag ID"),
+        TagEntriesQueryParams,
+    ),
+    responses(
+        (status = 200, description = "Entries associated with the tag", body = TagEntriesResponse),
+        (status = 404, description = "Tag not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "tags"
+)]
 #[axum::debug_handler]
 pub async fn tag_entries(
     State(state): State<AppState>,

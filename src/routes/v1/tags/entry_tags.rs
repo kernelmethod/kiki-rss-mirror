@@ -12,12 +12,12 @@ use tracing::{event, Level};
 
 use super::list_tags::TagResponse;
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct SetEntryTagsRequest {
     pub tag_ids: Vec<i64>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct GetEntryTagsResponse {
     pub tags: Vec<TagResponse>,
 }
@@ -35,6 +35,19 @@ enum EntryTagsTaskError {
 }
 
 /// Route handler for getting tags associated with an entry.
+#[utoipa::path(
+    get,
+    path = "/v1/entries/id/{id}/tags",
+    params(
+        ("id" = i64, Path, description = "Entry ID"),
+    ),
+    responses(
+        (status = 200, description = "Tags for the entry", body = GetEntryTagsResponse),
+        (status = 404, description = "Entry not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "entries"
+)]
 #[axum::debug_handler]
 pub async fn get_entry_tags(
     State(state): State<AppState>,
@@ -95,6 +108,21 @@ pub async fn get_entry_tags(
 }
 
 /// Route handler for setting tags on an entry (replaces existing).
+#[utoipa::path(
+    put,
+    path = "/v1/entries/id/{id}/tags",
+    params(
+        ("id" = i64, Path, description = "Entry ID"),
+    ),
+    request_body = SetEntryTagsRequest,
+    responses(
+        (status = 200, description = "Tags updated for the entry", body = GetEntryTagsResponse),
+        (status = 400, description = "One or more tag IDs not found"),
+        (status = 404, description = "Entry not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "entries"
+)]
 #[axum::debug_handler]
 pub async fn set_entry_tags(
     State(state): State<AppState>,

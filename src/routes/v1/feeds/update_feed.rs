@@ -10,14 +10,14 @@ use thiserror::Error;
 use tokio::task;
 use tracing::{event, Level};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateFeedRequest {
     pub title: Option<String>,
     pub url: Option<String>,
     pub description: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateFeedResponse {
     pub id: i64,
     pub title: String,
@@ -38,6 +38,21 @@ enum UpdateFeedTaskError {
 }
 
 /// Route handler for updating a feed.
+#[utoipa::path(
+    put,
+    path = "/v1/feeds/id/{id}",
+    params(
+        ("id" = i64, Path, description = "Feed ID"),
+    ),
+    request_body = UpdateFeedRequest,
+    responses(
+        (status = 200, description = "Feed updated successfully", body = UpdateFeedResponse),
+        (status = 400, description = "No update fields provided"),
+        (status = 404, description = "Feed not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "feeds"
+)]
 #[axum::debug_handler]
 pub async fn update_feed(
     State(state): State<AppState>,
