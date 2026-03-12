@@ -10,6 +10,8 @@ pub mod http;
 pub mod routes;
 pub mod server;
 
+pub mod scripting;
+
 #[cfg(test)]
 pub mod test;
 

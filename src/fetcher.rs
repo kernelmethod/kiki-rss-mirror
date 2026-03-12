@@ -1,4 +1,5 @@
 use crate::http::USER_AGENT;
+use crate::scripting::{FeedEntry, ScriptRunner};
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use r2d2::{Pool, PooledConnection};
@@ -47,7 +48,7 @@ pub async fn manager(
 }
 
 /// Refresh the feed corresponding to the provided `feed_id`.
-async fn refresh_feed(
+pub(crate) async fn refresh_feed(
     client: &reqwest::Client,
     feed_id: i64,
     pool: Pool<SqliteConnectionManager>,
@@ -126,11 +127,44 @@ async fn refresh_feed(
         return Ok(());
     };
 
+    // Load Lua scripts associated with this feed (only when the lua feature is enabled).
+    #[cfg(feature = "lua")]
+    let lua_runner: Option<crate::scripting::lua::LuaScriptRunner> = {
+        let sources: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT s.text FROM scripts s
+                 INNER JOIN feed_scripts fs ON fs.script_id = s.id
+                 WHERE fs.feed_id = ?1",
+            )?;
+            let rows = stmt.query_map([feed_id], |row| row.get(0))?;
+            let collected: Result<Vec<String>, _> = rows.collect();
+            collected?
+        };
+        if sources.is_empty() {
+            None
+        } else {
+            match crate::scripting::lua::LuaScriptRunner::new(&sources) {
+                Ok(runner) => Some(runner),
+                Err(e) => {
+                    warn!("failed to load scripts for feed {}: {}", feed_id, e);
+                    None
+                }
+            }
+        }
+    };
+
+    // Build a unified trait-object reference regardless of which backend is active.
+    #[cfg(feature = "lua")]
+    let script_runner: Option<&dyn ScriptRunner> =
+        lua_runner.as_ref().map(|r| r as &dyn ScriptRunner);
+    #[cfg(not(feature = "lua"))]
+    let script_runner: Option<&dyn ScriptRunner> = None;
+
     // Attempt to parse content as Atom, with fallback to RSS.
     if let Ok(feed) = atom_syndication::Feed::read_from(&content[..]) {
-        process_atom_feed(feed_id, feed, conn)?;
+        process_atom_feed(feed_id, feed, conn, script_runner)?;
     } else if let Ok(channel) = rss::Channel::read_from(&content[..]) {
-        process_rss_feed(feed_id, channel, conn)?;
+        process_rss_feed(feed_id, channel, conn, script_runner)?;
     } else {
         warn!(
             "Feed {} ({}) was not detected as a valid RSS or XML feed",
@@ -297,36 +331,93 @@ fn retrieve_file_feed(
     Ok(Some(content))
 }
 
+/// Extract a [`FeedEntry`] from an Atom syndication entry.
+fn atom_entry_to_feed_entry(feed_id: i64, entry: atom_syndication::Entry) -> FeedEntry {
+    FeedEntry {
+        feed_id,
+        syndication_format: "atom".to_string(),
+        guid: entry.id,
+        published_at: entry.published.map(|d| d.to_utc().timestamp()),
+        title: entry.title.value,
+        url: entry.links.into_iter().next().map(|l| l.href),
+        content: entry.content.and_then(|c| c.value),
+        tags: vec![],
+    }
+}
+
+/// Extract a [`FeedEntry`] from an RSS item.
+fn rss_item_to_feed_entry(feed_id: i64, item: rss::Item) -> FeedEntry {
+    let rss::Item {
+        pub_date,
+        guid,
+        title,
+        link,
+        description,
+        ..
+    } = item;
+
+    let timestamp = pub_date
+        .as_deref()
+        .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+        .map(|d| d.timestamp())
+        .unwrap_or_else(|| Utc::now().timestamp());
+
+    let guid = guid.map(|g| g.value).unwrap_or_else(|| {
+        // Generate a GUID if none exists
+        format!(
+            "rss-{}-{}",
+            timestamp,
+            title.as_deref().unwrap_or("no-title")
+        )
+    });
+
+    FeedEntry {
+        feed_id,
+        syndication_format: "rss".to_string(),
+        guid,
+        published_at: Some(timestamp),
+        title: title.unwrap_or_default(),
+        url: link,
+        content: description,
+        tags: vec![],
+    }
+}
+
 fn process_atom_feed(
     feed_id: i64,
     feed: atom_syndication::Feed,
     conn: PooledConnection<SqliteConnectionManager>,
+    script_runner: Option<&dyn ScriptRunner>,
 ) -> Result<()> {
     info!(
         "Successfully fetched Atom feed {} with {} items",
         feed_id,
-        feed.entries().len()
+        feed.entries.len()
     );
 
-    // Insert or update entries from the Atom feed
-    for entry in feed.entries() {
-        let params = (
-            feed_id,
-            entry.id().to_string(),
-            entry
-                .published()
-                // Attempt to parse using RFC 2822 first; failing that we resort to
-                // RFC 3339.
-                .map(|d| d.to_utc().timestamp()),
-            entry.title().as_str().to_string(),
-            entry.links().first().map(|l| l.href().to_string()),
-            entry
-                .content()
-                .and_then(|c| c.value())
-                .map(|v| v.to_string()),
-        );
+    for entry in feed.entries.into_iter() {
+        let feed_entry = atom_entry_to_feed_entry(feed_id, entry);
 
-        // Insert or update the entry in the database
+        let feed_entry = if let Some(runner) = script_runner {
+            let original = feed_entry.clone();
+            match runner.process_entry(feed_entry) {
+                Ok(Some(e)) => e,
+                Ok(None) => {
+                    debug!("atom entry filtered by script for feed {}", feed_id);
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "script error processing atom entry for feed {}: {}; inserting unmodified",
+                        feed_id, e
+                    );
+                    original
+                }
+            }
+        } else {
+            feed_entry
+        };
+
         conn.execute(
             "INSERT OR REPLACE INTO entries (
                 feed_id,
@@ -335,10 +426,21 @@ fn process_atom_feed(
                 published_at,
                 title,
                 url,
-                content,
+                content
             ) VALUES (?1, 'atom', ?2, ?3, ?4, ?5, ?6)",
-            params,
+            rusqlite::params![
+                feed_id,
+                feed_entry.guid,
+                feed_entry.published_at,
+                feed_entry.title,
+                feed_entry.url,
+                feed_entry.content
+            ],
         )?;
+
+        if !feed_entry.tags.is_empty() {
+            sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
+        }
     }
 
     Ok(())
@@ -348,35 +450,37 @@ fn process_rss_feed(
     feed_id: i64,
     channel: rss::Channel,
     conn: PooledConnection<SqliteConnectionManager>,
+    script_runner: Option<&dyn ScriptRunner>,
 ) -> Result<()> {
     info!(
         "Successfully fetched RSS feed {} with {} items",
         feed_id,
-        channel.items().len()
+        channel.items.len()
     );
 
-    // Insert or update entries from the RSS feed
-    for item in channel.items() {
-        let timestamp = item
-            .pub_date()
-            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-            .map(|d| d.timestamp())
-            .unwrap_or_else(|| Utc::now().timestamp());
-        let params = (
-            feed_id,
-            item.guid()
-                .map(|g| g.value().to_string())
-                .unwrap_or_else(|| {
-                    // Generate a GUID if none exists
-                    format!("rss-{}-{}", timestamp, item.title().unwrap_or("no-title"))
-                }),
-            timestamp,
-            item.title(),
-            item.link(),
-            item.description(),
-        );
+    for item in channel.items.into_iter() {
+        let feed_entry = rss_item_to_feed_entry(feed_id, item);
 
-        // Insert or update the entry in the database
+        let feed_entry = if let Some(runner) = script_runner {
+            let original = feed_entry.clone();
+            match runner.process_entry(feed_entry) {
+                Ok(Some(e)) => e,
+                Ok(None) => {
+                    debug!("rss entry filtered by script for feed {}", feed_id);
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "script error processing rss entry for feed {}: {}; inserting unmodified",
+                        feed_id, e
+                    );
+                    original
+                }
+            }
+        } else {
+            feed_entry
+        };
+
         conn.execute(
             "INSERT OR REPLACE INTO entries (
                 feed_id,
@@ -387,9 +491,288 @@ fn process_rss_feed(
                 url,
                 content
             ) VALUES (?1, 'rss', ?2, ?3, ?4, ?5, ?6)",
-            params,
+            rusqlite::params![
+                feed_id,
+                feed_entry.guid,
+                feed_entry.published_at,
+                feed_entry.title,
+                feed_entry.url,
+                feed_entry.content
+            ],
+        )?;
+
+        if !feed_entry.tags.is_empty() {
+            sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve and sync the script-provided tags for a newly inserted database entry.
+///
+/// For each tag name in `tags`:
+/// - ensures the tag row exists in `tags` (`INSERT OR IGNORE`)
+/// - looks up its `id`
+///
+/// Then removes any `entry_tags` rows for this entry whose `tag_id` is not in the
+/// script-provided set, and inserts new associations (`INSERT OR IGNORE`).
+fn sync_entry_tags(
+    conn: &PooledConnection<SqliteConnectionManager>,
+    feed_id: i64,
+    guid: &str,
+    tags: &[String],
+) -> Result<()> {
+    let entry_id: i64 = conn.query_row(
+        "SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2",
+        rusqlite::params![feed_id, guid],
+        |row| row.get(0),
+    )?;
+
+    // Upsert each tag and collect its id.
+    let mut tag_ids: Vec<i64> = Vec::with_capacity(tags.len());
+    for name in tags {
+        conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [name])?;
+        let id: i64 = conn.query_row(
+            "SELECT id FROM tags WHERE name = ?1",
+            [name.as_str()],
+            |row| row.get(0),
+        )?;
+        tag_ids.push(id);
+    }
+
+    // Remove stale entry_tags rows (those not in the script-provided set).
+    if tag_ids.is_empty() {
+        conn.execute("DELETE FROM entry_tags WHERE entry_id = ?1", [entry_id])?;
+    } else {
+        let placeholders = tag_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "DELETE FROM entry_tags WHERE entry_id = ?1 AND tag_id NOT IN ({placeholders})"
+        );
+        let params: Vec<rusqlite::types::Value> =
+            std::iter::once(rusqlite::types::Value::Integer(entry_id))
+                .chain(
+                    tag_ids
+                        .iter()
+                        .map(|&id| rusqlite::types::Value::Integer(id)),
+                )
+                .collect();
+        conn.execute(&sql, rusqlite::params_from_iter(params))?;
+    }
+
+    // Insert new tag associations.
+    for tag_id in tag_ids {
+        conn.execute(
+            "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+            rusqlite::params![entry_id, tag_id],
         )?;
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "lua"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::test::TestBuilder;
+    use anyhow::Result;
+    use rusqlite::OpenFlags;
+
+    fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
+        let manager = SqliteConnectionManager::file(path)
+            .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
+        Ok(r2d2::Pool::new(manager)?)
+    }
+
+    /// Insert a feed and a Lua script linked to it, then return the feed id,
+    /// an HTTP client, and a connection pool ready to call [`refresh_feed`].
+    async fn setup_feed_with_script(
+        tc: &crate::test::TestConfig,
+        script_text: &str,
+    ) -> Result<(i64, reqwest::Client, r2d2::Pool<SqliteConnectionManager>)> {
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (title, url) VALUES ('test feed', ?1)",
+            [tc.example_feed_url()],
+        )?;
+        let feed_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO scripts (lang, text) VALUES ('lua', ?1)",
+            [script_text],
+        )?;
+        let script_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO feed_scripts (feed_id, script_id) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, script_id],
+        )?;
+
+        let client = reqwest::Client::builder()
+            .user_agent(crate::http::USER_AGENT)
+            .build()?;
+        let pool = make_pool(&tc.database_path())?;
+
+        Ok((feed_id, client, pool))
+    }
+
+    /// A filter-all script should result in zero entries being inserted.
+    #[tokio::test]
+    async fn integration_filter_script_drops_all_entries() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        let (feed_id, client, pool) =
+            setup_feed_with_script(&tc, "return function(entry) return nil end").await?;
+
+        refresh_feed(&client, feed_id, pool).await?;
+
+        let conn = tc.database_conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
+            [feed_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0, "filter script should have dropped all entries");
+
+        Ok(())
+    }
+
+    /// A modifying script should persist its changes to the database.
+    #[tokio::test]
+    async fn integration_modify_script_changes_titles() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        let (feed_id, client, pool) = setup_feed_with_script(
+            &tc,
+            r#"return function(entry) entry.title = "[MODIFIED] " .. entry.title; return entry end"#,
+        )
+        .await?;
+
+        refresh_feed(&client, feed_id, pool).await?;
+
+        let conn = tc.database_conn()?;
+        let mut stmt = conn.prepare("SELECT title FROM entries WHERE feed_id = ?1")?;
+        let titles: Vec<String> = stmt
+            .query_map([feed_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert!(!titles.is_empty(), "expected entries to be inserted");
+        for title in &titles {
+            assert!(
+                title.starts_with("[MODIFIED] "),
+                "title was not modified by script: {title}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A tagging script should add the specified tag to every entry.
+    #[tokio::test]
+    async fn integration_tagging_script_adds_tags() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        let (feed_id, client, pool) = setup_feed_with_script(
+            &tc,
+            r#"return function(entry) table.insert(entry.tags, "test-tag"); return entry end"#,
+        )
+        .await?;
+
+        refresh_feed(&client, feed_id, pool).await?;
+
+        let conn = tc.database_conn()?;
+        let entry_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
+            [feed_id],
+            |row| row.get(0),
+        )?;
+        assert!(entry_count > 0, "expected entries to be inserted");
+
+        let tagged_count: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT e.id) FROM entries e
+             JOIN entry_tags et ON et.entry_id = e.id
+             JOIN tags t ON t.id = et.tag_id
+             WHERE e.feed_id = ?1 AND t.name = 'test-tag'",
+            [feed_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            entry_count, tagged_count,
+            "every entry should have the test-tag"
+        );
+
+        Ok(())
+    }
+
+    /// When a filter script runs before a tagging script, the filter should
+    /// prevent all entries from being inserted and the tagging script should
+    /// never run.
+    #[tokio::test]
+    async fn integration_filter_script_prevents_tagging_script() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (title, url) VALUES ('test feed', ?1)",
+            [tc.example_feed_url()],
+        )?;
+        let feed_id = conn.last_insert_rowid();
+
+        // Insert the filter script first so it runs first in the chain.
+        conn.execute(
+            "INSERT INTO scripts (lang, text) VALUES ('lua', 'return function(entry) return nil end')",
+            [],
+        )?;
+        let filter_script_id = conn.last_insert_rowid();
+
+        // Insert the tagging script second.
+        conn.execute(
+            "INSERT INTO scripts (lang, text) VALUES ('lua', 'return function(entry) table.insert(entry.tags, \"should-not-appear\"); return entry end')",
+            [],
+        )?;
+        let tag_script_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO feed_scripts (feed_id, script_id) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, filter_script_id],
+        )?;
+        conn.execute(
+            "INSERT INTO feed_scripts (feed_id, script_id) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, tag_script_id],
+        )?;
+
+        let client = reqwest::Client::builder()
+            .user_agent(crate::http::USER_AGENT)
+            .build()?;
+        let pool = make_pool(&tc.database_path())?;
+
+        refresh_feed(&client, feed_id, pool).await?;
+
+        let conn = tc.database_conn()?;
+        let entry_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
+            [feed_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            entry_count, 0,
+            "filter script should have prevented all entries from being inserted"
+        );
+
+        let tag_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tags WHERE name = 'should-not-appear'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            tag_count, 0,
+            "tagging script should not have run after filter script dropped the entry"
+        );
+
+        Ok(())
+    }
 }
