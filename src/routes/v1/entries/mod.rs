@@ -5,15 +5,17 @@ mod list_entries;
 use delete_entry::delete_entry;
 use get_entry::get_entry;
 #[allow(unused_imports)]
-pub use list_entries::{list_entries, ListEntriesResponse};
+pub use list_entries::{list_entries, ListEntriesResponse, ListEntriesResponseEntry};
 
+use crate::routes::v1::tags::{get_entry_tags, set_entry_tags};
 use crate::server::AppState;
 use axum::{routing::get, Router};
 
 pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_entries))
-        .route("/id/{*id}", get(get_entry).delete(delete_entry))
+        .route("/id/{id}", get(get_entry).delete(delete_entry))
+        .route("/id/{id}/tags", get(get_entry_tags).put(set_entry_tags))
 }
 
 #[cfg(test)]
