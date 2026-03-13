@@ -15,6 +15,7 @@ path = "src/main.rs"
 default = ["lua", "systemd"]
 lua = ["mlua"]
 systemd = []
+extra-tests = []
 
 [dependencies]
 anyhow = "1.0"
@@ -46,6 +47,7 @@ libc = "0.2"
 [dev-dependencies]
 flate2 = "1"
 itertools = "0.14"
+serial_test = "3.4"
 tempdir = "0.3"
 
 [profile.release]

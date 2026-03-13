@@ -138,7 +138,11 @@ impl Server {
         // the threads that we spawn.
         let manager = SqliteConnectionManager::file(&self.db_path)
             .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-            .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
+            .with_init(|c| {
+                c.execute_batch(
+                    "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+                )
+            });
         let pool = r2d2::Pool::new(manager).with_context(|| {
             format!(
                 "Unable to open connection pool to database at {:?}",

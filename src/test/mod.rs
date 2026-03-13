@@ -395,6 +395,71 @@ impl TestConfig {
             .build()
             .with_context(|| "failed to connect to database")
     }
+
+    /// Assert database referential integrity: no FK violations, no orphaned
+    /// join-table rows, and no duplicate entries (same feed_id + guid).
+    ///
+    /// Panics with a descriptive message on the first violation found.
+    pub fn assert_db_integrity(&self) {
+        let conn = self
+            .database_conn()
+            .expect("failed to open DB for integrity check");
+
+        // 1. PRAGMA foreign_key_check — returns one row per violation.
+        let fk_violations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check()",
+                [],
+                |row| row.get(0),
+            )
+            .expect("foreign_key_check query failed");
+        assert_eq!(
+            fk_violations, 0,
+            "foreign key violations found: {fk_violations}"
+        );
+
+        // 2. Orphaned entry_tags (entry_id not in entries).
+        let orphaned_entry_tags: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entry_tags WHERE entry_id NOT IN (SELECT id FROM entries)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("orphaned entry_tags query failed");
+        assert_eq!(
+            orphaned_entry_tags, 0,
+            "orphaned entry_tags found: {orphaned_entry_tags}"
+        );
+
+        // 3. Orphaned feed_tags (feed_id not in feeds).
+        let orphaned_feed_tags: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM feed_tags WHERE feed_id NOT IN (SELECT id FROM feeds)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("orphaned feed_tags query failed");
+        assert_eq!(
+            orphaned_feed_tags, 0,
+            "orphaned feed_tags found: {orphaned_feed_tags}"
+        );
+
+        // 4. Duplicate entries (same feed_id + guid).
+        let duplicate_entries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                    SELECT feed_id, guid, COUNT(*) AS c
+                    FROM entries GROUP BY feed_id, guid HAVING c > 1
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("duplicate entries query failed");
+        assert_eq!(
+            duplicate_entries, 0,
+            "duplicate entries (feed_id, guid) found: {duplicate_entries}"
+        );
+    }
 }
 
 /// Compress `data` using the given encoding (`"gzip"` or `"deflate"`).

@@ -151,6 +151,14 @@ mod test {
         assert_eq!(resp.status(), StatusCode::CREATED);
         let script_id = resp.json::<AddScriptResponse>().await?.id;
 
+        // Trigger a reload so workers pick up the new filter script.
+        let resp = client
+            .post("http://localhost/v1/scripts/reload")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        std::thread::sleep(Duration::from_millis(250));
+
         // Add a feed.
         let resp = client
             .post("http://localhost/v1/feeds/create")
@@ -164,7 +172,7 @@ mod test {
         let feed_id = resp.json::<AddFeedResponse>().await?.id;
 
         // Wait for the initial fetch.
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(500));
 
         // No entries should exist because the filter script drops everything.
         let resp = client.get("http://localhost/v1/entries").send().await?;
