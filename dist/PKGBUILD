@@ -1,0 +1,24 @@
+# Maintainer: kernelmethod
+pkgname=kiki
+pkgver=${PKGVER:-0.2.0}
+pkgrel=1
+pkgdesc="An RSS feed aggregator"
+arch=('x86_64')
+url="https://github.com/kernelmethod/kiki-rss"
+license=('MIT')
+depends=('gcc-libs' 'systemd')
+makedepends=('cargo')
+source=()
+
+build() {
+    cd "$startdir"
+    cargo build --release --locked
+}
+
+package() {
+    cd "$startdir"
+    install -Dm755 "target/release/kiki" "$pkgdir/usr/bin/kiki"
+    install -Dm644 "dist/kiki.service" "$pkgdir/usr/lib/systemd/system/kiki.service"
+    install -Dm644 "README.md" "$pkgdir/usr/share/doc/kiki-rss/README.md"
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

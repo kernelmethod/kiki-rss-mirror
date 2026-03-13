@@ -4,12 +4,29 @@ use clap::Args;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Set restrictive permissions on a path so that only the owner and group can
+/// access it. On non-Unix platforms this is a no-op.
+fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(mode);
+        fs::set_permissions(path, perms)
+            .with_context(|| format!("unable to set permissions on {path:?}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
+}
+
 /// Returns the platform-default data directory for Kiki.
 ///
 /// - Linux: `$XDG_DATA_HOME/kiki/` (defaults to `~/.local/share/kiki/`)
 /// - macOS: `~/Library/Application Support/kiki/`
 /// - Windows: `%APPDATA%\kiki\`
-fn default_directory() -> Result<PathBuf> {
+pub(crate) fn default_directory() -> Result<PathBuf> {
     let base = dirs::data_dir().context("unable to determine platform data directory")?;
     Ok(base.join("kiki"))
 }
@@ -34,6 +51,19 @@ pub struct InitArgs {
 }
 
 impl InitArgs {
+    /// Create an `InitArgs` equivalent to `kiki init --auto --check`.
+    ///
+    /// This initializes the platform-default data directory if it hasn't been
+    /// set up yet, and is a no-op otherwise.
+    pub(crate) fn auto_with_check() -> Self {
+        Self {
+            directory: None,
+            auto: true,
+            check: true,
+            force: false,
+        }
+    }
+
     /// Resolve the target directory from the provided arguments.
     fn resolve_directory(&self) -> Result<PathBuf> {
         if self.auto {
@@ -65,12 +95,14 @@ impl InitArgs {
 
         fs::create_dir_all(&directory)
             .with_context(|| format!("unable to create directory {directory:?}"))?;
+        restrict_permissions(&directory, 0o750)?;
 
         ConnectionBuilder::default()
             .at_path(&db_path)
             .create()
             .build()
             .with_context(|| format!("failed to create database in {:?}", &db_path))?;
+        restrict_permissions(&db_path, 0o660)?;
 
         println!("Initialized Kiki in {}", directory.display());
 

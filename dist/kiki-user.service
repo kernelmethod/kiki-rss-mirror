@@ -1,0 +1,18 @@
+# User-level systemd service for Kiki RSS
+# Preferred: run `kiki service install` instead of copying this manually.
+# Manual install: copy to ~/.config/systemd/user/kiki.service
+
+[Unit]
+Description=Kiki RSS feed aggregator (user)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/kiki
+ExecStartPre=/usr/bin/kiki init --auto --check
+ExecStart=/usr/bin/kiki serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

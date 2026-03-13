@@ -1,0 +1,16 @@
+[Unit]
+Description=Kiki RSS feed aggregator
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=kiki
+WorkingDirectory=/var/lib/kiki
+ExecStartPre=/usr/bin/kiki init --check /var/lib/kiki
+ExecStart=/usr/bin/kiki serve -p 8080
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

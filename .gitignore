@@ -1,3 +1,7 @@
 /target
+/result
 
 *.db
+*.deb
+*.rpm
+*.pkg.tar.zst

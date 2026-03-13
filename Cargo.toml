@@ -12,8 +12,9 @@ name = "kiki"
 path = "src/main.rs"
 
 [features]
-default = ["lua"]
+default = ["lua", "systemd"]
 lua = ["mlua"]
+systemd = []
 
 [dependencies]
 anyhow = "1.0"
@@ -47,3 +48,24 @@ tempdir = "0.3"
 
 [profile.release]
 lto = "thin"
+
+[package.metadata.deb]
+maintainer = "kernelmethod"
+depends = "$auto"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/kiki", "usr/bin/", "755"],
+    ["dist/kiki.service", "usr/lib/systemd/system/", "644"],
+    ["README.md", "usr/share/doc/kiki-rss/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/kiki", dest = "/usr/bin/kiki", mode = "755" },
+    { source = "dist/kiki.service", dest = "/usr/lib/systemd/system/kiki.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/kiki-rss/README.md", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+systemd = "*"

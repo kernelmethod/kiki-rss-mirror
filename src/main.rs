@@ -37,6 +37,10 @@ pub enum Commands {
 
     /// Migrate the Kiki database schema to the latest version
     Migrate(cli::migrate::MigrateArgs),
+
+    /// Manage the kiki systemd user service
+    #[cfg(feature = "systemd")]
+    Service(cli::service::ServiceArgs),
 }
 
 impl Commands {
@@ -46,6 +50,8 @@ impl Commands {
             Commands::Init(args) => args.run(),
             Commands::Migrate(args) => args.run(),
             Commands::Serve(args) => args.run(),
+            #[cfg(feature = "systemd")]
+            Commands::Service(args) => args.run(),
         }
     }
 }
