@@ -19,7 +19,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[command(about, long_about = None)]
 pub struct Cli {
     /// The subcommand that should be run. See [Commands].
     #[command(subcommand)]
@@ -41,6 +41,9 @@ pub enum Commands {
     /// Manage the kiki systemd user service
     #[cfg(feature = "systemd")]
     Service(cli::service::ServiceArgs),
+
+    /// Print the version of Kiki
+    Version,
 }
 
 impl Commands {
@@ -52,6 +55,10 @@ impl Commands {
             Commands::Serve(args) => args.run(),
             #[cfg(feature = "systemd")]
             Commands::Service(args) => args.run(),
+            Commands::Version => {
+                println!("kiki {}", env!("CARGO_PKG_VERSION"));
+                Ok(())
+            }
         }
     }
 }
