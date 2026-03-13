@@ -6,6 +6,10 @@ use anyhow::Result;
 use axum::{routing::get, Router};
 use rusqlite::OpenFlags;
 
+fn test_tx() -> tokio::sync::mpsc::Sender<FetchManagerCommand> {
+    tokio::sync::mpsc::channel(64).0
+}
+
 fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
     let manager = SqliteConnectionManager::file(path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
@@ -72,7 +76,7 @@ async fn test_invalid_feed_error() -> Result<()> {
     let feed_url = format!("http://{}/feed", addr);
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
-    refresh_feed(&client, feed_id, pool, None).await?;
+    refresh_feed(&client, feed_id, pool, &test_tx(), None).await?;
 
     let conn = tc.database_conn()?;
     let entry_count: i64 = conn.query_row(
@@ -110,7 +114,7 @@ async fn test_http_status_error() -> Result<()> {
     let feed_url = format!("http://{}/feed", addr);
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
-    refresh_feed(&client, feed_id, pool, None).await?;
+    refresh_feed(&client, feed_id, pool, &test_tx(), None).await?;
 
     let conn = tc.database_conn()?;
     let (error, error_at) = read_stored_error(&conn, feed_id)?;
@@ -150,7 +154,7 @@ async fn test_too_many_redirects_error() -> Result<()> {
     let feed_url = format!("http://{}/feed", addr);
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
-    refresh_feed(&client, feed_id, pool, None).await?;
+    refresh_feed(&client, feed_id, pool, &test_tx(), None).await?;
 
     let conn = tc.database_conn()?;
     let (error, error_at) = read_stored_error(&conn, feed_id)?;
@@ -187,7 +191,7 @@ async fn test_successful_fetch_clears_error() -> Result<()> {
     let feed_url = format!("http://{}/feed", addr);
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
-    refresh_feed(&client, feed_id, pool, None).await?;
+    refresh_feed(&client, feed_id, pool, &test_tx(), None).await?;
 
     let conn = tc.database_conn()?;
     let (error, _) = read_stored_error(&conn, feed_id)?;
@@ -201,7 +205,7 @@ async fn test_successful_fetch_clears_error() -> Result<()> {
     )?;
 
     let pool2 = make_pool(&tc.database_path())?;
-    refresh_feed(&client, feed_id, pool2, None).await?;
+    refresh_feed(&client, feed_id, pool2, &test_tx(), None).await?;
 
     let (error, error_at) = read_stored_error(&conn, feed_id)?;
     assert!(

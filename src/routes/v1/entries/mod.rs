@@ -1,7 +1,9 @@
+pub mod cleanup;
 pub mod delete_entry;
 pub mod get_entry;
 pub mod list_entries;
 
+use cleanup::cleanup;
 use delete_entry::delete_entry;
 use get_entry::get_entry;
 #[allow(unused_imports)]
@@ -9,11 +11,15 @@ pub use list_entries::{list_entries, ListEntriesResponse, ListEntriesResponseEnt
 
 use crate::routes::v1::tags::{get_entry_tags, set_entry_tags};
 use crate::server::AppState;
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 
 pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_entries))
+        .route("/cleanup", post(cleanup))
         .route("/id/{id}", get(get_entry).delete(delete_entry))
         .route("/id/{id}/tags", get(get_entry_tags).put(set_entry_tags))
 }

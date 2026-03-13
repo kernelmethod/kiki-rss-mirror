@@ -96,6 +96,10 @@ impl CacheControl {
 #[derive(Debug)]
 pub enum FetchManagerCommand {
     RefreshFeed(i64),
+    /// Run retention cleanup for the given feed.
+    CleanupFeed(i64),
+    /// Run retention cleanup across all feeds.
+    CleanupAll,
     /// Clears the cached [`crate::scripting::lua::LuaScriptRunner`] for every feed,
     /// forcing runners to be rebuilt from the database on the next refresh.
     ReloadScripts,
@@ -104,6 +108,7 @@ pub enum FetchManagerCommand {
 /// Create a manager for the fetcher tasks.
 pub async fn manager(
     mut rx: mpsc::Receiver<FetchManagerCommand>,
+    tx: mpsc::Sender<FetchManagerCommand>,
     pool: Pool<SqliteConnectionManager>,
     token: CancellationToken,
 ) -> Result<()> {
@@ -130,7 +135,7 @@ pub async fn manager(
                 #[cfg(not(feature = "lua"))]
                 let script_runner: Option<&dyn ScriptRunner> = None;
 
-                let _ = refresh_feed(&client, feed_id, pool.clone(), script_runner)
+                let _ = refresh_feed(&client, feed_id, pool.clone(), &tx, script_runner)
                     .await
                     .inspect_err(|e| {
                         error!(
@@ -147,6 +152,31 @@ pub async fn manager(
                             );
                         }
                     });
+            }
+
+            FetchManagerCommand::CleanupFeed(feed_id) => {
+                if let Ok(conn) = pool.get() {
+                    match crate::db::retention::cleanup_feed(&conn, feed_id) {
+                        Ok(0) => {}
+                        Ok(n) => info!(
+                            "Retention cleanup deleted {} old entries for feed {}",
+                            n, feed_id
+                        ),
+                        Err(e) => {
+                            warn!("Retention cleanup failed for feed {}: {:?}", feed_id, e)
+                        }
+                    }
+                }
+            }
+
+            FetchManagerCommand::CleanupAll => {
+                if let Ok(conn) = pool.get() {
+                    match crate::db::retention::cleanup_all(&conn) {
+                        Ok(0) => {}
+                        Ok(n) => info!("Retention cleanup deleted {} entries", n),
+                        Err(e) => warn!("Retention cleanup failed: {:?}", e),
+                    }
+                }
             }
 
             FetchManagerCommand::ReloadScripts => {
@@ -248,6 +278,7 @@ pub(crate) async fn refresh_feed(
     client: &reqwest::Client,
     feed_id: i64,
     pool: Pool<SqliteConnectionManager>,
+    fetcher_tx: &mpsc::Sender<FetchManagerCommand>,
     script_runner: Option<&dyn ScriptRunner>,
 ) -> Result<()> {
     // Get the feed URL and headers from the database
@@ -337,6 +368,12 @@ pub(crate) async fn refresh_feed(
         };
         warn!("Feed {}: {}", feed_id, fetch_err);
         set_feed_error(&pool.get()?, feed_id, &fetch_err);
+        return Ok(());
+    }
+
+    // Queue retention cleanup for this feed.
+    if let Err(e) = fetcher_tx.try_send(FetchManagerCommand::CleanupFeed(feed_id)) {
+        warn!("Failed to queue cleanup for feed {}: {:?}", feed_id, e);
     }
 
     Ok(())

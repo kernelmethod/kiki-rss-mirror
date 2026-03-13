@@ -12,6 +12,10 @@ fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManage
     Ok(r2d2::Pool::new(manager)?)
 }
 
+fn test_tx() -> tokio::sync::mpsc::Sender<FetchManagerCommand> {
+    tokio::sync::mpsc::channel(64).0
+}
+
 /// Insert a feed and a Lua script linked to it, then return the feed id,
 /// an HTTP client, and a connection pool ready to call [`refresh_feed`].
 async fn setup_feed_with_script(
@@ -56,7 +60,14 @@ async fn integration_filter_script_drops_all_entries() -> Result<()> {
         let sources = load_all_script_sources(&conn)?;
         crate::scripting::lua::LuaScriptRunner::new(&sources)?
     };
-    refresh_feed(&client, feed_id, pool, Some(&runner as &dyn ScriptRunner)).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        &test_tx(),
+        Some(&runner as &dyn ScriptRunner),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let count: i64 = conn.query_row(
@@ -84,7 +95,14 @@ async fn integration_modify_script_changes_titles() -> Result<()> {
         let sources = load_all_script_sources(&conn)?;
         crate::scripting::lua::LuaScriptRunner::new(&sources)?
     };
-    refresh_feed(&client, feed_id, pool, Some(&runner as &dyn ScriptRunner)).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        &test_tx(),
+        Some(&runner as &dyn ScriptRunner),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let mut stmt = conn.prepare("SELECT title FROM entries WHERE feed_id = ?1")?;
@@ -118,7 +136,14 @@ async fn integration_tagging_script_adds_tags() -> Result<()> {
         let sources = load_all_script_sources(&conn)?;
         crate::scripting::lua::LuaScriptRunner::new(&sources)?
     };
-    refresh_feed(&client, feed_id, pool, Some(&runner as &dyn ScriptRunner)).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        &test_tx(),
+        Some(&runner as &dyn ScriptRunner),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let entry_count: i64 = conn.query_row(
@@ -191,7 +216,14 @@ async fn integration_filter_script_prevents_tagging_script() -> Result<()> {
         let sources = load_all_script_sources(&conn)?;
         crate::scripting::lua::LuaScriptRunner::new(&sources)?
     };
-    refresh_feed(&client, feed_id, pool, Some(&runner as &dyn ScriptRunner)).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        &test_tx(),
+        Some(&runner as &dyn ScriptRunner),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let entry_count: i64 = conn.query_row(

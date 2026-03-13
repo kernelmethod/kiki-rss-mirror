@@ -6,6 +6,12 @@ CREATE TABLE migrations (
     applied_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    type  TEXT
+);
+
 CREATE TABLE tags (
     id      INTEGER PRIMARY KEY,
     name    VARCHAR UNIQUE NOT NULL

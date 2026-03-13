@@ -4,6 +4,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
 pub mod migrations;
+pub mod retention;
 
 enum ConnectionType<'a> {
     DefaultConnection,
@@ -162,6 +163,7 @@ mod tests {
             "rss_entry_data",
             "rss_feed_data",
             "scripts",
+            "settings",
             "tags",
         ]
         .into_iter()

@@ -36,6 +36,9 @@ use utoipa::OpenApi;
         crate::routes::v1::scripts::update_script::update_script,
         crate::routes::v1::scripts::delete_script::delete_script,
         crate::routes::v1::scripts::reload_scripts::reload_scripts,
+        crate::routes::v1::settings::retention::get_retention,
+        crate::routes::v1::settings::retention::put_retention,
+        crate::routes::v1::entries::cleanup::cleanup,
     ),
     components(
         schemas(
@@ -71,6 +74,9 @@ use utoipa::OpenApi;
             crate::routes::v1::scripts::list_scripts::ScriptResponse,
             crate::routes::v1::scripts::list_scripts::ListScriptsResponse,
             crate::routes::v1::scripts::update_script::UpdateScriptRequest,
+            crate::routes::v1::settings::retention::RetentionResponse,
+            crate::routes::v1::settings::retention::RetentionRequest,
+            crate::routes::v1::entries::cleanup::CleanupResponse,
         )
     ),
     tags(
@@ -79,6 +85,7 @@ use utoipa::OpenApi;
         (name = "entries", description = "Access and manage feed entries"),
         (name = "tags", description = "Organize feeds and entries with tags"),
         (name = "scripts", description = "Manage and reload scripts"),
+        (name = "settings", description = "Global configuration settings"),
     ),
     info(
         title = "kiki-rss",

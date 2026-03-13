@@ -185,6 +185,7 @@ impl Server {
 
         fetcher_runtime.spawn(fetcher::manager(
             rx,
+            tx.clone(),
             pool.clone(),
             self.cancel_token.clone(),
         ));
@@ -195,6 +196,7 @@ impl Server {
                 pool.clone(),
                 self.cancel_token.clone(),
             ));
+            web_runtime.spawn(cleanup_loop(tx.clone(), self.cancel_token.clone()));
         }
 
         match self.listen_addr {
@@ -246,6 +248,29 @@ async fn check_feeds_loop(
             _ = interval.tick() => {
                 if let Err(e) = check_feeds(&fetcher_tx, &pool) {
                     tracing::error!("Error checking feeds: {:?}", e);
+                }
+            }
+            _ = cancel_token.cancelled() => {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Periodically sends a [`FetchManagerCommand::CleanupAll`] command to
+/// trigger retention cleanup. Runs every hour.
+async fn cleanup_loop(
+    fetcher_tx: mpsc::Sender<FetchManagerCommand>,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    let mut interval = tokio::time::interval(Duration::from_secs(3600));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if let Err(e) = fetcher_tx.try_send(FetchManagerCommand::CleanupAll) {
+                    tracing::warn!("Failed to queue periodic cleanup: {:?}", e);
                 }
             }
             _ = cancel_token.cancelled() => {

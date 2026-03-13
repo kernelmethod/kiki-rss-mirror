@@ -4,6 +4,7 @@ pub mod feeds;
 pub mod health;
 pub mod root;
 pub mod scripts;
+pub mod settings;
 pub mod tags;
 
 use crate::server::AppState;
@@ -16,5 +17,6 @@ pub fn create_router() -> Router<AppState> {
         .nest("/feeds", feeds::create_router())
         .nest("/entries", entries::create_router())
         .nest("/scripts", scripts::create_router())
+        .nest("/settings", settings::create_router())
         .nest("/tags", tags::create_router())
 }
