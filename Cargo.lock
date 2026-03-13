@@ -1157,6 +1157,7 @@ dependencies = [
  "rss",
  "rusqlite",
  "serde",
+ "serde_json",
  "tempdir",
  "thiserror",
  "tokio",

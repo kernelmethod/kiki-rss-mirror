@@ -38,7 +38,12 @@ CREATE TABLE feeds (
     -- Unix timestamp parsed from the HTTP Expires response header.
     -- When set, the fetcher will skip refreshing the feed until this
     -- time has passed.
-    header_expires          INTEGER
+    header_expires          INTEGER,
+
+    -- Most recent fetch error message, if any. Cleared on successful fetch.
+    last_fetch_error        VARCHAR,
+    -- Timestamp of the most recent fetch error.
+    last_fetch_error_at     DATETIME
 );
 CREATE INDEX idx_feeds_syndication ON feeds(syndication_format);
 

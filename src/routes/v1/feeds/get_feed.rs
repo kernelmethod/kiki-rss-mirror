@@ -1,3 +1,4 @@
+use crate::fetcher::FetchError;
 use crate::server::AppState;
 use axum::{
     extract::{Path, State},
@@ -16,6 +17,12 @@ pub struct GetFeedResponse {
     pub description: Option<String>,
     /// Last checked time in RFC3339 format.
     pub last_checked: Option<String>,
+    /// Most recent fetch error, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fetch_error: Option<FetchError>,
+    /// Time of the most recent fetch error in RFC3339 format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fetch_error_at: Option<String>,
 }
 
 /// Route handler for fetching a single feed's information.
@@ -46,7 +53,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
     // statement on a blocking thread.
     let task_result = task::spawn_blocking(move || {
         let mut stmt = match conn.prepare(
-            "SELECT id, title, url, description, last_checked
+            "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at
                 FROM feeds WHERE id = ?1 LIMIT 1",
         ) {
             Ok(s) => s,
@@ -61,8 +68,15 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
                 title: row.get(1)?,
                 url: row.get(2)?,
                 description: row.get(3)?,
-                last_checked: chrono::DateTime::from_timestamp_secs(row.get(4)?)
-                    .map(|d| d.to_rfc3339()),
+                last_checked: row.get::<usize, Option<i64>>(4)?.and_then(|ts| {
+                    chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
+                }),
+                last_fetch_error: row
+                    .get::<usize, Option<String>>(5)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
+                last_fetch_error_at: row.get::<usize, Option<i64>>(6)?.and_then(|ts| {
+                    chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
+                }),
             };
             Ok(resp)
         });

@@ -92,7 +92,7 @@ pub async fn tag_feeds(
 
         let feeds = conn
             .prepare(
-                "SELECT f.id, f.title, f.url, f.description, f.last_checked
+                "SELECT f.id, f.title, f.url, f.description, f.last_checked, f.last_fetch_error, f.last_fetch_error_at
                  FROM feeds f
                  INNER JOIN feed_tags ft ON ft.feed_id = f.id
                  WHERE ft.tag_id = ?1
@@ -108,6 +108,12 @@ pub async fn tag_feeds(
                     url: row.get(2)?,
                     description: row.get(3)?,
                     last_checked: row.get::<usize, Option<i64>>(4)?.and_then(|ts| {
+                        chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
+                    }),
+                    last_fetch_error: row
+                        .get::<usize, Option<String>>(5)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    last_fetch_error_at: row.get::<usize, Option<i64>>(6)?.and_then(|ts| {
                         chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
                     }),
                 })
