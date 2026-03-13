@@ -1,17 +1,12 @@
-use crate::{db::SCHEMA_VERSION, server::AppState};
+use crate::server::AppState;
 use axum::{extract::State, http::StatusCode, Json};
 use clap::crate_version;
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
-pub struct RootResponse<'a> {
-    version: &'a str,
-    schema_version: &'a str,
+pub struct RootResponse {
+    version: String,
+    schema_version: String,
 }
-
-const ROOT: RootResponse = RootResponse {
-    version: crate_version!(),
-    schema_version: SCHEMA_VERSION,
-};
 
 /// Route handler for the root url, `/`.
 #[utoipa::path(
@@ -23,13 +18,42 @@ const ROOT: RootResponse = RootResponse {
     tag = "meta"
 )]
 #[axum::debug_handler]
-pub async fn root(State(_state): State<AppState>) -> (StatusCode, Json<RootResponse<'static>>) {
-    (StatusCode::OK, Json(ROOT))
+pub async fn root(State(state): State<AppState>) -> (StatusCode, Json<RootResponse>) {
+    let schema_version = match state.conn_pool.get() {
+        Ok(conn) => {
+            let mut stmt =
+                match conn.prepare("SELECT name FROM migrations ORDER BY id DESC LIMIT 1") {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(RootResponse {
+                                version: crate_version!().to_string(),
+                                schema_version: "unknown".to_string(),
+                            }),
+                        );
+                    }
+                };
+            match stmt.query_row([], |row| row.get::<_, String>(0)) {
+                Ok(name) => name,
+                Err(_) => "unknown".to_string(),
+            }
+        }
+        Err(_) => "unknown".to_string(),
+    };
+
+    (
+        StatusCode::OK,
+        Json(RootResponse {
+            version: crate_version!().to_string(),
+            schema_version,
+        }),
+    )
 }
 
 #[cfg(test)]
 mod test {
-    use crate::{db::SCHEMA_VERSION, test::TestBuilder};
+    use crate::{db::migrations, test::TestBuilder};
     use anyhow::Result;
     use axum::http::StatusCode;
     use clap::crate_version;
@@ -45,7 +69,13 @@ mod test {
 
         let json = resp.json::<HashMap<String, String>>().await?;
         assert_eq!(json["version"], crate_version!());
-        assert_eq!(json["schema_version"], SCHEMA_VERSION);
+
+        // The schema version should be the last migration name
+        let last_migration = migrations::MIGRATIONS
+            .last()
+            .map(|m| m.name)
+            .unwrap_or("unknown");
+        assert_eq!(json["schema_version"], last_migration);
 
         Ok(())
     }

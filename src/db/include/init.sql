@@ -1,7 +1,9 @@
 PRAGMA foreign_keys = ON;
 
-CREATE TABLE schema_version (
-    version VARCHAR NOT NULL
+CREATE TABLE migrations (
+    id          INTEGER PRIMARY KEY,
+    name        VARCHAR NOT NULL UNIQUE,
+    applied_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE tags (

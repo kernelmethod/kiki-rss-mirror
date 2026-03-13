@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: &str = "1.0";
+pub mod migrations;
 
 enum ConnectionType<'a> {
     DefaultConnection,
@@ -73,11 +73,18 @@ impl<'a> ConnectionBuilder<'a> {
             // Initialize database
             conn.execute_batch(include_str!("include/init.sql"))
                 .with_context(|| "Failed to initialize database")?;
-            conn.execute(
-                "INSERT INTO schema_version (version) VALUES (?1)",
-                (SCHEMA_VERSION,),
-            )
-            .with_context(|| "unable to add schema version metadata to database")?;
+
+            // Mark all known migrations as applied since init.sql
+            // contains the complete current schema
+            for migration in migrations::MIGRATIONS {
+                conn.execute(
+                    "INSERT INTO migrations (name) VALUES (?1)",
+                    (migration.name,),
+                )
+                .with_context(|| {
+                    format!("unable to record migration {} during init", migration.name)
+                })?;
+            }
         }
 
         Ok(conn)
@@ -150,10 +157,10 @@ mod tests {
             "feed_scripts",
             "feed_tags",
             "feeds",
+            "migrations",
             "rss_categories",
             "rss_entry_data",
             "rss_feed_data",
-            "schema_version",
             "scripts",
             "tags",
         ]
@@ -164,13 +171,18 @@ mod tests {
 
         assert_eq!(tables, expected_tables);
 
-        // Check that schema information was set correctly
-        let mut stmt = conn.prepare("SELECT version FROM schema_version")?;
-        let schema_info = stmt
-            .query_row([], |row| Ok(QueryStringResult { text: row.get(0)? }))
-            .with_context(|| "Could not retrieve version information from schema_version")?;
+        // Check that all known migrations are recorded
+        let mut stmt = conn.prepare("SELECT name FROM migrations ORDER BY id")?;
+        let applied = stmt
+            .query_map([], |row| Ok(QueryStringResult { text: row.get(0)? }))?
+            .collect::<Result<Vec<_>, _>>()?;
 
-        assert_eq!(schema_info.text, SCHEMA_VERSION);
+        let expected_migrations: Vec<String> = migrations::MIGRATIONS
+            .iter()
+            .map(|m| String::from(m.name))
+            .collect();
+        let applied_names: Vec<String> = applied.into_iter().map(|r| r.text).collect();
+        assert_eq!(applied_names, expected_migrations);
 
         Ok(())
     }

@@ -1,8 +1,9 @@
 use crate::{
+    db::migrations,
     fetcher::{self, FetchManagerCommand},
     routes,
 };
-use anyhow::{Context, Error, Result};
+use anyhow::{bail, Context, Error, Result};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use std::{
@@ -121,6 +122,22 @@ impl Server {
                 &self.db_path
             )
         })?;
+
+        // Check for pending migrations before starting the server
+        {
+            let conn = pool
+                .get()
+                .with_context(|| "failed to get connection for migration check")?;
+            let pending = migrations::pending_migrations(&conn)?;
+            if !pending.is_empty() {
+                let names: Vec<&str> = pending.iter().map(|m| m.name).collect();
+                bail!(
+                    "Database has {} pending migration(s): {}. Run `kiki migrate` first.",
+                    pending.len(),
+                    names.join(", ")
+                );
+            }
+        }
 
         // We create two separate runtimes, one for the feed-fetchers and
         // one for the web service workers.
