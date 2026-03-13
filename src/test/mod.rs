@@ -5,12 +5,42 @@ use anyhow::{bail, Context, Result};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 use tempdir::TempDir;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
+
+/// Configurable state for the test feed server, allowing tests to control
+/// which HTTP cache headers are returned and to inspect request counts.
+#[derive(Default)]
+pub struct FeedServerState {
+    /// If set, the server includes an `ETag` response header with this value.
+    pub etag: Option<String>,
+    /// If set, the server includes a `Last-Modified` response header with this value.
+    pub last_modified: Option<String>,
+    /// If set, the server includes an `Expires` response header with this value.
+    pub expires: Option<String>,
+    /// Total number of requests received by the server.
+    pub request_count: usize,
+    /// Number of 200 OK responses served.
+    pub full_response_count: usize,
+    /// Number of 304 Not Modified responses served.
+    pub not_modified_count: usize,
+}
+
+/// Convenience alias for the shared, mutable feed-server state.
+pub type SharedFeedServerState = Arc<Mutex<FeedServerState>>;
+
+/// Combined Axum handler state: the user-configurable [`FeedServerState`]
+/// plus the static RSS content to serve on 200 responses.
+#[derive(Clone)]
+struct HandlerState {
+    config: SharedFeedServerState,
+    rss_content: Arc<Vec<u8>>,
+}
 
 pub struct TestBuilder {
     init_database: bool,
@@ -69,6 +99,7 @@ pub struct TestConfig {
     pub server_token: Option<CancellationToken>,
     pub feed_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub feed_server_addr: Option<SocketAddr>,
+    pub feed_server_state: Option<SharedFeedServerState>,
 }
 
 impl Drop for TestConfig {
@@ -87,6 +118,7 @@ impl TestConfig {
             server_token: None,
             feed_server_handle: None,
             feed_server_addr: None,
+            feed_server_state: None,
         };
         Ok(config)
     }
@@ -161,6 +193,112 @@ impl TestConfig {
 
         self.feed_server_addr = Some(addr);
         self.feed_server_handle = Some(handle);
+
+        Ok(())
+    }
+
+    /// Start a lightweight HTTP server that serves test feeds with configurable
+    /// cache headers and conditional-request handling.
+    ///
+    /// The server binds to `127.0.0.1:0` (OS-assigned port) and serves:
+    /// - `/rss.xml` — the contents of `test/example.xml`, with cache headers
+    ///   and 304 responses driven by the provided [`SharedFeedServerState`].
+    ///
+    /// Use [`rss_feed_url`] to get the URL for the RSS endpoint.
+    pub async fn init_feed_server_with_state(
+        &mut self,
+        state: SharedFeedServerState,
+    ) -> Result<()> {
+        use axum::{
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::get,
+            Router,
+        };
+
+        if self.feed_server_addr.is_some() {
+            bail!("feed server has already been started");
+        }
+
+        let rss_content = Arc::new(
+            std::fs::read(Self::test_data_path("example.xml"))
+                .with_context(|| "failed to read test/example.xml")?,
+        );
+
+        async fn rss_handler(
+            headers: HeaderMap,
+            State(hs): State<HandlerState>,
+        ) -> impl IntoResponse {
+            let mut s = hs.config.lock().unwrap();
+            s.request_count += 1;
+
+            let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
+            let if_modified_since = headers
+                .get("if-modified-since")
+                .and_then(|v| v.to_str().ok());
+
+            let etag_match = s
+                .etag
+                .as_deref()
+                .zip(if_none_match)
+                .is_some_and(|(a, b)| a == b);
+            let lm_match = s
+                .last_modified
+                .as_deref()
+                .zip(if_modified_since)
+                .is_some_and(|(a, b)| a == b);
+
+            if etag_match || lm_match {
+                s.not_modified_count += 1;
+                return StatusCode::NOT_MODIFIED.into_response();
+            }
+
+            s.full_response_count += 1;
+
+            let body = hs.rss_content.as_ref().clone();
+            let mut response = body.into_response();
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/rss+xml".parse().unwrap(),
+            );
+            if let Some(ref etag) = s.etag {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::ETAG, etag.parse().unwrap());
+            }
+            if let Some(ref lm) = s.last_modified {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::LAST_MODIFIED, lm.parse().unwrap());
+            }
+            if let Some(ref exp) = s.expires {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::EXPIRES, exp.parse().unwrap());
+            }
+            response
+        }
+
+        let handler_state = HandlerState {
+            config: state.clone(),
+            rss_content,
+        };
+
+        let app = Router::new()
+            .route("/rss.xml", get(rss_handler))
+            .with_state(handler_state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        self.feed_server_addr = Some(addr);
+        self.feed_server_handle = Some(handle);
+        self.feed_server_state = Some(state);
 
         Ok(())
     }

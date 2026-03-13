@@ -3,11 +3,11 @@ pub mod list_scripts;
 pub mod reload_scripts;
 
 use crate::server::AppState;
+use add_script::add_script;
 use axum::{
     routing::{get, post},
     Router,
 };
-use add_script::add_script;
 use list_scripts::list_scripts;
 use reload_scripts::reload_scripts;
 

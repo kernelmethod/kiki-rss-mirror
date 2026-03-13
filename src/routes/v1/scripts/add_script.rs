@@ -64,7 +64,11 @@ pub async fn add_script(
             Ok((StatusCode::CREATED, Json(AddScriptResponse { id })))
         }
         Ok(Err(e)) => {
-            event!(Level::ERROR, "failed to insert script into database: {:?}", e);
+            event!(
+                Level::ERROR,
+                "failed to insert script into database: {:?}",
+                e
+            );
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
         Err(e) => {
