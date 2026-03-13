@@ -94,7 +94,7 @@ impl CacheControl {
 }
 
 #[derive(Debug)]
-pub enum FetchManagerCommand {
+pub enum TaskManagerCommand {
     RefreshFeed(i64),
     /// Run retention cleanup for the given feed.
     CleanupFeed(i64),
@@ -107,8 +107,8 @@ pub enum FetchManagerCommand {
 
 /// Create a manager for the fetcher tasks.
 pub async fn manager(
-    mut rx: mpsc::Receiver<FetchManagerCommand>,
-    tx: mpsc::Sender<FetchManagerCommand>,
+    mut rx: mpsc::Receiver<TaskManagerCommand>,
+    tx: mpsc::Sender<TaskManagerCommand>,
     pool: Pool<SqliteConnectionManager>,
     token: CancellationToken,
 ) -> Result<()> {
@@ -128,7 +128,7 @@ pub async fn manager(
         _ = token.cancelled() => return Ok(()),
     } {
         match command {
-            FetchManagerCommand::RefreshFeed(feed_id) => {
+            TaskManagerCommand::RefreshFeed(feed_id) => {
                 #[cfg(feature = "lua")]
                 let script_runner: Option<&dyn ScriptRunner> =
                     runner.as_ref().map(|r| r as &dyn ScriptRunner);
@@ -154,7 +154,7 @@ pub async fn manager(
                     });
             }
 
-            FetchManagerCommand::CleanupFeed(feed_id) => {
+            TaskManagerCommand::CleanupFeed(feed_id) => {
                 if let Ok(conn) = pool.get() {
                     match crate::db::retention::cleanup_feed(&conn, feed_id) {
                         Ok(0) => {}
@@ -169,7 +169,7 @@ pub async fn manager(
                 }
             }
 
-            FetchManagerCommand::CleanupAll => {
+            TaskManagerCommand::CleanupAll => {
                 if let Ok(conn) = pool.get() {
                     match crate::db::retention::cleanup_all(&conn) {
                         Ok(0) => {}
@@ -179,7 +179,7 @@ pub async fn manager(
                 }
             }
 
-            FetchManagerCommand::ReloadScripts => {
+            TaskManagerCommand::ReloadScripts => {
                 #[cfg(feature = "lua")]
                 {
                     debug!("Reloading LuaScriptRunner from database");
@@ -278,7 +278,7 @@ pub(crate) async fn refresh_feed(
     client: &reqwest::Client,
     feed_id: i64,
     pool: Pool<SqliteConnectionManager>,
-    fetcher_tx: &mpsc::Sender<FetchManagerCommand>,
+    task_manager_tx: &mpsc::Sender<TaskManagerCommand>,
     script_runner: Option<&dyn ScriptRunner>,
 ) -> Result<()> {
     // Get the feed URL and headers from the database
@@ -372,7 +372,7 @@ pub(crate) async fn refresh_feed(
     }
 
     // Queue retention cleanup for this feed.
-    if let Err(e) = fetcher_tx.try_send(FetchManagerCommand::CleanupFeed(feed_id)) {
+    if let Err(e) = task_manager_tx.try_send(TaskManagerCommand::CleanupFeed(feed_id)) {
         warn!("Failed to queue cleanup for feed {}: {:?}", feed_id, e);
     }
 

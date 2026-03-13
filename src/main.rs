@@ -5,10 +5,10 @@
 
 pub mod cli;
 pub mod db;
-pub mod fetcher;
 pub mod http;
 pub mod routes;
 pub mod server;
+pub mod tasks;
 
 pub mod scripting;
 

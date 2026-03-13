@@ -1,5 +1,5 @@
-use crate::fetcher::FetchManagerCommand;
 use crate::server::AppState;
+use crate::tasks::TaskManagerCommand;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -24,8 +24,8 @@ use tracing::{event, Level};
 pub async fn fetch_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     // Send a command to the feed fetcher workers to refresh this feed
     if let Err(e) = state
-        .fetcher_tx
-        .send(FetchManagerCommand::RefreshFeed(id))
+        .task_manager_tx
+        .send(TaskManagerCommand::RefreshFeed(id))
         .await
     {
         event!(

@@ -1,5 +1,5 @@
-use crate::fetcher::FetchManagerCommand;
 use crate::server::AppState;
+use crate::tasks::TaskManagerCommand;
 use axum::{extract::State, http::StatusCode, Json};
 use tokio::task;
 use tracing::{event, Level};
@@ -95,8 +95,8 @@ pub async fn add_feed(
     // Issue a command to the feed-fetch workers to make them fetch
     // the latest version of the feed.
     if let Err(e) = state
-        .fetcher_tx
-        .send(FetchManagerCommand::RefreshFeed(id))
+        .task_manager_tx
+        .send(TaskManagerCommand::RefreshFeed(id))
         .await
     {
         event!(

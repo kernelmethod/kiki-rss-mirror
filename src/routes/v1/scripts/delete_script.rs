@@ -51,10 +51,10 @@ pub async fn delete_script(
     match result {
         Ok(Ok(0)) => Ok((StatusCode::NOT_FOUND, "Script not found").into_response()),
         Ok(Ok(_)) => {
-            use crate::fetcher::FetchManagerCommand;
+            use crate::tasks::TaskManagerCommand;
             if let Err(e) = state
-                .fetcher_tx
-                .send(FetchManagerCommand::ReloadScripts)
+                .task_manager_tx
+                .send(TaskManagerCommand::ReloadScripts)
                 .await
             {
                 event!(

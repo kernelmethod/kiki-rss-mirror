@@ -1,5 +1,5 @@
-use crate::fetcher::FetchManagerCommand;
 use crate::server::AppState;
+use crate::tasks::TaskManagerCommand;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -120,8 +120,8 @@ pub async fn import_opml(
             // Queue fetches for all new feeds
             for id in feed_ids {
                 if let Err(e) = state
-                    .fetcher_tx
-                    .send(FetchManagerCommand::RefreshFeed(id))
+                    .task_manager_tx
+                    .send(TaskManagerCommand::RefreshFeed(id))
                     .await
                 {
                     event!(

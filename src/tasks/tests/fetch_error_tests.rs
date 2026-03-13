@@ -6,7 +6,7 @@ use anyhow::Result;
 use axum::{routing::get, Router};
 use rusqlite::OpenFlags;
 
-fn test_tx() -> tokio::sync::mpsc::Sender<FetchManagerCommand> {
+fn test_tx() -> tokio::sync::mpsc::Sender<TaskManagerCommand> {
     tokio::sync::mpsc::channel(64).0
 }
 

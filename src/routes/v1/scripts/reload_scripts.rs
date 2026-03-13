@@ -18,11 +18,11 @@ use tracing::error;
 )]
 #[axum::debug_handler]
 pub async fn reload_scripts(State(state): State<AppState>) -> impl IntoResponse {
-    use crate::fetcher::FetchManagerCommand;
+    use crate::tasks::TaskManagerCommand;
 
     if let Err(e) = state
-        .fetcher_tx
-        .send(FetchManagerCommand::ReloadScripts)
+        .task_manager_tx
+        .send(TaskManagerCommand::ReloadScripts)
         .await
     {
         error!("failed to send ReloadScripts command: {:?}", e);

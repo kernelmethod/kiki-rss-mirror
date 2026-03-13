@@ -14,7 +14,7 @@ fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManage
 }
 
 /// Create a throwaway sender for tests that don't need to inspect queued commands.
-fn test_tx() -> tokio::sync::mpsc::Sender<FetchManagerCommand> {
+fn test_tx() -> tokio::sync::mpsc::Sender<TaskManagerCommand> {
     tokio::sync::mpsc::channel(64).0
 }
 

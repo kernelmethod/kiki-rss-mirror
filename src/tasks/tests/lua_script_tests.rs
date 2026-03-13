@@ -12,7 +12,7 @@ fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManage
     Ok(r2d2::Pool::new(manager)?)
 }
 
-fn test_tx() -> tokio::sync::mpsc::Sender<FetchManagerCommand> {
+fn test_tx() -> tokio::sync::mpsc::Sender<TaskManagerCommand> {
     tokio::sync::mpsc::channel(64).0
 }
 

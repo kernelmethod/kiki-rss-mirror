@@ -117,10 +117,10 @@ pub async fn update_script(
 
     match result {
         Ok(Ok(script)) => {
-            use crate::fetcher::FetchManagerCommand;
+            use crate::tasks::TaskManagerCommand;
             if let Err(e) = state
-                .fetcher_tx
-                .send(FetchManagerCommand::ReloadScripts)
+                .task_manager_tx
+                .send(TaskManagerCommand::ReloadScripts)
                 .await
             {
                 event!(

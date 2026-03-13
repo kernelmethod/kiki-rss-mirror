@@ -48,10 +48,10 @@ pub async fn add_script(
         Ok(Ok(id)) => {
             event!(Level::INFO, "created new script with id={}", id);
 
-            use crate::fetcher::FetchManagerCommand;
+            use crate::tasks::TaskManagerCommand;
             if let Err(e) = state
-                .fetcher_tx
-                .send(FetchManagerCommand::ReloadScripts)
+                .task_manager_tx
+                .send(TaskManagerCommand::ReloadScripts)
                 .await
             {
                 event!(

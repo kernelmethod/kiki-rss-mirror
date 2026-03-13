@@ -1,7 +1,7 @@
 use crate::{
     db::migrations,
-    fetcher::{self, FetchManagerCommand},
     routes,
+    tasks::{self, TaskManagerCommand},
 };
 use anyhow::{bail, Context, Error, Result};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -24,7 +24,7 @@ use tracing::{debug, span, Level};
 pub struct SharedAppState {
     /// An [`mpsc::Sender`] instance that may be used to send commands
     /// to workers threads used to fetch and process feeds.
-    pub fetcher_tx: mpsc::Sender<FetchManagerCommand>,
+    pub task_manager_tx: mpsc::Sender<TaskManagerCommand>,
 
     /// A [`r2d2::Pool`] instance that intermediates connections to the
     /// SQLite database.
@@ -160,7 +160,7 @@ impl Server {
         //
         // This ensures that feed fetcher threads don't consume all of
         // the resources being used by the server threads.
-        let fetcher_runtime = tokio::runtime::Builder::new_multi_thread()
+        let task_manager_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name_fn(|| {
                 static ATOMIC_ID: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
@@ -183,7 +183,7 @@ impl Server {
         // to the feed fetchers
         let (tx, rx) = mpsc::channel(1024);
 
-        fetcher_runtime.spawn(fetcher::manager(
+        task_manager_runtime.spawn(tasks::manager(
             rx,
             tx.clone(),
             pool.clone(),
@@ -238,7 +238,7 @@ impl Server {
 }
 
 async fn check_feeds_loop(
-    fetcher_tx: mpsc::Sender<FetchManagerCommand>,
+    task_manager_tx: mpsc::Sender<TaskManagerCommand>,
     pool: r2d2::Pool<SqliteConnectionManager>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
@@ -246,7 +246,7 @@ async fn check_feeds_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = check_feeds(&fetcher_tx, &pool) {
+                if let Err(e) = check_feeds(&task_manager_tx, &pool) {
                     tracing::error!("Error checking feeds: {:?}", e);
                 }
             }
@@ -259,17 +259,17 @@ async fn check_feeds_loop(
     Ok(())
 }
 
-/// Periodically sends a [`FetchManagerCommand::CleanupAll`] command to
+/// Periodically sends a [`TaskManagerCommand::CleanupAll`] command to
 /// trigger retention cleanup. Runs every hour.
 async fn cleanup_loop(
-    fetcher_tx: mpsc::Sender<FetchManagerCommand>,
+    task_manager_tx: mpsc::Sender<TaskManagerCommand>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = fetcher_tx.try_send(FetchManagerCommand::CleanupAll) {
+                if let Err(e) = task_manager_tx.try_send(TaskManagerCommand::CleanupAll) {
                     tracing::warn!("Failed to queue periodic cleanup: {:?}", e);
                 }
             }
@@ -283,7 +283,7 @@ async fn cleanup_loop(
 }
 
 fn check_feeds(
-    fetcher_tx: &mpsc::Sender<FetchManagerCommand>,
+    task_manager_tx: &mpsc::Sender<TaskManagerCommand>,
     pool: &r2d2::Pool<SqliteConnectionManager>,
 ) -> Result<()> {
     debug!("Sending RefreshFeed commands for all feeds");
@@ -300,7 +300,7 @@ fn check_feeds(
     // Send a RefreshFeed command for each feed
     for feed_id in feed_ids {
         let feed_id = feed_id?;
-        if let Err(e) = fetcher_tx.try_send(FetchManagerCommand::RefreshFeed(feed_id)) {
+        if let Err(e) = task_manager_tx.try_send(TaskManagerCommand::RefreshFeed(feed_id)) {
             tracing::error!(
                 "Failed to send RefreshFeed command for feed {}: {:?}",
                 feed_id,
@@ -349,12 +349,12 @@ async fn shutdown_signal(token: CancellationToken) {
 /// Parent function for the Unix domain socket web worker threads.
 async fn uds_server(
     socket_path: PathBuf,
-    tx: mpsc::Sender<FetchManagerCommand>,
+    tx: mpsc::Sender<TaskManagerCommand>,
     pool: r2d2::Pool<SqliteConnectionManager>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
-        fetcher_tx: tx,
+        task_manager_tx: tx,
         conn_pool: pool,
     });
     let app = routes::create_router().with_state(shared_state);
@@ -382,12 +382,12 @@ async fn uds_server(
 /// Parent function for the TCP web worker threads.
 async fn tcp_server(
     port: u16,
-    tx: mpsc::Sender<FetchManagerCommand>,
+    tx: mpsc::Sender<TaskManagerCommand>,
     pool: r2d2::Pool<SqliteConnectionManager>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
-        fetcher_tx: tx,
+        task_manager_tx: tx,
         conn_pool: pool,
     });
     let app = routes::create_router().with_state(shared_state);

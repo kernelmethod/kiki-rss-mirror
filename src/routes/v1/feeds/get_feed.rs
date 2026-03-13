@@ -1,5 +1,5 @@
-use crate::fetcher::FetchError;
 use crate::server::AppState;
+use crate::tasks::FetchError;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
