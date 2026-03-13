@@ -1,0 +1,217 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use super::super::*;
+use crate::test::TestBuilder;
+use anyhow::Result;
+use axum::{routing::get, Router};
+use rusqlite::OpenFlags;
+
+fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
+    let manager = SqliteConnectionManager::file(path)
+        .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
+    Ok(r2d2::Pool::new(manager)?)
+}
+
+/// Helper: insert a feed pointing at the given URL and return the feed id,
+/// an HTTP client (with manual redirect policy), and a connection pool.
+fn setup_feed(
+    tc: &crate::test::TestConfig,
+    feed_url: &str,
+) -> Result<(i64, reqwest::Client, r2d2::Pool<SqliteConnectionManager>)> {
+    let conn = tc.database_conn()?;
+    conn.execute(
+        "INSERT INTO feeds (title, url) VALUES ('error test feed', ?1)",
+        [feed_url],
+    )?;
+    let feed_id = conn.last_insert_rowid();
+
+    // Use Policy::none() to match the production client in `manager()`,
+    // so that redirect handling is done by our code, not reqwest.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(crate::http::USER_AGENT)
+        .build()?;
+    let pool = make_pool(&tc.database_path())?;
+    Ok((feed_id, client, pool))
+}
+
+/// Read the stored FetchError JSON from the database for the given feed.
+fn read_stored_error(
+    conn: &rusqlite::Connection,
+    feed_id: i64,
+) -> Result<(Option<FetchError>, Option<i64>)> {
+    let (json, at): (Option<String>, Option<i64>) = conn.query_row(
+        "SELECT last_fetch_error, last_fetch_error_at FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let error = json.and_then(|s| serde_json::from_str(&s).ok());
+    Ok((error, at))
+}
+
+/// When a server returns HTML instead of a feed, the fetcher stores an
+/// `InvalidFeed` error and inserts no entries.
+#[tokio::test]
+async fn test_invalid_feed_error() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+
+    let app = Router::new().route(
+        "/feed",
+        get(|| async {
+            (
+                [("content-type", "text/html")],
+                "<html><body>Not a feed</body></html>",
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+    let feed_url = format!("http://{}/feed", addr);
+    let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
+
+    refresh_feed(&client, feed_id, pool, None).await?;
+
+    let conn = tc.database_conn()?;
+    let entry_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(entry_count, 0, "HTML response should not produce entries");
+
+    let (error, error_at) = read_stored_error(&conn, feed_id)?;
+    assert_eq!(
+        error,
+        Some(FetchError::InvalidFeed {
+            url: feed_url.clone()
+        }),
+    );
+    assert!(error_at.is_some());
+
+    Ok(())
+}
+
+/// When a server returns a non-success HTTP status, the fetcher stores an
+/// `HttpStatus` error.
+#[tokio::test]
+async fn test_http_status_error() -> Result<()> {
+    use axum::http::StatusCode;
+
+    let tc = TestBuilder::default().init_database().build()?;
+
+    let app = Router::new().route("/feed", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+    let feed_url = format!("http://{}/feed", addr);
+    let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
+
+    refresh_feed(&client, feed_id, pool, None).await?;
+
+    let conn = tc.database_conn()?;
+    let (error, error_at) = read_stored_error(&conn, feed_id)?;
+    assert_eq!(
+        error,
+        Some(FetchError::HttpStatus {
+            url: feed_url.clone(),
+            status: 500,
+        }),
+    );
+    assert!(error_at.is_some());
+
+    Ok(())
+}
+
+/// When a server sends an endless redirect loop, the fetcher stores a
+/// `TooManyRedirects` error.
+#[tokio::test]
+async fn test_too_many_redirects_error() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+
+    // Server that always redirects back to itself.
+    let app = Router::new().route(
+        "/feed",
+        get(|| async {
+            (
+                axum::http::StatusCode::MOVED_PERMANENTLY,
+                [("location", "/feed")],
+                "",
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+    let feed_url = format!("http://{}/feed", addr);
+    let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
+
+    refresh_feed(&client, feed_id, pool, None).await?;
+
+    let conn = tc.database_conn()?;
+    let (error, error_at) = read_stored_error(&conn, feed_id)?;
+    assert_eq!(
+        error,
+        Some(FetchError::TooManyRedirects {
+            url: feed_url.clone(),
+        }),
+    );
+    assert!(error_at.is_some());
+
+    Ok(())
+}
+
+/// After an error is stored, a successful fetch clears it.
+#[tokio::test]
+async fn test_successful_fetch_clears_error() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+
+    // Start with a server returning HTML (causes InvalidFeed error).
+    let app = Router::new().route(
+        "/feed",
+        get(|| async {
+            (
+                [("content-type", "text/html")],
+                "<html><body>Not a feed</body></html>",
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+    let feed_url = format!("http://{}/feed", addr);
+    let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
+
+    refresh_feed(&client, feed_id, pool, None).await?;
+
+    let conn = tc.database_conn()?;
+    let (error, _) = read_stored_error(&conn, feed_id)?;
+    assert!(error.is_some(), "error should be set after HTML response");
+
+    // Now point the feed at a valid RSS source and refresh again.
+    let valid_url = tc.example_feed_url();
+    conn.execute(
+        "UPDATE feeds SET url = ?1, last_checked = NULL WHERE id = ?2",
+        rusqlite::params![valid_url, feed_id],
+    )?;
+
+    let pool2 = make_pool(&tc.database_path())?;
+    refresh_feed(&client, feed_id, pool2, None).await?;
+
+    let (error, error_at) = read_stored_error(&conn, feed_id)?;
+    assert!(
+        error.is_none(),
+        "error should be cleared after successful fetch"
+    );
+    assert!(
+        error_at.is_none(),
+        "error_at should be cleared after successful fetch"
+    );
+
+    Ok(())
+}
