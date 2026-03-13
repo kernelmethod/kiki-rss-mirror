@@ -105,6 +105,9 @@ pub struct TestConfig {
 
 impl Drop for TestConfig {
     fn drop(&mut self) {
+        if let Some(token) = self.server_token.take() {
+            token.cancel();
+        }
         if let Some(handle) = self.feed_server_handle.take() {
             handle.abort();
         }
