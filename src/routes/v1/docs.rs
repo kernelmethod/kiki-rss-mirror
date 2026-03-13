@@ -39,6 +39,7 @@ use utoipa::OpenApi;
         crate::routes::v1::settings::retention::get_retention,
         crate::routes::v1::settings::retention::put_retention,
         crate::routes::v1::entries::cleanup::cleanup,
+        crate::routes::v1::shutdown::shutdown,
     ),
     components(
         schemas(

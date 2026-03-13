@@ -32,6 +32,10 @@ pub struct SharedAppState {
     /// A [`r2d2::Pool`] instance that intermediates connections to the
     /// SQLite database.
     pub conn_pool: r2d2::Pool<SqliteConnectionManager>,
+
+    /// A [`CancellationToken`] that can be used to trigger a graceful
+    /// server shutdown.
+    pub cancel_token: CancellationToken,
 }
 
 pub type AppState = Arc<SharedAppState>;
@@ -374,6 +378,7 @@ async fn uds_server(
         task_manager_tx: tx,
         reload_tx,
         conn_pool: pool,
+        cancel_token: cancel_token.clone(),
     });
     let app = routes::create_router().with_state(shared_state);
 
@@ -409,6 +414,7 @@ async fn tcp_server(
         task_manager_tx: tx,
         reload_tx,
         conn_pool: pool,
+        cancel_token: cancel_token.clone(),
     });
     let app = routes::create_router().with_state(shared_state);
 
