@@ -25,6 +25,9 @@ pub struct FeedServerState {
     pub expires: Option<String>,
     /// If set, the server includes a `Cache-Control` response header with this value.
     pub cache_control: Option<String>,
+    /// If set, the server compresses response bodies using this encoding
+    /// (e.g. `"gzip"` or `"deflate"`) and includes the `Content-Encoding` header.
+    pub content_encoding: Option<String>,
     /// Total number of requests received by the server.
     pub request_count: usize,
     /// Number of 200 OK responses served.
@@ -258,31 +261,49 @@ impl TestConfig {
 
             s.full_response_count += 1;
 
+            // Capture header values before releasing the lock.
+            let etag = s.etag.clone();
+            let last_modified = s.last_modified.clone();
+            let expires = s.expires.clone();
+            let cache_control = s.cache_control.clone();
+            let content_encoding = s.content_encoding.clone();
+            drop(s);
+
             let body = hs.rss_content.as_ref().clone();
+            let body = if let Some(ref encoding) = content_encoding {
+                compress_body(&body, encoding)
+            } else {
+                body
+            };
             let mut response = body.into_response();
             response.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
                 "application/rss+xml".parse().unwrap(),
             );
-            if let Some(ref etag) = s.etag {
+            if let Some(ref etag) = etag {
                 response
                     .headers_mut()
                     .insert(axum::http::header::ETAG, etag.parse().unwrap());
             }
-            if let Some(ref lm) = s.last_modified {
+            if let Some(ref lm) = last_modified {
                 response
                     .headers_mut()
                     .insert(axum::http::header::LAST_MODIFIED, lm.parse().unwrap());
             }
-            if let Some(ref exp) = s.expires {
+            if let Some(ref exp) = expires {
                 response
                     .headers_mut()
                     .insert(axum::http::header::EXPIRES, exp.parse().unwrap());
             }
-            if let Some(ref cc) = s.cache_control {
+            if let Some(ref cc) = cache_control {
                 response
                     .headers_mut()
                     .insert(axum::http::header::CACHE_CONTROL, cc.parse().unwrap());
+            }
+            if let Some(ref enc) = content_encoding {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_ENCODING, enc.parse().unwrap());
             }
             response
         }
@@ -377,5 +398,32 @@ impl TestConfig {
             .read_write()
             .build()
             .with_context(|| "failed to connect to database")
+    }
+}
+
+/// Compress `data` using the given encoding (`"gzip"` or `"deflate"`).
+///
+/// Panics on unsupported encodings — this is intentional since it is only
+/// used in test helpers.
+#[cfg(test)]
+fn compress_body(data: &[u8], encoding: &str) -> Vec<u8> {
+    use flate2::write::{GzEncoder, ZlibEncoder};
+    use flate2::Compression;
+    use std::io::Write;
+
+    match encoding {
+        "gzip" => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(data).unwrap();
+            encoder.finish().unwrap()
+        }
+        "deflate" => {
+            // Content-Encoding: deflate uses zlib-wrapped deflate (RFC 1950),
+            // not raw deflate (RFC 1951).
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(data).unwrap();
+            encoder.finish().unwrap()
+        }
+        other => panic!("unsupported test content encoding: {other}"),
     }
 }

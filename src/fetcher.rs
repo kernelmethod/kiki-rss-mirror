@@ -1383,4 +1383,69 @@ mod cache_tests {
 
         Ok(())
     }
+
+    /// A gzip-compressed response is transparently decompressed by reqwest,
+    /// and the feed entries are correctly parsed and inserted.
+    #[tokio::test]
+    async fn test_gzip_compressed_response() -> Result<()> {
+        let mut tc = TestBuilder::default().init_database().build()?;
+        let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+            content_encoding: Some("gzip".into()),
+            ..Default::default()
+        }));
+        tc.init_feed_server_with_state(state.clone()).await?;
+
+        let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+        refresh_feed(&client, feed_id, pool, None).await?;
+
+        let conn = tc.database_conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
+            [feed_id],
+            |row| row.get(0),
+        )?;
+        assert!(
+            count > 0,
+            "entries should be inserted from gzip-compressed response"
+        );
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.full_response_count, 1);
+
+        Ok(())
+    }
+
+    /// A deflate-compressed response is transparently decompressed by reqwest,
+    /// and the feed entries are correctly parsed and inserted.
+    #[tokio::test]
+    async fn test_deflate_compressed_response() -> Result<()> {
+        let mut tc = TestBuilder::default().init_database().build()?;
+        let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+            content_encoding: Some("deflate".into()),
+            ..Default::default()
+        }));
+        tc.init_feed_server_with_state(state.clone()).await?;
+
+        let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+        refresh_feed(&client, feed_id, pool, None).await?;
+
+        let conn = tc.database_conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
+            [feed_id],
+            |row| row.get(0),
+        )?;
+        assert!(
+            count > 0,
+            "entries should be inserted from deflate-compressed response"
+        );
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.full_response_count, 1);
+
+        Ok(())
+    }
+
 }
