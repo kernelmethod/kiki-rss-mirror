@@ -52,6 +52,7 @@ pub async fn root(State(state): State<AppState>) -> (StatusCode, Json<RootRespon
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod test {
     use crate::{db::migrations, test::TestBuilder};
     use anyhow::Result;

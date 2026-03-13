@@ -1,4 +1,8 @@
-/// Utilities for testing Kiki.
+//! Utilities for testing Kiki.
+#![allow(clippy::panic)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
+#![allow(clippy::indexing_slicing)]
 use crate::db::ConnectionBuilder;
 use crate::server::ServerBuilder;
 use anyhow::{bail, Context, Result};
@@ -47,18 +51,10 @@ struct HandlerState {
     rss_content: Arc<Vec<u8>>,
 }
 
+#[derive(Default)]
 pub struct TestBuilder {
     init_database: bool,
     init_server: bool,
-}
-
-impl Default for TestBuilder {
-    fn default() -> Self {
-        TestBuilder {
-            init_database: false,
-            init_server: false,
-        }
-    }
 }
 
 impl TestBuilder {
@@ -140,7 +136,7 @@ impl TestConfig {
 
     pub fn init_server(mut self) -> Result<Self> {
         debug!("starting server at {:?}", &self.socket_path());
-        if let Some(_) = self.server_token {
+        if self.server_token.is_some() {
             bail!("server has already been started");
         }
 
@@ -405,7 +401,6 @@ impl TestConfig {
 ///
 /// Panics on unsupported encodings — this is intentional since it is only
 /// used in test helpers.
-#[cfg(test)]
 fn compress_body(data: &[u8], encoding: &str) -> Vec<u8> {
     use flate2::write::{GzEncoder, ZlibEncoder};
     use flate2::Compression;

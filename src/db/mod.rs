@@ -165,7 +165,7 @@ mod tests {
             "tags",
         ]
         .into_iter()
-        .map(|s| String::from(s))
+        .map(String::from)
         .sorted()
         .collect::<Vec<_>>();
 

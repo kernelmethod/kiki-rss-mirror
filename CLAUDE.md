@@ -9,7 +9,7 @@ cargo build --release   # Build in release mode
 
 # Formatting and linting commands
 cargo fmt
-cargo clippy
+cargo clippy --all-targets --all-features -- -D warnings
 
 # Testing commands
 cargo test

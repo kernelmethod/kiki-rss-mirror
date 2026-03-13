@@ -79,6 +79,7 @@ pub async fn add_script(
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod test {
     use super::*;
     use crate::routes::v1::scripts::list_scripts::ListScriptsResponse;

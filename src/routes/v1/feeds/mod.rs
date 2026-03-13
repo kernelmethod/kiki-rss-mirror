@@ -44,6 +44,7 @@ pub fn create_router() -> Router<AppState> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod test {
     use super::*;
     use crate::routes::v1::entries::ListEntriesResponse;
