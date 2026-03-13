@@ -8,40 +8,48 @@
   };
 
   outputs = { self, nixpkgs, crane, flake-utils, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
-        craneLib = crane.mkLib pkgs;
+    let
+      perSystem = flake-utils.lib.eachDefaultSystem (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          craneLib = crane.mkLib pkgs;
 
-        commonArgs = {
-          src = craneLib.cleanCargoSource ./.;
-          strictDeps = true;
+          commonArgs = {
+            src = craneLib.cleanCargoSource ./.;
+            strictDeps = true;
 
-          buildInputs = [ ];
-          nativeBuildInputs = [ pkgs.pkg-config ];
-        };
+            buildInputs = [ ];
+            nativeBuildInputs = [ pkgs.pkg-config ];
+          };
 
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        kiki = craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
-        });
-      in
-      {
-        checks = {
-          inherit kiki;
-        };
+          kiki = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+          });
+        in
+        {
+          checks = {
+            inherit kiki;
+          };
 
-        packages.default = kiki;
+          packages.default = kiki;
 
-        devShells.default = craneLib.devShell {
-          checks = self.checks.${system};
+          devShells.default = craneLib.devShell {
+            checks = self.checks.${system};
 
-          packages = with pkgs; [
-            cargo-deb
-            cargo-generate-rpm
-          ];
-        };
-      }
-    );
+            packages = with pkgs; [
+              cargo-deb
+              cargo-generate-rpm
+            ];
+          };
+        }
+      );
+    in
+    perSystem // {
+      nixosModules.default = { pkgs, lib, ... }: {
+        imports = [ ./nix/module.nix ];
+        services.kiki.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      };
+    };
 }
