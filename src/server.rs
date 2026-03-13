@@ -12,7 +12,11 @@ use std::{
     sync::{atomic, Arc},
     time::Duration,
 };
-use tokio::{net::UnixListener, signal, sync::mpsc};
+use tokio::{
+    net::{TcpListener, UnixListener},
+    signal,
+    sync::mpsc,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, span, Level};
 
@@ -31,6 +35,7 @@ pub type AppState = Arc<SharedAppState>;
 pub struct ServerBuilder<'a> {
     db_path: &'a Path,
     socket_path: Option<&'a Path>,
+    port: Option<u16>,
     autofetch: bool,
 }
 
@@ -39,12 +44,18 @@ impl<'a> ServerBuilder<'a> {
         ServerBuilder {
             db_path,
             socket_path: None,
+            port: None,
             autofetch: false,
         }
     }
 
     pub fn socket_path(mut self, p: &'a Path) -> Self {
         self.socket_path = Some(p);
+        self
+    }
+
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = Some(port);
         self
     }
 
@@ -63,6 +74,7 @@ impl<'a> ServerBuilder<'a> {
         Server {
             db_path,
             socket_path,
+            port: self.port,
             autofetch: self.autofetch,
             cancel_token: CancellationToken::new(),
         }
@@ -100,6 +112,9 @@ pub struct Server {
 
     /// Path to the Unix socket used by the server.
     socket_path: PathBuf,
+
+    /// Optional TCP port to listen on (localhost).
+    port: Option<u16>,
 
     /// Whether or not to automatically fetch feed contents.
     autofetch: bool,
@@ -196,6 +211,14 @@ impl Server {
             pool.clone(),
             self.cancel_token.clone(),
         ));
+        if let Some(port) = self.port {
+            web_runtime.spawn(tcp_server(
+                port,
+                tx.clone(),
+                pool.clone(),
+                self.cancel_token.clone(),
+            ));
+        }
         let cancel_task = web_runtime.spawn(shutdown_signal(self.cancel_token.clone()));
 
         web_runtime.block_on(cancel_task)?;
@@ -310,11 +333,40 @@ async fn server(
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Unable to bind to Unix socket at {:?}", &socket_path))?;
 
+    let absolute_path = fs::canonicalize(&socket_path).unwrap_or(socket_path.clone());
+    tracing::info!("Listening on {}", absolute_path.display());
+
     span!(Level::TRACE, "web-worker");
     axum::serve(listener, app)
         .with_graceful_shutdown(web_shutdown_signal(socket_path, cancel_token.clone()))
         .await
         .with_context(|| "Error encountered while running server")
+}
+
+/// Parent function for the TCP web worker threads.
+async fn tcp_server(
+    port: u16,
+    tx: mpsc::Sender<FetchManagerCommand>,
+    pool: r2d2::Pool<SqliteConnectionManager>,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    let shared_state = Arc::new(SharedAppState {
+        fetcher_tx: tx,
+        conn_pool: pool,
+    });
+    let app = routes::create_router().with_state(shared_state);
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Unable to bind to TCP port {}", port))?;
+
+    tracing::info!("Listening on http://127.0.0.1:{}", port);
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(cancel_token.cancelled_owned())
+        .await
+        .with_context(|| "Error encountered while running TCP server")
 }
 
 async fn web_shutdown_signal(socket_path: PathBuf, cancel_token: CancellationToken) {
