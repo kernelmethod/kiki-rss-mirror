@@ -52,6 +52,8 @@ pub struct ServerBuilder<'a> {
     db_path: &'a Path,
     listen_addr: Option<ListenAddr>,
     autofetch: bool,
+    single_threaded: bool,
+    worker_count: Option<usize>,
 }
 
 impl<'a> ServerBuilder<'a> {
@@ -60,6 +62,8 @@ impl<'a> ServerBuilder<'a> {
             db_path,
             listen_addr: None,
             autofetch: false,
+            single_threaded: false,
+            worker_count: None,
         }
     }
 
@@ -78,6 +82,18 @@ impl<'a> ServerBuilder<'a> {
         self
     }
 
+    /// Use single-threaded tokio runtimes instead of multi-threaded ones.
+    pub fn single_threaded(mut self) -> Self {
+        self.single_threaded = true;
+        self
+    }
+
+    /// Set the number of feed-fetcher worker tasks.
+    pub fn worker_count(mut self, n: usize) -> Self {
+        self.worker_count = Some(n);
+        self
+    }
+
     pub fn build(self) -> Server {
         let listen_addr = self
             .listen_addr
@@ -87,6 +103,8 @@ impl<'a> ServerBuilder<'a> {
             db_path: PathBuf::from(self.db_path),
             listen_addr,
             autofetch: self.autofetch,
+            single_threaded: self.single_threaded,
+            worker_count: self.worker_count,
             cancel_token: CancellationToken::new(),
         }
     }
@@ -126,6 +144,12 @@ pub struct Server {
 
     /// Whether or not to automatically fetch feed contents.
     autofetch: bool,
+
+    /// Use single-threaded tokio runtimes instead of multi-threaded ones.
+    single_threaded: bool,
+
+    /// Override the number of feed-fetcher worker tasks.
+    worker_count: Option<usize>,
 
     /// A [`CancellationToken`] used to indicate that the server should
     /// be killed.
@@ -171,22 +195,29 @@ impl Server {
         //
         // This ensures that feed fetcher threads don't consume all of
         // the resources being used by the server threads.
-        let task_manager_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name_fn(|| {
-                static ATOMIC_ID: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
-                let id = ATOMIC_ID.fetch_add(1, atomic::Ordering::SeqCst);
-                format!("feed-fetcher-{}", id)
-            })
+        let mut task_rt_builder = tokio::runtime::Builder::new_multi_thread();
+        task_rt_builder.enable_all().thread_name_fn(|| {
+            static ATOMIC_ID: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+            let id = ATOMIC_ID.fetch_add(1, atomic::Ordering::SeqCst);
+            format!("feed-fetcher-{}", id)
+        });
+        if self.single_threaded {
+            task_rt_builder.worker_threads(1);
+        }
+        let task_manager_runtime = task_rt_builder
             .build()
             .with_context(|| "failed to build Tokio runtime for feed fetchers")?;
-        let web_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name_fn(|| {
-                static ATOMIC_ID: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
-                let id = ATOMIC_ID.fetch_add(1, atomic::Ordering::SeqCst);
-                format!("server-worker-{}", id)
-            })
+
+        let mut web_rt_builder = tokio::runtime::Builder::new_multi_thread();
+        web_rt_builder.enable_all().thread_name_fn(|| {
+            static ATOMIC_ID: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+            let id = ATOMIC_ID.fetch_add(1, atomic::Ordering::SeqCst);
+            format!("server-worker-{}", id)
+        });
+        if self.single_threaded {
+            web_rt_builder.worker_threads(1);
+        }
+        let web_runtime = web_rt_builder
             .build()
             .with_context(|| "failed to build Tokio runtime for web service workers")?;
 
@@ -197,7 +228,7 @@ impl Server {
         // Watch channel for broadcasting script-reload signals to all workers.
         let (reload_tx, _) = tokio::sync::watch::channel(());
 
-        let num_workers = tasks::worker_count();
+        let num_workers = self.worker_count.unwrap_or_else(tasks::worker_count);
         debug!("Spawning {} task-manager workers", num_workers);
 
         let _worker_handles = {

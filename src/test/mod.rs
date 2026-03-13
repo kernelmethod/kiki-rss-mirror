@@ -6,6 +6,7 @@
 use crate::db::ConnectionBuilder;
 use crate::server::ServerBuilder;
 use anyhow::{bail, Context, Result};
+use std::sync::LazyLock;
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -16,6 +17,15 @@ use std::{
 use tempdir::TempDir;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
+
+static RSS_CONTENT: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    std::fs::read(TestConfig::test_data_path("example.xml"))
+        .expect("failed to read test/example.xml")
+});
+static ATOM_CONTENT: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    std::fs::read(TestConfig::test_data_path("example_atom.xml"))
+        .expect("failed to read test/example_atom.xml")
+});
 
 /// Configurable state for the test feed server, allowing tests to control
 /// which HTTP cache headers are returned and to inspect request counts.
@@ -145,6 +155,8 @@ impl TestConfig {
 
         let server = ServerBuilder::new(&self.database_path())
             .socket_path(&self.socket_path())
+            .single_threaded()
+            .worker_count(1)
             .build();
         self.server_token = Some(server.cancel_token());
         let handle = thread::spawn(move || server.run());
@@ -169,10 +181,8 @@ impl TestConfig {
             bail!("feed server has already been started");
         }
 
-        let rss_content = std::fs::read(Self::test_data_path("example.xml"))
-            .with_context(|| "failed to read test/example.xml")?;
-        let atom_content = std::fs::read(Self::test_data_path("example_atom.xml"))
-            .with_context(|| "failed to read test/example_atom.xml")?;
+        let rss_content = RSS_CONTENT.clone();
+        let atom_content = ATOM_CONTENT.clone();
 
         let app = Router::new()
             .route(
@@ -225,10 +235,7 @@ impl TestConfig {
             bail!("feed server has already been started");
         }
 
-        let rss_content = Arc::new(
-            std::fs::read(Self::test_data_path("example.xml"))
-                .with_context(|| "failed to read test/example.xml")?,
-        );
+        let rss_content = Arc::new(RSS_CONTENT.clone());
 
         async fn rss_handler(
             headers: HeaderMap,
@@ -356,7 +363,7 @@ impl TestConfig {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             if !p.exists() {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(5));
                 continue;
             }
 
