@@ -32,10 +32,17 @@ pub struct SharedAppState {
 
 pub type AppState = Arc<SharedAppState>;
 
+/// Specifies how the server should listen for connections.
+pub enum ListenAddr {
+    /// Listen on a Unix domain socket at the given path.
+    Uds(PathBuf),
+    /// Listen on a localhost TCP port.
+    Tcp(u16),
+}
+
 pub struct ServerBuilder<'a> {
     db_path: &'a Path,
-    socket_path: Option<&'a Path>,
-    port: Option<u16>,
+    listen_addr: Option<ListenAddr>,
     autofetch: bool,
 }
 
@@ -43,19 +50,18 @@ impl<'a> ServerBuilder<'a> {
     pub fn new(db_path: &'a Path) -> Self {
         ServerBuilder {
             db_path,
-            socket_path: None,
-            port: None,
+            listen_addr: None,
             autofetch: false,
         }
     }
 
     pub fn socket_path(mut self, p: &'a Path) -> Self {
-        self.socket_path = Some(p);
+        self.listen_addr = Some(ListenAddr::Uds(p.to_path_buf()));
         self
     }
 
     pub fn port(mut self, port: u16) -> Self {
-        self.port = Some(port);
+        self.listen_addr = Some(ListenAddr::Tcp(port));
         self
     }
 
@@ -64,17 +70,14 @@ impl<'a> ServerBuilder<'a> {
         self
     }
 
-    pub fn build(&self) -> Server {
-        let db_path = PathBuf::from(self.db_path);
-        let socket_path = match self.socket_path {
-            Some(p) => PathBuf::from(p),
-            None => PathBuf::from("kiki.sock"),
-        };
+    pub fn build(self) -> Server {
+        let listen_addr = self
+            .listen_addr
+            .unwrap_or_else(|| ListenAddr::Uds(PathBuf::from("kiki.sock")));
 
         Server {
-            db_path,
-            socket_path,
-            port: self.port,
+            db_path: PathBuf::from(self.db_path),
+            listen_addr,
             autofetch: self.autofetch,
             cancel_token: CancellationToken::new(),
         }
@@ -110,11 +113,8 @@ pub struct Server {
     /// Path to the database used by the server.
     db_path: PathBuf,
 
-    /// Path to the Unix socket used by the server.
-    socket_path: PathBuf,
-
-    /// Optional TCP port to listen on (localhost).
-    port: Option<u16>,
+    /// How the server listens for connections.
+    listen_addr: ListenAddr,
 
     /// Whether or not to automatically fetch feed contents.
     autofetch: bool,
@@ -182,16 +182,6 @@ impl Server {
         // to the feed fetchers
         let (tx, rx) = mpsc::channel(1024);
 
-        // Create Unix socket for the server listener
-        if self.socket_path.exists() {
-            fs::remove_file(&self.socket_path).with_context(|| {
-                format!(
-                    "Unable to delete existing socket file from {:?}",
-                    &self.socket_path
-                )
-            })?;
-        }
-
         fetcher_runtime.spawn(fetcher::manager(
             rx,
             pool.clone(),
@@ -205,19 +195,32 @@ impl Server {
                 self.cancel_token.clone(),
             ));
         }
-        web_runtime.spawn(server(
-            self.socket_path,
-            tx.clone(),
-            pool.clone(),
-            self.cancel_token.clone(),
-        ));
-        if let Some(port) = self.port {
-            web_runtime.spawn(tcp_server(
-                port,
-                tx.clone(),
-                pool.clone(),
-                self.cancel_token.clone(),
-            ));
+
+        match self.listen_addr {
+            ListenAddr::Uds(socket_path) => {
+                if socket_path.exists() {
+                    fs::remove_file(&socket_path).with_context(|| {
+                        format!(
+                            "Unable to delete existing socket file from {:?}",
+                            &socket_path
+                        )
+                    })?;
+                }
+                web_runtime.spawn(uds_server(
+                    socket_path,
+                    tx.clone(),
+                    pool.clone(),
+                    self.cancel_token.clone(),
+                ));
+            }
+            ListenAddr::Tcp(port) => {
+                web_runtime.spawn(tcp_server(
+                    port,
+                    tx.clone(),
+                    pool.clone(),
+                    self.cancel_token.clone(),
+                ));
+            }
         }
         let cancel_task = web_runtime.spawn(shutdown_signal(self.cancel_token.clone()));
 
@@ -317,8 +320,8 @@ async fn shutdown_signal(token: CancellationToken) {
     }
 }
 
-/// Parent function for the web worker threads.
-async fn server(
+/// Parent function for the Unix domain socket web worker threads.
+async fn uds_server(
     socket_path: PathBuf,
     tx: mpsc::Sender<FetchManagerCommand>,
     pool: r2d2::Pool<SqliteConnectionManager>,

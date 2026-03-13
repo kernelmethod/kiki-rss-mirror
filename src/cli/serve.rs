@@ -19,17 +19,13 @@ impl ServeArgs {
         tracing_subscriber::fmt::init();
 
         let db_path = PathBuf::from("./kiki.db");
-        let socket_path = self
-            .socket_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("./kiki.sock"));
-        let mut builder = server::ServerBuilder::new(&db_path);
-        builder = builder.autofetch();
-        if let Some(port) = self.port {
-            builder = builder.port(port);
-        } else {
-            builder = builder.socket_path(&socket_path);
-        }
+        let default_socket = PathBuf::from("./kiki.sock");
+        let mut builder = server::ServerBuilder::new(&db_path).autofetch();
+        builder = match (self.port, &self.socket_path) {
+            (Some(port), _) => builder.port(port),
+            (None, Some(path)) => builder.socket_path(path),
+            (None, None) => builder.socket_path(&default_socket),
+        };
         let server = builder.build();
 
         std::thread::spawn(|| server.run())
