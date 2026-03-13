@@ -91,7 +91,7 @@ mod test {
         let client = tc.client()?;
 
         let resp = client
-            .post("http://kiki/v1/scripts/create")
+            .post("http://localhost/v1/scripts/create")
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
                 text: "return function(entry) return entry end".to_string(),
@@ -115,7 +115,7 @@ mod test {
         let text = "return function(entry) return entry end";
 
         client
-            .post("http://kiki/v1/scripts/create")
+            .post("http://localhost/v1/scripts/create")
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
                 text: text.to_string(),
@@ -123,7 +123,7 @@ mod test {
             .send()
             .await?;
 
-        let resp = client.get("http://kiki/v1/scripts").send().await?;
+        let resp = client.get("http://localhost/v1/scripts").send().await?;
 
         assert_eq!(resp.status(), StatusCode::OK);
 

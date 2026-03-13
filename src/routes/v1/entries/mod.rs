@@ -85,7 +85,7 @@ mod test {
         populate_entries(&tc)?;
 
         // Call the list_entries endpoint
-        let response = client.get("http://kiki/v1/entries").send().await?;
+        let response = client.get("http://localhost/v1/entries").send().await?;
 
         // Verify the response
         assert_eq!(response.status(), StatusCode::OK);
@@ -126,7 +126,10 @@ mod test {
         populate_entries(&tc)?;
 
         // Call the get_entry endpoint
-        let response = client.get("http://kiki/v1/entries/id/1").send().await?;
+        let response = client
+            .get("http://localhost/v1/entries/id/1")
+            .send()
+            .await?;
 
         // Verify the response
         assert_eq!(response.status(), StatusCode::OK);
@@ -143,7 +146,10 @@ mod test {
         assert_eq!(response.status_favorite, 0);
 
         // Attempt to retrieve an entry that does not exist
-        let response = client.get("http://kiki/v1/entries/id/1337").send().await?;
+        let response = client
+            .get("http://localhost/v1/entries/id/1337")
+            .send()
+            .await?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let content = response.text().await?;
         assert_eq!(&content, "Entry not found");
@@ -159,17 +165,23 @@ mod test {
         populate_entries(&tc)?;
 
         // Delete an existing entry
-        let response = client.delete("http://kiki/v1/entries/id/1").send().await?;
+        let response = client
+            .delete("http://localhost/v1/entries/id/1")
+            .send()
+            .await?;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         // Verify the entry was deleted by trying to retrieve it
-        let response = client.get("http://kiki/v1/entries/id/1").send().await?;
+        let response = client
+            .get("http://localhost/v1/entries/id/1")
+            .send()
+            .await?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(&response.text().await?, "Entry not found");
 
         // Try to delete a non-existent entry
         let response = client
-            .delete("http://kiki/v1/entries/id/1337")
+            .delete("http://localhost/v1/entries/id/1337")
             .send()
             .await?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);

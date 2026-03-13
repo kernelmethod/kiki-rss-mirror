@@ -64,7 +64,7 @@ mod test {
         let tc = TestBuilder::all().init_server().build()?;
         let client = tc.client()?;
 
-        let resp = client.get("http://kiki/v1/").send().await?;
+        let resp = client.get("http://localhost/v1/").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let json = resp.json::<HashMap<String, String>>().await?;

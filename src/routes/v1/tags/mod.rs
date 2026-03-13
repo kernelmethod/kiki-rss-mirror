@@ -94,7 +94,7 @@ mod test {
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;
 
-        let resp = client.get("http://kiki/v1/tags").send().await?;
+        let resp = client.get("http://localhost/v1/tags").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<list_tags::ListTagsResponse>().await?;
         assert_eq!(json.tags.len(), 0);
@@ -110,7 +110,7 @@ mod test {
 
         // Create a tag
         let resp = client
-            .post("http://kiki/v1/tags/create")
+            .post("http://localhost/v1/tags/create")
             .json(&create_tag::CreateTagRequest {
                 name: "news".to_string(),
             })
@@ -121,7 +121,7 @@ mod test {
         assert_eq!(tag.name, "news");
 
         // List tags
-        let resp = client.get("http://kiki/v1/tags").send().await?;
+        let resp = client.get("http://localhost/v1/tags").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<list_tags::ListTagsResponse>().await?;
         assert_eq!(json.tags.len(), 1);
@@ -141,7 +141,7 @@ mod test {
         };
 
         let resp = client
-            .post("http://kiki/v1/tags/create")
+            .post("http://localhost/v1/tags/create")
             .json(&req)
             .send()
             .await?;
@@ -149,7 +149,7 @@ mod test {
 
         // Try to create a duplicate
         let resp = client
-            .post("http://kiki/v1/tags/create")
+            .post("http://localhost/v1/tags/create")
             .json(&req)
             .send()
             .await?;
@@ -165,14 +165,14 @@ mod test {
 
         populate_tags(&tc)?;
 
-        let resp = client.get("http://kiki/v1/tags/id/1").send().await?;
+        let resp = client.get("http://localhost/v1/tags/id/1").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let tag = resp.json::<get_tag::GetTagResponse>().await?;
         assert_eq!(tag.id, 1);
         assert_eq!(tag.name, "news");
 
         // Non-existent tag
-        let resp = client.get("http://kiki/v1/tags/id/999").send().await?;
+        let resp = client.get("http://localhost/v1/tags/id/999").send().await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         Ok(())
@@ -187,7 +187,7 @@ mod test {
 
         // Rename tag
         let resp = client
-            .put("http://kiki/v1/tags/id/1")
+            .put("http://localhost/v1/tags/id/1")
             .json(&update_tag::UpdateTagRequest {
                 name: "breaking-news".to_string(),
             })
@@ -200,7 +200,7 @@ mod test {
 
         // Non-existent tag
         let resp = client
-            .put("http://kiki/v1/tags/id/999")
+            .put("http://localhost/v1/tags/id/999")
             .json(&update_tag::UpdateTagRequest {
                 name: "nope".to_string(),
             })
@@ -210,7 +210,7 @@ mod test {
 
         // Duplicate name conflict
         let resp = client
-            .put("http://kiki/v1/tags/id/1")
+            .put("http://localhost/v1/tags/id/1")
             .json(&update_tag::UpdateTagRequest {
                 name: "tech".to_string(),
             })
@@ -228,15 +228,21 @@ mod test {
 
         populate_tags(&tc)?;
 
-        let resp = client.delete("http://kiki/v1/tags/id/1").send().await?;
+        let resp = client
+            .delete("http://localhost/v1/tags/id/1")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         // Verify it's gone
-        let resp = client.get("http://kiki/v1/tags/id/1").send().await?;
+        let resp = client.get("http://localhost/v1/tags/id/1").send().await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         // Delete non-existent
-        let resp = client.delete("http://kiki/v1/tags/id/999").send().await?;
+        let resp = client
+            .delete("http://localhost/v1/tags/id/999")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         Ok(())
@@ -251,14 +257,17 @@ mod test {
         populate_feeds_and_entries(&tc)?;
 
         // Initially no tags on feed
-        let resp = client.get("http://kiki/v1/feeds/id/1/tags").send().await?;
+        let resp = client
+            .get("http://localhost/v1/feeds/id/1/tags")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<feed_tags::GetFeedTagsResponse>().await?;
         assert_eq!(json.tags.len(), 0);
 
         // Set tags on feed
         let resp = client
-            .put("http://kiki/v1/feeds/id/1/tags")
+            .put("http://localhost/v1/feeds/id/1/tags")
             .json(&feed_tags::SetFeedTagsRequest {
                 tag_ids: vec![1, 2],
             })
@@ -269,14 +278,17 @@ mod test {
         assert_eq!(json.tags.len(), 2);
 
         // Verify via GET
-        let resp = client.get("http://kiki/v1/feeds/id/1/tags").send().await?;
+        let resp = client
+            .get("http://localhost/v1/feeds/id/1/tags")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<feed_tags::GetFeedTagsResponse>().await?;
         assert_eq!(json.tags.len(), 2);
 
         // Replace tags
         let resp = client
-            .put("http://kiki/v1/feeds/id/1/tags")
+            .put("http://localhost/v1/feeds/id/1/tags")
             .json(&feed_tags::SetFeedTagsRequest { tag_ids: vec![3] })
             .send()
             .await?;
@@ -287,14 +299,14 @@ mod test {
 
         // Non-existent feed
         let resp = client
-            .get("http://kiki/v1/feeds/id/999/tags")
+            .get("http://localhost/v1/feeds/id/999/tags")
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         // Non-existent tag in set
         let resp = client
-            .put("http://kiki/v1/feeds/id/1/tags")
+            .put("http://localhost/v1/feeds/id/1/tags")
             .json(&feed_tags::SetFeedTagsRequest { tag_ids: vec![999] })
             .send()
             .await?;
@@ -313,7 +325,7 @@ mod test {
 
         // Initially no tags on entry
         let resp = client
-            .get("http://kiki/v1/entries/id/1/tags")
+            .get("http://localhost/v1/entries/id/1/tags")
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -322,7 +334,7 @@ mod test {
 
         // Set tags on entry
         let resp = client
-            .put("http://kiki/v1/entries/id/1/tags")
+            .put("http://localhost/v1/entries/id/1/tags")
             .json(&entry_tags::SetEntryTagsRequest {
                 tag_ids: vec![1, 3],
             })
@@ -334,7 +346,7 @@ mod test {
 
         // Non-existent entry
         let resp = client
-            .get("http://kiki/v1/entries/id/999/tags")
+            .get("http://localhost/v1/entries/id/999/tags")
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -363,21 +375,27 @@ mod test {
             )?;
         }
 
-        let resp = client.get("http://kiki/v1/tags/id/1/feeds").send().await?;
+        let resp = client
+            .get("http://localhost/v1/tags/id/1/feeds")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<tag_feeds::TagFeedsResponse>().await?;
         assert_eq!(json.count, 2);
         assert_eq!(json.feeds.len(), 2);
 
         // Tag with no feeds
-        let resp = client.get("http://kiki/v1/tags/id/3/feeds").send().await?;
+        let resp = client
+            .get("http://localhost/v1/tags/id/3/feeds")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<tag_feeds::TagFeedsResponse>().await?;
         assert_eq!(json.count, 0);
 
         // Non-existent tag
         let resp = client
-            .get("http://kiki/v1/tags/id/999/feeds")
+            .get("http://localhost/v1/tags/id/999/feeds")
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -403,7 +421,7 @@ mod test {
         }
 
         let resp = client
-            .get("http://kiki/v1/tags/id/2/entries")
+            .get("http://localhost/v1/tags/id/2/entries")
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);

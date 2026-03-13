@@ -58,7 +58,7 @@ mod test {
         // Add a new feed via the API
         let url = tc.example_feed_url();
         let resp = client
-            .post("http://kiki/v1/feeds/create")
+            .post("http://localhost/v1/feeds/create")
             .json(&add_feed::AddFeedRequest {
                 title: "my feed".to_string(),
                 url: url.clone(),
@@ -80,24 +80,24 @@ mod test {
         let client = tc.client()?;
 
         // We should start off with zero feeds and zero entries
-        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
         assert_eq!(json.feeds.len(), 0);
         assert_eq!(json.count, 0);
         assert_eq!(json.offset, 0);
-        let resp = client.get("http://kiki/v1/feeds/id/1").send().await?;
+        let resp = client.get("http://localhost/v1/feeds/id/1").send().await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(&resp.text().await?, "Feed not found");
 
-        let resp = client.get("http://kiki/v1/entries").send().await?;
+        let resp = client.get("http://localhost/v1/entries").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<ListEntriesResponse>().await?;
         assert_eq!(json.count, 0);
 
         let feed_id = add_example_feed(&tc).await?;
         let resp = client
-            .get(format!("http://kiki/v1/feeds/id/{:?}", feed_id))
+            .get(format!("http://localhost/v1/feeds/id/{:?}", feed_id))
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -109,11 +109,11 @@ mod test {
         assert!(json.last_checked.is_some());
 
         // We should also see the feed in the list of feeds
-        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Check that the entries from the feed were retrieved
-        let resp = client.get("http://kiki/v1/entries").send().await?;
+        let resp = client.get("http://localhost/v1/entries").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<ListEntriesResponse>().await?;
         assert_eq!(json.count, 6);
@@ -127,7 +127,7 @@ mod test {
         let client = tc.client()?;
 
         // Test empty feeds list
-        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
         assert_eq!(json.feeds.len(), 0);
@@ -135,7 +135,7 @@ mod test {
 
         // Add a feed and test that it appears in the list
         let resp = client
-            .post("http://kiki/v1/feeds/create")
+            .post("http://localhost/v1/feeds/create")
             .json(&add_feed::AddFeedRequest {
                 title: "test feed".to_string(),
                 url: "https://example.com/feed.xml".to_string(),
@@ -146,7 +146,7 @@ mod test {
         let feed_id = resp.json::<add_feed::AddFeedResponse>().await?.id;
 
         // Check that the feed appears in the list
-        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
         assert_eq!(json.feeds.len(), 1);
@@ -165,7 +165,7 @@ mod test {
 
         // Add a feed
         let resp = client
-            .post("http://kiki/v1/feeds/create")
+            .post("http://localhost/v1/feeds/create")
             .json(&add_feed::AddFeedRequest {
                 title: "test feed".to_string(),
                 url: "https://example.com/feed.xml".to_string(),
@@ -176,7 +176,7 @@ mod test {
         let feed_id = resp.json::<add_feed::AddFeedResponse>().await?.id;
 
         // Verify the feed exists
-        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
         assert_eq!(json.feeds.len(), 1);
@@ -187,20 +187,23 @@ mod test {
 
         // Delete the feed
         let resp = client
-            .delete(format!("http://kiki/v1/feeds/id/{:?}", feed_id))
+            .delete(format!("http://localhost/v1/feeds/id/{:?}", feed_id))
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         // Verify the feed is gone
-        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
         assert_eq!(json.feeds.len(), 0);
         assert_eq!(json.count, 0);
 
         // Try to delete a non-existent feed
-        let resp = client.delete("http://kiki/v1/feeds/id/999").send().await?;
+        let resp = client
+            .delete("http://localhost/v1/feeds/id/999")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let content = resp.text().await?;
         assert_eq!(&content, "Feed not found");
@@ -215,7 +218,7 @@ mod test {
 
         // Add a feed
         let resp = client
-            .post("http://kiki/v1/feeds/create")
+            .post("http://localhost/v1/feeds/create")
             .json(&add_feed::AddFeedRequest {
                 title: "original title".to_string(),
                 url: "https://example.com/feed.xml".to_string(),
@@ -226,7 +229,7 @@ mod test {
         let feed_id = resp.json::<add_feed::AddFeedResponse>().await?.id;
 
         // Verify the feed exists with original values
-        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
         assert_eq!(json.feeds.len(), 1);
@@ -236,7 +239,7 @@ mod test {
 
         // Update the feed
         let resp = client
-            .put(format!("http://kiki/v1/feeds/id/{:?}", feed_id))
+            .put(format!("http://localhost/v1/feeds/id/{:?}", feed_id))
             .json(&update_feed::UpdateFeedRequest {
                 title: Some("updated title".to_string()),
                 url: None,
@@ -252,7 +255,7 @@ mod test {
         assert_eq!(json.description, Some("updated description".to_string()));
 
         // Verify the feed was updated
-        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<list_feeds::ListFeedsResponse>().await?;
         assert_eq!(json.feeds.len(), 1);
@@ -266,7 +269,7 @@ mod test {
 
         // Try to update a non-existent feed
         let resp = client
-            .put("http://kiki/v1/feeds/id/999")
+            .put("http://localhost/v1/feeds/id/999")
             .json(&update_feed::UpdateFeedRequest {
                 title: Some("non-existent title".to_string()),
                 url: None,
@@ -280,7 +283,7 @@ mod test {
 
         // Try to update with no fields provided
         let resp = client
-            .put(format!("http://kiki/v1/feeds/id/{:?}", feed_id))
+            .put(format!("http://localhost/v1/feeds/id/{:?}", feed_id))
             .json(&update_feed::UpdateFeedRequest {
                 title: None,
                 url: None,
@@ -300,7 +303,7 @@ mod test {
 
         // Add a feed
         let resp = client
-            .post("http://kiki/v1/feeds/create")
+            .post("http://localhost/v1/feeds/create")
             .json(&add_feed::AddFeedRequest {
                 title: "test feed".to_string(),
                 url: "https://example.com/feed.xml".to_string(),
@@ -312,7 +315,7 @@ mod test {
 
         // Test the fetch endpoint - should return 202 Accepted
         let resp = client
-            .post(format!("http://kiki/v1/feeds/fetch/{:?}", feed_id))
+            .post(format!("http://localhost/v1/feeds/fetch/{:?}", feed_id))
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
@@ -325,7 +328,10 @@ mod test {
         let tc = TestBuilder::all().init_server().build()?;
         let client = tc.client()?;
 
-        let resp = client.get("http://kiki/v1/feeds/export").send().await?;
+        let resp = client
+            .get("http://localhost/v1/feeds/export")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let xml = resp.text().await?;
@@ -356,7 +362,10 @@ mod test {
             )?;
         }
 
-        let resp = client.get("http://kiki/v1/feeds/export").send().await?;
+        let resp = client
+            .get("http://localhost/v1/feeds/export")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let xml = resp.text().await?;
@@ -391,7 +400,10 @@ mod test {
             )?;
         }
 
-        let resp = client.get("http://kiki/v1/feeds/export").send().await?;
+        let resp = client
+            .get("http://localhost/v1/feeds/export")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let xml = resp.text().await?;
@@ -422,7 +434,7 @@ mod test {
 </opml>"#;
 
         let resp = client
-            .post("http://kiki/v1/feeds/import")
+            .post("http://localhost/v1/feeds/import")
             .body(opml)
             .send()
             .await?;
@@ -431,7 +443,7 @@ mod test {
         assert_eq!(json.imported, 2);
 
         // Verify feeds were created
-        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let list = resp.json::<list_feeds::ListFeedsResponse>().await?;
         assert_eq!(list.count, 2);
@@ -460,7 +472,7 @@ mod test {
 </opml>"#;
 
         let resp = client
-            .post("http://kiki/v1/feeds/import")
+            .post("http://localhost/v1/feeds/import")
             .body(opml)
             .send()
             .await?;
@@ -469,14 +481,17 @@ mod test {
         assert_eq!(json.imported, 2);
 
         // Verify both feeds were created
-        let resp = client.get("http://kiki/v1/feeds").send().await?;
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
         let list = resp.json::<list_feeds::ListFeedsResponse>().await?;
         assert_eq!(list.count, 2);
 
         // The feed inside the folder should have the folder name as a tag
         let tech_feed = list.feeds.iter().find(|f| f.title == "Tech Blog").unwrap();
         let resp = client
-            .get(format!("http://kiki/v1/feeds/id/{}/tags", tech_feed.id))
+            .get(format!(
+                "http://localhost/v1/feeds/id/{}/tags",
+                tech_feed.id
+            ))
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -493,7 +508,7 @@ mod test {
             .find(|f| f.title == "Untagged Feed")
             .unwrap();
         let resp = client
-            .get(format!("http://kiki/v1/feeds/id/{}/tags", untagged.id))
+            .get(format!("http://localhost/v1/feeds/id/{}/tags", untagged.id))
             .send()
             .await?;
         let tags_resp = resp
@@ -516,7 +531,7 @@ mod test {
 </opml>"#;
 
         let resp = client
-            .post("http://kiki/v1/feeds/import")
+            .post("http://localhost/v1/feeds/import")
             .body(opml)
             .send()
             .await?;
@@ -533,7 +548,7 @@ mod test {
         let client = tc.client()?;
 
         let resp = client
-            .post("http://kiki/v1/feeds/import")
+            .post("http://localhost/v1/feeds/import")
             .body("not xml at all <<<")
             .send()
             .await?;
@@ -560,7 +575,7 @@ mod test {
 </opml>"#;
 
         let resp = client
-            .post("http://kiki/v1/feeds/import")
+            .post("http://localhost/v1/feeds/import")
             .body(opml)
             .send()
             .await?;
@@ -569,7 +584,10 @@ mod test {
         assert_eq!(json.imported, 2);
 
         // Export and verify the OPML contains the imported feeds and tags
-        let resp = client.get("http://kiki/v1/feeds/export").send().await?;
+        let resp = client
+            .get("http://localhost/v1/feeds/export")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let exported_xml = resp.text().await?;
 

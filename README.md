@@ -20,7 +20,7 @@ curl \
     --header 'Content-Type: application/json' \
     --data '{"title": "my feed", "url": "https://kernelmethod.org/notes/index.xml"}' \
     --unix-socket ./kiki.sock \
-    http://kiki/v1/feeds/create
+    http://localhost/v1/feeds/create
 ```
 
 You should then be able to see the server listed with
@@ -28,11 +28,11 @@ You should then be able to see the server listed with
 ```bash
 curl \
     --unix-socket ./kiki.sock \
-    http://kiki/v1/feeds
+    http://localhost/v1/feeds
 
 curl \
     --unix-socket ./kiki.sock \
-    http://kiki/v1/feeds/id/$id
+    http://localhost/v1/feeds/id/$id
 ```
 
 The server will automatically populate its database with feed entries once
@@ -43,5 +43,5 @@ with
 curl \
     --unix-socket ./kiki.sock \
     --request POST \
-    http://kiki/v1/feeds/fetch/$id
+    http://localhost/v1/feeds/fetch/$id
 ```
