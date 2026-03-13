@@ -117,17 +117,8 @@ pub async fn update_script(
 
     match result {
         Ok(Ok(script)) => {
-            use crate::tasks::TaskManagerCommand;
-            if let Err(e) = state
-                .task_manager_tx
-                .send(TaskManagerCommand::ReloadScripts)
-                .await
-            {
-                event!(
-                    Level::ERROR,
-                    "failed to send ReloadScripts command: {:?}",
-                    e
-                );
+            if let Err(e) = state.reload_tx.send(()) {
+                event!(Level::ERROR, "failed to send ReloadScripts signal: {:?}", e);
             }
 
             Ok(Json(script).into_response())

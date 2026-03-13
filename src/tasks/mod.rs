@@ -6,8 +6,9 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -100,49 +101,174 @@ pub enum TaskManagerCommand {
     CleanupFeed(i64),
     /// Run retention cleanup across all feeds.
     CleanupAll,
-    /// Clears the cached [`crate::scripting::lua::LuaScriptRunner`] for every feed,
-    /// forcing runners to be rebuilt from the database on the next refresh.
-    ReloadScripts,
 }
 
-/// Create a manager for the fetcher tasks.
-pub async fn manager(
-    mut rx: mpsc::Receiver<TaskManagerCommand>,
-    tx: mpsc::Sender<TaskManagerCommand>,
+/// Set of feed IDs currently being processed by workers.
+type InProgressSet = Arc<Mutex<HashSet<i64>>>;
+
+/// RAII guard that removes a feed ID from an in-progress set when dropped.
+///
+/// This ensures cleanup happens even if the worker panics or returns early.
+struct InProgressGuard {
+    feed_id: i64,
+    set: InProgressSet,
+}
+
+impl InProgressGuard {
+    /// Try to claim a feed ID. Returns `Some(guard)` if the ID was not already
+    /// in the set, `None` if another worker is already processing it.
+    fn try_claim(set: &InProgressSet, feed_id: i64) -> Option<Self> {
+        let mut locked = set.lock().unwrap_or_else(|e| e.into_inner());
+        if locked.insert(feed_id) {
+            Some(InProgressGuard {
+                feed_id,
+                set: Arc::clone(set),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for InProgressGuard {
+    fn drop(&mut self) {
+        let mut locked = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        locked.remove(&self.feed_id);
+    }
+}
+
+/// Shared state for a pool of workers that process [`TaskManagerCommand`]s.
+///
+/// Each worker pulls commands from a shared channel and maintains its own
+/// script runner. Separate in-progress sets prevent two workers from
+/// refreshing (or cleaning up) the same feed simultaneously.
+#[derive(Clone)]
+struct Worker {
+    rx: async_channel::Receiver<TaskManagerCommand>,
+    tx: async_channel::Sender<TaskManagerCommand>,
     pool: Pool<SqliteConnectionManager>,
     token: CancellationToken,
+    refresh_in_progress: InProgressSet,
+    cleanup_in_progress: InProgressSet,
+}
+
+/// Determine the number of worker tasks to spawn.
+pub fn worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+/// Spawn multiple worker tasks that pull from a shared channel.
+///
+/// Each worker maintains its own `LuaScriptRunner` (when the `lua` feature is
+/// enabled) and subscribes to a `watch` channel for reload signals.
+pub fn spawn_workers(
+    rx: async_channel::Receiver<TaskManagerCommand>,
+    tx: async_channel::Sender<TaskManagerCommand>,
+    pool: Pool<SqliteConnectionManager>,
+    token: CancellationToken,
+    reload_tx: tokio::sync::watch::Sender<()>,
+    num_workers: usize,
+) -> Vec<tokio::task::JoinHandle<Result<()>>> {
+    let worker = Worker {
+        rx,
+        tx,
+        pool,
+        token,
+        refresh_in_progress: Arc::new(Mutex::new(HashSet::new())),
+        cleanup_in_progress: Arc::new(Mutex::new(HashSet::new())),
+    };
+    let mut handles = Vec::with_capacity(num_workers);
+
+    for worker_id in 0..num_workers {
+        let worker = worker.clone();
+        let reload_rx = reload_tx.subscribe();
+
+        handles.push(tokio::spawn(run_worker(worker_id, worker, reload_rx)));
+    }
+
+    handles
+}
+
+/// A single worker loop that pulls commands from the shared channel.
+async fn run_worker(
+    worker_id: usize,
+    w: Worker,
+    mut reload_rx: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(USER_AGENT)
         .build()?;
 
-    // Single script runner for all feeds, built eagerly from the current database state.
-    // Replaced wholesale when a ReloadScripts command is received.
+    // Each worker has its own script runner, built eagerly from the current
+    // database state.  Rebuilt when a reload signal arrives via the watch channel.
     #[cfg(feature = "lua")]
-    let mut runner: Option<crate::scripting::lua::LuaScriptRunner> = build_runner(&pool);
+    let mut runner: Option<crate::scripting::lua::LuaScriptRunner> = build_runner(&w.pool);
 
-    // Process commands as they come in
-    while let Some(command) = tokio::select! {
-        command = rx.recv() => command,
-        _ = token.cancelled() => return Ok(()),
-    } {
+    loop {
+        // Check for a pending reload signal before processing the next command.
+        #[cfg(feature = "lua")]
+        if reload_rx.has_changed().unwrap_or(false) {
+            // Mark the current value as seen so has_changed() returns false
+            // until the next send.
+            reload_rx.borrow_and_update();
+            debug!(
+                "Worker {} reloading LuaScriptRunner from database",
+                worker_id
+            );
+            runner = build_runner(&w.pool);
+            info!("Worker {} LuaScriptRunner reloaded", worker_id);
+        }
+
+        let command = tokio::select! {
+            cmd = w.rx.recv() => {
+                match cmd {
+                    Ok(c) => c,
+                    Err(_) => return Ok(()), // channel closed
+                }
+            }
+            _ = w.token.cancelled() => return Ok(()),
+            _ = reload_rx.changed() => {
+                // A reload signal arrived while we were waiting for a command.
+                #[cfg(feature = "lua")]
+                {
+                    debug!("Worker {} reloading LuaScriptRunner from database", worker_id);
+                    runner = build_runner(&w.pool);
+                    info!("Worker {} LuaScriptRunner reloaded", worker_id);
+                }
+                continue;
+            }
+        };
+
         match command {
             TaskManagerCommand::RefreshFeed(feed_id) => {
+                let guard = match InProgressGuard::try_claim(&w.refresh_in_progress, feed_id) {
+                    Some(g) => g,
+                    None => {
+                        debug!(
+                            "Worker {}: feed {} already in progress, skipping refresh",
+                            worker_id, feed_id
+                        );
+                        continue;
+                    }
+                };
+
                 #[cfg(feature = "lua")]
                 let script_runner: Option<&dyn ScriptRunner> =
                     runner.as_ref().map(|r| r as &dyn ScriptRunner);
                 #[cfg(not(feature = "lua"))]
                 let script_runner: Option<&dyn ScriptRunner> = None;
 
-                let _ = refresh_feed(&client, feed_id, pool.clone(), &tx, script_runner)
+                let _ = refresh_feed(&client, feed_id, w.pool.clone(), script_runner)
                     .await
                     .inspect_err(|e| {
                         error!(
                             "An error occurred while refreshing feed {}: {:?}",
                             feed_id, e
                         );
-                        if let Ok(conn) = pool.get() {
+                        if let Ok(conn) = w.pool.get() {
                             set_feed_error(
                                 &conn,
                                 feed_id,
@@ -152,10 +278,28 @@ pub async fn manager(
                             );
                         }
                     });
+
+                drop(guard);
+
+                // Queue retention cleanup for this feed.
+                if let Err(e) = w.tx.try_send(TaskManagerCommand::CleanupFeed(feed_id)) {
+                    warn!("Failed to queue cleanup for feed {}: {:?}", feed_id, e);
+                }
             }
 
             TaskManagerCommand::CleanupFeed(feed_id) => {
-                if let Ok(conn) = pool.get() {
+                let _guard = match InProgressGuard::try_claim(&w.cleanup_in_progress, feed_id) {
+                    Some(g) => g,
+                    None => {
+                        debug!(
+                            "Worker {}: feed {} already in progress, skipping cleanup",
+                            worker_id, feed_id
+                        );
+                        continue;
+                    }
+                };
+
+                if let Ok(conn) = w.pool.get() {
                     match crate::db::retention::cleanup_feed(&conn, feed_id) {
                         Ok(0) => {}
                         Ok(n) => info!(
@@ -170,7 +314,7 @@ pub async fn manager(
             }
 
             TaskManagerCommand::CleanupAll => {
-                if let Ok(conn) = pool.get() {
+                if let Ok(conn) = w.pool.get() {
                     match crate::db::retention::cleanup_all(&conn) {
                         Ok(0) => {}
                         Ok(n) => info!("Retention cleanup deleted {} entries", n),
@@ -178,19 +322,8 @@ pub async fn manager(
                     }
                 }
             }
-
-            TaskManagerCommand::ReloadScripts => {
-                #[cfg(feature = "lua")]
-                {
-                    debug!("Reloading LuaScriptRunner from database");
-                    runner = build_runner(&pool);
-                    info!("LuaScriptRunner reloaded");
-                }
-            }
         }
     }
-
-    Ok(())
 }
 
 /// Load all Lua script source texts from the database.
@@ -278,7 +411,6 @@ pub(crate) async fn refresh_feed(
     client: &reqwest::Client,
     feed_id: i64,
     pool: Pool<SqliteConnectionManager>,
-    task_manager_tx: &mpsc::Sender<TaskManagerCommand>,
     script_runner: Option<&dyn ScriptRunner>,
 ) -> Result<()> {
     // Get the feed URL and headers from the database
@@ -369,11 +501,6 @@ pub(crate) async fn refresh_feed(
         warn!("Feed {}: {}", feed_id, fetch_err);
         set_feed_error(&pool.get()?, feed_id, &fetch_err);
         return Ok(());
-    }
-
-    // Queue retention cleanup for this feed.
-    if let Err(e) = task_manager_tx.try_send(TaskManagerCommand::CleanupFeed(feed_id)) {
-        warn!("Failed to queue cleanup for feed {}: {:?}", feed_id, e);
     }
 
     Ok(())

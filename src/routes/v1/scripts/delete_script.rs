@@ -51,17 +51,8 @@ pub async fn delete_script(
     match result {
         Ok(Ok(0)) => Ok((StatusCode::NOT_FOUND, "Script not found").into_response()),
         Ok(Ok(_)) => {
-            use crate::tasks::TaskManagerCommand;
-            if let Err(e) = state
-                .task_manager_tx
-                .send(TaskManagerCommand::ReloadScripts)
-                .await
-            {
-                event!(
-                    Level::ERROR,
-                    "failed to send ReloadScripts command: {:?}",
-                    e
-                );
+            if let Err(e) = state.reload_tx.send(()) {
+                event!(Level::ERROR, "failed to send ReloadScripts signal: {:?}", e);
             }
 
             Ok((StatusCode::NO_CONTENT, "").into_response())

@@ -16,15 +16,18 @@ use std::{
 use tokio::{
     net::{TcpListener, UnixListener},
     signal,
-    sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, span, Level};
 
 pub struct SharedAppState {
-    /// An [`mpsc::Sender`] instance that may be used to send commands
-    /// to workers threads used to fetch and process feeds.
-    pub task_manager_tx: mpsc::Sender<TaskManagerCommand>,
+    /// An [`async_channel::Sender`] instance that may be used to send commands
+    /// to worker tasks used to fetch and process feeds.
+    pub task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+
+    /// A [`tokio::sync::watch::Sender`] used to signal all workers to reload
+    /// their configuration (e.g. Lua script runners).
+    pub reload_tx: tokio::sync::watch::Sender<()>,
 
     /// A [`r2d2::Pool`] instance that intermediates connections to the
     /// SQLite database.
@@ -179,16 +182,27 @@ impl Server {
             .build()
             .with_context(|| "failed to build Tokio runtime for web service workers")?;
 
-        // Create a channel so that web service workers can send tasks
-        // to the feed fetchers
-        let (tx, rx) = mpsc::channel(1024);
+        // Create a multi-producer, multi-consumer channel so that web
+        // service workers can send tasks to the feed-fetcher workers.
+        let (tx, rx) = async_channel::bounded(1024);
 
-        task_manager_runtime.spawn(tasks::manager(
-            rx,
-            tx.clone(),
-            pool.clone(),
-            self.cancel_token.clone(),
-        ));
+        // Watch channel for broadcasting script-reload signals to all workers.
+        let (reload_tx, _) = tokio::sync::watch::channel(());
+
+        let num_workers = tasks::worker_count();
+        debug!("Spawning {} task-manager workers", num_workers);
+
+        let _worker_handles = {
+            let _guard = task_manager_runtime.enter();
+            tasks::spawn_workers(
+                rx,
+                tx.clone(),
+                pool.clone(),
+                self.cancel_token.clone(),
+                reload_tx.clone(),
+                num_workers,
+            )
+        };
 
         if self.autofetch {
             web_runtime.spawn(check_feeds_loop(
@@ -212,6 +226,7 @@ impl Server {
                 web_runtime.spawn(uds_server(
                     socket_path,
                     tx.clone(),
+                    reload_tx.clone(),
                     pool.clone(),
                     self.cancel_token.clone(),
                 ));
@@ -220,6 +235,7 @@ impl Server {
                 web_runtime.spawn(tcp_server(
                     port,
                     tx.clone(),
+                    reload_tx.clone(),
                     pool.clone(),
                     self.cancel_token.clone(),
                 ));
@@ -238,7 +254,7 @@ impl Server {
 }
 
 async fn check_feeds_loop(
-    task_manager_tx: mpsc::Sender<TaskManagerCommand>,
+    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
     pool: r2d2::Pool<SqliteConnectionManager>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
@@ -262,7 +278,7 @@ async fn check_feeds_loop(
 /// Periodically sends a [`TaskManagerCommand::CleanupAll`] command to
 /// trigger retention cleanup. Runs every hour.
 async fn cleanup_loop(
-    task_manager_tx: mpsc::Sender<TaskManagerCommand>,
+    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
@@ -283,7 +299,7 @@ async fn cleanup_loop(
 }
 
 fn check_feeds(
-    task_manager_tx: &mpsc::Sender<TaskManagerCommand>,
+    task_manager_tx: &async_channel::Sender<TaskManagerCommand>,
     pool: &r2d2::Pool<SqliteConnectionManager>,
 ) -> Result<()> {
     debug!("Sending RefreshFeed commands for all feeds");
@@ -349,12 +365,14 @@ async fn shutdown_signal(token: CancellationToken) {
 /// Parent function for the Unix domain socket web worker threads.
 async fn uds_server(
     socket_path: PathBuf,
-    tx: mpsc::Sender<TaskManagerCommand>,
+    tx: async_channel::Sender<TaskManagerCommand>,
+    reload_tx: tokio::sync::watch::Sender<()>,
     pool: r2d2::Pool<SqliteConnectionManager>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
         task_manager_tx: tx,
+        reload_tx,
         conn_pool: pool,
     });
     let app = routes::create_router().with_state(shared_state);
@@ -382,12 +400,14 @@ async fn uds_server(
 /// Parent function for the TCP web worker threads.
 async fn tcp_server(
     port: u16,
-    tx: mpsc::Sender<TaskManagerCommand>,
+    tx: async_channel::Sender<TaskManagerCommand>,
+    reload_tx: tokio::sync::watch::Sender<()>,
     pool: r2d2::Pool<SqliteConnectionManager>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
         task_manager_tx: tx,
+        reload_tx,
         conn_pool: pool,
     });
     let app = routes::create_router().with_state(shared_state);

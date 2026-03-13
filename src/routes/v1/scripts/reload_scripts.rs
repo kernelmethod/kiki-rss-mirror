@@ -18,14 +18,8 @@ use tracing::error;
 )]
 #[axum::debug_handler]
 pub async fn reload_scripts(State(state): State<AppState>) -> impl IntoResponse {
-    use crate::tasks::TaskManagerCommand;
-
-    if let Err(e) = state
-        .task_manager_tx
-        .send(TaskManagerCommand::ReloadScripts)
-        .await
-    {
-        error!("failed to send ReloadScripts command: {:?}", e);
+    if let Err(e) = state.reload_tx.send(()) {
+        error!("failed to send ReloadScripts signal: {:?}", e);
         return StatusCode::INTERNAL_SERVER_ERROR;
     }
     StatusCode::ACCEPTED
