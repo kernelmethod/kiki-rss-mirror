@@ -57,6 +57,13 @@ impl Commands {
 }
 
 pub fn main() -> Result<()> {
+    // Ensure files created by kiki are not accessible to other users.
+    // SAFETY: umask is always safe to call and has no failure modes.
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(0o007);
+    }
+
     let cli = Cli::parse();
 
     cli.command.run()

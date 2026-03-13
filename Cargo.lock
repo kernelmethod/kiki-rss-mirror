@@ -1242,6 +1242,7 @@ dependencies = [
  "dirs",
  "flate2",
  "itertools",
+ "libc",
  "mlua",
  "quick-xml",
  "r2d2",

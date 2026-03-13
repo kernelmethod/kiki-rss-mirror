@@ -8,6 +8,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{atomic, Arc},
     time::Duration,
@@ -335,6 +336,13 @@ async fn uds_server(
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Unable to bind to Unix socket at {:?}", &socket_path))?;
+
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o660)).with_context(|| {
+        format!(
+            "Unable to set permissions on Unix socket at {:?}",
+            &socket_path
+        )
+    })?;
 
     let absolute_path = fs::canonicalize(&socket_path).unwrap_or(socket_path.clone());
     tracing::info!("Listening on {}", absolute_path.display());
