@@ -12,28 +12,21 @@ use tracing::error;
     path = "/v1/scripts/reload",
     responses(
         (status = 202, description = "Script runner reload queued successfully"),
-        (status = 200, description = "No-op (lua feature disabled)"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "scripts"
 )]
 #[axum::debug_handler]
 pub async fn reload_scripts(State(state): State<AppState>) -> impl IntoResponse {
-    #[cfg(feature = "lua")]
+    use crate::fetcher::FetchManagerCommand;
+
+    if let Err(e) = state
+        .fetcher_tx
+        .send(FetchManagerCommand::ReloadScripts)
+        .await
     {
-        use crate::fetcher::FetchManagerCommand;
-
-        if let Err(e) = state
-            .fetcher_tx
-            .send(FetchManagerCommand::ReloadScripts)
-            .await
-        {
-            error!("failed to send ReloadScripts command: {:?}", e);
-            return StatusCode::INTERNAL_SERVER_ERROR;
-        }
-        StatusCode::ACCEPTED
+        error!("failed to send ReloadScripts command: {:?}", e);
+        return StatusCode::INTERNAL_SERVER_ERROR;
     }
-
-    #[cfg(not(feature = "lua"))]
-    StatusCode::OK
+    StatusCode::ACCEPTED
 }

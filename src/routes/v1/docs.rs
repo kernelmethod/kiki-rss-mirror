@@ -30,6 +30,7 @@ use utoipa::OpenApi;
         crate::routes::v1::tags::feed_tags::set_feed_tags,
         crate::routes::v1::tags::entry_tags::get_entry_tags,
         crate::routes::v1::tags::entry_tags::set_entry_tags,
+        crate::routes::v1::scripts::add_script::add_script,
         crate::routes::v1::scripts::list_scripts::list_scripts,
         crate::routes::v1::scripts::reload_scripts::reload_scripts,
     ),
@@ -62,6 +63,8 @@ use utoipa::OpenApi;
             crate::routes::v1::tags::entry_tags::GetEntryTagsResponse,
             crate::routes::v1::tags::tag_feeds::TagFeedsResponse,
             crate::routes::v1::tags::tag_entries::TagEntriesResponse,
+            crate::routes::v1::scripts::add_script::AddScriptRequest,
+            crate::routes::v1::scripts::add_script::AddScriptResponse,
             crate::routes::v1::scripts::list_scripts::ScriptResponse,
             crate::routes::v1::scripts::list_scripts::ListScriptsResponse,
         )

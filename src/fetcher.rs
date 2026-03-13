@@ -14,7 +14,6 @@ pub enum FetchManagerCommand {
     RefreshFeed(i64),
     /// Clears the cached [`crate::scripting::lua::LuaScriptRunner`] for every feed,
     /// forcing runners to be rebuilt from the database on the next refresh.
-    #[cfg(feature = "lua")]
     ReloadScripts,
 }
 
@@ -57,11 +56,13 @@ pub async fn manager(
                     });
             }
 
-            #[cfg(feature = "lua")]
             FetchManagerCommand::ReloadScripts => {
-                debug!("Reloading LuaScriptRunner from database");
-                runner = build_runner(&pool);
-                info!("LuaScriptRunner reloaded");
+                #[cfg(feature = "lua")]
+                {
+                    debug!("Reloading LuaScriptRunner from database");
+                    runner = build_runner(&pool);
+                    info!("LuaScriptRunner reloaded");
+                }
             }
         }
     }

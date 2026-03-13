@@ -8,14 +8,14 @@ use axum::{
 use tokio::task;
 use tracing::{event, Level};
 
-#[derive(serde::Serialize, utoipa::ToSchema)]
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 pub struct ScriptResponse {
     pub id: i64,
     pub engine: String,
     pub text: String,
 }
 
-#[derive(serde::Serialize, utoipa::ToSchema)]
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 pub struct ListScriptsResponse {
     pub scripts: Vec<ScriptResponse>,
     pub count: usize,
