@@ -319,9 +319,10 @@ mod test {
     /// Ensure that we can start and stop the server without a panic.
     #[test]
     fn test_start_stop_server() -> Result<()> {
-        let tc = TestBuilder::all().build()?;
-        tc.server_token.unwrap().cancel();
+        let mut tc = TestBuilder::all().build()?;
+        tc.server_token.take().unwrap().cancel();
         tc.server_handle
+            .take()
             .unwrap()
             .join()
             .expect("panic in server thread")?;

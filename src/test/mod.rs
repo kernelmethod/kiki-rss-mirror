@@ -3,6 +3,7 @@ use crate::db::ConnectionBuilder;
 use crate::server::ServerBuilder;
 use anyhow::{bail, Context, Result};
 use std::{
+    net::SocketAddr,
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -66,6 +67,16 @@ pub struct TestConfig {
     td: TempDir,
     pub server_handle: Option<thread::JoinHandle<Result<()>>>,
     pub server_token: Option<CancellationToken>,
+    pub feed_server_handle: Option<tokio::task::JoinHandle<()>>,
+    pub feed_server_addr: Option<SocketAddr>,
+}
+
+impl Drop for TestConfig {
+    fn drop(&mut self) {
+        if let Some(handle) = self.feed_server_handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl TestConfig {
@@ -74,6 +85,8 @@ impl TestConfig {
             td: TempDir::new("kiki_")?,
             server_handle: None,
             server_token: None,
+            feed_server_handle: None,
+            feed_server_addr: None,
         };
         Ok(config)
     }
@@ -105,6 +118,69 @@ impl TestConfig {
         Ok(self)
     }
 
+    /// Start a lightweight HTTP server that serves test RSS and Atom feeds.
+    ///
+    /// The server binds to `127.0.0.1:0` (OS-assigned port) and serves:
+    /// - `/rss.xml` — the contents of `test/example.xml`
+    /// - `/atom.xml` — the contents of `test/example_atom.xml`
+    ///
+    /// Use [`rss_feed_url`] and [`atom_feed_url`] to get the URLs for each
+    /// endpoint.
+    pub async fn init_feed_server(&mut self) -> Result<()> {
+        use axum::{routing::get, Router};
+
+        if self.feed_server_addr.is_some() {
+            bail!("feed server has already been started");
+        }
+
+        let rss_content = std::fs::read(Self::test_data_path("example.xml"))
+            .with_context(|| "failed to read test/example.xml")?;
+        let atom_content = std::fs::read(Self::test_data_path("example_atom.xml"))
+            .with_context(|| "failed to read test/example_atom.xml")?;
+
+        let app = Router::new()
+            .route(
+                "/rss.xml",
+                get(move || async move {
+                    ([("content-type", "application/rss+xml")], rss_content)
+                }),
+            )
+            .route(
+                "/atom.xml",
+                get(move || async move {
+                    ([("content-type", "application/atom+xml")], atom_content)
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        self.feed_server_addr = Some(addr);
+        self.feed_server_handle = Some(handle);
+
+        Ok(())
+    }
+
+    /// Return the URL to the RSS feed served by the test feed server.
+    pub fn rss_feed_url(&self) -> String {
+        let addr = self
+            .feed_server_addr
+            .expect("feed server not initialized; call init_feed_server() first");
+        format!("http://{}/rss.xml", addr)
+    }
+
+    /// Return the URL to the Atom feed served by the test feed server.
+    pub fn atom_feed_url(&self) -> String {
+        let addr = self
+            .feed_server_addr
+            .expect("feed server not initialized; call init_feed_server() first");
+        format!("http://{}/atom.xml", addr)
+    }
+
     /// Create an HTTP client to connect to the test server being run
     /// in the background.
     pub fn client(&self) -> Result<reqwest::Client> {
@@ -125,11 +201,17 @@ impl TestConfig {
         bail!("HTTP server has not been started on {:?}", &p);
     }
 
+    /// Return the path to a file in the `test/` data directory.
+    pub fn test_data_path(filename: &str) -> PathBuf {
+        let mut p = std::env::current_dir().unwrap();
+        p.push("test");
+        p.push(filename);
+        p
+    }
+
     pub fn example_feed_url(&self) -> String {
-        let mut cwd = std::env::current_dir().unwrap();
-        cwd.push("test");
-        cwd.push("example.xml");
-        format!("file://{}", cwd.into_os_string().into_string().unwrap())
+        let p = Self::test_data_path("example.xml");
+        format!("file://{}", p.into_os_string().into_string().unwrap())
     }
 
     pub fn config_dir(&self) -> &Path {

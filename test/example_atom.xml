@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Test Atom Feed</title>
+  <link href="http://example.com/atom" rel="self" type="application/atom+xml"/>
+  <link href="http://example.com/"/>
+  <id>urn:uuid:60a76c80-d399-11d9-b93C-0003939e0af6</id>
+  <updated>2024-11-27T12:00:00Z</updated>
+  <author>
+    <name>Test Author</name>
+  </author>
+  <entry>
+    <title>First Atom Entry</title>
+    <link href="http://example.com/entries/1"/>
+    <id>urn:uuid:1225c695-cfb8-4ebb-aaaa-80da344efa6a</id>
+    <published>2024-11-27T12:00:00Z</published>
+    <updated>2024-11-27T12:00:00Z</updated>
+    <summary>A summary of the first entry.</summary>
+    <content type="html">&lt;p&gt;This is the content of the first Atom entry.&lt;/p&gt;</content>
+  </entry>
+  <entry>
+    <title>Second Atom Entry</title>
+    <link href="http://example.com/entries/2"/>
+    <id>urn:uuid:1225c695-cfb8-4ebb-bbbb-80da344efa6a</id>
+    <published>2024-06-16T10:00:00Z</published>
+    <updated>2024-06-16T10:00:00Z</updated>
+    <summary>A summary of the second entry.</summary>
+    <content type="html">&lt;p&gt;This is the content of the second Atom entry.&lt;/p&gt;</content>
+  </entry>
+  <entry>
+    <title>Third Atom Entry</title>
+    <link href="http://example.com/entries/3"/>
+    <id>urn:uuid:1225c695-cfb8-4ebb-cccc-80da344efa6a</id>
+    <published>2024-01-05T08:30:00Z</published>
+    <updated>2024-01-05T08:30:00Z</updated>
+    <summary>A summary of the third entry.</summary>
+    <content type="html">&lt;p&gt;This is the content of the third Atom entry.&lt;/p&gt;</content>
+  </entry>
+</feed>
