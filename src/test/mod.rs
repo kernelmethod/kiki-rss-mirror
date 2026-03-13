@@ -23,6 +23,8 @@ pub struct FeedServerState {
     pub last_modified: Option<String>,
     /// If set, the server includes an `Expires` response header with this value.
     pub expires: Option<String>,
+    /// If set, the server includes a `Cache-Control` response header with this value.
+    pub cache_control: Option<String>,
     /// Total number of requests received by the server.
     pub request_count: usize,
     /// Number of 200 OK responses served.
@@ -276,6 +278,11 @@ impl TestConfig {
                 response
                     .headers_mut()
                     .insert(axum::http::header::EXPIRES, exp.parse().unwrap());
+            }
+            if let Some(ref cc) = s.cache_control {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CACHE_CONTROL, cc.parse().unwrap());
             }
             response
         }

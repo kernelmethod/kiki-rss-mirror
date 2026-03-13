@@ -9,6 +9,43 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+/// Parsed `Cache-Control` directives relevant to the fetcher.
+struct CacheControl {
+    /// `max-age=N` — freshness lifetime in seconds.
+    max_age: Option<u64>,
+    /// `no-cache` — must revalidate; don't skip fetching.
+    no_cache: bool,
+    /// `no-store` — don't cache at all.
+    no_store: bool,
+}
+
+impl CacheControl {
+    /// Parse a `Cache-Control` header value into the directives we care about.
+    fn parse(header: &str) -> Self {
+        let mut cc = CacheControl {
+            max_age: None,
+            no_cache: false,
+            no_store: false,
+        };
+
+        for directive in header.split(',') {
+            let directive = directive.trim();
+            if directive.eq_ignore_ascii_case("no-cache") {
+                cc.no_cache = true;
+            } else if directive.eq_ignore_ascii_case("no-store") {
+                cc.no_store = true;
+            } else {
+                let lower = directive.to_ascii_lowercase();
+                if let Some(val) = lower.strip_prefix("max-age=") {
+                    cc.max_age = val.trim().parse::<u64>().ok();
+                }
+            }
+        }
+
+        cc
+    }
+}
+
 #[derive(Debug)]
 pub enum FetchManagerCommand {
     RefreshFeed(i64),
@@ -305,15 +342,15 @@ async fn retrieve_feed(
     }
 
     // Update the feed's headers in the database
-    let etag = resp.headers().get("etag").and_then(|h| h.to_str().ok());
-    let last_modified = resp
+    let mut etag: Option<&str> = resp.headers().get("etag").and_then(|h| h.to_str().ok());
+    let mut last_modified: Option<&str> = resp
         .headers()
         .get("last-modified")
         .and_then(|h| h.to_str().ok());
 
     // Parse the Expires header into a Unix timestamp so we can skip future
     // fetches until the declared expiry time has passed.
-    let expires: Option<i64> = resp
+    let mut expires: Option<i64> = resp
         .headers()
         .get("expires")
         .and_then(|h| h.to_str().ok())
@@ -322,6 +359,27 @@ async fn retrieve_feed(
                 .ok()
                 .map(|dt| dt.and_utc().timestamp())
         });
+
+    // Parse Cache-Control and apply precedence rules (RFC 7234):
+    // - no-store: clear all cache headers
+    // - no-cache: allow conditional requests but never skip fetching
+    // - max-age: overrides Expires header
+    if let Some(cc) = resp
+        .headers()
+        .get("cache-control")
+        .and_then(|h| h.to_str().ok())
+        .map(CacheControl::parse)
+    {
+        if cc.no_store {
+            etag = None;
+            last_modified = None;
+            expires = None;
+        } else if cc.no_cache {
+            expires = None;
+        } else if let Some(max_age) = cc.max_age {
+            expires = Some(Utc::now().timestamp() + max_age as i64);
+        }
+    }
 
     {
         let params = (
@@ -1116,6 +1174,212 @@ mod cache_tests {
         assert_eq!(s.full_response_count, 1);
         assert_eq!(s.not_modified_count, 1);
         assert_eq!(s.request_count, 2);
+
+        Ok(())
+    }
+
+    /// Cache-Control: max-age=3600 stores header_expires ≈ now+3600 and skips
+    /// the second fetch.
+    #[tokio::test]
+    async fn test_max_age_sets_expires() -> Result<()> {
+        let mut tc = TestBuilder::default().init_database().build()?;
+        let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+            cache_control: Some("max-age=3600".into()),
+            ..Default::default()
+        }));
+        tc.init_feed_server_with_state(state.clone()).await?;
+
+        let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+        let before = Utc::now().timestamp();
+
+        refresh_feed(&client, feed_id, pool.clone(), None).await?;
+
+        let conn = tc.database_conn()?;
+        let stored_expires: Option<i64> = conn.query_row(
+            "SELECT header_expires FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| row.get(0),
+        )?;
+        let expires = stored_expires.expect("header_expires should be set");
+        assert!(
+            expires >= before + 3600 && expires <= before + 3600 + 5,
+            "header_expires should be approximately now + 3600, got offset {}",
+            expires - before
+        );
+
+        reset_last_checked(&conn, feed_id);
+
+        // Second fetch: should be skipped because max-age hasn't expired
+        refresh_feed(&client, feed_id, pool, None).await?;
+
+        let s = state.lock().unwrap();
+        assert_eq!(
+            s.request_count, 1,
+            "second fetch should be skipped due to max-age"
+        );
+
+        Ok(())
+    }
+
+    /// Cache-Control: max-age takes precedence over a past Expires header.
+    #[tokio::test]
+    async fn test_max_age_overrides_expires() -> Result<()> {
+        let past_expires = (Utc::now() - chrono::Duration::seconds(60))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+
+        let mut tc = TestBuilder::default().init_database().build()?;
+        let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+            expires: Some(past_expires),
+            cache_control: Some("max-age=3600".into()),
+            ..Default::default()
+        }));
+        tc.init_feed_server_with_state(state.clone()).await?;
+
+        let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+        let before = Utc::now().timestamp();
+
+        refresh_feed(&client, feed_id, pool.clone(), None).await?;
+
+        let conn = tc.database_conn()?;
+        let stored_expires: Option<i64> = conn.query_row(
+            "SELECT header_expires FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| row.get(0),
+        )?;
+        let expires = stored_expires.expect("header_expires should be set");
+        // max-age should win over the past Expires header
+        assert!(
+            expires >= before + 3600,
+            "max-age should override past Expires; got {} which is only {} from now",
+            expires,
+            expires - before
+        );
+
+        Ok(())
+    }
+
+    /// Cache-Control: no-cache clears header_expires but preserves ETag for
+    /// conditional requests.
+    #[tokio::test]
+    async fn test_no_cache_clears_expires() -> Result<()> {
+        let mut tc = TestBuilder::default().init_database().build()?;
+        let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+            etag: Some("\"no-cache-test\"".into()),
+            cache_control: Some("no-cache".into()),
+            ..Default::default()
+        }));
+        tc.init_feed_server_with_state(state.clone()).await?;
+
+        let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+        refresh_feed(&client, feed_id, pool.clone(), None).await?;
+
+        let conn = tc.database_conn()?;
+        let (stored_etag, stored_expires): (Option<String>, Option<i64>) = conn.query_row(
+            "SELECT header_etag, header_expires FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            stored_etag.as_deref(),
+            Some("\"no-cache-test\""),
+            "ETag should be preserved with no-cache"
+        );
+        assert!(
+            stored_expires.is_none(),
+            "header_expires should be NULL with no-cache"
+        );
+
+        reset_last_checked(&conn, feed_id);
+
+        // Second fetch: should make an HTTP request (no skip) and get 304
+        refresh_feed(&client, feed_id, pool, None).await?;
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.full_response_count, 1);
+        assert_eq!(
+            s.not_modified_count, 1,
+            "conditional request should get 304"
+        );
+
+        Ok(())
+    }
+
+    /// Cache-Control: no-store clears all cache headers.
+    #[tokio::test]
+    async fn test_no_store_clears_all_cache_headers() -> Result<()> {
+        let mut tc = TestBuilder::default().init_database().build()?;
+        let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+            etag: Some("\"no-store-test\"".into()),
+            last_modified: Some("Sat, 01 Jan 2025 00:00:00 GMT".into()),
+            cache_control: Some("no-store".into()),
+            ..Default::default()
+        }));
+        tc.init_feed_server_with_state(state.clone()).await?;
+
+        let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+        refresh_feed(&client, feed_id, pool, None).await?;
+
+        let conn = tc.database_conn()?;
+        let (stored_etag, stored_lm, stored_expires): (
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        ) = conn.query_row(
+            "SELECT header_etag, header_last_modified, header_expires FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert!(
+            stored_etag.is_none(),
+            "etag should be cleared with no-store"
+        );
+        assert!(
+            stored_lm.is_none(),
+            "last_modified should be cleared with no-store"
+        );
+        assert!(
+            stored_expires.is_none(),
+            "expires should be cleared with no-store"
+        );
+
+        Ok(())
+    }
+
+    /// After no-store clears headers, the second fetch sends no conditional
+    /// headers, resulting in two full 200 responses.
+    #[tokio::test]
+    async fn test_no_store_prevents_conditional_request() -> Result<()> {
+        let mut tc = TestBuilder::default().init_database().build()?;
+        let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+            etag: Some("\"no-store-cond\"".into()),
+            cache_control: Some("no-store".into()),
+            ..Default::default()
+        }));
+        tc.init_feed_server_with_state(state.clone()).await?;
+
+        let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+        // First fetch: 200 (no-store clears stored etag)
+        refresh_feed(&client, feed_id, pool.clone(), None).await?;
+
+        let conn = tc.database_conn()?;
+        reset_last_checked(&conn, feed_id);
+
+        // Second fetch: no conditional headers sent, so another 200
+        refresh_feed(&client, feed_id, pool, None).await?;
+
+        let s = state.lock().unwrap();
+        assert_eq!(
+            s.full_response_count, 2,
+            "both requests should get full 200 responses"
+        );
+        assert_eq!(
+            s.not_modified_count, 0,
+            "no 304 should occur since no-store cleared conditional headers"
+        );
 
         Ok(())
     }
