@@ -8,6 +8,7 @@ url="https://github.com/kernelmethod/kiki-rss"
 license=('MIT')
 depends=('gcc-libs' 'systemd')
 makedepends=('cargo')
+install=kiki.install
 source=()
 
 build() {

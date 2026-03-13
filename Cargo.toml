@@ -55,6 +55,7 @@ maintainer = "kernelmethod"
 depends = "$auto"
 section = "net"
 priority = "optional"
+maintainer-scripts = "dist/scripts"
 assets = [
     ["target/release/kiki", "usr/bin/", "755"],
     ["dist/kiki.service", "usr/lib/systemd/system/", "644"],
@@ -67,6 +68,31 @@ assets = [
     { source = "dist/kiki.service", dest = "/usr/lib/systemd/system/kiki.service", mode = "644" },
     { source = "README.md", dest = "/usr/share/doc/kiki-rss/README.md", mode = "644", doc = true },
 ]
+
+pre_install_script = """
+# Create system group if it doesn't exist
+getent group kiki >/dev/null 2>&1 || groupadd --system kiki
+# Create system user if it doesn't exist
+getent passwd kiki >/dev/null 2>&1 || \
+    useradd --system --gid kiki --home-dir /var/lib/kiki \
+        --shell /usr/sbin/nologin --no-create-home kiki
+"""
+
+post_install_script = """
+# Create and set ownership on data directory
+install -d -m 0750 -o kiki -g kiki /var/lib/kiki
+# Initialize the database (idempotent)
+su -s /bin/sh kiki -c '/usr/bin/kiki init --check /var/lib/kiki'
+# Reload systemd and enable service
+systemctl daemon-reload
+"""
+
+pre_uninstall_script = """
+# Stop and disable service before removal
+systemctl is-active --quiet kiki.service 2>/dev/null && systemctl stop kiki.service
+systemctl is-enabled --quiet kiki.service 2>/dev/null && systemctl disable kiki.service
+true
+"""
 
 [package.metadata.generate-rpm.requires]
 systemd = "*"

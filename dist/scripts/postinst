@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Create system group if it doesn't exist
+        if ! getent group kiki >/dev/null 2>&1; then
+            groupadd --system kiki
+        fi
+
+        # Create system user if it doesn't exist
+        if ! getent passwd kiki >/dev/null 2>&1; then
+            useradd --system --gid kiki --home-dir /var/lib/kiki \
+                --shell /usr/sbin/nologin --no-create-home kiki
+        fi
+
+        # Create and set ownership on data directory
+        install -d -m 0750 -o kiki -g kiki /var/lib/kiki
+
+        # Initialize the database (idempotent — skips if already set up)
+        su -s /bin/sh kiki -c '/usr/bin/kiki init --check /var/lib/kiki'
+        ;;
+esac

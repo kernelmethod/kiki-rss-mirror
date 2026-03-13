@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Remove data directory on purge
+        rm -rf /var/lib/kiki
+
+        # Remove system user and group
+        if getent passwd kiki >/dev/null 2>&1; then
+            userdel kiki
+        fi
+        if getent group kiki >/dev/null 2>&1; then
+            groupdel kiki
+        fi
+        ;;
+esac
