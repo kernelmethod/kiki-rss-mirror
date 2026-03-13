@@ -2,11 +2,11 @@ use crate::server::AppState;
 use axum::{extract::State, http::StatusCode, response::IntoResponse};
 use tracing::error;
 
-/// Route handler that rebuilds the global [`LuaScriptRunner`] from the latest scripts in
-/// the database.
+/// Route handler that reloads all scripts from the database.
 ///
-/// After this endpoint is called the fetcher manager replaces the cached runner with a
-/// freshly compiled one, picking up any script additions, removals, or edits.
+/// Calling this endpoint forces the server to reload all scripts, picking up any script additions,
+/// removals or edits. Calling this usually isn't necessary, as a reload is cued after changes are
+/// made to the server's scripts.
 #[utoipa::path(
     post,
     path = "/v1/scripts/reload",

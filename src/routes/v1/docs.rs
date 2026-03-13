@@ -32,6 +32,9 @@ use utoipa::OpenApi;
         crate::routes::v1::tags::entry_tags::set_entry_tags,
         crate::routes::v1::scripts::add_script::add_script,
         crate::routes::v1::scripts::list_scripts::list_scripts,
+        crate::routes::v1::scripts::get_script::get_script,
+        crate::routes::v1::scripts::update_script::update_script,
+        crate::routes::v1::scripts::delete_script::delete_script,
         crate::routes::v1::scripts::reload_scripts::reload_scripts,
     ),
     components(
@@ -67,6 +70,7 @@ use utoipa::OpenApi;
             crate::routes::v1::scripts::add_script::AddScriptResponse,
             crate::routes::v1::scripts::list_scripts::ScriptResponse,
             crate::routes::v1::scripts::list_scripts::ListScriptsResponse,
+            crate::routes::v1::scripts::update_script::UpdateScriptRequest,
         )
     ),
     tags(
@@ -74,7 +78,7 @@ use utoipa::OpenApi;
         (name = "feeds", description = "Manage RSS/Atom feed subscriptions"),
         (name = "entries", description = "Access and manage feed entries"),
         (name = "tags", description = "Organize feeds and entries with tags"),
-        (name = "scripts", description = "Manage and reload Lua processing scripts"),
+        (name = "scripts", description = "Manage and reload scripts"),
     ),
     info(
         title = "kiki-rss",
