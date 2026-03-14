@@ -20,10 +20,7 @@ pub struct Migration {
 /// When adding a new migration:
 /// 1. Create the SQL file in `src/db/include/migrations/`
 /// 2. Append an entry to this array
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_initial",
-    sql: include_str!("include/migrations/0001_initial.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[];
 
 /// SQL to create the migrations table. Safe to run on databases that already
 /// have it (uses `IF NOT EXISTS`).
@@ -147,59 +144,6 @@ mod tests {
             count, 0,
             "no migrations should be applied on fresh database"
         );
-        Ok(())
-    }
-
-    /// Simulates a legacy database that has a schema_version table but no
-    /// migrations table. Running the migration runner should bootstrap the
-    /// migrations table, apply 0001_initial (which drops schema_version),
-    /// and record the migration.
-    #[test]
-    fn test_migrate_legacy_db() -> Result<()> {
-        let mut conn = ConnectionBuilder::default()
-            .in_memory()
-            .read_write()
-            .build()?;
-
-        // Simulate legacy database state: has schema_version, no migrations table
-        conn.execute_batch(
-            "CREATE TABLE schema_version (version VARCHAR NOT NULL);
-             INSERT INTO schema_version (version) VALUES ('1.0');",
-        )?;
-
-        // Verify schema_version exists
-        let has_schema_version: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert!(
-            has_schema_version,
-            "schema_version should exist before migration"
-        );
-
-        // Run migrations
-        let count = run_pending_migrations(&mut conn)?;
-        assert_eq!(count, 1, "should apply exactly one migration");
-
-        // Verify schema_version was dropped
-        let has_schema_version: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert!(
-            !has_schema_version,
-            "schema_version should be dropped after migration"
-        );
-
-        // Verify migrations table has the right entries
-        let applied = applied_migration_names(&conn)?;
-        assert!(
-            applied.contains("0001_initial"),
-            "0001_initial should be recorded"
-        );
-
         Ok(())
     }
 }
