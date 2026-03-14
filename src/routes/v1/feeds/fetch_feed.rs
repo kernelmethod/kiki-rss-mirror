@@ -7,10 +7,13 @@ use axum::{
 };
 use tracing::{event, Level};
 
-/// Route handler for fetching a single feed.
+/// Refresh single feed
+///
+/// Queue a request to refresh an individual feed by its ID. This will force a refresh even if kiki
+/// has updated the feed recently.
 #[utoipa::path(
     post,
-    path = "/v1/feeds/fetch/{id}",
+    path = "/v1/feeds/refresh/{id}",
     params(
         ("id" = i64, Path, description = "Feed ID"),
     ),

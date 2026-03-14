@@ -16,7 +16,9 @@ pub struct HealthResponse {
     pub entry_count: usize,
 }
 
-/// Route handler for the health check endpoint.
+/// Health check
+///
+/// Returns a 200 response if the server is live and healthy.
 #[utoipa::path(
     get,
     path = "/v1/health",

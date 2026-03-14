@@ -17,7 +17,9 @@ pub struct AddFeedResponse {
     pub id: i64,
 }
 
-/// Route handler for adding a new feed.
+/// Add a new feed
+///
+/// Register a new feed from which to fetch content.
 #[utoipa::path(
     post,
     path = "/v1/feeds/create",

@@ -56,7 +56,9 @@ impl Default for ListEntriesError {
     }
 }
 
-/// Route handler for listing all feed entries.
+/// List all entries
+///
+/// Retrieve a paginated list of all RSS and Atom entries that the server has retrieved.
 #[utoipa::path(
     get,
     path = "/v1/entries",

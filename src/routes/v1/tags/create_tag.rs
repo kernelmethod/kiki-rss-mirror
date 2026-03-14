@@ -30,7 +30,9 @@ enum CreateTagTaskError {
     Database(#[from] rusqlite::Error),
 }
 
-/// Route handler for creating a new tag.
+/// Create a new tag
+///
+/// Create a new tag with the given name. Tag names must be unique.
 #[utoipa::path(
     post,
     path = "/v1/tags/create",

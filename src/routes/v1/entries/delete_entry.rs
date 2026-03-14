@@ -6,7 +6,9 @@ use axum::{
 use tokio::task;
 use tracing::{event, Level};
 
-/// Route handler for deleting an entry by ID.
+/// Delete an entry
+///
+/// Delete an entry by its ID.
 #[utoipa::path(
     delete,
     path = "/v1/entries/id/{id}",

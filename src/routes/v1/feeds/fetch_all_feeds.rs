@@ -15,10 +15,13 @@ pub struct FetchAllFeedsResponse {
     pub queued: usize,
 }
 
-/// Route handler for triggering a refresh of all feeds.
+/// Refresh all feeds
+///
+/// Queue requests to refresh all of the feeds that kiki is configured to read from. This will
+/// force a refresh even for feeds that kiki has updated recently.
 #[utoipa::path(
     post,
-    path = "/v1/feeds/fetch",
+    path = "/v1/feeds/refresh",
     responses(
         (status = 202, description = "All feeds queued for refresh", body = FetchAllFeedsResponse),
         (status = 500, description = "Internal server error"),

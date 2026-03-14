@@ -38,7 +38,9 @@ enum TagEntriesTaskError {
     Database(#[from] rusqlite::Error),
 }
 
-/// Route handler for listing entries associated with a tag.
+/// Get entries by tag
+///
+/// Retrieve a paginated list of entries associated with a tag.
 #[utoipa::path(
     get,
     path = "/v1/tags/id/{id}/entries",

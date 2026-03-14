@@ -33,7 +33,9 @@ enum UpdateTagTaskError {
     Database(#[from] rusqlite::Error),
 }
 
-/// Route handler for updating a tag (rename).
+/// Update a tag
+///
+/// Rename the tag with the provided ID.
 #[utoipa::path(
     put,
     path = "/v1/tags/id/{id}",

@@ -33,7 +33,9 @@ pub struct ListTagsResponse {
     pub limit: usize,
 }
 
-/// Route handler for listing all tags.
+/// List all tags
+///
+/// Retrieve a paginated list of all tags that are known to the server.
 #[utoipa::path(
     get,
     path = "/v1/tags",

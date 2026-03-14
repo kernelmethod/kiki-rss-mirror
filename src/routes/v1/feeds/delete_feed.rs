@@ -7,7 +7,9 @@ use axum::{
 use tokio::task;
 use tracing::{event, Level};
 
-/// Route handler for deleting a feed.
+/// Delete a feed
+///
+/// Delete a feed and all entries associated with that feed.
 #[utoipa::path(
     delete,
     path = "/v1/feeds/id/{id}",

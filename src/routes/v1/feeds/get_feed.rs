@@ -25,7 +25,9 @@ pub struct GetFeedResponse {
     pub last_fetch_error_at: Option<String>,
 }
 
-/// Route handler for fetching a single feed's information.
+/// Get feed information
+///
+/// Retrieve information about a single feed by that feed's ID.
 #[utoipa::path(
     get,
     path = "/v1/feeds/id/{id}",

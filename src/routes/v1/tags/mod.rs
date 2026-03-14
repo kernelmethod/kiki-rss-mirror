@@ -1,7 +1,5 @@
 pub mod create_tag;
 pub mod delete_tag;
-pub mod entry_tags;
-pub mod feed_tags;
 pub mod get_tag;
 pub mod list_tags;
 pub mod tag_entries;
@@ -15,9 +13,6 @@ use list_tags::list_tags;
 use tag_entries::tag_entries;
 use tag_feeds::tag_feeds;
 use update_tag::update_tag;
-
-pub use entry_tags::{get_entry_tags, set_entry_tags};
-pub use feed_tags::{get_feed_tags, set_feed_tags};
 
 use crate::server::AppState;
 use axum::{
@@ -242,112 +237,6 @@ mod test {
         // Delete non-existent
         let resp = client
             .delete("http://localhost/v1/tags/id/999")
-            .send()
-            .await?;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_feed_tags() -> Result<()> {
-        let tc = TestBuilder::all().build()?;
-        let client = tc.client()?;
-
-        populate_tags(&tc)?;
-        populate_feeds_and_entries(&tc)?;
-
-        // Initially no tags on feed
-        let resp = client
-            .get("http://localhost/v1/feeds/id/1/tags")
-            .send()
-            .await?;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = resp.json::<feed_tags::GetFeedTagsResponse>().await?;
-        assert_eq!(json.tags.len(), 0);
-
-        // Set tags on feed
-        let resp = client
-            .put("http://localhost/v1/feeds/id/1/tags")
-            .json(&feed_tags::SetFeedTagsRequest {
-                tag_ids: vec![1, 2],
-            })
-            .send()
-            .await?;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = resp.json::<feed_tags::GetFeedTagsResponse>().await?;
-        assert_eq!(json.tags.len(), 2);
-
-        // Verify via GET
-        let resp = client
-            .get("http://localhost/v1/feeds/id/1/tags")
-            .send()
-            .await?;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = resp.json::<feed_tags::GetFeedTagsResponse>().await?;
-        assert_eq!(json.tags.len(), 2);
-
-        // Replace tags
-        let resp = client
-            .put("http://localhost/v1/feeds/id/1/tags")
-            .json(&feed_tags::SetFeedTagsRequest { tag_ids: vec![3] })
-            .send()
-            .await?;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = resp.json::<feed_tags::GetFeedTagsResponse>().await?;
-        assert_eq!(json.tags.len(), 1);
-        assert_eq!(json.tags[0].name, "science");
-
-        // Non-existent feed
-        let resp = client
-            .get("http://localhost/v1/feeds/id/999/tags")
-            .send()
-            .await?;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-        // Non-existent tag in set
-        let resp = client
-            .put("http://localhost/v1/feeds/id/1/tags")
-            .json(&feed_tags::SetFeedTagsRequest { tag_ids: vec![999] })
-            .send()
-            .await?;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_entry_tags() -> Result<()> {
-        let tc = TestBuilder::all().build()?;
-        let client = tc.client()?;
-
-        populate_tags(&tc)?;
-        populate_feeds_and_entries(&tc)?;
-
-        // Initially no tags on entry
-        let resp = client
-            .get("http://localhost/v1/entries/id/1/tags")
-            .send()
-            .await?;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = resp.json::<entry_tags::GetEntryTagsResponse>().await?;
-        assert_eq!(json.tags.len(), 0);
-
-        // Set tags on entry
-        let resp = client
-            .put("http://localhost/v1/entries/id/1/tags")
-            .json(&entry_tags::SetEntryTagsRequest {
-                tag_ids: vec![1, 3],
-            })
-            .send()
-            .await?;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = resp.json::<entry_tags::GetEntryTagsResponse>().await?;
-        assert_eq!(json.tags.len(), 2);
-
-        // Non-existent entry
-        let resp = client
-            .get("http://localhost/v1/entries/id/999/tags")
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);

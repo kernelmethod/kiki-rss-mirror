@@ -200,7 +200,7 @@ mod test {
 
         // Re-fetch the feed.
         let resp = client
-            .post(format!("http://localhost/v1/feeds/fetch/{feed_id}"))
+            .post(format!("http://localhost/v1/feeds/refresh/{feed_id}"))
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);

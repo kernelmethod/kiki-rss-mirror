@@ -15,7 +15,9 @@ pub struct GetTagResponse {
     pub name: String,
 }
 
-/// Route handler for getting a single tag by ID.
+/// Get tag information
+///
+/// Retrieve information about a tag by its ID.
 #[utoipa::path(
     get,
     path = "/v1/tags/id/{id}",

@@ -17,10 +17,10 @@ struct FeedWithTags {
     tags: Vec<String>,
 }
 
-/// Route handler for exporting feeds as OPML.
+/// Export feeds as OPML
 ///
-/// Feeds are grouped into folders by tag. Untagged feeds appear at the
-/// top level. Feeds with multiple tags appear in each corresponding folder.
+/// Export all feeds as [OPML](https://en.wikipedia.org/wiki/OPML) so that they may be imported
+/// into another RSS feed aggregator.
 #[utoipa::path(
     get,
     path = "/v1/feeds/export",

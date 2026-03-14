@@ -1,15 +1,16 @@
 pub mod cleanup;
 pub mod delete_entry;
+pub mod entry_tags;
 pub mod get_entry;
 pub mod list_entries;
 
 use cleanup::cleanup;
 use delete_entry::delete_entry;
+use entry_tags::{get_entry_tags, set_entry_tags};
 use get_entry::get_entry;
 #[allow(unused_imports)]
 pub use list_entries::{list_entries, ListEntriesResponse, ListEntriesResponseEntry};
 
-use crate::routes::v1::tags::{get_entry_tags, set_entry_tags};
 use crate::server::AppState;
 use axum::{
     routing::{get, post},
@@ -32,6 +33,54 @@ mod test {
     use anyhow::Result;
     use axum::http::StatusCode;
     use chrono::{TimeZone, Utc};
+
+    fn populate_tags(tc: &TestConfig) -> Result<()> {
+        let conn = tc.database_conn()?;
+        conn.execute("INSERT INTO tags (name) VALUES (?)", ["news"])?;
+        conn.execute("INSERT INTO tags (name) VALUES (?)", ["tech"])?;
+        conn.execute("INSERT INTO tags (name) VALUES (?)", ["science"])?;
+        Ok(())
+    }
+
+    fn populate_feeds_and_entries(tc: &TestConfig) -> Result<()> {
+        let conn = tc.database_conn()?;
+
+        conn.execute(
+            "INSERT INTO feeds (title, url, syndication_format) VALUES (?, ?, ?)",
+            ["Feed A", "http://example.com/a", "rss"],
+        )?;
+        conn.execute(
+            "INSERT INTO feeds (title, url, syndication_format) VALUES (?, ?, ?)",
+            ["Feed B", "http://example.com/b", "atom"],
+        )?;
+
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                1,
+                "rss",
+                "guid-1",
+                1700000000i64,
+                "Entry 1",
+                "http://example.com/1"
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                2,
+                "atom",
+                "guid-2",
+                1700000001i64,
+                "Entry 2",
+                "http://example.com/2"
+            ],
+        )?;
+
+        Ok(())
+    }
 
     fn populate_entries(tc: &TestConfig) -> Result<()> {
         // Insert some test entries
@@ -193,6 +242,45 @@ mod test {
             .await?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(&response.text().await?, "Entry not found");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_entry_tags() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        populate_tags(&tc)?;
+        populate_feeds_and_entries(&tc)?;
+
+        // Initially no tags on entry
+        let resp = client
+            .get("http://localhost/v1/entries/id/1/tags")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<entry_tags::GetEntryTagsResponse>().await?;
+        assert_eq!(json.tags.len(), 0);
+
+        // Set tags on entry
+        let resp = client
+            .put("http://localhost/v1/entries/id/1/tags")
+            .json(&entry_tags::SetEntryTagsRequest {
+                tag_ids: vec![1, 3],
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<entry_tags::GetEntryTagsResponse>().await?;
+        assert_eq!(json.tags.len(), 2);
+
+        // Non-existent entry
+        let resp = client
+            .get("http://localhost/v1/entries/id/999/tags")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         Ok(())
     }

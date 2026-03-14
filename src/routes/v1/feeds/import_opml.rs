@@ -25,11 +25,10 @@ struct OpmlFeed {
     tags: Vec<String>,
 }
 
-/// Route handler for importing feeds from OPML.
+/// Import feeds from OPML
 ///
-/// Accepts raw OPML XML in the request body. Parses outline elements,
-/// creates feeds and tags, and associates tags based on the OPML folder
-/// structure. Triggers a fetch for each newly imported feed.
+/// Import feeds from [OPML](https://en.wikipedia.org/wiki/OPML) format to start retrieving content
+/// from that feed.
 #[utoipa::path(
     post,
     path = "/v1/feeds/import",

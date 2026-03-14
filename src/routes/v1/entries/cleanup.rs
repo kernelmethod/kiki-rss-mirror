@@ -15,10 +15,9 @@ pub struct CleanupResponse {
     pub deleted_count: usize,
 }
 
-/// Manually trigger retention cleanup across all feeds.
+/// Purge old entries
 ///
-/// Deletes entries older than the configured `retention_max_age_days`.
-/// Returns `deleted_count: 0` if no retention policy is configured.
+/// Manually trigger entry cleanup across all feeds, per the server's configured retention policy.
 #[utoipa::path(
     post,
     path = "/v1/entries/cleanup",

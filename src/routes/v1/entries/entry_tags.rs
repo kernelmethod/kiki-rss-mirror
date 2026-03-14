@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::task;
 use tracing::{event, Level};
 
-use super::list_tags::TagResponse;
+use crate::routes::v1::tags::list_tags::TagResponse;
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct SetEntryTagsRequest {
@@ -34,7 +34,9 @@ enum EntryTagsTaskError {
     Database(#[from] rusqlite::Error),
 }
 
-/// Route handler for getting tags associated with an entry.
+/// Get entry tags
+///
+/// Retrieve all tags associated with an entry.
 #[utoipa::path(
     get,
     path = "/v1/entries/id/{id}/tags",
@@ -107,7 +109,10 @@ pub async fn get_entry_tags(
     }
 }
 
-/// Route handler for setting tags on an entry (replaces existing).
+/// Set entry tags
+///
+/// Set the list of tags that are applied to an entry. This endpoint replaces all tags that are
+/// currently applied to that entry.
 #[utoipa::path(
     put,
     path = "/v1/entries/id/{id}/tags",

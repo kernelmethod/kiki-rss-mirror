@@ -40,7 +40,10 @@ impl Default for ListFeedsError {
     }
 }
 
-/// Route handler for listing all of the available feeds.
+/// List feeds
+///
+/// Retrieve a paginated list of all available feeds that the server is configured to fetch content
+/// from.
 #[utoipa::path(
     get,
     path = "/v1/feeds",

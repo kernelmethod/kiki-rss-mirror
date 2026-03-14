@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::task;
 use tracing::{event, Level};
 
-use super::list_tags::TagResponse;
+use crate::routes::v1::tags::list_tags::TagResponse;
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct SetFeedTagsRequest {
@@ -34,7 +34,10 @@ enum FeedTagsTaskError {
     Database(#[from] rusqlite::Error),
 }
 
-/// Route handler for getting tags associated with a feed.
+/// Get feed tags
+///
+/// Get all tags that are associated with a feed. These tags are automatically applied to any
+/// entries that are retrieved by that feed.
 #[utoipa::path(
     get,
     path = "/v1/feeds/id/{id}/tags",
@@ -107,7 +110,12 @@ pub async fn get_feed_tags(
     }
 }
 
-/// Route handler for setting tags on a feed (replaces existing).
+/// Set feed tags
+///
+/// Set the list of tags that are applied to a feed. This endpoint replaces all tags that are
+/// currently applied to that feed.
+///
+/// Tags applied at a feed level are automatically applied to all entries retrieved from that feed.
 #[utoipa::path(
     put,
     path = "/v1/feeds/id/{id}/tags",

@@ -7,7 +7,9 @@ use axum::{
 use tokio::task;
 use tracing::{event, Level};
 
-/// Route handler for deleting a tag.
+/// Delete a tag
+///
+/// Delete a tag by its ID.
 #[utoipa::path(
     delete,
     path = "/v1/tags/id/{id}",

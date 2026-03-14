@@ -38,7 +38,9 @@ enum FeedEntriesTaskError {
     Database(#[from] rusqlite::Error),
 }
 
-/// Route handler for listing entries belonging to a specific feed.
+/// List entries
+///
+/// List all of the entries belonging to a specific feed.
 #[utoipa::path(
     get,
     path = "/v1/feeds/id/{id}/entries",

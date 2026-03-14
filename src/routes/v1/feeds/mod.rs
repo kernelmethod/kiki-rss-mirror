@@ -2,6 +2,7 @@ pub mod add_feed;
 pub mod delete_feed;
 pub mod export_opml;
 pub mod feed_entries;
+pub mod feed_tags;
 pub mod fetch_all_feeds;
 pub mod fetch_feed;
 pub mod get_feed;
@@ -13,6 +14,7 @@ use add_feed::add_feed;
 use delete_feed::delete_feed;
 use export_opml::export_opml;
 use feed_entries::feed_entries;
+use feed_tags::{get_feed_tags, set_feed_tags};
 use fetch_all_feeds::fetch_all_feeds;
 use fetch_feed::fetch_feed;
 use get_feed::get_feed;
@@ -20,7 +22,6 @@ use import_opml::import_opml;
 use list_feeds::list_feeds;
 use update_feed::update_feed;
 
-use crate::routes::v1::tags::{get_feed_tags, set_feed_tags};
 use crate::server::AppState;
 use axum::{
     routing::{get, post},
@@ -37,8 +38,8 @@ pub fn create_router() -> Router<AppState> {
         )
         .route("/id/{id}/tags", get(get_feed_tags).put(set_feed_tags))
         .route("/id/{id}/entries", get(feed_entries))
-        .route("/fetch", post(fetch_all_feeds))
-        .route("/fetch/{id}", post(fetch_feed))
+        .route("/refresh", post(fetch_all_feeds))
+        .route("/refresh/{id}", post(fetch_feed))
         .route("/import", post(import_opml))
         .route("/export", get(export_opml))
 }
@@ -48,10 +49,59 @@ pub fn create_router() -> Router<AppState> {
 mod test {
     use super::*;
     use crate::routes::v1::entries::ListEntriesResponse;
+    use crate::routes::v1::feeds::feed_tags;
     use crate::test::{TestBuilder, TestConfig};
     use anyhow::Result;
     use axum::http::StatusCode;
     use std::time::Duration;
+
+    fn populate_tags(tc: &TestConfig) -> Result<()> {
+        let conn = tc.database_conn()?;
+        conn.execute("INSERT INTO tags (name) VALUES (?)", ["news"])?;
+        conn.execute("INSERT INTO tags (name) VALUES (?)", ["tech"])?;
+        conn.execute("INSERT INTO tags (name) VALUES (?)", ["science"])?;
+        Ok(())
+    }
+
+    fn populate_feeds_and_entries(tc: &TestConfig) -> Result<()> {
+        let conn = tc.database_conn()?;
+
+        conn.execute(
+            "INSERT INTO feeds (title, url, syndication_format) VALUES (?, ?, ?)",
+            ["Feed A", "http://example.com/a", "rss"],
+        )?;
+        conn.execute(
+            "INSERT INTO feeds (title, url, syndication_format) VALUES (?, ?, ?)",
+            ["Feed B", "http://example.com/b", "atom"],
+        )?;
+
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                1,
+                "rss",
+                "guid-1",
+                1700000000i64,
+                "Entry 1",
+                "http://example.com/1"
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                2,
+                "atom",
+                "guid-2",
+                1700000001i64,
+                "Entry 2",
+                "http://example.com/2"
+            ],
+        )?;
+
+        Ok(())
+    }
 
     async fn add_example_feed(tc: &TestConfig) -> Result<i64> {
         let client = tc.client()?;
@@ -316,7 +366,7 @@ mod test {
 
         // Test the fetch endpoint - should return 202 Accepted
         let resp = client
-            .post(format!("http://localhost/v1/feeds/fetch/{:?}", feed_id))
+            .post(format!("http://localhost/v1/feeds/refresh/{:?}", feed_id))
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
@@ -496,9 +546,7 @@ mod test {
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
-        let tags_resp = resp
-            .json::<crate::routes::v1::tags::feed_tags::GetFeedTagsResponse>()
-            .await?;
+        let tags_resp = resp.json::<feed_tags::GetFeedTagsResponse>().await?;
         assert_eq!(tags_resp.tags.len(), 1);
         assert_eq!(tags_resp.tags[0].name, "tech");
 
@@ -512,9 +560,7 @@ mod test {
             .get(format!("http://localhost/v1/feeds/id/{}/tags", untagged.id))
             .send()
             .await?;
-        let tags_resp = resp
-            .json::<crate::routes::v1::tags::feed_tags::GetFeedTagsResponse>()
-            .await?;
+        let tags_resp = resp.json::<feed_tags::GetFeedTagsResponse>().await?;
         assert_eq!(tags_resp.tags.len(), 0);
 
         Ok(())
@@ -598,6 +644,73 @@ mod test {
         assert!(exported_xml.contains("https://example.com/blog.xml"));
         // The "news" folder should appear in the export
         assert!(exported_xml.contains("news"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_tags() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        populate_tags(&tc)?;
+        populate_feeds_and_entries(&tc)?;
+
+        // Initially no tags on feed
+        let resp = client
+            .get("http://localhost/v1/feeds/id/1/tags")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<feed_tags::GetFeedTagsResponse>().await?;
+        assert_eq!(json.tags.len(), 0);
+
+        // Set tags on feed
+        let resp = client
+            .put("http://localhost/v1/feeds/id/1/tags")
+            .json(&feed_tags::SetFeedTagsRequest {
+                tag_ids: vec![1, 2],
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<feed_tags::GetFeedTagsResponse>().await?;
+        assert_eq!(json.tags.len(), 2);
+
+        // Verify via GET
+        let resp = client
+            .get("http://localhost/v1/feeds/id/1/tags")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<feed_tags::GetFeedTagsResponse>().await?;
+        assert_eq!(json.tags.len(), 2);
+
+        // Replace tags
+        let resp = client
+            .put("http://localhost/v1/feeds/id/1/tags")
+            .json(&feed_tags::SetFeedTagsRequest { tag_ids: vec![3] })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<feed_tags::GetFeedTagsResponse>().await?;
+        assert_eq!(json.tags.len(), 1);
+        assert_eq!(json.tags[0].name, "science");
+
+        // Non-existent feed
+        let resp = client
+            .get("http://localhost/v1/feeds/id/999/tags")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Non-existent tag in set
+        let resp = client
+            .put("http://localhost/v1/feeds/id/1/tags")
+            .json(&feed_tags::SetFeedTagsRequest { tag_ids: vec![999] })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         Ok(())
     }

@@ -25,7 +25,9 @@ pub struct GetEntryResponse {
     pub status_favorite: i32,
 }
 
-/// Route handler for fetching a single entry by ID.
+/// Get entry content
+///
+/// Retrieve content and metadata for a single entry by its ID.
 #[utoipa::path(
     get,
     path = "/v1/entries/id/{id}",

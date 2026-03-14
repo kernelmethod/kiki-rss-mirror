@@ -20,7 +20,9 @@ pub struct RetentionRequest {
     pub max_age_days: Option<i64>,
 }
 
-/// Get the current retention policy settings.
+/// Get retention policy
+///
+/// Retrieve settings for the current retention policy for RSS/Atom entries.
 #[utoipa::path(
     get,
     path = "/v1/settings/retention",
@@ -52,7 +54,9 @@ pub async fn get_retention(State(state): State<AppState>) -> Result<Response, Re
     }
 }
 
-/// Update the retention policy settings.
+/// Update retention policy
+///
+/// Update the settings for the retention policy for RSS/Atom entries.
 #[utoipa::path(
     put,
     path = "/v1/settings/retention",

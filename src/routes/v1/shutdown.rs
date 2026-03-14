@@ -1,6 +1,8 @@
 use crate::server::AppState;
 use axum::{extract::State, http::StatusCode, response::IntoResponse};
 
+/// Shutdown server
+///
 /// Initiates a graceful shutdown of the server.
 #[utoipa::path(
     post,

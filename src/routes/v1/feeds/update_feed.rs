@@ -37,7 +37,9 @@ enum UpdateFeedTaskError {
     Database(#[from] rusqlite::Error),
 }
 
-/// Route handler for updating a feed.
+/// Update a feed
+///
+/// Update data used to configure a single feed.
 #[utoipa::path(
     put,
     path = "/v1/feeds/id/{id}",

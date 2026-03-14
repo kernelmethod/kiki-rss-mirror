@@ -8,7 +8,9 @@ pub struct RootResponse {
     schema_version: String,
 }
 
-/// Route handler for the root url, `/`.
+/// Version information
+///
+/// Get information about the version of the server that is running.
 #[utoipa::path(
     get,
     path = "/v1/",

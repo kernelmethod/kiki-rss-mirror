@@ -38,7 +38,9 @@ enum TagFeedsTaskError {
     Database(#[from] rusqlite::Error),
 }
 
-/// Route handler for listing feeds associated with a tag.
+/// Get feeds by tag
+///
+/// Retrieve a paginated list of feeds associated with a tag.
 #[utoipa::path(
     get,
     path = "/v1/tags/id/{id}/feeds",
