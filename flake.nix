@@ -15,7 +15,15 @@
           craneLib = crane.mkLib pkgs;
 
           commonArgs = {
-            src = craneLib.cleanCargoSource ./.;
+            src = let
+              sqlFilter = path: _type: builtins.match ".*\\.sql$" path != null;
+              sqlOrCargo = path: type:
+                (sqlFilter path type) || (craneLib.filterCargoSources path type);
+            in
+              pkgs.lib.cleanSourceWith {
+                src = ./.;
+                filter = sqlOrCargo;
+              };
             strictDeps = true;
 
             buildInputs = [ ];
