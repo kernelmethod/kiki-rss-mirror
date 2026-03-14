@@ -50,16 +50,36 @@ pub struct SearchEntriesRequest {
     pub content_glob: Option<String>,
     /// GLOB pattern matched against URL.
     pub url_glob: Option<String>,
+    /// FTS5 full-text search query matched against title, content, and url.
+    pub query: Option<String>,
+    /// Regex pattern matched against title.
+    pub title_regex: Option<String>,
+    /// Regex pattern matched against content.
+    pub content_regex: Option<String>,
+    /// Regex pattern matched against url.
+    pub url_regex: Option<String>,
+    /// Sort order: "published_at" (default) or "relevance" (only valid when `query` is set).
+    pub sort: Option<String>,
     /// Number of records to skip (default: 0).
     pub offset: Option<usize>,
     /// Maximum number of records to return (default: 50).
     pub limit: Option<usize>,
 }
 
+/// A single entry in the search response.
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct SearchEntriesResponseEntry {
+    #[serde(flatten)]
+    pub entry: ListEntriesResponseEntry,
+    /// BM25 relevance score. Only populated when a full-text `query` is provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<f64>,
+}
+
 /// Response from the entry search endpoint.
 #[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct SearchEntriesResponse {
-    pub entries: Vec<ListEntriesResponseEntry>,
+    pub entries: Vec<SearchEntriesResponseEntry>,
     pub count: usize,
     pub offset: usize,
     pub limit: usize,
@@ -72,6 +92,9 @@ enum SearchEntriesError {
 
     #[error("empty tag filter array")]
     EmptyTagFilter,
+
+    #[error("invalid regex: {0}")]
+    InvalidRegex(String),
 
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
@@ -177,18 +200,7 @@ fn collect_or_leaves(
                 }
                 collect_or_leaves(inner, out)?;
             }
-            // Nested AND inside OR: delegate to normal recursive translation
-            // (will be handled by the AND branch of tag_filter_to_sql)
             TagFilter::Expr(TagExpr::And(_)) => {
-                // For nested AND inside OR, we can't flatten — fall back to
-                // the general recursive approach by returning an error that
-                // signals the caller to use the non-flattened path.
-                // Actually, we should not hit this in collect_or_leaves
-                // because the caller only calls this for Or variants.
-                // For correctness, just push nothing and let the caller
-                // handle it via tag_filter_to_sql directly.
-                // Re-design: instead of collecting, handle mixed OR with
-                // nested AND by using the general path.
                 return Err(SearchEntriesError::EmptyTagFilter);
             }
         }
@@ -233,9 +245,17 @@ fn parse_rfc3339_to_timestamp(s: &str) -> Result<i64, SearchEntriesError> {
         .map_err(|_| SearchEntriesError::InvalidDate(s.to_string()))
 }
 
+/// Validate a regex pattern, returning a user-friendly error on failure.
+fn validate_regex(pattern: &str) -> Result<(), SearchEntriesError> {
+    regex::Regex::new(pattern)
+        .map(|_| ())
+        .map_err(|e| SearchEntriesError::InvalidRegex(e.to_string()))
+}
+
 /// Search entries
 ///
-/// Search for entries using tag filters, date ranges, and GLOB patterns.
+/// Search for entries using tag filters, date ranges, GLOB patterns,
+/// full-text search, and regex filters.
 /// Uses POST because the tag query requires a structured expression.
 #[utoipa::path(
     post,
@@ -252,6 +272,39 @@ pub async fn search_entries(
     State(state): State<AppState>,
     Json(payload): Json<SearchEntriesRequest>,
 ) -> Result<Response, Response> {
+    // Validate regex patterns upfront for clear 400 errors
+    if let Some(ref pat) = payload.title_regex {
+        validate_regex(pat)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+    }
+    if let Some(ref pat) = payload.content_regex {
+        validate_regex(pat)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+    }
+    if let Some(ref pat) = payload.url_regex {
+        validate_regex(pat)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+    }
+    if let Some(ref sort) = payload.sort {
+        match sort.as_str() {
+            "published_at" | "relevance" => {}
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid sort value: {}", sort),
+                )
+                    .into_response());
+            }
+        }
+        if sort == "relevance" && payload.query.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "sort by relevance requires a query",
+            )
+                .into_response());
+        }
+    }
+
     let conn = state.conn_pool.get().map_err(|e| {
         event!(Level::ERROR, "failed to get database connection: {:?}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
@@ -264,6 +317,15 @@ pub async fn search_entries(
         let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<SqlParam> = Vec::new();
         let mut next_idx: usize = 1;
+
+        let use_fts = payload.query.is_some();
+
+        // FTS5 MATCH condition
+        if let Some(ref query) = payload.query {
+            conditions.push(format!("entries_fts MATCH ?{}", next_idx));
+            params.push(SqlParam::from_string(query.clone()));
+            next_idx += 1;
+        }
 
         // Tag filter
         if let Some(ref tag_filter) = payload.tags {
@@ -303,6 +365,29 @@ pub async fn search_entries(
             next_idx += 1;
         }
 
+        // REGEXP filters
+        if let Some(ref pat) = payload.title_regex {
+            conditions.push(format!("e.title REGEXP ?{}", next_idx));
+            params.push(SqlParam::from_string(pat.clone()));
+            next_idx += 1;
+        }
+        if let Some(ref pat) = payload.content_regex {
+            conditions.push(format!("COALESCE(e.content, '') REGEXP ?{}", next_idx));
+            params.push(SqlParam::from_string(pat.clone()));
+            next_idx += 1;
+        }
+        if let Some(ref pat) = payload.url_regex {
+            conditions.push(format!("e.url REGEXP ?{}", next_idx));
+            params.push(SqlParam::from_string(pat.clone()));
+            next_idx += 1;
+        }
+
+        let from_clause = if use_fts {
+            "entries e JOIN entries_fts ON e.id = entries_fts.rowid"
+        } else {
+            "entries e"
+        };
+
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {
@@ -310,7 +395,7 @@ pub async fn search_entries(
         };
 
         // Count query
-        let count_sql = format!("SELECT COUNT(*) FROM entries e{}", where_clause);
+        let count_sql = format!("SELECT COUNT(*) FROM {}{}", from_clause, where_clause);
         let count: usize = conn
             .prepare(&count_sql)
             .inspect_err(|e| {
@@ -318,13 +403,29 @@ pub async fn search_entries(
             })?
             .query_row(rusqlite::params_from_iter(params.iter()), |row| row.get(0))?;
 
+        // Determine rank column and order clause
+        let (rank_expr, order_clause) = if use_fts {
+            let sort = payload.sort.as_deref().unwrap_or("published_at");
+            let order = if sort == "relevance" {
+                "bm25(entries_fts)".to_string()
+            } else {
+                "e.published_at DESC".to_string()
+            };
+            ("bm25(entries_fts)", order)
+        } else {
+            ("NULL", "e.published_at DESC".to_string())
+        };
+
         // Data query
         let data_sql = format!(
             "SELECT e.id, e.feed_id, e.source_id, e.syndication_format, \
              e.guid, e.published_at, e.title, e.url, e.content, \
-             e.status_read, e.status_favorite \
-             FROM entries e{} ORDER BY e.published_at DESC LIMIT ?{} OFFSET ?{}",
+             {} \
+             FROM {}{} ORDER BY {} LIMIT ?{} OFFSET ?{}",
+            rank_expr,
+            from_clause,
             where_clause,
+            order_clause,
             next_idx,
             next_idx + 1
         );
@@ -337,19 +438,21 @@ pub async fn search_entries(
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
             .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                Ok(ListEntriesResponseEntry {
-                    id: row.get(0)?,
-                    feed_id: row.get(1)?,
-                    source_id: row.get(2)?,
-                    syndication_format: row.get(3)?,
-                    guid: row.get(4)?,
-                    published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
-                        .map(|d| d.to_rfc3339()),
-                    title: row.get(6)?,
-                    url: row.get(7)?,
-                    content: row.get(8)?,
-                    status_read: row.get(9)?,
-                    status_favorite: row.get(10)?,
+                let rank: Option<f64> = row.get(9)?;
+                Ok(SearchEntriesResponseEntry {
+                    entry: ListEntriesResponseEntry {
+                        id: row.get(0)?,
+                        feed_id: row.get(1)?,
+                        source_id: row.get(2)?,
+                        syndication_format: row.get(3)?,
+                        guid: row.get(4)?,
+                        published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
+                            .map(|d| d.to_rfc3339()),
+                        title: row.get(6)?,
+                        url: row.get(7)?,
+                        content: row.get(8)?,
+                    },
+                    rank,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -376,6 +479,9 @@ pub async fn search_entries(
         }
         Ok(Err(SearchEntriesError::EmptyTagFilter)) => {
             Err((StatusCode::BAD_REQUEST, "Empty tag filter array").into_response())
+        }
+        Ok(Err(SearchEntriesError::InvalidRegex(msg))) => {
+            Err((StatusCode::BAD_REQUEST, format!("Invalid regex: {}", msg)).into_response())
         }
         Ok(Err(SearchEntriesError::Database(e))) => {
             event!(Level::ERROR, "database error in search_entries: {:?}", e);

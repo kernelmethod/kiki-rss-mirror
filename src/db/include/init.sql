@@ -331,6 +331,36 @@ JOIN atom_feed_contributors afc ON
     e.feed_id = afc.feed_id;
 
 ---------------------------------------------------------------------------------
+-- Full-text search index over entries (FTS5, external content)
+---------------------------------------------------------------------------------
+
+CREATE VIRTUAL TABLE entries_fts USING fts5(
+    title,
+    content,
+    url,
+    content=entries,
+    content_rowid=id
+);
+
+-- Keep the FTS index in sync with the entries table.
+CREATE TRIGGER entries_fts_ai AFTER INSERT ON entries BEGIN
+    INSERT INTO entries_fts(rowid, title, content, url)
+    VALUES (new.id, new.title, new.content, new.url);
+END;
+
+CREATE TRIGGER entries_fts_bd BEFORE DELETE ON entries BEGIN
+    INSERT INTO entries_fts(entries_fts, rowid, title, content, url)
+    VALUES ('delete', old.id, old.title, old.content, old.url);
+END;
+
+CREATE TRIGGER entries_fts_au AFTER UPDATE ON entries BEGIN
+    INSERT INTO entries_fts(entries_fts, rowid, title, content, url)
+    VALUES ('delete', old.id, old.title, old.content, old.url);
+    INSERT INTO entries_fts(rowid, title, content, url)
+    VALUES (new.id, new.title, new.content, new.url);
+END;
+
+---------------------------------------------------------------------------------
 -- Additional views to make it easy to retrieve feed and entry information
 -- in a format-independent way.
 ---------------------------------------------------------------------------------

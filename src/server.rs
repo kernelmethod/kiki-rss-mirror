@@ -165,7 +165,23 @@ impl Server {
             .with_init(|c| {
                 c.execute_batch(
                     "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
-                )
+                )?;
+                {
+                    use rusqlite::functions::FunctionFlags;
+                    c.create_scalar_function(
+                        "regexp",
+                        2,
+                        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                        |ctx| {
+                            let pattern = ctx.get_raw(0).as_str()?;
+                            let text = ctx.get_raw(1).as_str().unwrap_or("");
+                            let re = regex::Regex::new(pattern)
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                            Ok(re.is_match(text))
+                        },
+                    )?;
+                }
+                Ok(())
             });
         let pool = r2d2::Pool::new(manager).with_context(|| {
             format!(

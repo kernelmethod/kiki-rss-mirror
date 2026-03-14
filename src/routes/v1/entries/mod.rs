@@ -401,8 +401,8 @@ mod test {
         assert_eq!(body.count, 4);
         assert_eq!(body.entries.len(), 4);
         // Ordered by published_at DESC
-        assert_eq!(body.entries[0].title, "Sports Update");
-        assert_eq!(body.entries[3].title, "Breaking News Today");
+        assert_eq!(body.entries[0].entry.title, "Sports Update");
+        assert_eq!(body.entries[3].entry.title, "Breaking News Today");
 
         Ok(())
     }
@@ -421,7 +421,7 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
         assert_eq!(body.count, 1);
-        assert_eq!(body.entries[0].title, "Breaking News Today");
+        assert_eq!(body.entries[0].entry.title, "Breaking News Today");
 
         Ok(())
     }
@@ -440,7 +440,11 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
         assert_eq!(body.count, 2);
-        let titles: Vec<&str> = body.entries.iter().map(|e| e.title.as_str()).collect();
+        let titles: Vec<&str> = body
+            .entries
+            .iter()
+            .map(|e| e.entry.title.as_str())
+            .collect();
         assert!(titles.contains(&"Breaking News Today"));
         assert!(titles.contains(&"Sports Update"));
 
@@ -462,7 +466,7 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
         assert_eq!(body.count, 1);
-        assert_eq!(body.entries[0].title, "Breaking News Today");
+        assert_eq!(body.entries[0].entry.title, "Breaking News Today");
 
         Ok(())
     }
@@ -488,7 +492,11 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
         assert_eq!(body.count, 2);
-        let titles: Vec<&str> = body.entries.iter().map(|e| e.title.as_str()).collect();
+        let titles: Vec<&str> = body
+            .entries
+            .iter()
+            .map(|e| e.entry.title.as_str())
+            .collect();
         assert!(titles.contains(&"Breaking News Today"));
         assert!(titles.contains(&"Tech Review"));
 
@@ -513,7 +521,11 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
         assert_eq!(body.count, 2);
-        let titles: Vec<&str> = body.entries.iter().map(|e| e.title.as_str()).collect();
+        let titles: Vec<&str> = body
+            .entries
+            .iter()
+            .map(|e| e.entry.title.as_str())
+            .collect();
         assert!(titles.contains(&"Science Discovery"));
         assert!(titles.contains(&"Tech Review"));
 
@@ -534,7 +546,7 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
         assert_eq!(body.count, 1);
-        assert_eq!(body.entries[0].title, "Tech Review");
+        assert_eq!(body.entries[0].entry.title, "Tech Review");
 
         Ok(())
     }
@@ -553,7 +565,7 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
         assert_eq!(body.count, 1);
-        assert_eq!(body.entries[0].title, "Science Discovery");
+        assert_eq!(body.entries[0].entry.title, "Science Discovery");
 
         Ok(())
     }
@@ -572,7 +584,7 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
         assert_eq!(body.count, 1);
-        assert_eq!(body.entries[0].title, "Tech Review");
+        assert_eq!(body.entries[0].entry.title, "Tech Review");
 
         Ok(())
     }
@@ -596,7 +608,7 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
         assert_eq!(body.count, 1);
-        assert_eq!(body.entries[0].title, "Tech Review");
+        assert_eq!(body.entries[0].entry.title, "Tech Review");
 
         Ok(())
     }
@@ -664,8 +676,8 @@ mod test {
         assert_eq!(page2.offset, 2);
 
         // Pages must contain different entries
-        let page1_ids: Vec<i64> = page1.entries.iter().map(|e| e.id).collect();
-        let page2_ids: Vec<i64> = page2.entries.iter().map(|e| e.id).collect();
+        let page1_ids: Vec<i64> = page1.entries.iter().map(|e| e.entry.id).collect();
+        let page2_ids: Vec<i64> = page2.entries.iter().map(|e| e.entry.id).collect();
         for id in &page2_ids {
             assert!(
                 !page1_ids.contains(id),
@@ -673,6 +685,245 @@ mod test {
                 id
             );
         }
+
+        Ok(())
+    }
+
+    // ── FTS5 + REGEXP tests (search feature only) ─────────────────────
+
+    #[tokio::test]
+    async fn test_search_fts5_query() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // "gadgets" appears in entry 3's content
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"query": "gadgets"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].entry.title, "Tech Review");
+        assert!(body.entries[0].rank.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_fts5_prefix_query() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // Prefix query: "break*" should match "Breaking News Today" and
+        // "Science Discovery" (content contains "breakthrough")
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"query": "break*"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 2);
+        let titles: Vec<&str> = body
+            .entries
+            .iter()
+            .map(|e| e.entry.title.as_str())
+            .collect();
+        assert!(titles.contains(&"Breaking News Today"));
+        assert!(titles.contains(&"Science Discovery"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_fts5_relevance_sort() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // "news" appears in entry 1 title+content and entry 2 is unrelated.
+        // With sort=relevance we just check that the endpoint works and returns ranked results.
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"query": "news", "sort": "relevance"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert!(body.count >= 1);
+        // All results should have a rank
+        for entry in &body.entries {
+            assert!(entry.rank.is_some());
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_title_regex() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // Regex: titles starting with "Break" or "Tech"
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"title_regex": "^(Break|Tech)"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 2);
+        let titles: Vec<&str> = body
+            .entries
+            .iter()
+            .map(|e| e.entry.title.as_str())
+            .collect();
+        assert!(titles.contains(&"Breaking News Today"));
+        assert!(titles.contains(&"Tech Review"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_content_regex() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // Regex on content: "break.*physics"
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"content_regex": "break.*physics"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].entry.title, "Science Discovery");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_url_regex() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // Regex on URL: ends with "science" or "sports"
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"url_regex": "(science|sports)$"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 2);
+        let titles: Vec<&str> = body
+            .entries
+            .iter()
+            .map(|e| e.entry.title.as_str())
+            .collect();
+        assert!(titles.contains(&"Science Discovery"));
+        assert!(titles.contains(&"Sports Update"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_fts5_combined_with_regex() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // FTS5 narrows to entries with "news", regex further filters title
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({
+                "query": "news",
+                "title_regex": "^Breaking"
+            }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].entry.title, "Breaking News Today");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_invalid_regex() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"title_regex": "[invalid"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_invalid_sort() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"sort": "bogus"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_relevance_without_query() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"sort": "relevance"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_fts5_with_existing_filters() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // Combine FTS5 with tag, date, and GLOB filters
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({
+                "query": "tech",
+                "tags": "tech",
+                "published_after": "2026-02-01T00:00:00Z",
+                "title_glob": "*Review*"
+            }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].entry.title, "Tech Review");
 
         Ok(())
     }
