@@ -263,6 +263,90 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_delete_feed_keep_entries() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // Add a feed (this fetches entries automatically)
+        let feed_id = add_example_feed(&tc).await?;
+
+        // Verify entries exist
+        let resp = client.get("http://localhost/v1/entries").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<ListEntriesResponse>().await?;
+        let entry_count = json.count;
+        assert!(entry_count > 0);
+
+        // Delete the feed with delete_entries=false
+        let resp = client
+            .delete(format!(
+                "http://localhost/v1/feeds/id/{:?}?delete_entries=false",
+                feed_id
+            ))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Verify the feed is gone
+        let resp = client
+            .get(format!("http://localhost/v1/feeds/id/{:?}", feed_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Verify entries are still present but no longer associated with a feed
+        let resp = client.get("http://localhost/v1/entries").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<ListEntriesResponse>().await?;
+        assert_eq!(json.count, entry_count);
+        for entry in &json.entries {
+            assert_eq!(entry.feed_id, None);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_feed_with_entries() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // Add a feed (this fetches entries automatically)
+        let feed_id = add_example_feed(&tc).await?;
+
+        // Verify entries exist
+        let resp = client.get("http://localhost/v1/entries").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<ListEntriesResponse>().await?;
+        assert!(json.count > 0);
+
+        // Delete the feed with delete_entries=true (explicit default)
+        let resp = client
+            .delete(format!(
+                "http://localhost/v1/feeds/id/{:?}?delete_entries=true",
+                feed_id
+            ))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Verify the feed is gone
+        let resp = client
+            .get(format!("http://localhost/v1/feeds/id/{:?}", feed_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Verify entries are also deleted
+        let resp = client.get("http://localhost/v1/entries").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<ListEntriesResponse>().await?;
+        assert_eq!(json.count, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_update_feed() -> Result<()> {
         let tc = TestBuilder::all().init_server().build()?;
         let client = tc.client()?;

@@ -1,11 +1,18 @@
 use crate::server::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use serde::Deserialize;
 use tokio::task;
 use tracing::{event, Level};
+
+#[derive(Deserialize, utoipa::IntoParams)]
+pub struct DeleteFeedParams {
+    /// Whether to also delete all entries associated with the feed (default: true).
+    pub delete_entries: Option<bool>,
+}
 
 /// Delete a feed
 ///
@@ -15,6 +22,7 @@ use tracing::{event, Level};
     path = "/v1/feeds/id/{id}",
     params(
         ("id" = i64, Path, description = "Feed ID"),
+        DeleteFeedParams,
     ),
     responses(
         (status = 204, description = "Feed deleted successfully"),
@@ -27,13 +35,20 @@ use tracing::{event, Level};
 pub async fn delete_feed(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    Query(params): Query<DeleteFeedParams>,
 ) -> Result<Response, Response> {
     let conn = state.conn_pool.get().map_err(|e| {
         event!(Level::ERROR, "failed to get database connection: {:?}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
+    let delete_entries = params.delete_entries.unwrap_or(true);
+
     let result = task::spawn_blocking(move || {
+        if delete_entries {
+            conn.execute("DELETE FROM entries WHERE feed_id = ?1", [id])?;
+        }
+
         let affected_rows = conn
             .prepare("DELETE FROM feeds WHERE id = ?1")
             .inspect_err(|e| {

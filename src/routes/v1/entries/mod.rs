@@ -192,7 +192,7 @@ mod test {
         let response = response.json::<get_entry::GetEntryResponse>().await?;
 
         assert_eq!(response.id, 1);
-        assert_eq!(response.feed_id, 1);
+        assert_eq!(response.feed_id, Some(1));
         assert_eq!(response.syndication_format, "rss");
         assert_eq!(response.guid, "rss-guid-1");
         assert_eq!(response.title, "RSS Entry");

@@ -94,7 +94,7 @@ CREATE TABLE entry_sources (
 
 CREATE TABLE entries (
     id                  INTEGER PRIMARY KEY,
-    feed_id             INTEGER NOT NULL,
+    feed_id             INTEGER,
     source_id           INTEGER,
 
     -- "rss" or "atom"
@@ -109,7 +109,7 @@ CREATE TABLE entries (
     status_read     INTEGER NOT NULL DEFAULT 0,
     status_favorite INTEGER NOT NULL DEFAULT 0,
 
-    FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
+    FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE SET NULL,
     FOREIGN KEY(source_id) REFERENCES entry_sources(id) ON DELETE SET NULL
 );
 CREATE INDEX idx_entry_syndication ON entries(syndication_format);

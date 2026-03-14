@@ -11,7 +11,7 @@ use tracing::{event, Level};
 #[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct GetEntryResponse {
     pub id: i64,
-    pub feed_id: i64,
+    pub feed_id: Option<i64>,
     pub source_id: Option<i64>,
     /// Syndication format: "rss" or "atom".
     pub syndication_format: String,
