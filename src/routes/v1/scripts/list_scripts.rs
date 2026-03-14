@@ -22,7 +22,9 @@ pub struct ListScriptsResponse {
     pub count: usize,
 }
 
-/// Route handler for listing all Lua scripts.
+/// List scripts
+///
+/// Return a list of all of the scripts that have been installed to the server.
 #[utoipa::path(
     get,
     path = "/v1/scripts",

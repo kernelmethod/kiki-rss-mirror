@@ -10,7 +10,9 @@ use tracing::{event, Level};
 
 use super::list_scripts::ScriptResponse;
 
-/// Route handler for fetching a single script by ID.
+/// Get script information
+///
+/// Retrieve the information and contents of a script by its ID.
 #[utoipa::path(
     get,
     path = "/v1/scripts/id/{id}",

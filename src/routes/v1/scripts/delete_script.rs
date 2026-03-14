@@ -7,9 +7,9 @@ use axum::{
 use tokio::task;
 use tracing::{event, Level};
 
-/// Route handler for deleting a script by ID.
+/// Delete a script
 ///
-/// After deleting the script, a reload is triggered so that the removal takes effect immediately.
+/// Delete a script by its ID. Calls to this endpoint queue a script reload in all worker threads.
 #[utoipa::path(
     delete,
     path = "/v1/scripts/id/{id}",

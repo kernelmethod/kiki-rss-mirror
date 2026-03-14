@@ -30,9 +30,9 @@ enum UpdateScriptTaskError {
     Database(#[from] rusqlite::Error),
 }
 
-/// Route handler for updating a script by ID.
+/// Update a script
 ///
-/// After updating the script, a reload is triggered so that the changes take effect immediately.
+/// Update a script by its ID. Calls to this endpoint queue a script reload in all worker threads.
 #[utoipa::path(
     put,
     path = "/v1/scripts/id/{id}",
