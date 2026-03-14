@@ -8,6 +8,7 @@ use axum::{
 };
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use rusqlite::TransactionBehavior;
 use serde::{Deserialize, Serialize};
 use tokio::task;
 use tracing::{event, Level};
@@ -56,18 +57,24 @@ pub async fn import_opml(
         return Ok((StatusCode::OK, Json(ImportOpmlResponse { imported: 0 })).into_response());
     }
 
-    let conn = state.conn_pool.get().map_err(|e| {
+    let mut conn = state.conn_pool.get().map_err(|e| {
         event!(Level::ERROR, "failed to get database connection: {:?}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
     let result = task::spawn_blocking(move || {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .inspect_err(|e| {
+                event!(Level::ERROR, "unable to begin transaction: {:?}", e);
+            })?;
+
         let mut imported = 0;
         let mut feed_ids = Vec::new();
 
         for feed in &feeds {
             // Insert the feed (skip if URL already exists)
-            let insert_result = conn
+            let insert_result = tx
                 .prepare("INSERT INTO feeds (title, url) VALUES (?1, ?2) RETURNING id")
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
@@ -93,19 +100,21 @@ pub async fn import_opml(
             // Create tags and associations
             for tag_name in &feed.tags {
                 // Insert or get existing tag
-                conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [tag_name])?;
+                tx.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [tag_name])?;
 
-                let tag_id: i64 = conn
+                let tag_id: i64 = tx
                     .prepare("SELECT id FROM tags WHERE name = ?1")?
                     .query_row([tag_name], |row| row.get(0))?;
 
                 // Associate tag with feed
-                conn.execute(
+                tx.execute(
                     "INSERT OR IGNORE INTO feed_tags (feed_id, tag_id) VALUES (?1, ?2)",
                     rusqlite::params![feed_id, tag_id],
                 )?;
             }
         }
+
+        tx.commit()?;
 
         Ok::<(usize, Vec<i64>), rusqlite::Error>((imported, feed_ids))
     })

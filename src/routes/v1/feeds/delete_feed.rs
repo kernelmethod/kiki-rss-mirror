@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use rusqlite::TransactionBehavior;
 use serde::Deserialize;
 use tokio::task;
 use tracing::{event, Level};
@@ -37,7 +38,7 @@ pub async fn delete_feed(
     Path(id): Path<i64>,
     Query(params): Query<DeleteFeedParams>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
+    let mut conn = state.conn_pool.get().map_err(|e| {
         event!(Level::ERROR, "failed to get database connection: {:?}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
@@ -45,16 +46,24 @@ pub async fn delete_feed(
     let delete_entries = params.delete_entries.unwrap_or(true);
 
     let result = task::spawn_blocking(move || {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .inspect_err(|e| {
+                event!(Level::ERROR, "unable to begin transaction: {:?}", e);
+            })?;
+
         if delete_entries {
-            conn.execute("DELETE FROM entries WHERE feed_id = ?1", [id])?;
+            tx.execute("DELETE FROM entries WHERE feed_id = ?1", [id])?;
         }
 
-        let affected_rows = conn
+        let affected_rows = tx
             .prepare("DELETE FROM feeds WHERE id = ?1")
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
             .execute([id])?;
+
+        tx.commit()?;
 
         Ok::<usize, rusqlite::Error>(affected_rows)
     })
