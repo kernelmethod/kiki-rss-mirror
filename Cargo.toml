@@ -12,9 +12,10 @@ name = "kiki"
 path = "src/main.rs"
 
 [features]
-default = ["lua", "systemd"]
+default = ["lua", "systemd", "api-docs"]
 lua = ["mlua"]
 systemd = []
+api-docs = ["utoipa-scalar"]
 extra-tests = []
 
 [dependencies]
@@ -36,7 +37,7 @@ serde_json = "1.0"
 mlua = { version = "0.10", features = ["luajit", "vendored", "send"], optional = true }
 thiserror = "2.0.18"
 utoipa = { version = "5", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "9", features = ["axum"] }
+utoipa-scalar = { version = "0.3", features = ["axum"], optional = true }
 tokio = { version = ">=1.40,<1.45", features = ["full"] }
 tokio-util = "0.7"
 tower-http = { version = "^0.6.5", features = ["trace", "timeout"] }
