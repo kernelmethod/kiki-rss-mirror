@@ -21,8 +21,6 @@ pub struct GetEntryResponse {
     pub title: String,
     pub url: String,
     pub content: Option<String>,
-    pub status_read: i32,
-    pub status_favorite: i32,
 }
 
 /// Get entry content
@@ -58,8 +56,7 @@ pub async fn get_entry(
         let entry = conn
             .prepare(
                 "SELECT id, feed_id, source_id, syndication_format,
-                    guid, published_at, title, url, content,
-                    status_read, status_favorite
+                    guid, published_at, title, url, content
                 FROM entries WHERE id = ?1 LIMIT 1",
             )
             .inspect_err(|e| {
@@ -77,8 +74,6 @@ pub async fn get_entry(
                     title: row.get(6)?,
                     url: row.get(7)?,
                     content: row.get(8)?,
-                    status_read: row.get(9)?,
-                    status_favorite: row.get(10)?,
                 })
             })
             .map(Some)

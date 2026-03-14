@@ -36,8 +36,6 @@ pub struct ListEntriesResponseEntry {
     pub title: String,
     pub url: String,
     pub content: Option<String>,
-    pub status_read: i32,
-    pub status_favorite: i32,
 }
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
@@ -95,8 +93,7 @@ pub async fn list_entries(
         let entries = conn
             .prepare(
                 "SELECT id, feed_id, source_id, syndication_format,
-                    guid, published_at, title, url, content,
-                    status_read, status_favorite
+                    guid, published_at, title, url, content
                 FROM entries LIMIT ?1 OFFSET ?2",
             )
             .inspect_err(|e| {
@@ -114,8 +111,6 @@ pub async fn list_entries(
                     title: row.get(6)?,
                     url: row.get(7)?,
                     content: row.get(8)?,
-                    status_read: row.get(9)?,
-                    status_favorite: row.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()

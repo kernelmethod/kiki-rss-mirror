@@ -198,8 +198,6 @@ mod test {
         assert_eq!(response.title, "RSS Entry");
         assert_eq!(response.url, "http://example.com/rss-entry");
         assert_eq!(response.content.as_deref(), Some("RSS Content"));
-        assert_eq!(response.status_read, 0);
-        assert_eq!(response.status_favorite, 0);
 
         // Attempt to retrieve an entry that does not exist
         let response = client

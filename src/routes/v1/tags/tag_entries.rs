@@ -95,8 +95,7 @@ pub async fn tag_entries(
         let entries = conn
             .prepare(
                 "SELECT e.id, e.feed_id, e.source_id, e.syndication_format,
-                        e.guid, e.published_at, e.title, e.url, e.content,
-                        e.status_read, e.status_favorite
+                        e.guid, e.published_at, e.title, e.url, e.content
                  FROM entries e
                  INNER JOIN entry_tags et ON et.entry_id = e.id
                  WHERE et.tag_id = ?1
@@ -117,8 +116,6 @@ pub async fn tag_entries(
                     title: row.get(6)?,
                     url: row.get(7)?,
                     content: row.get(8)?,
-                    status_read: row.get(9)?,
-                    status_favorite: row.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

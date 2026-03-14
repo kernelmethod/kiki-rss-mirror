@@ -108,9 +108,6 @@ CREATE TABLE entries (
     title           VARCHAR NOT NULL,
     url             VARCHAR NOT NULL,
     content         VARCHAR,
-    status_read     INTEGER NOT NULL DEFAULT 0,
-    status_favorite INTEGER NOT NULL DEFAULT 0,
-
     FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE SET NULL,
     FOREIGN KEY(source_id) REFERENCES entry_sources(id) ON DELETE SET NULL
 );
