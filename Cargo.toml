@@ -34,7 +34,7 @@ rss = "2.0"
 rusqlite = { version = "0.34", features = ["bundled", "functions"] }
 serde = { version = "1.0", features = ["serde_derive"] }
 serde_json = "1.0"
-mlua = { version = "0.10", features = ["luajit", "vendored", "send"], optional = true }
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"], optional = true }
 regex = "1"
 thiserror = "2.0.18"
 utoipa = { version = "5", features = ["axum_extras"] }
