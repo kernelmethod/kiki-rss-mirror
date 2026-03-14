@@ -10,7 +10,7 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{atomic, Arc},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -157,7 +157,31 @@ pub struct Server {
 }
 
 impl Server {
+    /// Run the server synchronously, creating a Tokio runtime and installing
+    /// signal handlers. This is the entry point used by the CLI.
     pub fn run(self) -> Result<()> {
+        let rt = if self.single_threaded {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+        } else {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+        };
+        let cancel = self.cancel_token.clone();
+        rt.block_on(async {
+            tokio::spawn(shutdown_signal(cancel));
+            self.run_async().await
+        })
+    }
+
+    /// Run the server within an existing Tokio runtime.
+    ///
+    /// This method does **not** install signal handlers — the caller is
+    /// responsible for triggering graceful shutdown via
+    /// [`Server::cancel_token()`].
+    pub async fn run_async(self) -> Result<()> {
         // Create a pool of connections that can be shared between all of
         // the threads that we spawn.
         let manager = SqliteConnectionManager::file(&self.db_path)
@@ -206,37 +230,6 @@ impl Server {
             }
         }
 
-        // We create two separate runtimes, one for the feed-fetchers and
-        // one for the web service workers.
-        //
-        // This ensures that feed fetcher threads don't consume all of
-        // the resources being used by the server threads.
-        let mut task_rt_builder = tokio::runtime::Builder::new_multi_thread();
-        task_rt_builder.enable_all().thread_name_fn(|| {
-            static ATOMIC_ID: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
-            let id = ATOMIC_ID.fetch_add(1, atomic::Ordering::SeqCst);
-            format!("feed-fetcher-{}", id)
-        });
-        if self.single_threaded {
-            task_rt_builder.worker_threads(1);
-        }
-        let task_manager_runtime = task_rt_builder
-            .build()
-            .with_context(|| "failed to build Tokio runtime for feed fetchers")?;
-
-        let mut web_rt_builder = tokio::runtime::Builder::new_multi_thread();
-        web_rt_builder.enable_all().thread_name_fn(|| {
-            static ATOMIC_ID: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
-            let id = ATOMIC_ID.fetch_add(1, atomic::Ordering::SeqCst);
-            format!("server-worker-{}", id)
-        });
-        if self.single_threaded {
-            web_rt_builder.worker_threads(1);
-        }
-        let web_runtime = web_rt_builder
-            .build()
-            .with_context(|| "failed to build Tokio runtime for web service workers")?;
-
         // Create a multi-producer, multi-consumer channel so that web
         // service workers can send tasks to the feed-fetcher workers.
         let (tx, rx) = async_channel::bounded(1024);
@@ -247,25 +240,22 @@ impl Server {
         let num_workers = self.worker_count.unwrap_or_else(tasks::worker_count);
         debug!("Spawning {} task-manager workers", num_workers);
 
-        let _worker_handles = {
-            let _guard = task_manager_runtime.enter();
-            tasks::spawn_workers(
-                rx,
-                tx.clone(),
-                pool.clone(),
-                self.cancel_token.clone(),
-                reload_tx.clone(),
-                num_workers,
-            )
-        };
+        let _worker_handles = tasks::spawn_workers(
+            rx,
+            tx.clone(),
+            pool.clone(),
+            self.cancel_token.clone(),
+            reload_tx.clone(),
+            num_workers,
+        );
 
         if self.autofetch {
-            web_runtime.spawn(check_feeds_loop(
+            tokio::spawn(check_feeds_loop(
                 tx.clone(),
                 pool.clone(),
                 self.cancel_token.clone(),
             ));
-            web_runtime.spawn(cleanup_loop(tx.clone(), self.cancel_token.clone()));
+            tokio::spawn(cleanup_loop(tx.clone(), self.cancel_token.clone()));
         }
 
         match self.listen_addr {
@@ -278,7 +268,7 @@ impl Server {
                         )
                     })?;
                 }
-                web_runtime.spawn(uds_server(
+                tokio::spawn(uds_server(
                     socket_path,
                     tx.clone(),
                     reload_tx.clone(),
@@ -287,7 +277,7 @@ impl Server {
                 ));
             }
             ListenAddr::Tcp(port) => {
-                web_runtime.spawn(tcp_server(
+                tokio::spawn(tcp_server(
                     port,
                     tx.clone(),
                     reload_tx.clone(),
@@ -296,9 +286,8 @@ impl Server {
                 ));
             }
         }
-        let cancel_task = web_runtime.spawn(shutdown_signal(self.cancel_token.clone()));
 
-        web_runtime.block_on(cancel_task)?;
+        self.cancel_token.cancelled().await;
 
         Ok(())
     }

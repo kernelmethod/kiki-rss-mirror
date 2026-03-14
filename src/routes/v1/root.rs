@@ -1,6 +1,5 @@
 use crate::server::AppState;
 use axum::{extract::State, http::StatusCode, Json};
-use clap::crate_version;
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct RootResponse {
@@ -30,7 +29,7 @@ pub async fn root(State(state): State<AppState>) -> (StatusCode, Json<RootRespon
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(RootResponse {
-                                version: crate_version!().to_string(),
+                                version: env!("CARGO_PKG_VERSION").to_string(),
                                 schema_version: "unknown".to_string(),
                             }),
                         );
@@ -47,7 +46,7 @@ pub async fn root(State(state): State<AppState>) -> (StatusCode, Json<RootRespon
     (
         StatusCode::OK,
         Json(RootResponse {
-            version: crate_version!().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             schema_version,
         }),
     )
@@ -59,7 +58,6 @@ mod test {
     use crate::{db::migrations, test::TestBuilder};
     use anyhow::Result;
     use axum::http::StatusCode;
-    use clap::crate_version;
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -71,7 +69,7 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let json = resp.json::<HashMap<String, String>>().await?;
-        assert_eq!(json["version"], crate_version!());
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
 
         // The schema version should be the last migration name
         let last_migration = migrations::MIGRATIONS

@@ -4,6 +4,7 @@ use crate::server::AppState;
 use axum::{http::StatusCode, Router};
 use std::time::Duration;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
+#[cfg(feature = "api-docs")]
 use utoipa::OpenApi;
 
 #[cfg(feature = "api-docs")]

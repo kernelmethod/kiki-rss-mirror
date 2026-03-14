@@ -1,22 +1,6 @@
-#![deny(clippy::panic)]
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![deny(clippy::indexing_slicing)]
-
-pub mod cli;
-pub mod db;
-pub mod http;
-pub mod routes;
-pub mod server;
-pub mod tasks;
-
-pub mod scripting;
-
-#[cfg(test)]
-pub mod test;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use kiki_rss::cli;
 
 #[derive(Parser)]
 #[command(about, long_about = None)]
