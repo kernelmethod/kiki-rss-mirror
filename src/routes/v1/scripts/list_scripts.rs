@@ -13,6 +13,7 @@ pub struct ScriptResponse {
     pub id: i64,
     pub engine: String,
     pub text: String,
+    pub kind: String,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
@@ -40,7 +41,7 @@ pub async fn list_scripts(State(state): State<AppState>) -> Result<Response, Res
 
     let result = task::spawn_blocking(move || {
         let scripts = conn
-            .prepare("SELECT id, engine, text FROM scripts ORDER BY id")
+            .prepare("SELECT id, engine, text, kind FROM scripts ORDER BY id")
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
@@ -49,6 +50,7 @@ pub async fn list_scripts(State(state): State<AppState>) -> Result<Response, Res
                     id: row.get(0)?,
                     engine: row.get(1)?,
                     text: row.get(2)?,
+                    kind: row.get(3)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

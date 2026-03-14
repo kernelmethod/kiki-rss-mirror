@@ -36,7 +36,7 @@ pub async fn get_script(State(state): State<AppState>, Path(id): Path<i64>) -> R
 
     let task_result = task::spawn_blocking(move || {
         let query_result = conn
-            .prepare("SELECT id, engine, text FROM scripts WHERE id = ?1 LIMIT 1")
+            .prepare("SELECT id, engine, text, kind FROM scripts WHERE id = ?1 LIMIT 1")
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
@@ -45,6 +45,7 @@ pub async fn get_script(State(state): State<AppState>, Path(id): Path<i64>) -> R
                     id: row.get(0)?,
                     engine: row.get(1)?,
                     text: row.get(2)?,
+                    kind: row.get(3)?,
                 })
             });
         Ok::<_, rusqlite::Error>(query_result)
@@ -85,6 +86,7 @@ mod test {
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
                 text: text.to_string(),
+                kind: "user".to_string(),
             })
             .send()
             .await?;
@@ -101,6 +103,7 @@ mod test {
         assert_eq!(body.id, id);
         assert_eq!(body.engine, "lua");
         assert_eq!(body.text, text);
+        assert_eq!(body.kind, "user");
 
         Ok(())
     }

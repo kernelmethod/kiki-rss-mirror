@@ -26,7 +26,7 @@ async fn setup_feed_with_script(
     let feed_id = conn.last_insert_rowid();
 
     conn.execute(
-        "INSERT INTO scripts (engine, text) VALUES ('lua', ?1)",
+        "INSERT INTO scripts (engine, text, kind) VALUES ('lua', ?1, 'user')",
         [script_text],
     )?;
     let script_id = conn.last_insert_rowid();
@@ -160,14 +160,14 @@ async fn integration_filter_script_prevents_tagging_script() -> Result<()> {
 
     // Insert the filter script first so it runs first in the chain.
     conn.execute(
-        "INSERT INTO scripts (engine, text) VALUES ('lua', 'return function(entry) return nil end')",
+        "INSERT INTO scripts (engine, text, kind) VALUES ('lua', 'return function(entry) return nil end', 'user')",
         [],
     )?;
     let filter_script_id = conn.last_insert_rowid();
 
     // Insert the tagging script second.
     conn.execute(
-        "INSERT INTO scripts (engine, text) VALUES ('lua', 'return function(entry) table.insert(entry.tags, \"should-not-appear\"); return entry end')",
+        "INSERT INTO scripts (engine, text, kind) VALUES ('lua', 'return function(entry) table.insert(entry.tags, \"should-not-appear\"); return entry end', 'user')",
         [],
     )?;
     let tag_script_id = conn.last_insert_rowid();

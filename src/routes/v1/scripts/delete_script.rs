@@ -89,6 +89,7 @@ mod test {
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
                 text: "return function(entry) return entry end".to_string(),
+                kind: "user".to_string(),
             })
             .send()
             .await?;
@@ -145,6 +146,7 @@ mod test {
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
                 text: "return function(entry) return nil end".to_string(),
+                kind: "user".to_string(),
             })
             .send()
             .await?;

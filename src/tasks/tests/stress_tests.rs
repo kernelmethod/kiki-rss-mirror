@@ -599,7 +599,7 @@ async fn stress_script_reload_during_processing() -> Result<()> {
 
         // Insert a simple pass-through Lua script
         conn.execute(
-            "INSERT INTO scripts (engine, text) VALUES ('lua', 'return entry')",
+            "INSERT INTO scripts (engine, text, kind) VALUES ('lua', 'return entry', 'user')",
             [],
         )?;
         let script_id = conn.last_insert_rowid();

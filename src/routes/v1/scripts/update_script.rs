@@ -15,6 +15,7 @@ use super::list_scripts::ScriptResponse;
 pub struct UpdateScriptRequest {
     pub engine: Option<String>,
     pub text: Option<String>,
+    pub kind: Option<String>,
 }
 
 #[derive(Error, Debug)]
@@ -83,6 +84,11 @@ pub async fn update_script(
             params.push(Box::new(text.clone()));
         }
 
+        if let Some(kind) = &payload.kind {
+            updates.push("kind = ?".to_string());
+            params.push(Box::new(kind.clone()));
+        }
+
         if updates.is_empty() {
             return Err(UpdateScriptTaskError::InvalidUpdate);
         }
@@ -96,7 +102,7 @@ pub async fn update_script(
         })?;
 
         let script = conn
-            .prepare("SELECT id, engine, text FROM scripts WHERE id = ?1 LIMIT 1")
+            .prepare("SELECT id, engine, text, kind FROM scripts WHERE id = ?1 LIMIT 1")
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare select statement: {:?}", e);
             })?
@@ -105,6 +111,7 @@ pub async fn update_script(
                     id: row.get(0)?,
                     engine: row.get(1)?,
                     text: row.get(2)?,
+                    kind: row.get(3)?,
                 })
             })?;
 
@@ -164,6 +171,7 @@ mod test {
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
                 text: "return function(entry) return entry end".to_string(),
+                kind: "user".to_string(),
             })
             .send()
             .await?;
@@ -176,6 +184,7 @@ mod test {
             .json(&UpdateScriptRequest {
                 engine: None,
                 text: Some(new_text.to_string()),
+                kind: None,
             })
             .send()
             .await?;
@@ -199,6 +208,7 @@ mod test {
             .json(&UpdateScriptRequest {
                 engine: Some("lua".to_string()),
                 text: None,
+                kind: None,
             })
             .send()
             .await?;
@@ -218,6 +228,7 @@ mod test {
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
                 text: "return function(entry) return entry end".to_string(),
+                kind: "user".to_string(),
             })
             .send()
             .await?;
@@ -229,6 +240,7 @@ mod test {
             .json(&UpdateScriptRequest {
                 engine: None,
                 text: None,
+                kind: None,
             })
             .send()
             .await?;
@@ -252,6 +264,7 @@ mod test {
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
                 text: "return function(entry) return entry end".to_string(),
+                kind: "user".to_string(),
             })
             .send()
             .await?;
@@ -284,6 +297,7 @@ mod test {
             .json(&UpdateScriptRequest {
                 engine: None,
                 text: Some("return function(entry) return nil end".to_string()),
+                kind: None,
             })
             .send()
             .await?;
