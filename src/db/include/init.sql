@@ -122,6 +122,9 @@ CREATE TABLE entry_tags (
     FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE,
     FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
 );
+CREATE INDEX idx_entry_published_at ON entries(published_at);
+CREATE INDEX idx_entry_tags_entry_id ON entry_tags(entry_id);
+CREATE INDEX idx_entry_tags_tag_id ON entry_tags(tag_id);
 
 ---------------------------------------------------------------------------------
 -- RSS-related data

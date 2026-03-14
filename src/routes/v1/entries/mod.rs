@@ -3,6 +3,7 @@ pub mod delete_entry;
 pub mod entry_tags;
 pub mod get_entry;
 pub mod list_entries;
+pub mod search_entries;
 
 use cleanup::cleanup;
 use delete_entry::delete_entry;
@@ -10,6 +11,7 @@ use entry_tags::{get_entry_tags, set_entry_tags};
 use get_entry::get_entry;
 #[allow(unused_imports)]
 pub use list_entries::{list_entries, ListEntriesResponse, ListEntriesResponseEntry};
+use search_entries::search_entries;
 
 use crate::server::AppState;
 use axum::{
@@ -21,6 +23,7 @@ pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_entries))
         .route("/cleanup", post(cleanup))
+        .route("/search", post(search_entries))
         .route("/id/{id}", get(get_entry).delete(delete_entry))
         .route("/id/{id}/tags", get(get_entry_tags).put(set_entry_tags))
 }
@@ -279,6 +282,397 @@ mod test {
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        Ok(())
+    }
+
+    /// Helper to populate search test data: 4 entries with various tags, dates,
+    /// titles, content, and URLs.
+    fn populate_search_data(tc: &TestConfig) -> Result<()> {
+        let conn = tc.database_conn()?;
+
+        // Tags: news(1), tech(2), science(3), sports(4)
+        conn.execute("INSERT INTO tags (name) VALUES (?)", ["news"])?;
+        conn.execute("INSERT INTO tags (name) VALUES (?)", ["tech"])?;
+        conn.execute("INSERT INTO tags (name) VALUES (?)", ["science"])?;
+        conn.execute("INSERT INTO tags (name) VALUES (?)", ["sports"])?;
+
+        // Feed
+        conn.execute(
+            "INSERT INTO feeds (title, url, syndication_format) VALUES (?, ?, ?)",
+            ["Test Feed", "http://example.com/feed", "rss"],
+        )?;
+
+        // Entry 1: "Breaking News Today" — news+tech, 2026-01-10
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url, content)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                1, "rss", "g1",
+                Utc.with_ymd_and_hms(2026, 1, 10, 12, 0, 0).unwrap().timestamp(),
+                "Breaking News Today",
+                "http://example.com/news-today",
+                "Latest tech news coverage"
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (1, 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (1, 2)",
+            [],
+        )?;
+
+        // Entry 2: "Science Discovery" — science, 2026-02-15
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url, content)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                1, "rss", "g2",
+                Utc.with_ymd_and_hms(2026, 2, 15, 8, 0, 0).unwrap().timestamp(),
+                "Science Discovery",
+                "http://example.com/science",
+                "New scientific breakthrough in physics"
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (2, 3)",
+            [],
+        )?;
+
+        // Entry 3: "Tech Review" — tech+science, 2026-03-01
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url, content)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                1, "rss", "g3",
+                Utc.with_ymd_and_hms(2026, 3, 1, 10, 0, 0).unwrap().timestamp(),
+                "Tech Review",
+                "http://example.com/tech-review",
+                "Reviewing the latest gadgets"
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (3, 2)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (3, 3)",
+            [],
+        )?;
+
+        // Entry 4: "Sports Update" — sports, 2026-03-10 (no content)
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                1,
+                "rss",
+                "g4",
+                Utc.with_ymd_and_hms(2026, 3, 10, 6, 0, 0)
+                    .unwrap()
+                    .timestamp(),
+                "Sports Update",
+                "http://example.com/sports"
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (4, 4)",
+            [],
+        )?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_no_filters() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 4);
+        assert_eq!(body.entries.len(), 4);
+        // Ordered by published_at DESC
+        assert_eq!(body.entries[0].title, "Sports Update");
+        assert_eq!(body.entries[3].title, "Breaking News Today");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_single_tag() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"tags": "news"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].title, "Breaking News Today");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_tags_or() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"tags": {"or": ["news", "sports"]}}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 2);
+        let titles: Vec<&str> = body.entries.iter().map(|e| e.title.as_str()).collect();
+        assert!(titles.contains(&"Breaking News Today"));
+        assert!(titles.contains(&"Sports Update"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_tags_and() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // news AND tech — only entry 1 has both
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"tags": {"and": ["news", "tech"]}}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].title, "Breaking News Today");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_tags_nested_and_or() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // (news OR science) AND (tech)
+        // Entry 1 has news+tech ✓, Entry 3 has tech+science ✓
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({
+                "tags": {"and": [
+                    {"or": ["news", "science"]},
+                    "tech"
+                ]}
+            }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 2);
+        let titles: Vec<&str> = body.entries.iter().map(|e| e.title.as_str()).collect();
+        assert!(titles.contains(&"Breaking News Today"));
+        assert!(titles.contains(&"Tech Review"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_date_range() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // Entries between Feb 1 and Mar 5
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({
+                "published_after": "2026-02-01T00:00:00Z",
+                "published_before": "2026-03-05T00:00:00Z"
+            }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 2);
+        let titles: Vec<&str> = body.entries.iter().map(|e| e.title.as_str()).collect();
+        assert!(titles.contains(&"Science Discovery"));
+        assert!(titles.contains(&"Tech Review"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_title_glob() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"title_glob": "*Review*"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].title, "Tech Review");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_content_glob() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"content_glob": "*physics*"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].title, "Science Discovery");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_url_glob() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"url_glob": "*tech*"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].title, "Tech Review");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_combined_filters() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // tech tag + after Feb + title contains "*ech*"
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({
+                "tags": "tech",
+                "published_after": "2026-02-01T00:00:00Z",
+                "title_glob": "*ech*"
+            }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].title, "Tech Review");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_invalid_date() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"published_after": "not-a-date"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_malformed_json() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .header("content-type", "application/json")
+            .body("{invalid json")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_pagination() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // Limit to 2 entries (page 1)
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"limit": 2, "offset": 0}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page1 = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(page1.count, 4); // total count is still 4
+        assert_eq!(page1.entries.len(), 2);
+        assert_eq!(page1.limit, 2);
+        assert_eq!(page1.offset, 0);
+
+        // Get next page (page 2)
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"limit": 2, "offset": 2}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page2 = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(page2.count, 4);
+        assert_eq!(page2.entries.len(), 2);
+        assert_eq!(page2.offset, 2);
+
+        // Pages must contain different entries
+        let page1_ids: Vec<i64> = page1.entries.iter().map(|e| e.id).collect();
+        let page2_ids: Vec<i64> = page2.entries.iter().map(|e| e.id).collect();
+        for id in &page2_ids {
+            assert!(
+                !page1_ids.contains(id),
+                "entry {} appears on both pages",
+                id
+            );
+        }
 
         Ok(())
     }
