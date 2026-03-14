@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use rusqlite::TransactionBehavior;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::task;
@@ -134,14 +135,20 @@ pub async fn set_entry_tags(
     Path(id): Path<i64>,
     Json(payload): Json<SetEntryTagsRequest>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
+    let mut conn = state.conn_pool.get().map_err(|e| {
         event!(Level::ERROR, "failed to get database connection: {:?}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
     let result = task::spawn_blocking(move || {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .inspect_err(|e| {
+                event!(Level::ERROR, "unable to begin transaction: {:?}", e);
+            })?;
+
         // Check if entry exists
-        let exists: bool = conn
+        let exists: bool = tx
             .prepare("SELECT EXISTS(SELECT 1 FROM entries WHERE id = ?1)")
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
@@ -154,7 +161,7 @@ pub async fn set_entry_tags(
 
         // Validate all tag IDs exist
         for &tag_id in &payload.tag_ids {
-            let tag_exists: bool = conn
+            let tag_exists: bool = tx
                 .prepare("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)")
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
@@ -167,25 +174,27 @@ pub async fn set_entry_tags(
         }
 
         // Delete existing associations
-        conn.prepare("DELETE FROM entry_tags WHERE entry_id = ?1")
+        tx.prepare("DELETE FROM entry_tags WHERE entry_id = ?1")
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
             .execute([id])?;
 
         // Insert new associations
-        let mut stmt = conn
-            .prepare("INSERT INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?;
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?;
 
-        for &tag_id in &payload.tag_ids {
-            stmt.execute(rusqlite::params![id, tag_id])?;
+            for &tag_id in &payload.tag_ids {
+                stmt.execute(rusqlite::params![id, tag_id])?;
+            }
         }
 
         // Return the updated tags
-        let tags = conn
+        let tags = tx
             .prepare(
                 "SELECT t.id, t.name FROM tags t
                  INNER JOIN entry_tags et ON et.tag_id = t.id
@@ -201,6 +210,10 @@ pub async fn set_entry_tags(
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+
+        tx.commit().inspect_err(|e| {
+            event!(Level::ERROR, "unable to commit transaction: {:?}", e);
+        })?;
 
         Ok::<GetEntryTagsResponse, EntryTagsTaskError>(GetEntryTagsResponse { tags })
     })
