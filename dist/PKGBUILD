@@ -12,7 +12,7 @@ install=kiki.install
 source=()
 
 build() {
-    cd "$startdir"
+    cd "$startdir/.."
     # Disable GCC LTO for C code compiled by vendored build scripts
     # (zstd-sys, libsqlite3-sys, mlua-sys). Arch's makepkg.conf adds
     # -flto=auto to CFLAGS, which produces GCC GIMPLE LTO objects that
@@ -23,7 +23,7 @@ build() {
 }
 
 package() {
-    cd "$startdir"
+    cd "$startdir/.."
     install -Dm755 "target/release/kiki" "$pkgdir/usr/bin/kiki"
     install -Dm644 "dist/kiki.service" "$pkgdir/usr/lib/systemd/system/kiki.service"
     install -Dm644 "README.md" "$pkgdir/usr/share/doc/kiki-rss/README.md"
