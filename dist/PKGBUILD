@@ -7,7 +7,7 @@ arch=('x86_64')
 url="https://github.com/kernelmethod/kiki-rss"
 license=('MIT')
 depends=('gcc-libs' 'systemd')
-makedepends=('cargo' 'cmake' 'openssl')
+makedepends=('cargo' 'openssl')
 install=kiki.install
 source=()
 
