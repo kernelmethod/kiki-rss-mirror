@@ -27,7 +27,7 @@
               };
             strictDeps = true;
 
-            buildInputs = [ ];
+            buildInputs = [ pkgs.openssl ];
             nativeBuildInputs = [ pkgs.pkg-config pkgs.cacert ];
             SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
           };
@@ -50,7 +50,6 @@
 
             packages = with pkgs; [
               cargo-deb
-              cargo-generate-rpm
             ];
           };
         }
