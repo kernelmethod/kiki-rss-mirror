@@ -13,6 +13,10 @@ source=()
 
 build() {
     cd "$startdir"
+    # Clear RUSTFLAGS set by makepkg.conf -- its linker flags (e.g.
+    # -Clink-arg=-Wl,--as-needed) break linking of vendored C libraries
+    # (zstd-sys, libsqlite3-sys, mlua-sys).
+    unset RUSTFLAGS
     cargo build --release --locked
 }
 
