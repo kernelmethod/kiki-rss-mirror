@@ -17,17 +17,19 @@
           commonArgs = {
             src = let
               sqlFilter = path: _type: builtins.match ".*\\.sql$" path != null;
-              sqlOrCargo = path: type:
-                (sqlFilter path type) || (craneLib.filterCargoSources path type);
+              xmlFilter = path: _type: builtins.match ".*\\.xml$" path != null;
+              customOrCargo = path: type:
+                (sqlFilter path type) || (xmlFilter path type) || (craneLib.filterCargoSources path type);
             in
               pkgs.lib.cleanSourceWith {
                 src = ./.;
-                filter = sqlOrCargo;
+                filter = customOrCargo;
               };
             strictDeps = true;
 
             buildInputs = [ ];
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.cacert ];
+            SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
           };
 
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
