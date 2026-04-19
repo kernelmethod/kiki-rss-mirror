@@ -23,6 +23,8 @@ pub struct GetFeedResponse {
     /// Time of the most recent fetch error in RFC3339 format.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_fetch_error_at: Option<String>,
+    /// Minimum interval, in seconds, between fetches of this feed.
+    pub min_fetch_interval_seconds: i64,
 }
 
 /// Get feed information
@@ -55,7 +57,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
     // statement on a blocking thread.
     let task_result = task::spawn_blocking(move || {
         let mut stmt = match conn.prepare(
-            "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at
+            "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at, min_fetch_interval_seconds
                 FROM feeds WHERE id = ?1 LIMIT 1",
         ) {
             Ok(s) => s,
@@ -79,6 +81,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
                 last_fetch_error_at: row.get::<usize, Option<i64>>(6)?.and_then(|ts| {
                     chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
                 }),
+                min_fetch_interval_seconds: row.get(7)?,
             };
             Ok(resp)
         });

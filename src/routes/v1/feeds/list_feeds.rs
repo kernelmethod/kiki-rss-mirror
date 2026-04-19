@@ -77,7 +77,7 @@ pub async fn list_feeds(
 
         let feeds = conn
             .prepare(
-                "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at
+                "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at, min_fetch_interval_seconds
                 FROM feeds LIMIT ?1 OFFSET ?2",
             )
             .inspect_err(|e| {
@@ -98,6 +98,7 @@ pub async fn list_feeds(
                     last_fetch_error_at: row.get::<usize, Option<i64>>(6)?.and_then(|ts| {
                         chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
                     }),
+                    min_fetch_interval_seconds: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

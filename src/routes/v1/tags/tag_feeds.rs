@@ -94,7 +94,7 @@ pub async fn tag_feeds(
 
         let feeds = conn
             .prepare(
-                "SELECT f.id, f.title, f.url, f.description, f.last_checked, f.last_fetch_error, f.last_fetch_error_at
+                "SELECT f.id, f.title, f.url, f.description, f.last_checked, f.last_fetch_error, f.last_fetch_error_at, f.min_fetch_interval_seconds
                  FROM feeds f
                  INNER JOIN feed_tags ft ON ft.feed_id = f.id
                  WHERE ft.tag_id = ?1
@@ -118,6 +118,7 @@ pub async fn tag_feeds(
                     last_fetch_error_at: row.get::<usize, Option<i64>>(6)?.and_then(|ts| {
                         chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
                     }),
+                    min_fetch_interval_seconds: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

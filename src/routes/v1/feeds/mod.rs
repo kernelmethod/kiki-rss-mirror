@@ -379,6 +379,7 @@ mod test {
                 title: Some("updated title".to_string()),
                 url: None,
                 description: Some("updated description".to_string()),
+                min_fetch_interval_seconds: Some(7200),
             })
             .send()
             .await?;
@@ -388,6 +389,16 @@ mod test {
         assert_eq!(json.title, "updated title");
         assert_eq!(json.url, "https://example.com/feed.xml");
         assert_eq!(json.description, Some("updated description".to_string()));
+        assert_eq!(json.min_fetch_interval_seconds, 7200);
+
+        // Verify the updated min_fetch_interval_seconds is reflected in get_feed
+        let resp = client
+            .get(format!("http://localhost/v1/feeds/id/{:?}", feed_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<get_feed::GetFeedResponse>().await?;
+        assert_eq!(json.min_fetch_interval_seconds, 7200);
 
         // Verify the feed was updated
         let resp = client.get("http://localhost/v1/feeds").send().await?;
@@ -409,6 +420,7 @@ mod test {
                 title: Some("non-existent title".to_string()),
                 url: None,
                 description: None,
+                min_fetch_interval_seconds: None,
             })
             .send()
             .await?;
@@ -423,6 +435,20 @@ mod test {
                 title: None,
                 url: None,
                 description: None,
+                min_fetch_interval_seconds: None,
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Try to update with an invalid min_fetch_interval_seconds
+        let resp = client
+            .put(format!("http://localhost/v1/feeds/id/{:?}", feed_id))
+            .json(&update_feed::UpdateFeedRequest {
+                title: None,
+                url: None,
+                description: None,
+                min_fetch_interval_seconds: Some(0),
             })
             .send()
             .await?;
