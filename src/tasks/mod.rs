@@ -415,14 +415,22 @@ pub(crate) async fn refresh_feed(
 ) -> Result<()> {
     // Get the feed URL and headers from the database
     let conn = pool.get()?;
-    let (feed_url, header_etag, header_last_modified, header_expires, last_checked): (
+    let (
+        feed_url,
+        header_etag,
+        header_last_modified,
+        header_expires,
+        last_checked,
+        min_fetch_interval,
+    ): (
         String,
         Option<String>,
         Option<String>,
         Option<i64>,
         Option<i64>,
+        i64,
     ) = conn.query_row(
-        "SELECT url, header_etag, header_last_modified, header_expires, last_checked FROM feeds WHERE id = ?1",
+        "SELECT url, header_etag, header_last_modified, header_expires, last_checked, min_fetch_interval_seconds FROM feeds WHERE id = ?1",
         [feed_id],
         |row| {
             let url: String = row.get(0)?;
@@ -430,7 +438,8 @@ pub(crate) async fn refresh_feed(
             let last_modified: Option<String> = row.get(2)?;
             let expires: Option<i64> = row.get(3)?;
             let last_checked: Option<i64> = row.get(4)?;
-            Ok((url, etag, last_modified, expires, last_checked))
+            let min_fetch_interval: i64 = row.get(5)?;
+            Ok((url, etag, last_modified, expires, last_checked, min_fetch_interval))
         },
     )?;
 
@@ -455,7 +464,7 @@ pub(crate) async fn refresh_feed(
         if let Some(last_checked_ts) = Utc.timestamp_opt(last_checked_ts, 0).single() {
             let now = Utc::now();
             let duration_since = now.signed_duration_since(last_checked_ts);
-            if duration_since.num_hours() < 3 {
+            if duration_since.num_seconds() < min_fetch_interval {
                 debug!(
                     "Feed {} was last checked {} seconds ago, skipping update",
                     feed_id,

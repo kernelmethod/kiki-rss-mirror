@@ -51,7 +51,11 @@ CREATE TABLE feeds (
     -- Most recent fetch error message, if any. Cleared on successful fetch.
     last_fetch_error        VARCHAR,
     -- Timestamp of the most recent fetch error.
-    last_fetch_error_at     DATETIME
+    last_fetch_error_at     DATETIME,
+
+    -- Minimum interval, in seconds, between fetches of this feed.
+    -- Defaults to 3 hours (10800 seconds).
+    min_fetch_interval_seconds  INTEGER NOT NULL DEFAULT 10800
 );
 CREATE INDEX idx_feeds_syndication ON feeds(syndication_format);
 

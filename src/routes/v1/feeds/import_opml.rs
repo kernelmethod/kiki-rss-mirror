@@ -218,10 +218,8 @@ fn parse_outline_attrs(e: &quick_xml::events::BytesStart) -> OutlineAttrs {
         let val = std::str::from_utf8(&attr.value).unwrap_or("").to_string();
 
         match key {
-            "text" | "title" => {
-                if text.is_none() {
-                    text = Some(val);
-                }
+            "text" | "title" if text.is_none() => {
+                text = Some(val);
             }
             "xmlUrl" => xml_url = Some(val),
             _ => {}
