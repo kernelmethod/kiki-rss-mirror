@@ -1,5 +1,10 @@
 PRAGMA foreign_keys = ON;
 
+-- Enable incremental auto-vacuum so freed pages can be reclaimed by
+-- `PRAGMA incremental_vacuum` without a full database rebuild. Must be set
+-- before any tables are created for it to persist in the database file.
+PRAGMA auto_vacuum = INCREMENTAL;
+
 CREATE TABLE migrations (
     id          INTEGER PRIMARY KEY,
     name        VARCHAR NOT NULL UNIQUE,
@@ -15,6 +20,13 @@ CREATE TABLE settings (
 -- Default global settings.
 INSERT INTO settings (key, value, type)
 VALUES ('feed_update_timeout_seconds', '15', 'integer');
+
+-- Persistent record of when recurring background tasks last ran, so their
+-- schedules survive server restarts. Keyed by an opaque task name.
+CREATE TABLE task_queue (
+    task_type    TEXT PRIMARY KEY NOT NULL,
+    last_run_at  INTEGER NOT NULL DEFAULT (unixepoch())
+);
 
 CREATE TABLE tags (
     id      INTEGER PRIMARY KEY,

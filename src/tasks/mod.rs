@@ -95,13 +95,19 @@ impl CacheControl {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TaskManagerCommand {
     RefreshFeed(i64),
     /// Run retention cleanup for the given feed.
     CleanupFeed(i64),
     /// Run retention cleanup across all feeds.
     CleanupAll,
+    /// Merge FTS5 index segments to improve search performance.
+    OptimizeFts,
+    /// Checkpoint the WAL file and refresh query-planner statistics.
+    WalCheckpointAnalyze,
+    /// Reclaim free pages via `PRAGMA incremental_vacuum`.
+    IncrementalVacuum,
 }
 
 /// Set of feed IDs currently being processed by workers.
@@ -323,7 +329,77 @@ async fn run_worker(
                     }
                 }
             }
+
+            TaskManagerCommand::OptimizeFts => {
+                run_maintenance(
+                    &w.pool,
+                    crate::db::task_queue::TASK_FTS_OPTIMIZE,
+                    "FTS5 optimize",
+                    |conn| {
+                        conn.execute(
+                            "INSERT INTO entries_fts(entries_fts) VALUES ('optimize')",
+                            [],
+                        )?;
+                        Ok(())
+                    },
+                );
+            }
+
+            TaskManagerCommand::WalCheckpointAnalyze => {
+                run_maintenance(
+                    &w.pool,
+                    crate::db::task_queue::TASK_WAL_CHECKPOINT_ANALYZE,
+                    "WAL checkpoint and ANALYZE",
+                    |conn| {
+                        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); ANALYZE;")?;
+                        Ok(())
+                    },
+                );
+            }
+
+            TaskManagerCommand::IncrementalVacuum => {
+                run_maintenance(
+                    &w.pool,
+                    crate::db::task_queue::TASK_INCREMENTAL_VACUUM,
+                    "incremental vacuum",
+                    |conn| {
+                        conn.execute_batch("PRAGMA incremental_vacuum;")?;
+                        Ok(())
+                    },
+                );
+            }
         }
+    }
+}
+
+/// Run a maintenance operation and, on success, update its `task_queue`
+/// row so the schedule survives server restarts.
+pub(crate) fn run_maintenance<F>(
+    pool: &Pool<SqliteConnectionManager>,
+    task_type: &str,
+    label: &str,
+    op: F,
+) where
+    F: FnOnce(&PooledConnection<SqliteConnectionManager>) -> Result<()>,
+{
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                "{} skipped: failed to acquire DB connection: {:?}",
+                label, e
+            );
+            return;
+        }
+    };
+    match op(&conn) {
+        Ok(()) => {
+            info!("{} completed", label);
+            if let Err(e) = crate::db::task_queue::record_run(&conn, task_type) {
+                warn!("Failed to record {} run: {:?}", label, e);
+            }
+        }
+        Err(e) => warn!("{} failed: {:?}", label, e),
     }
 }
 

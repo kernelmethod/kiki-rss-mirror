@@ -6,6 +6,7 @@ use std::path::Path;
 pub mod migrations;
 pub mod retention;
 pub mod settings;
+pub mod task_queue;
 
 enum ConnectionType<'a> {
     DefaultConnection,
@@ -169,6 +170,7 @@ mod tests {
             "scripts",
             "settings",
             "tags",
+            "task_queue",
         ]
         .into_iter()
         .map(String::from)
