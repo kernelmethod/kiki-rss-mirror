@@ -76,6 +76,7 @@ pub async fn fetch_all_feeds(State(state): State<AppState>) -> Result<Response, 
                 e
             );
         } else {
+            state.metrics.record_task_enqueued("refresh_feed");
             queued += 1;
         }
     }

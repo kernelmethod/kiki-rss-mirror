@@ -36,6 +36,9 @@ pub struct SharedAppState {
     /// A [`CancellationToken`] that can be used to trigger a graceful
     /// server shutdown.
     pub cancel_token: CancellationToken,
+
+    /// Per-server Prometheus metrics recorder.
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 pub type AppState = Arc<SharedAppState>;
@@ -182,6 +185,11 @@ impl Server {
     /// responsible for triggering graceful shutdown via
     /// [`Server::cancel_token()`].
     pub async fn run_async(self) -> Result<()> {
+        // Build a per-server metrics recorder. Every instrumented code path
+        // in this server instance writes samples into the returned `Metrics`
+        // value, which is rendered by the `/metrics` handler.
+        let metrics = Arc::new(crate::metrics::Metrics::new()?);
+
         // Create a pool of connections that can be shared between all of
         // the threads that we spawn.
         let manager = SqliteConnectionManager::file(&self.db_path)
@@ -239,6 +247,7 @@ impl Server {
 
         let num_workers = self.worker_count.unwrap_or_else(tasks::worker_count);
         debug!("Spawning {} task-manager workers", num_workers);
+        metrics.set_workers_total(num_workers as f64);
 
         let _worker_handles = tasks::spawn_workers(
             rx,
@@ -247,15 +256,28 @@ impl Server {
             self.cancel_token.clone(),
             reload_tx.clone(),
             num_workers,
+            metrics.clone(),
         );
+
+        tokio::spawn(metrics_sampler_loop(
+            tx.clone(),
+            pool.clone(),
+            self.cancel_token.clone(),
+            metrics.clone(),
+        ));
 
         if self.autofetch {
             tokio::spawn(check_feeds_loop(
                 tx.clone(),
                 pool.clone(),
                 self.cancel_token.clone(),
+                metrics.clone(),
             ));
-            tokio::spawn(cleanup_loop(tx.clone(), self.cancel_token.clone()));
+            tokio::spawn(cleanup_loop(
+                tx.clone(),
+                self.cancel_token.clone(),
+                metrics.clone(),
+            ));
             tokio::spawn(periodic_command_loop(
                 tx.clone(),
                 pool.clone(),
@@ -263,6 +285,7 @@ impl Server {
                 Duration::from_secs(86400),
                 TaskManagerCommand::WalCheckpointAnalyze,
                 crate::db::task_queue::TASK_WAL_CHECKPOINT_ANALYZE,
+                metrics.clone(),
             ));
             tokio::spawn(periodic_command_loop(
                 tx.clone(),
@@ -271,6 +294,7 @@ impl Server {
                 Duration::from_secs(86400),
                 TaskManagerCommand::IncrementalVacuum,
                 crate::db::task_queue::TASK_INCREMENTAL_VACUUM,
+                metrics.clone(),
             ));
             tokio::spawn(periodic_command_loop(
                 tx.clone(),
@@ -279,6 +303,7 @@ impl Server {
                 Duration::from_secs(604800),
                 TaskManagerCommand::OptimizeFts,
                 crate::db::task_queue::TASK_FTS_OPTIMIZE,
+                metrics.clone(),
             ));
         }
 
@@ -298,6 +323,7 @@ impl Server {
                     reload_tx.clone(),
                     pool.clone(),
                     self.cancel_token.clone(),
+                    metrics.clone(),
                 ));
             }
             ListenAddr::Tcp(port) => {
@@ -307,6 +333,7 @@ impl Server {
                     reload_tx.clone(),
                     pool.clone(),
                     self.cancel_token.clone(),
+                    metrics.clone(),
                 ));
             }
         }
@@ -321,16 +348,80 @@ impl Server {
     }
 }
 
+/// Periodically sample observable process state into the metrics recorder.
+///
+/// Covers DB pool utilization, task queue depth, and domain totals that are
+/// cheap to read (feed/entry counts, feeds with fetch errors).
+async fn metrics_sampler_loop(
+    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    pool: r2d2::Pool<SqliteConnectionManager>,
+    cancel_token: CancellationToken,
+    metrics: Arc<crate::metrics::Metrics>,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let mut iterations: u64 = 0;
+
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let state = pool.state();
+                metrics.set_db_pool_state(
+                    state.connections as f64,
+                    state.idle_connections as f64,
+                );
+                metrics.set_task_queue_depth(task_manager_tx.len() as f64);
+
+                // Sample domain totals less frequently to avoid running
+                // COUNT(*) against the database every 5s. 30s cadence.
+                if iterations.is_multiple_of(6) {
+                    let pool = pool.clone();
+                    let metrics = metrics.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let conn = match pool.get() {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        };
+                        if let Ok(n) = conn
+                            .query_row::<i64, _, _>("SELECT COUNT(*) FROM feeds", [], |row| row.get(0))
+                        {
+                            metrics.set_feeds_total(n as f64);
+                        }
+                        if let Ok(n) = conn.query_row::<i64, _, _>(
+                            "SELECT COUNT(*) FROM entries",
+                            [],
+                            |row| row.get(0),
+                        ) {
+                            metrics.set_entries_total(n as f64);
+                        }
+                        if let Ok(n) = conn.query_row::<i64, _, _>(
+                            "SELECT COUNT(*) FROM feeds WHERE last_fetch_error IS NOT NULL",
+                            [],
+                            |row| row.get(0),
+                        ) {
+                            metrics.set_feeds_with_fetch_error(n as f64);
+                        }
+                    })
+                    .await;
+                }
+
+                iterations = iterations.wrapping_add(1);
+            }
+            _ = cancel_token.cancelled() => break,
+        }
+    }
+}
+
 async fn check_feeds_loop(
     task_manager_tx: async_channel::Sender<TaskManagerCommand>,
     pool: r2d2::Pool<SqliteConnectionManager>,
     cancel_token: CancellationToken,
+    metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = check_feeds(&task_manager_tx, &pool) {
+                if let Err(e) = check_feeds(&task_manager_tx, &pool, &metrics) {
                     tracing::error!("Error checking feeds: {:?}", e);
                 }
             }
@@ -348,13 +439,15 @@ async fn check_feeds_loop(
 async fn cleanup_loop(
     task_manager_tx: async_channel::Sender<TaskManagerCommand>,
     cancel_token: CancellationToken,
+    metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = task_manager_tx.try_send(TaskManagerCommand::CleanupAll) {
-                    tracing::warn!("Failed to queue periodic cleanup: {:?}", e);
+                match task_manager_tx.try_send(TaskManagerCommand::CleanupAll) {
+                    Ok(()) => metrics.record_task_enqueued("cleanup_all"),
+                    Err(e) => tracing::warn!("Failed to queue periodic cleanup: {:?}", e),
                 }
             }
             _ = cancel_token.cancelled() => {
@@ -384,6 +477,7 @@ fn compute_initial_delay(period: Duration, last_run_at: i64, now: i64) -> Durati
 /// resumes across server restarts. If the task is already overdue, the
 /// first tick fires immediately; otherwise it waits for the remainder of
 /// the period.
+#[allow(clippy::too_many_arguments)]
 async fn periodic_command_loop(
     task_manager_tx: async_channel::Sender<TaskManagerCommand>,
     pool: r2d2::Pool<SqliteConnectionManager>,
@@ -391,6 +485,7 @@ async fn periodic_command_loop(
     period: Duration,
     cmd: TaskManagerCommand,
     task_type: &'static str,
+    metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
     let last_run_at = {
         let conn = match pool.get() {
@@ -421,8 +516,9 @@ async fn periodic_command_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = task_manager_tx.try_send(cmd.clone()) {
-                    tracing::warn!("Failed to queue {} task: {:?}", task_type, e);
+                match task_manager_tx.try_send(cmd.clone()) {
+                    Ok(()) => metrics.record_task_enqueued(task_type),
+                    Err(e) => tracing::warn!("Failed to queue {} task: {:?}", task_type, e),
                 }
             }
             _ = cancel_token.cancelled() => {
@@ -437,6 +533,7 @@ async fn periodic_command_loop(
 fn check_feeds(
     task_manager_tx: &async_channel::Sender<TaskManagerCommand>,
     pool: &r2d2::Pool<SqliteConnectionManager>,
+    metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
     debug!("Sending RefreshFeed commands for all feeds");
     let conn = pool.get()?;
@@ -452,12 +549,13 @@ fn check_feeds(
     // Send a RefreshFeed command for each feed
     for feed_id in feed_ids {
         let feed_id = feed_id?;
-        if let Err(e) = task_manager_tx.try_send(TaskManagerCommand::RefreshFeed(feed_id)) {
-            tracing::error!(
+        match task_manager_tx.try_send(TaskManagerCommand::RefreshFeed(feed_id)) {
+            Ok(()) => metrics.record_task_enqueued("refresh_feed"),
+            Err(e) => tracing::error!(
                 "Failed to send RefreshFeed command for feed {}: {:?}",
                 feed_id,
                 e
-            );
+            ),
         }
     }
 
@@ -505,14 +603,16 @@ async fn uds_server(
     reload_tx: tokio::sync::watch::Sender<()>,
     pool: r2d2::Pool<SqliteConnectionManager>,
     cancel_token: CancellationToken,
+    metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
         task_manager_tx: tx,
         reload_tx,
         conn_pool: pool,
         cancel_token: cancel_token.clone(),
+        metrics: metrics.clone(),
     });
-    let app = routes::create_router().with_state(shared_state);
+    let app = routes::create_router(metrics).with_state(shared_state);
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Unable to bind to Unix socket at {:?}", &socket_path))?;
@@ -541,14 +641,16 @@ async fn tcp_server(
     reload_tx: tokio::sync::watch::Sender<()>,
     pool: r2d2::Pool<SqliteConnectionManager>,
     cancel_token: CancellationToken,
+    metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
         task_manager_tx: tx,
         reload_tx,
         conn_pool: pool,
         cancel_token: cancel_token.clone(),
+        metrics: metrics.clone(),
     });
-    let app = routes::create_router().with_state(shared_state);
+    let app = routes::create_router(metrics).with_state(shared_state);
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(addr)
@@ -657,6 +759,7 @@ mod test {
             Duration::from_secs(60),
             TaskManagerCommand::OptimizeFts,
             "test_overdue",
+            Arc::new(crate::metrics::Metrics::new()?),
         ));
 
         let got = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
@@ -691,6 +794,7 @@ mod test {
             Duration::from_secs(60),
             TaskManagerCommand::OptimizeFts,
             "test_recent",
+            Arc::new(crate::metrics::Metrics::new()?),
         ));
 
         let got = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
@@ -731,6 +835,7 @@ mod test {
             Duration::from_secs(60),
             TaskManagerCommand::OptimizeFts,
             "test_fresh",
+            Arc::new(crate::metrics::Metrics::new()?),
         ));
 
         // Give the loop a moment to call ensure_task.

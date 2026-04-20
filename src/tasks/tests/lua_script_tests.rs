@@ -56,7 +56,14 @@ async fn integration_filter_script_drops_all_entries() -> Result<()> {
         let sources = load_all_script_sources(&conn)?;
         crate::scripting::lua::LuaScriptRunner::new(&sources)?
     };
-    refresh_feed(&client, feed_id, pool, Some(&runner as &dyn ScriptRunner)).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        Some(&runner as &dyn ScriptRunner),
+        &super::test_metrics(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let count: i64 = conn.query_row(
@@ -84,7 +91,14 @@ async fn integration_modify_script_changes_titles() -> Result<()> {
         let sources = load_all_script_sources(&conn)?;
         crate::scripting::lua::LuaScriptRunner::new(&sources)?
     };
-    refresh_feed(&client, feed_id, pool, Some(&runner as &dyn ScriptRunner)).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        Some(&runner as &dyn ScriptRunner),
+        &super::test_metrics(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let mut stmt = conn.prepare("SELECT title FROM entries WHERE feed_id = ?1")?;
@@ -118,7 +132,14 @@ async fn integration_tagging_script_adds_tags() -> Result<()> {
         let sources = load_all_script_sources(&conn)?;
         crate::scripting::lua::LuaScriptRunner::new(&sources)?
     };
-    refresh_feed(&client, feed_id, pool, Some(&runner as &dyn ScriptRunner)).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        Some(&runner as &dyn ScriptRunner),
+        &super::test_metrics(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let entry_count: i64 = conn.query_row(
@@ -191,7 +212,14 @@ async fn integration_filter_script_prevents_tagging_script() -> Result<()> {
         let sources = load_all_script_sources(&conn)?;
         crate::scripting::lua::LuaScriptRunner::new(&sources)?
     };
-    refresh_feed(&client, feed_id, pool, Some(&runner as &dyn ScriptRunner)).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        Some(&runner as &dyn ScriptRunner),
+        &super::test_metrics(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let entry_count: i64 = conn.query_row(

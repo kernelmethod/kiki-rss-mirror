@@ -1,4 +1,5 @@
 use crate::http::USER_AGENT;
+use crate::metrics::Metrics;
 use crate::scripting::{FeedEntry, ScriptRunner};
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -144,6 +145,13 @@ impl Drop for InProgressGuard {
     }
 }
 
+/// Snapshot the current size of an `InProgressSet` for the
+/// `kiki_feeds_refresh_in_progress` gauge. Takes the lock briefly.
+fn in_progress_len(set: &InProgressSet) -> f64 {
+    let locked = set.lock().unwrap_or_else(|e| e.into_inner());
+    locked.len() as f64
+}
+
 /// Shared state for a pool of workers that process [`TaskManagerCommand`]s.
 ///
 /// Each worker pulls commands from a shared channel and maintains its own
@@ -157,6 +165,7 @@ struct Worker {
     token: CancellationToken,
     refresh_in_progress: InProgressSet,
     cleanup_in_progress: InProgressSet,
+    metrics: Arc<Metrics>,
 }
 
 /// Determine the number of worker tasks to spawn.
@@ -177,6 +186,7 @@ pub fn spawn_workers(
     token: CancellationToken,
     reload_tx: tokio::sync::watch::Sender<()>,
     num_workers: usize,
+    metrics: Arc<Metrics>,
 ) -> Vec<tokio::task::JoinHandle<Result<()>>> {
     let worker = Worker {
         rx,
@@ -185,6 +195,7 @@ pub fn spawn_workers(
         token,
         refresh_in_progress: Arc::new(Mutex::new(HashSet::new())),
         cleanup_in_progress: Arc::new(Mutex::new(HashSet::new())),
+        metrics,
     };
     let mut handles = Vec::with_capacity(num_workers);
 
@@ -212,7 +223,8 @@ async fn run_worker(
     // Each worker has its own script runner, built eagerly from the current
     // database state.  Rebuilt when a reload signal arrives via the watch channel.
     #[cfg(feature = "lua")]
-    let mut runner: Option<crate::scripting::lua::LuaScriptRunner> = build_runner(&w.pool);
+    let mut runner: Option<crate::scripting::lua::LuaScriptRunner> =
+        build_runner(&w.pool, &w.metrics);
 
     loop {
         // Check for a pending reload signal before processing the next command.
@@ -225,7 +237,7 @@ async fn run_worker(
                 "Worker {} reloading LuaScriptRunner from database",
                 worker_id
             );
-            runner = build_runner(&w.pool);
+            runner = build_runner(&w.pool, &w.metrics);
             info!("Worker {} LuaScriptRunner reloaded", worker_id);
         }
 
@@ -242,22 +254,35 @@ async fn run_worker(
                 #[cfg(feature = "lua")]
                 {
                     debug!("Worker {} reloading LuaScriptRunner from database", worker_id);
-                    runner = build_runner(&w.pool);
+                    runner = build_runner(&w.pool, &w.metrics);
                     info!("Worker {} LuaScriptRunner reloaded", worker_id);
                 }
                 continue;
             }
         };
 
+        w.metrics.inc_workers_busy();
+        let task_start = Instant::now();
+
         match command {
             TaskManagerCommand::RefreshFeed(feed_id) => {
                 let guard = match InProgressGuard::try_claim(&w.refresh_in_progress, feed_id) {
-                    Some(g) => g,
+                    Some(g) => {
+                        w.metrics
+                            .set_feeds_refresh_in_progress(in_progress_len(&w.refresh_in_progress));
+                        g
+                    }
                     None => {
                         debug!(
                             "Worker {}: feed {} already in progress, skipping refresh",
                             worker_id, feed_id
                         );
+                        w.metrics.record_task_processed(
+                            "refresh_feed",
+                            "skipped_in_progress",
+                            task_start.elapsed().as_secs_f64(),
+                        );
+                        w.metrics.dec_workers_busy();
                         continue;
                     }
                 };
@@ -268,29 +293,44 @@ async fn run_worker(
                 #[cfg(not(feature = "lua"))]
                 let script_runner: Option<&dyn ScriptRunner> = None;
 
-                let _ = refresh_feed(&client, feed_id, w.pool.clone(), script_runner)
-                    .await
-                    .inspect_err(|e| {
-                        error!(
-                            "An error occurred while refreshing feed {}: {:?}",
-                            feed_id, e
-                        );
-                        if let Ok(conn) = w.pool.get() {
-                            set_feed_error(
-                                &conn,
-                                feed_id,
-                                &FetchError::Other {
-                                    message: format!("{}", e),
-                                },
+                let outcome =
+                    match refresh_feed(&client, feed_id, w.pool.clone(), script_runner, &w.metrics)
+                        .await
+                    {
+                        Ok(()) => "ok",
+                        Err(e) => {
+                            error!(
+                                "An error occurred while refreshing feed {}: {:?}",
+                                feed_id, e
                             );
+                            if let Ok(conn) = w.pool.get() {
+                                set_feed_error(
+                                    &conn,
+                                    feed_id,
+                                    &FetchError::Other {
+                                        message: format!("{}", e),
+                                    },
+                                );
+                            }
+                            "error"
                         }
-                    });
+                    };
 
                 drop(guard);
+                w.metrics
+                    .set_feeds_refresh_in_progress(in_progress_len(&w.refresh_in_progress));
+
+                w.metrics.record_task_processed(
+                    "refresh_feed",
+                    outcome,
+                    task_start.elapsed().as_secs_f64(),
+                );
 
                 // Queue retention cleanup for this feed.
                 if let Err(e) = w.tx.try_send(TaskManagerCommand::CleanupFeed(feed_id)) {
                     warn!("Failed to queue cleanup for feed {}: {:?}", feed_id, e);
+                } else {
+                    w.metrics.record_task_enqueued("cleanup_feed");
                 }
             }
 
@@ -302,32 +342,76 @@ async fn run_worker(
                             "Worker {}: feed {} already in progress, skipping cleanup",
                             worker_id, feed_id
                         );
+                        w.metrics.record_task_processed(
+                            "cleanup_feed",
+                            "skipped_in_progress",
+                            task_start.elapsed().as_secs_f64(),
+                        );
+                        w.metrics.dec_workers_busy();
                         continue;
                     }
                 };
 
+                let cleanup_start = Instant::now();
+                let mut outcome = "ok";
                 if let Ok(conn) = w.pool.get() {
                     match crate::db::retention::cleanup_feed(&conn, feed_id) {
                         Ok(0) => {}
-                        Ok(n) => info!(
-                            "Retention cleanup deleted {} old entries for feed {}",
-                            n, feed_id
-                        ),
+                        Ok(n) => {
+                            info!(
+                                "Retention cleanup deleted {} old entries for feed {}",
+                                n, feed_id
+                            );
+                            w.metrics.record_retention_cleanup(
+                                "feed",
+                                cleanup_start.elapsed().as_secs_f64(),
+                                n as u64,
+                            );
+                        }
                         Err(e) => {
-                            warn!("Retention cleanup failed for feed {}: {:?}", feed_id, e)
+                            warn!("Retention cleanup failed for feed {}: {:?}", feed_id, e);
+                            outcome = "error";
                         }
                     }
+                } else {
+                    outcome = "error";
                 }
+
+                w.metrics.record_task_processed(
+                    "cleanup_feed",
+                    outcome,
+                    task_start.elapsed().as_secs_f64(),
+                );
             }
 
             TaskManagerCommand::CleanupAll => {
+                let cleanup_start = Instant::now();
+                let mut outcome = "ok";
                 if let Ok(conn) = w.pool.get() {
                     match crate::db::retention::cleanup_all(&conn) {
                         Ok(0) => {}
-                        Ok(n) => info!("Retention cleanup deleted {} entries", n),
-                        Err(e) => warn!("Retention cleanup failed: {:?}", e),
+                        Ok(n) => {
+                            info!("Retention cleanup deleted {} entries", n);
+                            w.metrics.record_retention_cleanup(
+                                "all",
+                                cleanup_start.elapsed().as_secs_f64(),
+                                n as u64,
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Retention cleanup failed: {:?}", e);
+                            outcome = "error";
+                        }
                     }
+                } else {
+                    outcome = "error";
                 }
+
+                w.metrics.record_task_processed(
+                    "cleanup_all",
+                    outcome,
+                    task_start.elapsed().as_secs_f64(),
+                );
             }
 
             TaskManagerCommand::OptimizeFts => {
@@ -343,6 +427,11 @@ async fn run_worker(
                         Ok(())
                     },
                 );
+                w.metrics.record_task_processed(
+                    "optimize_fts",
+                    "ok",
+                    task_start.elapsed().as_secs_f64(),
+                );
             }
 
             TaskManagerCommand::WalCheckpointAnalyze => {
@@ -354,6 +443,11 @@ async fn run_worker(
                         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); ANALYZE;")?;
                         Ok(())
                     },
+                );
+                w.metrics.record_task_processed(
+                    "wal_checkpoint_analyze",
+                    "ok",
+                    task_start.elapsed().as_secs_f64(),
                 );
             }
 
@@ -367,8 +461,15 @@ async fn run_worker(
                         Ok(())
                     },
                 );
+                w.metrics.record_task_processed(
+                    "incremental_vacuum",
+                    "ok",
+                    task_start.elapsed().as_secs_f64(),
+                );
             }
         }
+
+        w.metrics.dec_workers_busy();
     }
 }
 
@@ -419,16 +520,25 @@ fn load_all_script_sources(
 #[cfg(feature = "lua")]
 fn build_runner(
     pool: &Pool<SqliteConnectionManager>,
+    metrics: &Metrics,
 ) -> Option<crate::scripting::lua::LuaScriptRunner> {
     match pool.get() {
         Ok(conn) => match load_all_script_sources(&conn) {
-            Ok(sources) => match crate::scripting::lua::LuaScriptRunner::new(&sources) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    warn!("failed to compile Lua scripts: {}", e);
-                    None
+            Ok(sources) => {
+                let count = sources.len() as f64;
+                match crate::scripting::lua::LuaScriptRunner::new(&sources) {
+                    Ok(r) => {
+                        metrics.set_scripts_loaded(count);
+                        Some(r)
+                    }
+                    Err(e) => {
+                        warn!("failed to compile Lua scripts: {}", e);
+                        metrics.record_script_compile_error();
+                        metrics.set_scripts_loaded(0.0);
+                        None
+                    }
                 }
-            },
+            }
             Err(e) => {
                 error!("failed to load script sources from database: {}", e);
                 None
@@ -489,7 +599,10 @@ pub(crate) async fn refresh_feed(
     feed_id: i64,
     pool: Pool<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
+    metrics: &Metrics,
 ) -> Result<()> {
+    let fetch_start = Instant::now();
+
     // Get the feed URL and headers from the database
     let conn = pool.get()?;
     let (
@@ -531,6 +644,8 @@ pub(crate) async fn refresh_feed(
                     feed_id,
                     expires_dt.signed_duration_since(now).num_seconds()
                 );
+                metrics.record_feed_cache_hit("expires");
+                metrics.record_feed_fetch("cache_hit", fetch_start.elapsed().as_secs_f64());
                 return Ok(());
             }
         }
@@ -547,6 +662,8 @@ pub(crate) async fn refresh_feed(
                     feed_id,
                     duration_since.num_seconds()
                 );
+                metrics.record_feed_cache_hit("min_interval");
+                metrics.record_feed_fetch("cache_hit", fetch_start.elapsed().as_secs_f64());
                 return Ok(());
             }
         }
@@ -563,35 +680,55 @@ pub(crate) async fn refresh_feed(
             header_etag.as_deref(),
             header_last_modified.as_deref(),
             pool.clone(),
+            fetch_start,
+            metrics,
         )
         .await
-    }?;
+    };
+
+    let feed_content = match feed_content {
+        Ok(c) => c,
+        Err(e) => {
+            metrics.record_feed_fetch("other", fetch_start.elapsed().as_secs_f64());
+            return Err(e);
+        }
+    };
 
     let content = if let Some(content) = feed_content {
         content
     } else {
+        // retrieve_feed / retrieve_file_feed already recorded the outcome.
         return Ok(());
     };
 
     // Attempt to parse content as Atom, with fallback to RSS.
+    let parse_start = Instant::now();
     if let Ok(feed) = atom_syndication::Feed::read_from(&content[..]) {
-        process_atom_feed(feed_id, feed, conn, script_runner)?;
+        let entries = feed.entries.len() as u64;
+        metrics.record_feed_parse("atom", parse_start.elapsed().as_secs_f64(), entries);
+        process_atom_feed(feed_id, feed, conn, script_runner, metrics)?;
         clear_feed_error(&pool.get()?, feed_id);
+        metrics.record_feed_fetch("success", fetch_start.elapsed().as_secs_f64());
     } else if let Ok(channel) = rss::Channel::read_from(&content[..]) {
-        process_rss_feed(feed_id, channel, conn, script_runner)?;
+        let items = channel.items.len() as u64;
+        metrics.record_feed_parse("rss", parse_start.elapsed().as_secs_f64(), items);
+        process_rss_feed(feed_id, channel, conn, script_runner, metrics)?;
         clear_feed_error(&pool.get()?, feed_id);
+        metrics.record_feed_fetch("success", fetch_start.elapsed().as_secs_f64());
     } else {
         let fetch_err = FetchError::InvalidFeed {
             url: feed_url.clone(),
         };
         warn!("Feed {}: {}", feed_id, fetch_err);
         set_feed_error(&pool.get()?, feed_id, &fetch_err);
+        metrics.record_feed_fetch("invalid_feed", fetch_start.elapsed().as_secs_f64());
         return Ok(());
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn retrieve_feed(
     client: &reqwest::Client,
     feed_id: i64,
@@ -599,6 +736,8 @@ async fn retrieve_feed(
     etag: Option<&str>,
     last_modified: Option<&str>,
     pool: Pool<SqliteConnectionManager>,
+    fetch_start: Instant,
+    metrics: &Metrics,
 ) -> Result<Option<Vec<u8>>> {
     let conn = pool.get()?;
 
@@ -606,6 +745,7 @@ async fn retrieve_feed(
 
     let mut current_url = feed_url.to_string();
     let mut had_permanent_redirect = false;
+    let mut redirects: u64 = 0;
     let max_redirects = 10;
 
     let resp = 'redirect: {
@@ -621,7 +761,15 @@ async fn retrieve_feed(
                 }
             }
 
-            let resp = request.send().await?;
+            let resp = match request.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let outcome = if e.is_timeout() { "timeout" } else { "other" };
+                    metrics.record_feed_fetch(outcome, fetch_start.elapsed().as_secs_f64());
+                    metrics.record_feed_redirects(redirects);
+                    return Err(e.into());
+                }
+            };
 
             if resp.status().is_redirection() && resp.status() != reqwest::StatusCode::NOT_MODIFIED
             {
@@ -643,6 +791,7 @@ async fn retrieve_feed(
                 // Resolve the Location against the current URL to handle relative redirects
                 let base = Url::parse(&current_url)?;
                 current_url = base.join(&location)?.to_string();
+                redirects += 1;
                 continue;
             }
 
@@ -657,8 +806,12 @@ async fn retrieve_feed(
             let conn = pool.get()?;
             set_feed_error(&conn, feed_id, &fetch_err);
         }
+        metrics.record_feed_fetch("too_many_redirects", fetch_start.elapsed().as_secs_f64());
+        metrics.record_feed_redirects(redirects);
         return Ok(None);
     };
+
+    metrics.record_feed_redirects(redirects);
 
     // Check if the feed was modified
     match resp.status() {
@@ -669,6 +822,8 @@ async fn retrieve_feed(
                 "UPDATE feeds SET last_checked = ?1 WHERE id = ?2",
                 (Utc::now().timestamp(), feed_id),
             )?;
+            metrics.record_feed_cache_hit("not_modified");
+            metrics.record_feed_fetch("not_modified", fetch_start.elapsed().as_secs_f64());
             return Ok(None);
         }
         reqwest::StatusCode::OK => { /* Do nothing */ }
@@ -680,6 +835,7 @@ async fn retrieve_feed(
             };
             warn!("Feed {}: {}", feed_id, fetch_err);
             set_feed_error(&conn, feed_id, &fetch_err);
+            metrics.record_feed_fetch("http_error", fetch_start.elapsed().as_secs_f64());
             return Ok(None);
         }
     }
@@ -751,6 +907,7 @@ async fn retrieve_feed(
     }
 
     let content = resp.bytes().await?;
+    metrics.record_feed_response_bytes(content.len() as u64);
     Ok(Some(content.to_vec()))
 }
 
@@ -1112,6 +1269,7 @@ fn process_atom_feed(
     feed: atom_syndication::Feed,
     mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
+    metrics: &Metrics,
 ) -> Result<()> {
     info!(
         "Successfully fetched Atom feed {} with {} items",
@@ -1136,13 +1294,20 @@ fn process_atom_feed(
 
         let feed_entry = if let Some(runner) = script_runner {
             let original = feed_entry.clone();
+            let script_start = Instant::now();
             match runner.process_entry(feed_entry) {
-                Ok(Some(e)) => e,
+                Ok(Some(e)) => {
+                    metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "ok");
+                    e
+                }
                 Ok(None) => {
+                    metrics
+                        .record_script_execution(script_start.elapsed().as_secs_f64(), "filtered");
                     debug!("atom entry filtered by script for feed {}", feed_id);
                     continue;
                 }
                 Err(e) => {
+                    metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "error");
                     warn!(
                         "script error processing atom entry for feed {}: {}; inserting unmodified",
                         feed_id, e
@@ -1183,6 +1348,7 @@ fn process_atom_feed(
 
         insert_atom_entry_data(&tx, entry_id, &ingest)?;
         tx.commit()?;
+        metrics.record_feed_entry_upserted("atom");
 
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
@@ -1197,6 +1363,7 @@ fn process_rss_feed(
     channel: rss::Channel,
     mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
+    metrics: &Metrics,
 ) -> Result<()> {
     info!(
         "Successfully fetched RSS feed {} with {} items",
@@ -1214,13 +1381,20 @@ fn process_rss_feed(
 
         let feed_entry = if let Some(runner) = script_runner {
             let original = feed_entry.clone();
+            let script_start = Instant::now();
             match runner.process_entry(feed_entry) {
-                Ok(Some(e)) => e,
+                Ok(Some(e)) => {
+                    metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "ok");
+                    e
+                }
                 Ok(None) => {
+                    metrics
+                        .record_script_execution(script_start.elapsed().as_secs_f64(), "filtered");
                     debug!("rss entry filtered by script for feed {}", feed_id);
                     continue;
                 }
                 Err(e) => {
+                    metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "error");
                     warn!(
                         "script error processing rss entry for feed {}: {}; inserting unmodified",
                         feed_id, e
@@ -1261,6 +1435,7 @@ fn process_rss_feed(
 
         insert_rss_entry_data(&tx, entry_id, &ingest)?;
         tx.commit()?;
+        metrics.record_feed_entry_upserted("rss");
 
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;

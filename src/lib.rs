@@ -5,6 +5,7 @@
 
 pub mod db;
 pub mod http;
+pub mod metrics;
 pub mod routes;
 pub mod server;
 pub mod tasks;
