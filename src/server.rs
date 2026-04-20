@@ -39,6 +39,10 @@ pub struct SharedAppState {
 
     /// Per-server Prometheus metrics recorder.
     pub metrics: Arc<crate::metrics::Metrics>,
+
+    /// Root directory for on-disk state. Used to locate the cached asset
+    /// filesystem under `{data_dir}/assets/`.
+    pub data_dir: PathBuf,
 }
 
 pub type AppState = Arc<SharedAppState>;
@@ -102,8 +106,18 @@ impl<'a> ServerBuilder<'a> {
             .listen_addr
             .unwrap_or_else(|| ListenAddr::Uds(PathBuf::from("kiki.sock")));
 
+        // Default the data directory to the directory containing the
+        // database file. Callers that want an explicit location can extend
+        // the builder later.
+        let data_dir = self
+            .db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
         Server {
             db_path: PathBuf::from(self.db_path),
+            data_dir,
             listen_addr,
             autofetch: self.autofetch,
             single_threaded: self.single_threaded,
@@ -141,6 +155,9 @@ impl std::error::Error for ServerError {
 pub struct Server {
     /// Path to the database used by the server.
     db_path: PathBuf,
+
+    /// Root directory for on-disk state (cached assets live beneath this).
+    data_dir: PathBuf,
 
     /// How the server listens for connections.
     listen_addr: ListenAddr,
@@ -249,6 +266,17 @@ impl Server {
         debug!("Spawning {} task-manager workers", num_workers);
         metrics.set_workers_total(num_workers as f64);
 
+        // Ensure the asset cache directory exists before workers start
+        // writing into it.
+        let assets_dir = self.data_dir.join("assets");
+        if let Err(e) = fs::create_dir_all(&assets_dir) {
+            tracing::warn!(
+                "failed to create asset cache directory {:?}: {}",
+                assets_dir,
+                e
+            );
+        }
+
         let _worker_handles = tasks::spawn_workers(
             rx,
             tx.clone(),
@@ -257,6 +285,7 @@ impl Server {
             reload_tx.clone(),
             num_workers,
             metrics.clone(),
+            self.data_dir.clone(),
         );
 
         tokio::spawn(metrics_sampler_loop(
@@ -324,6 +353,7 @@ impl Server {
                     pool.clone(),
                     self.cancel_token.clone(),
                     metrics.clone(),
+                    self.data_dir.clone(),
                 ));
             }
             ListenAddr::Tcp(port) => {
@@ -334,6 +364,7 @@ impl Server {
                     pool.clone(),
                     self.cancel_token.clone(),
                     metrics.clone(),
+                    self.data_dir.clone(),
                 ));
             }
         }
@@ -597,6 +628,7 @@ async fn shutdown_signal(token: CancellationToken) {
 }
 
 /// Parent function for the Unix domain socket web worker threads.
+#[allow(clippy::too_many_arguments)]
 async fn uds_server(
     socket_path: PathBuf,
     tx: async_channel::Sender<TaskManagerCommand>,
@@ -604,6 +636,7 @@ async fn uds_server(
     pool: r2d2::Pool<SqliteConnectionManager>,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
+    data_dir: PathBuf,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
         task_manager_tx: tx,
@@ -611,6 +644,7 @@ async fn uds_server(
         conn_pool: pool,
         cancel_token: cancel_token.clone(),
         metrics: metrics.clone(),
+        data_dir,
     });
     let app = routes::create_router(metrics).with_state(shared_state);
 
@@ -635,6 +669,7 @@ async fn uds_server(
 }
 
 /// Parent function for the TCP web worker threads.
+#[allow(clippy::too_many_arguments)]
 async fn tcp_server(
     port: u16,
     tx: async_channel::Sender<TaskManagerCommand>,
@@ -642,6 +677,7 @@ async fn tcp_server(
     pool: r2d2::Pool<SqliteConnectionManager>,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
+    data_dir: PathBuf,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
         task_manager_tx: tx,
@@ -649,6 +685,7 @@ async fn tcp_server(
         conn_pool: pool,
         cancel_token: cancel_token.clone(),
         metrics: metrics.clone(),
+        data_dir,
     });
     let app = routes::create_router(metrics).with_state(shared_state);
 

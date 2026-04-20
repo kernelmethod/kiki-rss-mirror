@@ -30,8 +30,11 @@ anyhow = "1.0"
 async-channel = "2"
 atom_syndication = { version = "0.12", features = ["with-serde"] }
 axum = { version = "0.8", features = ["macros"] }
+blake3 = "1"
 chrono = "0.4"
 dirs = "6"
+lol_html = "2"
+url = "2"
 clap = { version = "4.5", features = ["cargo", "derive"], optional = true }
 quick-xml = { version = "0.37", features = ["serialize", "escape-html"] }
 r2d2 = "0.8"

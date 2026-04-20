@@ -234,6 +234,7 @@ async fn maintenance_commands_end_to_end_via_worker() -> Result<()> {
         reload_tx,
         1,
         std::sync::Arc::new(super::test_metrics()),
+        std::path::PathBuf::from("."),
     );
 
     tx.send(TaskManagerCommand::OptimizeFts).await?;

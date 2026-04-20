@@ -56,7 +56,15 @@ async fn test_etag_stored_and_sent() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     // First fetch: should get 200, store the etag
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let stored_etag: Option<String> = conn.query_row(
@@ -70,7 +78,15 @@ async fn test_etag_stored_and_sent() -> Result<()> {
     reset_last_checked(&conn, feed_id);
 
     // Second fetch: should send If-None-Match and get 304
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let s = state.lock().unwrap();
     assert_eq!(
@@ -96,7 +112,15 @@ async fn test_last_modified_stored_and_sent() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     // First fetch: 200, stores Last-Modified
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let stored_lm: Option<String> = conn.query_row(
@@ -109,7 +133,15 @@ async fn test_last_modified_stored_and_sent() -> Result<()> {
     reset_last_checked(&conn, feed_id);
 
     // Second fetch: should send If-Modified-Since and get 304
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let s = state.lock().unwrap();
     assert_eq!(s.full_response_count, 1);
@@ -135,7 +167,15 @@ async fn test_expires_skips_fetch() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     // First fetch: 200, stores Expires timestamp
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let stored_expires: Option<i64> = conn.query_row(
@@ -148,7 +188,15 @@ async fn test_expires_skips_fetch() -> Result<()> {
     // Second call: should skip entirely because `next_fetch_at` was set
     // from the Expires hint. Intentionally no `reset_last_checked` — the
     // scheduler gate must persist a server's freshness guarantee.
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let s = state.lock().unwrap();
     assert_eq!(
@@ -176,13 +224,29 @@ async fn test_expired_expires_allows_fetch() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     // First fetch: 200, stores the already-past Expires timestamp
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     reset_last_checked(&conn, feed_id);
 
     // Second call: expires is in the past, so a new HTTP request should be made
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let s = state.lock().unwrap();
     assert_eq!(
@@ -206,7 +270,15 @@ async fn test_304_updates_last_checked_only() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     // First fetch: inserts entries
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let entry_count_after_first: i64 = conn.query_row(
@@ -222,7 +294,15 @@ async fn test_304_updates_last_checked_only() -> Result<()> {
     reset_last_checked(&conn, feed_id);
 
     // Second fetch: 304, should not change entry count
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let entry_count_after_second: i64 = conn.query_row(
         "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
@@ -264,7 +344,15 @@ async fn test_etag_and_last_modified_both_sent() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     // First fetch: stores both headers
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let (stored_etag, stored_lm): (Option<String>, Option<String>) = conn.query_row(
@@ -278,7 +366,15 @@ async fn test_etag_and_last_modified_both_sent() -> Result<()> {
     reset_last_checked(&conn, feed_id);
 
     // Second fetch: both conditional headers sent, server returns 304
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let s = state.lock().unwrap();
     assert_eq!(s.full_response_count, 1);
@@ -302,7 +398,15 @@ async fn test_max_age_sets_expires() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
     let before = Utc::now().timestamp();
 
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let stored_expires: Option<i64> = conn.query_row(
@@ -319,7 +423,15 @@ async fn test_max_age_sets_expires() -> Result<()> {
 
     // Second fetch: should be skipped because max-age sets `next_fetch_at`
     // into the future. Intentionally no `reset_last_checked`.
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let s = state.lock().unwrap();
     assert_eq!(
@@ -348,7 +460,15 @@ async fn test_max_age_overrides_expires() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
     let before = Utc::now().timestamp();
 
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let stored_expires: Option<i64> = conn.query_row(
@@ -382,7 +502,15 @@ async fn test_no_cache_clears_expires() -> Result<()> {
 
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let (stored_etag, stored_expires): (Option<String>, Option<i64>) = conn.query_row(
@@ -403,7 +531,15 @@ async fn test_no_cache_clears_expires() -> Result<()> {
     reset_last_checked(&conn, feed_id);
 
     // Second fetch: should make an HTTP request (no skip) and get 304
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let s = state.lock().unwrap();
     assert_eq!(s.full_response_count, 1);
@@ -429,7 +565,15 @@ async fn test_no_store_clears_all_cache_headers() -> Result<()> {
 
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let (stored_etag, stored_lm, stored_expires): (Option<String>, Option<String>, Option<i64>) =
@@ -469,13 +613,29 @@ async fn test_no_store_prevents_conditional_request() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     // First fetch: 200 (no-store clears stored etag)
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     reset_last_checked(&conn, feed_id);
 
     // Second fetch: no conditional headers sent, so another 200
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let s = state.lock().unwrap();
     assert_eq!(
@@ -503,7 +663,15 @@ async fn test_gzip_compressed_response() -> Result<()> {
 
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let count: i64 = conn.query_row(
@@ -535,7 +703,15 @@ async fn test_deflate_compressed_response() -> Result<()> {
 
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let count: i64 = conn.query_row(
@@ -571,7 +747,15 @@ async fn test_next_fetch_at_gate_skips_fetch() -> Result<()> {
         rusqlite::params![Utc::now().timestamp() + 600, feed_id],
     )?;
 
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let s = state.lock().unwrap();
     assert_eq!(
@@ -595,7 +779,15 @@ async fn test_max_age_below_min_cadence_is_floored() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     let before = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
     let after = Utc::now().timestamp();
 
     let conn = tc.database_conn()?;
@@ -636,7 +828,15 @@ async fn test_max_age_above_min_fetch_interval_is_capped() -> Result<()> {
     }
 
     let before = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
     let after = Utc::now().timestamp();
 
     let conn = tc.database_conn()?;
@@ -672,7 +872,15 @@ async fn test_success_resets_consecutive_failures() -> Result<()> {
         )?;
     }
 
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let failures: i64 = conn.query_row(
@@ -699,7 +907,15 @@ async fn test_304_resets_consecutive_failures_and_reschedules() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     // First fetch stores ETag and succeeds.
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     // Inject a failure streak plus clear the gate so the next refresh runs.
     {
@@ -711,7 +927,15 @@ async fn test_304_resets_consecutive_failures_and_reschedules() -> Result<()> {
     }
 
     let before = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
     let after = Utc::now().timestamp();
 
     let conn = tc.database_conn()?;

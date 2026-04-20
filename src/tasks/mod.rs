@@ -9,10 +9,13 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+pub mod assets;
 
 #[cfg(test)]
 mod tests;
@@ -209,6 +212,11 @@ pub enum TaskManagerCommand {
     CleanupFeed(i64),
     /// Run retention cleanup across all feeds.
     CleanupAll,
+    /// Download and cache the external assets referenced by an entry
+    /// (inline images plus any enclosure).
+    CacheEntryAssets {
+        entry_id: i64,
+    },
     /// Merge FTS5 index segments to improve search performance.
     OptimizeFts,
     /// Checkpoint the WAL file and refresh query-planner statistics.
@@ -272,6 +280,7 @@ struct Worker {
     refresh_in_progress: InProgressSet,
     cleanup_in_progress: InProgressSet,
     metrics: Arc<Metrics>,
+    data_dir: PathBuf,
 }
 
 /// Determine the number of worker tasks to spawn.
@@ -285,6 +294,7 @@ pub fn worker_count() -> usize {
 ///
 /// Each worker maintains its own `LuaScriptRunner` (when the `lua` feature is
 /// enabled) and subscribes to a `watch` channel for reload signals.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_workers(
     rx: async_channel::Receiver<TaskManagerCommand>,
     tx: async_channel::Sender<TaskManagerCommand>,
@@ -293,6 +303,7 @@ pub fn spawn_workers(
     reload_tx: tokio::sync::watch::Sender<()>,
     num_workers: usize,
     metrics: Arc<Metrics>,
+    data_dir: PathBuf,
 ) -> Vec<tokio::task::JoinHandle<Result<()>>> {
     let worker = Worker {
         rx,
@@ -302,6 +313,7 @@ pub fn spawn_workers(
         refresh_in_progress: Arc::new(Mutex::new(HashSet::new())),
         cleanup_in_progress: Arc::new(Mutex::new(HashSet::new())),
         metrics,
+        data_dir,
     };
     let mut handles = Vec::with_capacity(num_workers);
 
@@ -399,29 +411,35 @@ async fn run_worker(
                 #[cfg(not(feature = "lua"))]
                 let script_runner: Option<&dyn ScriptRunner> = None;
 
-                let outcome =
-                    match refresh_feed(&client, feed_id, w.pool.clone(), script_runner, &w.metrics)
-                        .await
-                    {
-                        Ok(()) => "ok",
-                        Err(e) => {
-                            error!(
-                                "An error occurred while refreshing feed {}: {:?}",
-                                feed_id, e
+                let outcome = match refresh_feed(
+                    &client,
+                    feed_id,
+                    w.pool.clone(),
+                    script_runner,
+                    &w.metrics,
+                    &w.tx,
+                )
+                .await
+                {
+                    Ok(()) => "ok",
+                    Err(e) => {
+                        error!(
+                            "An error occurred while refreshing feed {}: {:?}",
+                            feed_id, e
+                        );
+                        if let Ok(conn) = w.pool.get() {
+                            set_feed_error(
+                                &conn,
+                                feed_id,
+                                &FetchError::Other {
+                                    message: format!("{}", e),
+                                },
+                                &w.metrics,
                             );
-                            if let Ok(conn) = w.pool.get() {
-                                set_feed_error(
-                                    &conn,
-                                    feed_id,
-                                    &FetchError::Other {
-                                        message: format!("{}", e),
-                                    },
-                                    &w.metrics,
-                                );
-                            }
-                            "error"
                         }
-                    };
+                        "error"
+                    }
+                };
 
                 drop(guard);
                 w.metrics
@@ -516,6 +534,22 @@ async fn run_worker(
 
                 w.metrics.record_task_processed(
                     "cleanup_all",
+                    outcome,
+                    task_start.elapsed().as_secs_f64(),
+                );
+            }
+
+            TaskManagerCommand::CacheEntryAssets { entry_id } => {
+                let outcome =
+                    match cache_entry_assets(&client, &w.pool, &w.data_dir, entry_id).await {
+                        Ok(()) => "ok",
+                        Err(e) => {
+                            warn!("failed caching assets for entry {}: {:?}", entry_id, e);
+                            "error"
+                        }
+                    };
+                w.metrics.record_task_processed(
+                    "cache_entry_assets",
                     outcome,
                     task_start.elapsed().as_secs_f64(),
                 );
@@ -828,6 +862,7 @@ pub(crate) async fn refresh_feed(
     pool: Pool<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
+    task_tx: &async_channel::Sender<TaskManagerCommand>,
 ) -> Result<()> {
     let fetch_start = Instant::now();
 
@@ -918,13 +953,15 @@ pub(crate) async fn refresh_feed(
     if let Ok(feed) = atom_syndication::Feed::read_from(&content[..]) {
         let entries = feed.entries.len() as u64;
         metrics.record_feed_parse("atom", parse_start.elapsed().as_secs_f64(), entries);
-        process_atom_feed(feed_id, feed, conn, script_runner, metrics)?;
+        let inserted = process_atom_feed(feed_id, feed, conn, script_runner, metrics)?;
+        enqueue_asset_caching(task_tx, metrics, &inserted);
         clear_feed_error(&pool.get()?, feed_id);
         metrics.record_feed_fetch("success", fetch_start.elapsed().as_secs_f64());
     } else if let Ok(channel) = rss::Channel::read_from(&content[..]) {
         let items = channel.items.len() as u64;
         metrics.record_feed_parse("rss", parse_start.elapsed().as_secs_f64(), items);
-        process_rss_feed(feed_id, channel, conn, script_runner, metrics)?;
+        let inserted = process_rss_feed(feed_id, channel, conn, script_runner, metrics)?;
+        enqueue_asset_caching(task_tx, metrics, &inserted);
         clear_feed_error(&pool.get()?, feed_id);
         metrics.record_feed_fetch("success", fetch_start.elapsed().as_secs_f64());
     } else {
@@ -1599,13 +1636,125 @@ fn insert_rss_entry_data(
     Ok(())
 }
 
+/// Download and cache the external assets referenced by an entry.
+///
+/// Runs in an async worker: looks up the entry's post-script `content` HTML
+/// plus its feed URL and any RSS enclosure, extracts `<img src>` URLs, and
+/// delegates each to [`assets::cache_asset`]. Individual asset failures are
+/// logged and skipped.
+pub(crate) async fn cache_entry_assets(
+    client: &reqwest::Client,
+    pool: &Pool<SqliteConnectionManager>,
+    data_dir: &std::path::Path,
+    entry_id: i64,
+) -> Result<()> {
+    #[derive(Debug)]
+    struct EntryCtx {
+        content: Option<String>,
+        base: Option<String>,
+        enclosure_url: Option<String>,
+    }
+
+    let ctx = {
+        let conn = pool.get()?;
+        if !crate::db::assets::get_cache_enabled(&conn)? {
+            return Ok(());
+        }
+        let row = conn
+            .query_row(
+                "SELECT e.content, f.url, e.url, red.enclosure_url
+                 FROM entries e
+                 LEFT JOIN feeds f ON f.id = e.feed_id
+                 LEFT JOIN rss_entry_data red ON red.entry_id = e.id
+                 WHERE e.id = ?1",
+                [entry_id],
+                |row| {
+                    let content: Option<String> = row.get(0)?;
+                    let feed_url: Option<String> = row.get(1)?;
+                    let entry_url: Option<String> = row.get(2)?;
+                    let enclosure_url: Option<String> = row.get(3)?;
+                    // Prefer the entry URL as the resolution base; fall back
+                    // to the feed URL so relative URLs still work when the
+                    // entry URL is empty.
+                    let base = entry_url.filter(|s| !s.is_empty()).or(feed_url);
+                    Ok(EntryCtx {
+                        content,
+                        base,
+                        enclosure_url,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        match row {
+            Some(r) => r,
+            None => return Ok(()),
+        }
+    };
+
+    let base = match ctx.base.as_deref().and_then(|s| Url::parse(s).ok()) {
+        Some(u) => u,
+        None => {
+            debug!(
+                "entry {} has no resolvable base URL; skipping asset cache",
+                entry_id
+            );
+            return Ok(());
+        }
+    };
+
+    // Inline images from the entry's HTML content.
+    if let Some(content) = ctx.content.as_deref() {
+        for url in assets::extract_asset_urls(content, &base) {
+            if let Err(e) = assets::cache_asset(
+                client,
+                pool,
+                data_dir,
+                &url,
+                entry_id,
+                assets::AssetKind::InlineImg,
+            )
+            .await
+            {
+                warn!("cache_asset failed for {}: {:?}", url, e);
+            }
+        }
+    }
+
+    // RSS enclosure, when present.
+    if let Some(enc) = ctx.enclosure_url.as_deref() {
+        if let Some(url) = Url::parse(enc)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+        {
+            if let Err(e) = assets::cache_asset(
+                client,
+                pool,
+                data_dir,
+                &url,
+                entry_id,
+                assets::AssetKind::Enclosure,
+            )
+            .await
+            {
+                warn!("cache_asset failed for enclosure {}: {:?}", url, e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn process_atom_feed(
     feed_id: i64,
     feed: atom_syndication::Feed,
     mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
-) -> Result<()> {
+) -> Result<Vec<i64>> {
     info!(
         "Successfully fetched Atom feed {} with {} items",
         feed_id,
@@ -1624,6 +1773,7 @@ fn process_atom_feed(
         tx.commit()?;
     }
 
+    let mut inserted_entry_ids: Vec<i64> = Vec::new();
     for entry in feed.entries.into_iter() {
         let (feed_entry, ingest) = atom_entry_to_parts(feed_id, entry);
 
@@ -1684,13 +1834,14 @@ fn process_atom_feed(
         insert_atom_entry_data(&tx, entry_id, &ingest)?;
         tx.commit()?;
         metrics.record_feed_entry_upserted("atom");
+        inserted_entry_ids.push(entry_id);
 
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
         }
     }
 
-    Ok(())
+    Ok(inserted_entry_ids)
 }
 
 fn process_rss_feed(
@@ -1699,7 +1850,7 @@ fn process_rss_feed(
     mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
-) -> Result<()> {
+) -> Result<Vec<i64>> {
     info!(
         "Successfully fetched RSS feed {} with {} items",
         feed_id,
@@ -1711,6 +1862,7 @@ fn process_rss_feed(
         [feed_id],
     )?;
 
+    let mut inserted_entry_ids: Vec<i64> = Vec::new();
     for item in channel.items.into_iter() {
         let (feed_entry, ingest) = rss_item_to_parts(feed_id, item);
 
@@ -1771,13 +1923,32 @@ fn process_rss_feed(
         insert_rss_entry_data(&tx, entry_id, &ingest)?;
         tx.commit()?;
         metrics.record_feed_entry_upserted("rss");
+        inserted_entry_ids.push(entry_id);
 
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
         }
     }
 
-    Ok(())
+    Ok(inserted_entry_ids)
+}
+
+/// Enqueue a [`TaskManagerCommand::CacheEntryAssets`] for each of the given
+/// entry IDs. Best-effort: a full or closed queue is logged and ignored.
+fn enqueue_asset_caching(
+    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    metrics: &Metrics,
+    entry_ids: &[i64],
+) {
+    for &entry_id in entry_ids {
+        match task_tx.try_send(TaskManagerCommand::CacheEntryAssets { entry_id }) {
+            Ok(()) => metrics.record_task_enqueued("cache_entry_assets"),
+            Err(e) => debug!(
+                "failed to queue CacheEntryAssets for entry {}: {:?}",
+                entry_id, e
+            ),
+        }
+    }
 }
 
 /// Resolve and sync the script-provided tags for a newly inserted database entry.

@@ -1,5 +1,6 @@
 pub mod cleanup;
 pub mod delete_entry;
+pub mod entry_assets;
 pub mod entry_tags;
 pub mod format_data;
 pub mod get_entry;
@@ -8,6 +9,7 @@ pub mod search_entries;
 
 use cleanup::cleanup;
 use delete_entry::delete_entry;
+use entry_assets::list_entry_assets;
 use entry_tags::{get_entry_tags, set_entry_tags};
 use get_entry::get_entry;
 #[allow(unused_imports)]
@@ -27,6 +29,7 @@ pub fn create_router() -> Router<AppState> {
         .route("/search", post(search_entries))
         .route("/id/{id}", get(get_entry).delete(delete_entry))
         .route("/id/{id}/tags", get(get_entry_tags).put(set_entry_tags))
+        .route("/id/{id}/assets", get(list_entry_assets))
 }
 
 #[cfg(test)]

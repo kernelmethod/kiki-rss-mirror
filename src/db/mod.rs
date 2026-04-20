@@ -3,6 +3,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
+pub mod assets;
 pub mod migrations;
 pub mod retention;
 pub mod settings;
@@ -159,8 +160,10 @@ mod tests {
             "entries_fts_data",
             "entries_fts_docsize",
             "entries_fts_idx",
+            "entry_assets",
             "entry_sources",
             "entry_tags",
+            "feed_assets",
             "feed_scripts",
             "feed_tags",
             "feeds",

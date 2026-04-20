@@ -20,6 +20,10 @@ CREATE TABLE settings (
 -- Default global settings.
 INSERT INTO settings (key, value, type)
 VALUES ('feed_update_timeout_seconds', '15', 'integer');
+INSERT INTO settings (key, value, type)
+VALUES ('feed_asset_cache_enabled', 'true', 'boolean');
+INSERT INTO settings (key, value, type)
+VALUES ('feed_asset_cache_max_bytes', '1073741824', 'integer');
 
 -- Absolute floor on how often any single feed can be polled, in seconds.
 -- Caps the effect of a very low `max-age` or `Retry-After` value so a
@@ -386,6 +390,34 @@ UNION
 SELECT e.id AS entry_id, afc.contributor AS contributor
 FROM entries e
 JOIN atom_feed_contributors afc ON e.feed_id = afc.feed_id;
+
+---------------------------------------------------------------------------------
+-- Cached feed assets (images, enclosures) fetched from entry content.
+---------------------------------------------------------------------------------
+
+CREATE TABLE feed_assets (
+    id               INTEGER PRIMARY KEY,
+    blake3           TEXT NOT NULL UNIQUE,
+    original_url     TEXT NOT NULL,
+    content_type     TEXT,
+    size_bytes       INTEGER NOT NULL,
+    cached_at        INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_accessed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    etag             TEXT,
+    last_modified    TEXT
+);
+CREATE INDEX idx_feed_assets_last_accessed ON feed_assets(last_accessed_at);
+CREATE INDEX idx_feed_assets_original_url  ON feed_assets(original_url);
+
+CREATE TABLE entry_assets (
+    entry_id INTEGER NOT NULL,
+    asset_id INTEGER NOT NULL,
+    kind     TEXT NOT NULL,
+    PRIMARY KEY (entry_id, asset_id),
+    FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE,
+    FOREIGN KEY (asset_id) REFERENCES feed_assets(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_entry_assets_asset ON entry_assets(asset_id);
 
 ---------------------------------------------------------------------------------
 -- Full-text search index over entries (FTS5, external content)

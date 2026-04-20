@@ -114,7 +114,15 @@ async fn test_429_schedules_from_retry_after() -> Result<()> {
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
     let before = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let (next_fetch_at, retry_after_at, failures) = read_schedule(&conn, feed_id)?;
@@ -148,7 +156,15 @@ async fn test_503_honors_retry_after_http_date() -> Result<()> {
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
     let before = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let (next_fetch_at, retry_after_at, _) = read_schedule(&conn, feed_id)?;
@@ -168,7 +184,15 @@ async fn test_retry_after_below_min_cadence_floored() -> Result<()> {
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
     let before = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let (next_fetch_at, _, _) = read_schedule(&conn, feed_id)?;
@@ -193,7 +217,15 @@ async fn test_retry_after_above_max_backoff_capped() -> Result<()> {
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
     let before = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let (next_fetch_at, _, _) = read_schedule(&conn, feed_id)?;
@@ -216,7 +248,15 @@ async fn test_429_without_retry_after_uses_backoff() -> Result<()> {
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
     let before = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let (next_fetch_at, retry_after_at, failures) = read_schedule(&conn, feed_id)?;
@@ -261,7 +301,15 @@ async fn test_consecutive_500s_schedule_exponential_backoff() -> Result<()> {
 
     // First attempt: records one transient failure.
     let t1 = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let (next_after_1, _, failures_1) = read_schedule(&conn, feed_id)?;
@@ -284,7 +332,15 @@ async fn test_consecutive_500s_schedule_exponential_backoff() -> Result<()> {
     // Second attempt: records another transient failure. Backoff now
     // uses consecutive_failures = 2, so schedule should be ~120s out.
     let t2 = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let (next_after_2, _, failures_2) = read_schedule(&conn, feed_id)?;
     assert_eq!(failures_2, 2);

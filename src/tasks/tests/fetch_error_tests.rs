@@ -72,7 +72,15 @@ async fn test_invalid_feed_error() -> Result<()> {
     let feed_url = format!("http://{}/feed", addr);
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let entry_count: i64 = conn.query_row(
@@ -110,7 +118,15 @@ async fn test_http_status_error() -> Result<()> {
     let feed_url = format!("http://{}/feed", addr);
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let (error, error_at) = read_stored_error(&conn, feed_id)?;
@@ -150,7 +166,15 @@ async fn test_too_many_redirects_error() -> Result<()> {
     let feed_url = format!("http://{}/feed", addr);
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let (error, error_at) = read_stored_error(&conn, feed_id)?;
@@ -187,7 +211,15 @@ async fn test_successful_fetch_clears_error() -> Result<()> {
     let feed_url = format!("http://{}/feed", addr);
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let (error, _) = read_stored_error(&conn, feed_id)?;
@@ -201,7 +233,15 @@ async fn test_successful_fetch_clears_error() -> Result<()> {
     )?;
 
     let pool2 = make_pool(&tc.database_path())?;
-    refresh_feed(&client, feed_id, pool2, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool2,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let (error, error_at) = read_stored_error(&conn, feed_id)?;
     assert!(
@@ -242,7 +282,15 @@ async fn test_permanent_404_schedules_max_backoff() -> Result<()> {
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
     let before = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
     let after = Utc::now().timestamp();
 
     let conn = tc.database_conn()?;
@@ -283,7 +331,15 @@ async fn test_too_many_redirects_is_permanent() -> Result<()> {
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
     let before = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
     let after = Utc::now().timestamp();
 
     let conn = tc.database_conn()?;
@@ -319,7 +375,15 @@ async fn test_invalid_feed_is_permanent() -> Result<()> {
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
     let before = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
     let after = Utc::now().timestamp();
 
     let conn = tc.database_conn()?;
@@ -349,7 +413,15 @@ async fn test_network_error_transient_with_backoff() -> Result<()> {
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
     let before = Utc::now().timestamp();
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
     let after = Utc::now().timestamp();
 
     let conn = tc.database_conn()?;
