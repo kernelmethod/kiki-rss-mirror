@@ -21,6 +21,17 @@ CREATE TABLE settings (
 INSERT INTO settings (key, value, type)
 VALUES ('feed_update_timeout_seconds', '15', 'integer');
 
+-- Absolute floor on how often any single feed can be polled, in seconds.
+-- Caps the effect of a very low `max-age` or `Retry-After` value so a
+-- misbehaving server cannot trigger hyperpolling.
+INSERT INTO settings (key, value, type)
+VALUES ('min_polling_cadence_seconds', '60', 'integer');
+
+-- Cap on exponential backoff and the wait used for permanent errors,
+-- in seconds. Defaults to 24 hours.
+INSERT INTO settings (key, value, type)
+VALUES ('max_feed_backoff_seconds', '86400', 'integer');
+
 -- Persistent record of when recurring background tasks last ran, so their
 -- schedules survive server restarts. Keyed by an opaque task name.
 CREATE TABLE task_queue (
@@ -69,10 +80,31 @@ CREATE TABLE feeds (
     -- Timestamp of the most recent fetch error.
     last_fetch_error_at     DATETIME,
 
-    -- Minimum interval, in seconds, between fetches of this feed.
+    -- Minimum interval, in seconds, between fetches of this feed. Acts as
+    -- a ceiling on polling interval: even if the server advertises a
+    -- longer max-age, we will refresh at least this often. Also used as
+    -- the fallback interval when the server sends no cache hint.
     -- Defaults to 3 hours (10800 seconds).
-    min_fetch_interval_seconds  INTEGER NOT NULL DEFAULT 10800
+    min_fetch_interval_seconds  INTEGER NOT NULL DEFAULT 10800,
+
+    -- Unix timestamp (seconds) of the earliest moment this feed is
+    -- eligible for the next fetch. NULL means "fetch immediately" and is
+    -- the default for newly created feeds. Updated after every fetch
+    -- attempt (success, 304, or error) using server cache hints,
+    -- Retry-After, or exponential backoff.
+    next_fetch_at           INTEGER,
+
+    -- Number of consecutive transient failures. Reset to 0 on any
+    -- successful fetch (including 304). Drives exponential backoff.
+    consecutive_failures    INTEGER NOT NULL DEFAULT 0,
+
+    -- Unix timestamp (seconds) parsed from the most recent `Retry-After`
+    -- response header, if any. Retained for observability; the scheduled
+    -- retry time is folded into `next_fetch_at`.
+    retry_after_at          INTEGER
 );
+
+CREATE INDEX idx_feeds_next_fetch_at ON feeds(next_fetch_at);
 
 -- A list of the tags that are automatically assigned to entries from a given
 -- feed

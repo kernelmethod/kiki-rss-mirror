@@ -2,7 +2,7 @@ use crate::http::USER_AGENT;
 use crate::metrics::Metrics;
 use crate::scripting::{FeedEntry, ScriptRunner};
 use anyhow::Result;
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use reqwest::Url;
@@ -57,6 +57,112 @@ impl fmt::Display for FetchError {
             FetchError::Other { message } => write!(f, "{}", message),
         }
     }
+}
+
+impl FetchError {
+    /// Classify a fetch failure as transient (worth retrying with backoff) or
+    /// permanent (wait the full backoff cap before the next attempt).
+    ///
+    /// Transient: 408 Request Timeout, 429 Too Many Requests, any 5xx,
+    /// network/timeout errors (`Other`).
+    /// Permanent: other 4xx statuses, malformed feed bodies, redirect loops.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            FetchError::HttpStatus { status, .. } => {
+                matches!(*status, 408 | 429) || (500..=599).contains(status)
+            }
+            FetchError::Other { .. } => true,
+            FetchError::InvalidFeed { .. } | FetchError::TooManyRedirects { .. } => false,
+        }
+    }
+}
+
+/// Parse an HTTP `Retry-After` header value into an absolute Unix timestamp.
+///
+/// RFC 7231 §7.1.3 allows either a non-negative integer delta-seconds or an
+/// HTTP-date. Returns `None` if the value cannot be parsed.
+fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<i64> {
+    let trimmed = value.trim();
+
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(now.timestamp().saturating_add(secs as i64));
+    }
+
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%a, %d %b %Y %H:%M:%S GMT") {
+        return Some(dt.and_utc().timestamp());
+    }
+
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(trimmed) {
+        return Some(dt.timestamp());
+    }
+
+    None
+}
+
+/// Outcome of a fetch attempt, used to compute the next eligibility time.
+#[derive(Debug, Clone, Copy)]
+enum FetchOutcome {
+    /// Fresh 200 OK or a file:// read.
+    Success { server_hint_secs: Option<u64> },
+    /// 304 Not Modified.
+    NotModified { server_hint_secs: Option<u64> },
+    /// Transient error — eligible for exponential backoff.
+    TransientErr {
+        retry_after_ts: Option<i64>,
+        consecutive_failures: u32,
+    },
+    /// Permanent error — wait the full backoff cap.
+    PermanentErr,
+}
+
+/// Compute the Unix timestamp at which a feed is next eligible to be fetched.
+///
+/// Rules (all results clamped to `[now + min_cadence, now + max_backoff]`):
+/// - `Success` / `NotModified`: use `min(server_hint, min_fetch_interval)`
+///   when a hint is present; otherwise use `min_fetch_interval`. The per-feed
+///   `min_fetch_interval` is a ceiling, so we never wait longer than it.
+/// - `TransientErr` with `Retry-After`: honor the server's deadline.
+/// - `TransientErr` without `Retry-After`: exponential backoff
+///   `min_cadence * 2^(consecutive_failures - 1)`.
+/// - `PermanentErr`: wait the full `max_backoff`.
+fn compute_next_fetch_at(
+    outcome: FetchOutcome,
+    now_ts: i64,
+    min_cadence: u64,
+    max_backoff: u64,
+    min_fetch_interval: u64,
+) -> i64 {
+    let min_cadence = min_cadence.max(1);
+    let max_backoff = max_backoff.max(min_cadence);
+
+    let raw_next_ts: i64 = match outcome {
+        FetchOutcome::Success { server_hint_secs }
+        | FetchOutcome::NotModified { server_hint_secs } => {
+            let interval = match server_hint_secs {
+                Some(hint) => hint.min(min_fetch_interval),
+                None => min_fetch_interval,
+            };
+            now_ts.saturating_add(interval as i64)
+        }
+        FetchOutcome::TransientErr {
+            retry_after_ts: Some(ts),
+            ..
+        } => ts,
+        FetchOutcome::TransientErr {
+            retry_after_ts: None,
+            consecutive_failures,
+        } => {
+            let shift = consecutive_failures.saturating_sub(1).min(63);
+            let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+            let backoff = min_cadence.saturating_mul(multiplier);
+            now_ts.saturating_add(backoff as i64)
+        }
+        FetchOutcome::PermanentErr => now_ts.saturating_add(max_backoff as i64),
+    };
+
+    let floor = now_ts.saturating_add(min_cadence as i64);
+    let ceiling = now_ts.saturating_add(max_backoff as i64);
+    raw_next_ts.max(floor).min(ceiling)
 }
 
 /// Parsed `Cache-Control` directives relevant to the fetcher.
@@ -310,6 +416,7 @@ async fn run_worker(
                                     &FetchError::Other {
                                         message: format!("{}", e),
                                     },
+                                    &w.metrics,
                                 );
                             }
                             "error"
@@ -554,13 +661,25 @@ fn build_runner(
     }
 }
 
-/// Record a fetch error for a feed in the database.
+/// Record a fetch error for a feed in the database and reschedule the next
+/// fetch attempt.
 ///
-/// The error is serialized to JSON for structured storage.
-fn set_feed_error(
+/// `retry_after_ts` is the absolute Unix timestamp parsed from the
+/// server-provided `Retry-After` header (if any). It takes precedence over
+/// computed exponential backoff for transient errors.
+///
+/// The `consecutive_failures` column is incremented atomically; the rescheduled
+/// `next_fetch_at` is computed from that new streak length.
+#[allow(clippy::too_many_arguments)]
+fn set_feed_error_with_schedule(
     conn: &PooledConnection<SqliteConnectionManager>,
     feed_id: i64,
     fetch_error: &FetchError,
+    retry_after_ts: Option<i64>,
+    min_cadence: u64,
+    max_backoff: u64,
+    min_fetch_interval: u64,
+    metrics: &Metrics,
 ) {
     let json = match serde_json::to_string(fetch_error) {
         Ok(j) => j,
@@ -572,25 +691,134 @@ fn set_feed_error(
             return;
         }
     };
+
+    let now_ts = Utc::now().timestamp();
+    let is_transient = fetch_error.is_transient();
+
+    // Read the current failure count so we can compute the new streak length
+    // without a race window. Default to 0 if the row is somehow missing.
+    let current_failures: u32 = conn
+        .query_row(
+            "SELECT consecutive_failures FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v.max(0) as u32)
+        .unwrap_or(0);
+    let new_failures = current_failures.saturating_add(1);
+
+    let (outcome, retry_kind): (FetchOutcome, &'static str) = if is_transient {
+        let retry_kind = if retry_after_ts.is_some() {
+            "retry_after"
+        } else {
+            "backoff"
+        };
+        (
+            FetchOutcome::TransientErr {
+                retry_after_ts,
+                consecutive_failures: new_failures,
+            },
+            retry_kind,
+        )
+    } else {
+        (FetchOutcome::PermanentErr, "permanent")
+    };
+
+    let next_fetch_at = compute_next_fetch_at(
+        outcome,
+        now_ts,
+        min_cadence,
+        max_backoff,
+        min_fetch_interval,
+    );
+
     if let Err(e) = conn.execute(
-        "UPDATE feeds SET last_fetch_error = ?1, last_fetch_error_at = ?2 WHERE id = ?3",
-        (&json, Utc::now().timestamp(), feed_id),
+        "UPDATE feeds SET
+            last_fetch_error = ?1,
+            last_fetch_error_at = ?2,
+            retry_after_at = ?3,
+            consecutive_failures = consecutive_failures + 1,
+            next_fetch_at = ?4
+         WHERE id = ?5",
+        (&json, now_ts, retry_after_ts, next_fetch_at, feed_id),
     ) {
         error!(
             "Failed to persist fetch error for feed {}: {:?}",
             feed_id, e
         );
+        return;
     }
+
+    metrics.record_feed_retry_scheduled(retry_kind, (next_fetch_at - now_ts) as f64);
+    metrics.record_feed_consecutive_failures(new_failures);
 }
 
-/// Clear any previously recorded fetch error for a feed.
+/// Back-compat wrapper around [`set_feed_error_with_schedule`] for callsites
+/// that don't have a `Retry-After` timestamp and need to read the tuning
+/// settings themselves. Looks them up from the database.
+fn set_feed_error(
+    conn: &PooledConnection<SqliteConnectionManager>,
+    feed_id: i64,
+    fetch_error: &FetchError,
+    metrics: &Metrics,
+) {
+    let (min_cadence, max_backoff) = match (
+        crate::db::settings::get_min_polling_cadence_seconds(conn),
+        crate::db::settings::get_max_feed_backoff_seconds(conn),
+    ) {
+        (Ok(c), Ok(b)) => (c, b),
+        _ => {
+            error!(
+                "Failed to read scheduler settings while recording error for feed {}",
+                feed_id
+            );
+            return;
+        }
+    };
+    let min_fetch_interval = conn
+        .query_row(
+            "SELECT min_fetch_interval_seconds FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v.max(0) as u64)
+        .unwrap_or(10800);
+
+    set_feed_error_with_schedule(
+        conn,
+        feed_id,
+        fetch_error,
+        None,
+        min_cadence,
+        max_backoff,
+        min_fetch_interval,
+        metrics,
+    );
+}
+
+/// Clear any previously recorded fetch error for a feed and reset the failure
+/// streak counter.
 fn clear_feed_error(conn: &PooledConnection<SqliteConnectionManager>, feed_id: i64) {
     if let Err(e) = conn.execute(
-        "UPDATE feeds SET last_fetch_error = NULL, last_fetch_error_at = NULL WHERE id = ?1",
+        "UPDATE feeds SET
+            last_fetch_error = NULL,
+            last_fetch_error_at = NULL,
+            retry_after_at = NULL,
+            consecutive_failures = 0
+         WHERE id = ?1",
         (feed_id,),
     ) {
         error!("Failed to clear fetch error for feed {}: {:?}", feed_id, e);
     }
+}
+
+/// Settings controlling the fetch scheduler, read together so `refresh_feed`
+/// and its helpers don't hit the database separately.
+#[derive(Debug, Clone, Copy)]
+struct SchedulerConfig {
+    min_cadence: u64,
+    max_backoff: u64,
+    min_fetch_interval: u64,
 }
 
 /// Refresh the feed corresponding to the provided `feed_id`.
@@ -603,75 +831,58 @@ pub(crate) async fn refresh_feed(
 ) -> Result<()> {
     let fetch_start = Instant::now();
 
-    // Get the feed URL and headers from the database
+    // Load the feed URL, conditional-request headers, scheduling state, and
+    // per-feed override all at once.
     let conn = pool.get()?;
     let (
         feed_url,
         header_etag,
         header_last_modified,
-        header_expires,
-        last_checked,
+        next_fetch_at,
         min_fetch_interval,
     ): (
         String,
         Option<String>,
         Option<String>,
         Option<i64>,
-        Option<i64>,
         i64,
     ) = conn.query_row(
-        "SELECT url, header_etag, header_last_modified, header_expires, last_checked, min_fetch_interval_seconds FROM feeds WHERE id = ?1",
+        "SELECT url, header_etag, header_last_modified, next_fetch_at, min_fetch_interval_seconds FROM feeds WHERE id = ?1",
         [feed_id],
         |row| {
             let url: String = row.get(0)?;
             let etag: Option<String> = row.get(1)?;
             let last_modified: Option<String> = row.get(2)?;
-            let expires: Option<i64> = row.get(3)?;
-            let last_checked: Option<i64> = row.get(4)?;
-            let min_fetch_interval: i64 = row.get(5)?;
-            Ok((url, etag, last_modified, expires, last_checked, min_fetch_interval))
+            let next_fetch_at: Option<i64> = row.get(3)?;
+            let min_fetch_interval: i64 = row.get(4)?;
+            Ok((url, etag, last_modified, next_fetch_at, min_fetch_interval))
         },
     )?;
 
-    // If the server provided an Expires header, respect it: skip fetching
-    // until the declared expiry time has passed.
-    if let Some(expires_ts) = header_expires {
-        if let Some(expires_dt) = Utc.timestamp_opt(expires_ts, 0).single() {
-            let now = Utc::now();
-            if now < expires_dt {
-                debug!(
-                    "Feed {} has not yet expired (expires in {} seconds), skipping update",
-                    feed_id,
-                    expires_dt.signed_duration_since(now).num_seconds()
-                );
-                metrics.record_feed_cache_hit("expires");
-                metrics.record_feed_fetch("cache_hit", fetch_start.elapsed().as_secs_f64());
-                return Ok(());
-            }
-        }
-    }
+    let cfg = SchedulerConfig {
+        min_cadence: crate::db::settings::get_min_polling_cadence_seconds(&conn)?,
+        max_backoff: crate::db::settings::get_max_feed_backoff_seconds(&conn)?,
+        min_fetch_interval: min_fetch_interval.max(0) as u64,
+    };
 
-    // Check if the feed was last updated recently
-    if let Some(last_checked_ts) = last_checked {
-        if let Some(last_checked_ts) = Utc.timestamp_opt(last_checked_ts, 0).single() {
-            let now = Utc::now();
-            let duration_since = now.signed_duration_since(last_checked_ts);
-            if duration_since.num_seconds() < min_fetch_interval {
-                debug!(
-                    "Feed {} was last checked {} seconds ago, skipping update",
-                    feed_id,
-                    duration_since.num_seconds()
-                );
-                metrics.record_feed_cache_hit("min_interval");
-                metrics.record_feed_fetch("cache_hit", fetch_start.elapsed().as_secs_f64());
-                return Ok(());
-            }
+    // Eligibility gate: a scheduled `next_fetch_at` in the future means skip.
+    if let Some(next_ts) = next_fetch_at {
+        let now_ts = Utc::now().timestamp();
+        if now_ts < next_ts {
+            debug!(
+                "Feed {} not yet eligible; next fetch in {} seconds",
+                feed_id,
+                next_ts - now_ts
+            );
+            metrics.record_feed_cache_hit("next_fetch_at");
+            metrics.record_feed_fetch("cache_hit", fetch_start.elapsed().as_secs_f64());
+            return Ok(());
         }
     }
 
     // Handle file:// URLs differently
     let feed_content = if feed_url.starts_with("file://") {
-        retrieve_file_feed(&feed_url, feed_id, pool.clone())
+        retrieve_file_feed(&feed_url, feed_id, pool.clone(), cfg)
     } else {
         retrieve_feed(
             client,
@@ -681,6 +892,7 @@ pub(crate) async fn refresh_feed(
             header_last_modified.as_deref(),
             pool.clone(),
             fetch_start,
+            cfg,
             metrics,
         )
         .await
@@ -720,12 +932,46 @@ pub(crate) async fn refresh_feed(
             url: feed_url.clone(),
         };
         warn!("Feed {}: {}", feed_id, fetch_err);
-        set_feed_error(&pool.get()?, feed_id, &fetch_err);
+        set_feed_error_with_schedule(
+            &pool.get()?,
+            feed_id,
+            &fetch_err,
+            None,
+            cfg.min_cadence,
+            cfg.max_backoff,
+            cfg.min_fetch_interval,
+            metrics,
+        );
         metrics.record_feed_fetch("invalid_feed", fetch_start.elapsed().as_secs_f64());
         return Ok(());
     }
 
     Ok(())
+}
+
+/// Extract a freshness hint (in seconds from now) from a response's
+/// `Cache-Control: max-age` or `Expires` header. Returns the shorter of the
+/// two when both are present; `max-age` takes precedence per RFC 7234.
+fn extract_server_hint_secs(resp_headers: &reqwest::header::HeaderMap, now_ts: i64) -> Option<u64> {
+    let cc = resp_headers
+        .get("cache-control")
+        .and_then(|h| h.to_str().ok())
+        .map(CacheControl::parse);
+
+    if let Some(ref cc) = cc {
+        if cc.no_store || cc.no_cache {
+            return None;
+        }
+        if let Some(max_age) = cc.max_age {
+            return Some(max_age);
+        }
+    }
+
+    resp_headers
+        .get("expires")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%a, %d %b %Y %H:%M:%S GMT").ok())
+        .map(|dt| (dt.and_utc().timestamp() - now_ts).max(0) as u64)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -737,6 +983,7 @@ async fn retrieve_feed(
     last_modified: Option<&str>,
     pool: Pool<SqliteConnectionManager>,
     fetch_start: Instant,
+    cfg: SchedulerConfig,
     metrics: &Metrics,
 ) -> Result<Option<Vec<u8>>> {
     let conn = pool.get()?;
@@ -765,9 +1012,23 @@ async fn retrieve_feed(
                 Ok(r) => r,
                 Err(e) => {
                     let outcome = if e.is_timeout() { "timeout" } else { "other" };
+                    let fetch_err = FetchError::Other {
+                        message: format!("{}", e),
+                    };
+                    warn!("Feed {}: {}", feed_id, fetch_err);
+                    set_feed_error_with_schedule(
+                        &conn,
+                        feed_id,
+                        &fetch_err,
+                        None,
+                        cfg.min_cadence,
+                        cfg.max_backoff,
+                        cfg.min_fetch_interval,
+                        metrics,
+                    );
                     metrics.record_feed_fetch(outcome, fetch_start.elapsed().as_secs_f64());
                     metrics.record_feed_redirects(redirects);
-                    return Err(e.into());
+                    return Ok(None);
                 }
             };
 
@@ -802,10 +1063,16 @@ async fn retrieve_feed(
             url: feed_url.to_string(),
         };
         warn!("Feed {}: {}", feed_id, fetch_err);
-        {
-            let conn = pool.get()?;
-            set_feed_error(&conn, feed_id, &fetch_err);
-        }
+        set_feed_error_with_schedule(
+            &conn,
+            feed_id,
+            &fetch_err,
+            None,
+            cfg.min_cadence,
+            cfg.max_backoff,
+            cfg.min_fetch_interval,
+            metrics,
+        );
         metrics.record_feed_fetch("too_many_redirects", fetch_start.elapsed().as_secs_f64());
         metrics.record_feed_redirects(redirects);
         return Ok(None);
@@ -817,24 +1084,60 @@ async fn retrieve_feed(
     match resp.status() {
         reqwest::StatusCode::NOT_MODIFIED => {
             info!("Feed {} was not modified since last check", feed_id);
-            // Update last_checked timestamp in database
+            let now_ts = Utc::now().timestamp();
+            let server_hint_secs = extract_server_hint_secs(resp.headers(), now_ts);
+            let next_fetch_at = compute_next_fetch_at(
+                FetchOutcome::NotModified { server_hint_secs },
+                now_ts,
+                cfg.min_cadence,
+                cfg.max_backoff,
+                cfg.min_fetch_interval,
+            );
             conn.execute(
-                "UPDATE feeds SET last_checked = ?1 WHERE id = ?2",
-                (Utc::now().timestamp(), feed_id),
+                "UPDATE feeds SET
+                    last_checked = ?1,
+                    next_fetch_at = ?2,
+                    consecutive_failures = 0,
+                    retry_after_at = NULL
+                 WHERE id = ?3",
+                (now_ts, next_fetch_at, feed_id),
             )?;
             metrics.record_feed_cache_hit("not_modified");
+            metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
             metrics.record_feed_fetch("not_modified", fetch_start.elapsed().as_secs_f64());
             return Ok(None);
         }
         reqwest::StatusCode::OK => { /* Do nothing */ }
         // For other status codes, log an issue and stop processing
         status => {
+            let status_u16 = status.as_u16();
             let fetch_err = FetchError::HttpStatus {
                 url: feed_url.to_string(),
-                status: status.as_u16(),
+                status: status_u16,
             };
             warn!("Feed {}: {}", feed_id, fetch_err);
-            set_feed_error(&conn, feed_id, &fetch_err);
+
+            // Parse Retry-After for 429 Too Many Requests and 503 Service
+            // Unavailable. Other statuses don't carry retry hints.
+            let retry_after_ts = if status_u16 == 429 || status_u16 == 503 {
+                resp.headers()
+                    .get("retry-after")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| parse_retry_after(s, Utc::now()))
+            } else {
+                None
+            };
+
+            set_feed_error_with_schedule(
+                &conn,
+                feed_id,
+                &fetch_err,
+                retry_after_ts,
+                cfg.min_cadence,
+                cfg.max_backoff,
+                cfg.min_fetch_interval,
+                metrics,
+            );
             metrics.record_feed_fetch("http_error", fetch_start.elapsed().as_secs_f64());
             return Ok(None);
         }
@@ -871,6 +1174,12 @@ async fn retrieve_feed(
                 .map(|dt| dt.and_utc().timestamp())
         });
 
+    let now_ts = Utc::now().timestamp();
+
+    // Derive the freshness hint before Cache-Control directives can mutate
+    // `expires` — the hint reflects the server's original instruction.
+    let server_hint_secs = extract_server_hint_secs(resp.headers(), now_ts);
+
     // Parse Cache-Control and apply precedence rules (RFC 7234):
     // - no-store: clear all cache headers
     // - no-cache: allow conditional requests but never skip fetching
@@ -888,23 +1197,32 @@ async fn retrieve_feed(
         } else if cc.no_cache {
             expires = None;
         } else if let Some(max_age) = cc.max_age {
-            expires = Some(Utc::now().timestamp() + max_age as i64);
+            expires = Some(now_ts + max_age as i64);
         }
     }
 
-    {
-        let params = (
-            etag,
-            last_modified,
-            expires,
-            Utc::now().timestamp(),
-            feed_id,
-        );
-        conn.execute(
-            "UPDATE feeds SET header_etag = ?, header_last_modified = ?, header_expires = ?, last_checked = ? WHERE id = ?",
-            params,
-        )?;
-    }
+    let next_fetch_at = compute_next_fetch_at(
+        FetchOutcome::Success { server_hint_secs },
+        now_ts,
+        cfg.min_cadence,
+        cfg.max_backoff,
+        cfg.min_fetch_interval,
+    );
+
+    conn.execute(
+        "UPDATE feeds SET
+            header_etag = ?,
+            header_last_modified = ?,
+            header_expires = ?,
+            last_checked = ?,
+            next_fetch_at = ?,
+            consecutive_failures = 0,
+            retry_after_at = NULL
+         WHERE id = ?",
+        (etag, last_modified, expires, now_ts, next_fetch_at, feed_id),
+    )?;
+
+    metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
 
     let content = resp.bytes().await?;
     metrics.record_feed_response_bytes(content.len() as u64);
@@ -915,6 +1233,7 @@ fn retrieve_file_feed(
     feed_url: &str,
     feed_id: i64,
     pool: Pool<SqliteConnectionManager>,
+    cfg: SchedulerConfig,
 ) -> Result<Option<Vec<u8>>> {
     let conn = pool.get()?;
 
@@ -925,10 +1244,26 @@ fn retrieve_file_feed(
     let content = std::fs::read(file_path)
         .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file_path, e))?;
 
-    // Update the last_checked timestamp in the database
+    // File-backed feeds have no cache headers; schedule using the per-feed
+    // interval (clamped to the global floor and ceiling).
+    let now_ts = Utc::now().timestamp();
+    let next_fetch_at = compute_next_fetch_at(
+        FetchOutcome::Success {
+            server_hint_secs: None,
+        },
+        now_ts,
+        cfg.min_cadence,
+        cfg.max_backoff,
+        cfg.min_fetch_interval,
+    );
     conn.execute(
-        "UPDATE feeds SET last_checked = ?1 WHERE id = ?2",
-        (Utc::now().timestamp(), feed_id),
+        "UPDATE feeds SET
+            last_checked = ?1,
+            next_fetch_at = ?2,
+            consecutive_failures = 0,
+            retry_after_at = NULL
+         WHERE id = ?3",
+        (now_ts, next_fetch_at, feed_id),
     )?;
 
     Ok(Some(content))

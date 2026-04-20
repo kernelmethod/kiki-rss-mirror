@@ -262,7 +262,15 @@ impl TestConfig {
 
             if etag_match || lm_match {
                 s.not_modified_count += 1;
-                return StatusCode::NOT_MODIFIED.into_response();
+                let cache_control = s.cache_control.clone();
+                drop(s);
+                let mut response = StatusCode::NOT_MODIFIED.into_response();
+                if let Some(ref cc) = cache_control {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::CACHE_CONTROL, cc.parse().unwrap());
+                }
+                return response;
             }
 
             s.full_response_count += 1;

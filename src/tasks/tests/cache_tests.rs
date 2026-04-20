@@ -32,11 +32,12 @@ async fn setup_feed_for_cache_test(
     Ok((feed_id, client, pool))
 }
 
-/// Reset `last_checked` to 4 hours ago so the 3-hour throttle does not
-/// block the next call to `refresh_feed`.
+/// Reset the scheduler so the next call to `refresh_feed` is immediately
+/// eligible: clears `next_fetch_at` and backdates `last_checked` past any
+/// interval that might still matter.
 fn reset_last_checked(conn: &rusqlite::Connection, feed_id: i64) {
     conn.execute(
-        "UPDATE feeds SET last_checked = ?1 WHERE id = ?2",
+        "UPDATE feeds SET last_checked = ?1, next_fetch_at = NULL WHERE id = ?2",
         rusqlite::params![Utc::now().timestamp() - 4 * 3600, feed_id],
     )
     .unwrap();
@@ -144,9 +145,9 @@ async fn test_expires_skips_fetch() -> Result<()> {
     )?;
     assert!(stored_expires.is_some(), "expires should be stored in DB");
 
-    reset_last_checked(&conn, feed_id);
-
-    // Second call: should skip entirely due to unexpired Expires header
+    // Second call: should skip entirely because `next_fetch_at` was set
+    // from the Expires hint. Intentionally no `reset_last_checked` — the
+    // scheduler gate must persist a server's freshness guarantee.
     refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
 
     let s = state.lock().unwrap();
@@ -316,9 +317,8 @@ async fn test_max_age_sets_expires() -> Result<()> {
         expires - before
     );
 
-    reset_last_checked(&conn, feed_id);
-
-    // Second fetch: should be skipped because max-age hasn't expired
+    // Second fetch: should be skipped because max-age sets `next_fetch_at`
+    // into the future. Intentionally no `reset_last_checked`.
     refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
 
     let s = state.lock().unwrap();
@@ -551,5 +551,184 @@ async fn test_deflate_compressed_response() -> Result<()> {
     let s = state.lock().unwrap();
     assert_eq!(s.full_response_count, 1);
 
+    Ok(())
+}
+
+/// A `next_fetch_at` value in the future skips the HTTP request entirely
+/// and records the `next_fetch_at` cache-hit reason.
+#[tokio::test]
+async fn test_next_fetch_at_gate_skips_fetch() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState::default()));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    // Seed next_fetch_at 10 minutes into the future.
+    let conn = tc.database_conn()?;
+    conn.execute(
+        "UPDATE feeds SET next_fetch_at = ?1 WHERE id = ?2",
+        rusqlite::params![Utc::now().timestamp() + 600, feed_id],
+    )?;
+
+    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+
+    let s = state.lock().unwrap();
+    assert_eq!(
+        s.request_count, 0,
+        "fetch should be skipped when next_fetch_at is in the future"
+    );
+    Ok(())
+}
+
+/// `max-age=5` is below the 60s floor and must not schedule a
+/// next-fetch sooner than `min_polling_cadence_seconds`.
+#[tokio::test]
+async fn test_max_age_below_min_cadence_is_floored() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        cache_control: Some("max-age=5".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    let before = Utc::now().timestamp();
+    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    let after = Utc::now().timestamp();
+
+    let conn = tc.database_conn()?;
+    let next_fetch_at: Option<i64> = conn.query_row(
+        "SELECT next_fetch_at FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    let nf = next_fetch_at.expect("next_fetch_at should be set");
+    assert!(
+        nf >= before + 60 && nf <= after + 60,
+        "max-age=5 should be floored to now+60s, got offset {}",
+        nf - before
+    );
+    Ok(())
+}
+
+/// A generous `max-age` must be capped by the per-feed
+/// `min_fetch_interval_seconds` — we never wait longer than the user asked.
+#[tokio::test]
+async fn test_max_age_above_min_fetch_interval_is_capped() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        cache_control: Some("max-age=86400".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    // Lower the per-feed interval to 1 hour so we can assert the cap.
+    {
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "UPDATE feeds SET min_fetch_interval_seconds = 3600 WHERE id = ?1",
+            [feed_id],
+        )?;
+    }
+
+    let before = Utc::now().timestamp();
+    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    let after = Utc::now().timestamp();
+
+    let conn = tc.database_conn()?;
+    let next_fetch_at: Option<i64> = conn.query_row(
+        "SELECT next_fetch_at FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    let nf = next_fetch_at.expect("next_fetch_at should be set");
+    assert!(
+        nf >= before + 3600 && nf <= after + 3600,
+        "max-age should be capped at per-feed interval (3600s), got offset {}",
+        nf - before
+    );
+    Ok(())
+}
+
+/// A 200 OK after a failure streak resets `consecutive_failures` to 0.
+#[tokio::test]
+async fn test_success_resets_consecutive_failures() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState::default()));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    // Pre-populate a failure streak.
+    {
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "UPDATE feeds SET consecutive_failures = 3 WHERE id = ?1",
+            [feed_id],
+        )?;
+    }
+
+    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+
+    let conn = tc.database_conn()?;
+    let failures: i64 = conn.query_row(
+        "SELECT consecutive_failures FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(failures, 0);
+    Ok(())
+}
+
+/// A 304 Not Modified also resets the failure streak and reschedules
+/// from the max-age hint on the 304 response.
+#[tokio::test]
+async fn test_304_resets_consecutive_failures_and_reschedules() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"304-reset\"".into()),
+        cache_control: Some("max-age=600".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    // First fetch stores ETag and succeeds.
+    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+
+    // Inject a failure streak plus clear the gate so the next refresh runs.
+    {
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "UPDATE feeds SET consecutive_failures = 5, next_fetch_at = NULL WHERE id = ?1",
+            [feed_id],
+        )?;
+    }
+
+    let before = Utc::now().timestamp();
+    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    let after = Utc::now().timestamp();
+
+    let conn = tc.database_conn()?;
+    let (failures, next_fetch_at): (i64, Option<i64>) = conn.query_row(
+        "SELECT consecutive_failures, next_fetch_at FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(failures, 0, "304 should reset consecutive_failures");
+    let nf = next_fetch_at.expect("next_fetch_at should be set");
+    assert!(
+        nf >= before + 600 && nf <= after + 600,
+        "304 with max-age=600 should schedule ~600s out, got offset {}",
+        nf - before
+    );
+
+    let s = state.lock().unwrap();
+    assert_eq!(s.not_modified_count, 1);
     Ok(())
 }
