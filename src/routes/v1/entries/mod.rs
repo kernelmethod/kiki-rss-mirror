@@ -1,6 +1,7 @@
 pub mod cleanup;
 pub mod delete_entry;
 pub mod entry_tags;
+pub mod format_data;
 pub mod get_entry;
 pub mod list_entries;
 pub mod search_entries;
@@ -29,7 +30,7 @@ pub fn create_router() -> Router<AppState> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used)]
 mod test {
     use super::*;
     use crate::test::{TestBuilder, TestConfig};
@@ -243,6 +244,105 @@ mod test {
             .await?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(&response.text().await?, "Entry not found");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_entry_includes_rss_data() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+        tc.add_feed_from_url("rich rss", tc.rich_rss_feed_url())
+            .await?;
+
+        // Locate the "item with everything" by guid.
+        let conn = tc.database_conn()?;
+        let entry_id: i64 = conn.query_row(
+            "SELECT id FROM entries WHERE guid = ?1",
+            ["http://example.com/items/1"],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+
+        let resp = client
+            .get(format!("http://localhost/v1/entries/id/{}", entry_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+
+        assert!(body["atom"].is_null(), "atom should be null for rss entry");
+        let rss = body["rss"].as_object().expect("rss object present");
+        assert_eq!(rss["enclosure_url"], "http://example.com/audio.mp3");
+        assert_eq!(rss["enclosure_length"], 12345);
+        assert_eq!(rss["enclosure_mime_type"], "audio/mpeg");
+        assert_eq!(rss["author"], "alice@example.com (Alice)");
+        assert_eq!(rss["comments"], "http://example.com/items/1/comments");
+
+        let cats = rss["categories"].as_array().unwrap();
+        assert_eq!(cats.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_entry_includes_atom_data() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+        tc.add_feed_from_url("rich atom", tc.rich_atom_feed_url())
+            .await?;
+
+        let conn = tc.database_conn()?;
+        let entry_id: i64 = conn.query_row(
+            "SELECT id FROM entries WHERE guid = ?1",
+            ["urn:uuid:1225c695-cfb8-4ebb-aaaa-80da344efa6a"],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+
+        let resp = client
+            .get(format!("http://localhost/v1/entries/id/{}", entry_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+
+        assert!(body["rss"].is_null(), "rss should be null for atom entry");
+        let atom = body["atom"].as_object().expect("atom object present");
+        assert_eq!(atom["rights"], "(c) 2026 Entry Author");
+        assert_eq!(atom["authors"].as_array().unwrap().len(), 2);
+        assert_eq!(atom["contributors"].as_array().unwrap().len(), 1);
+        assert_eq!(atom["categories"].as_array().unwrap().len(), 1);
+        assert_eq!(atom["categories"][0]["term"], "et1");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_entries_does_not_include_format_data() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+        tc.add_feed_from_url("rich rss", tc.rich_rss_feed_url())
+            .await?;
+
+        let resp = client.get("http://localhost/v1/entries").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+
+        let entries = body["entries"].as_array().expect("entries array");
+        assert!(!entries.is_empty());
+        for entry in entries {
+            assert!(
+                entry.get("rss").is_none(),
+                "list endpoint leaked rss sub-object: {:?}",
+                entry
+            );
+            assert!(
+                entry.get("atom").is_none(),
+                "list endpoint leaked atom sub-object: {:?}",
+                entry
+            );
+        }
 
         Ok(())
     }

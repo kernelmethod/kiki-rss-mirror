@@ -698,9 +698,68 @@ fn retrieve_file_feed(
     Ok(Some(content))
 }
 
-/// Extract a [`FeedEntry`] from an Atom syndication entry.
-fn atom_entry_to_feed_entry(feed_id: i64, entry: atom_syndication::Entry) -> FeedEntry {
-    FeedEntry {
+/// Atom-specific feed-level data captured from a parsed feed.
+#[derive(Default)]
+struct AtomFeedIngestData {
+    atom_uri: Option<String>,
+    atom_language_tag: Option<String>,
+    rights: Option<String>,
+    generator: Option<atom_syndication::Generator>,
+    logo: Option<String>,
+    icon: Option<String>,
+    authors: Vec<String>,
+    contributors: Vec<String>,
+    categories: Vec<atom_syndication::Category>,
+}
+
+/// Atom-specific per-entry data captured from a parsed entry.
+#[derive(Default)]
+struct AtomEntryIngestData {
+    rights: Option<String>,
+    authors: Vec<String>,
+    contributors: Vec<String>,
+    categories: Vec<atom_syndication::Category>,
+}
+
+/// RSS-specific per-entry data captured from a parsed item.
+#[derive(Default)]
+struct RssEntryIngestData {
+    description: Option<String>,
+    comments: Option<String>,
+    author: Option<String>,
+    enclosure_url: Option<String>,
+    enclosure_length: Option<i64>,
+    enclosure_mime_type: Option<String>,
+    categories: Vec<rss::Category>,
+}
+
+fn extract_atom_feed_data(feed: &atom_syndication::Feed) -> AtomFeedIngestData {
+    AtomFeedIngestData {
+        atom_uri: feed.base.clone(),
+        atom_language_tag: feed.lang.clone(),
+        rights: feed.rights.as_ref().map(|r| r.value.clone()),
+        generator: feed.generator.clone(),
+        logo: feed.logo.clone(),
+        icon: feed.icon.clone(),
+        authors: feed.authors.iter().map(|p| p.name.clone()).collect(),
+        contributors: feed.contributors.iter().map(|p| p.name.clone()).collect(),
+        categories: feed.categories.clone(),
+    }
+}
+
+/// Extract both a [`FeedEntry`] and the Atom-specific sub-object from an
+/// Atom entry.
+fn atom_entry_to_parts(
+    feed_id: i64,
+    entry: atom_syndication::Entry,
+) -> (FeedEntry, AtomEntryIngestData) {
+    let ingest = AtomEntryIngestData {
+        rights: entry.rights.as_ref().map(|r| r.value.clone()),
+        authors: entry.authors.iter().map(|p| p.name.clone()).collect(),
+        contributors: entry.contributors.iter().map(|p| p.name.clone()).collect(),
+        categories: entry.categories.clone(),
+    };
+    let feed_entry = FeedEntry {
         feed_id,
         syndication_format: "atom".to_string(),
         guid: entry.id,
@@ -709,17 +768,23 @@ fn atom_entry_to_feed_entry(feed_id: i64, entry: atom_syndication::Entry) -> Fee
         url: entry.links.into_iter().next().map(|l| l.href),
         content: entry.content.and_then(|c| c.value),
         tags: vec![],
-    }
+    };
+    (feed_entry, ingest)
 }
 
-/// Extract a [`FeedEntry`] from an RSS item.
-fn rss_item_to_feed_entry(feed_id: i64, item: rss::Item) -> FeedEntry {
+/// Extract both a [`FeedEntry`] and the RSS-specific sub-object from an
+/// RSS item.
+fn rss_item_to_parts(feed_id: i64, item: rss::Item) -> (FeedEntry, RssEntryIngestData) {
     let rss::Item {
         pub_date,
         guid,
         title,
         link,
         description,
+        author,
+        comments,
+        enclosure,
+        categories,
         ..
     } = item;
 
@@ -730,7 +795,6 @@ fn rss_item_to_feed_entry(feed_id: i64, item: rss::Item) -> FeedEntry {
         .unwrap_or_else(|| Utc::now().timestamp());
 
     let guid = guid.map(|g| g.value).unwrap_or_else(|| {
-        // Generate a GUID if none exists
         format!(
             "rss-{}-{}",
             timestamp,
@@ -738,7 +802,22 @@ fn rss_item_to_feed_entry(feed_id: i64, item: rss::Item) -> FeedEntry {
         )
     });
 
-    FeedEntry {
+    let (enclosure_url, enclosure_length, enclosure_mime_type) = match enclosure {
+        Some(e) => (Some(e.url), e.length.parse::<i64>().ok(), Some(e.mime_type)),
+        None => (None, None, None),
+    };
+
+    let ingest = RssEntryIngestData {
+        description: description.clone(),
+        comments,
+        author,
+        enclosure_url,
+        enclosure_length,
+        enclosure_mime_type,
+        categories,
+    };
+
+    let feed_entry = FeedEntry {
         feed_id,
         syndication_format: "rss".to_string(),
         guid,
@@ -747,13 +826,212 @@ fn rss_item_to_feed_entry(feed_id: i64, item: rss::Item) -> FeedEntry {
         url: link,
         content: description,
         tags: vec![],
+    };
+    (feed_entry, ingest)
+}
+
+/// Upsert the single `atom_feed_data` row for `feed_id` and replace all
+/// atom_feed_* child rows (authors, contributors, rights, generator, logo,
+/// icon, categories). Children key directly on `feeds.id`, so the extra
+/// `atom_feed_data.id` is not needed anywhere outside the row itself.
+fn upsert_atom_feed_data(
+    tx: &rusqlite::Transaction,
+    feed_id: i64,
+    data: &AtomFeedIngestData,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO atom_feed_data (feed_id, atom_uri, atom_language_tag)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(feed_id) DO UPDATE SET
+             atom_uri = excluded.atom_uri,
+             atom_language_tag = excluded.atom_language_tag",
+        rusqlite::params![feed_id, data.atom_uri, data.atom_language_tag],
+    )?;
+
+    // Replace per-feed child rows. Rights/generator/logo/icon have a
+    // feed_id PRIMARY KEY — one-per-feed semantics — so we delete-and-
+    // reinsert to keep the logic uniform.
+    tx.execute("DELETE FROM atom_feed_rights WHERE feed_id = ?1", [feed_id])?;
+    if let Some(ref rights) = data.rights {
+        tx.execute(
+            "INSERT INTO atom_feed_rights (feed_id, rights) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, rights],
+        )?;
     }
+
+    tx.execute(
+        "DELETE FROM atom_feed_generators WHERE feed_id = ?1",
+        [feed_id],
+    )?;
+    if let Some(ref gen_) = data.generator {
+        tx.execute(
+            "INSERT INTO atom_feed_generators (feed_id, value, uri, version)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![feed_id, gen_.value, gen_.uri, gen_.version],
+        )?;
+    }
+
+    tx.execute("DELETE FROM atom_feed_logos WHERE feed_id = ?1", [feed_id])?;
+    if let Some(ref logo) = data.logo {
+        tx.execute(
+            "INSERT INTO atom_feed_logos (feed_id, uri) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, logo],
+        )?;
+    }
+
+    tx.execute("DELETE FROM atom_feed_icons WHERE feed_id = ?1", [feed_id])?;
+    if let Some(ref icon) = data.icon {
+        tx.execute(
+            "INSERT INTO atom_feed_icons (feed_id, uri) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, icon],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM atom_feed_authors WHERE feed_id = ?1",
+        [feed_id],
+    )?;
+    for author in &data.authors {
+        tx.execute(
+            "INSERT INTO atom_feed_authors (feed_id, author) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, author],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM atom_feed_contributors WHERE feed_id = ?1",
+        [feed_id],
+    )?;
+    for contributor in &data.contributors {
+        tx.execute(
+            "INSERT INTO atom_feed_contributors (feed_id, contributor) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, contributor],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM atom_feed_categories WHERE feed_id = ?1",
+        [feed_id],
+    )?;
+    for cat in &data.categories {
+        tx.execute(
+            "INSERT INTO atom_categories (category, scheme, label)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![cat.term, cat.scheme, cat.label],
+        )?;
+        let cat_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO atom_feed_categories (feed_id, category_id)
+             VALUES (?1, ?2)",
+            rusqlite::params![feed_id, cat_id],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Insert the atom-specific child rows for a single entry. Children key
+/// directly on `entries.id` and are cleared by the `INSERT OR REPLACE INTO
+/// entries` CASCADE; we also delete defensively in case we're called on an
+/// entry that wasn't replaced (e.g. a script-filtered re-ingest).
+fn insert_atom_entry_data(
+    tx: &rusqlite::Transaction,
+    entry_id: i64,
+    data: &AtomEntryIngestData,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM atom_entry_rights WHERE entry_id = ?1",
+        [entry_id],
+    )?;
+    if let Some(ref rights) = data.rights {
+        tx.execute(
+            "INSERT INTO atom_entry_rights (entry_id, rights) VALUES (?1, ?2)",
+            rusqlite::params![entry_id, rights],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM atom_entry_authors WHERE entry_id = ?1",
+        [entry_id],
+    )?;
+    for author in &data.authors {
+        tx.execute(
+            "INSERT INTO atom_entry_authors (entry_id, author) VALUES (?1, ?2)",
+            rusqlite::params![entry_id, author],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM atom_entry_contributors WHERE entry_id = ?1",
+        [entry_id],
+    )?;
+    for contributor in &data.contributors {
+        tx.execute(
+            "INSERT INTO atom_entry_contributors (entry_id, contributor) VALUES (?1, ?2)",
+            rusqlite::params![entry_id, contributor],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM atom_entry_categories WHERE entry_id = ?1",
+        [entry_id],
+    )?;
+    for cat in &data.categories {
+        tx.execute(
+            "INSERT INTO atom_categories (category, scheme, label)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![cat.term, cat.scheme, cat.label],
+        )?;
+        let cat_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO atom_entry_categories (entry_id, category_id)
+             VALUES (?1, ?2)",
+            rusqlite::params![entry_id, cat_id],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Insert the RSS-specific child rows for a single entry.
+fn insert_rss_entry_data(
+    tx: &rusqlite::Transaction,
+    entry_id: i64,
+    data: &RssEntryIngestData,
+) -> Result<()> {
+    tx.execute("DELETE FROM rss_entry_data WHERE entry_id = ?1", [entry_id])?;
+    tx.execute(
+        "INSERT INTO rss_entry_data (
+            entry_id, description, comments, author,
+            enclosure_url, enclosure_length, enclosure_mime_type
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            entry_id,
+            data.description,
+            data.comments,
+            data.author,
+            data.enclosure_url,
+            data.enclosure_length,
+            data.enclosure_mime_type,
+        ],
+    )?;
+
+    tx.execute("DELETE FROM rss_categories WHERE entry_id = ?1", [entry_id])?;
+    for cat in &data.categories {
+        tx.execute(
+            "INSERT OR IGNORE INTO rss_categories (entry_id, category, domain)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![entry_id, cat.name, cat.domain],
+        )?;
+    }
+
+    Ok(())
 }
 
 fn process_atom_feed(
     feed_id: i64,
     feed: atom_syndication::Feed,
-    conn: PooledConnection<SqliteConnectionManager>,
+    mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
 ) -> Result<()> {
     info!(
@@ -762,8 +1040,20 @@ fn process_atom_feed(
         feed.entries.len()
     );
 
+    let feed_data = extract_atom_feed_data(&feed);
+
+    {
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE feeds SET syndication_format = 'atom' WHERE id = ?1",
+            [feed_id],
+        )?;
+        upsert_atom_feed_data(&tx, feed_id, &feed_data)?;
+        tx.commit()?;
+    }
+
     for entry in feed.entries.into_iter() {
-        let feed_entry = atom_entry_to_feed_entry(feed_id, entry);
+        let (feed_entry, ingest) = atom_entry_to_parts(feed_id, entry);
 
         let feed_entry = if let Some(runner) = script_runner {
             let original = feed_entry.clone();
@@ -785,7 +1075,8 @@ fn process_atom_feed(
             feed_entry
         };
 
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO entries (
                 feed_id,
                 syndication_format,
@@ -805,6 +1096,15 @@ fn process_atom_feed(
             ],
         )?;
 
+        let entry_id: i64 = tx.query_row(
+            "SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2",
+            rusqlite::params![feed_id, feed_entry.guid],
+            |row| row.get(0),
+        )?;
+
+        insert_atom_entry_data(&tx, entry_id, &ingest)?;
+        tx.commit()?;
+
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
         }
@@ -816,7 +1116,7 @@ fn process_atom_feed(
 fn process_rss_feed(
     feed_id: i64,
     channel: rss::Channel,
-    conn: PooledConnection<SqliteConnectionManager>,
+    mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
 ) -> Result<()> {
     info!(
@@ -825,8 +1125,13 @@ fn process_rss_feed(
         channel.items.len()
     );
 
+    conn.execute(
+        "UPDATE feeds SET syndication_format = 'rss' WHERE id = ?1",
+        [feed_id],
+    )?;
+
     for item in channel.items.into_iter() {
-        let feed_entry = rss_item_to_feed_entry(feed_id, item);
+        let (feed_entry, ingest) = rss_item_to_parts(feed_id, item);
 
         let feed_entry = if let Some(runner) = script_runner {
             let original = feed_entry.clone();
@@ -848,7 +1153,8 @@ fn process_rss_feed(
             feed_entry
         };
 
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO entries (
                 feed_id,
                 syndication_format,
@@ -867,6 +1173,15 @@ fn process_rss_feed(
                 feed_entry.content
             ],
         )?;
+
+        let entry_id: i64 = tx.query_row(
+            "SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2",
+            rusqlite::params![feed_id, feed_entry.guid],
+            |row| row.get(0),
+        )?;
+
+        insert_rss_entry_data(&tx, entry_id, &ingest)?;
+        tx.commit()?;
 
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;

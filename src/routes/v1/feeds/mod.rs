@@ -5,6 +5,7 @@ pub mod feed_entries;
 pub mod feed_tags;
 pub mod fetch_all_feeds;
 pub mod fetch_feed;
+pub mod format_data;
 pub mod get_feed;
 pub mod import_opml;
 pub mod list_feeds;
@@ -45,7 +46,7 @@ pub fn create_router() -> Router<AppState> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used)]
 mod test {
     use super::*;
     use crate::routes::v1::entries::ListEntriesResponse;
@@ -53,7 +54,6 @@ mod test {
     use crate::test::{TestBuilder, TestConfig};
     use anyhow::Result;
     use axum::http::StatusCode;
-    use std::time::Duration;
 
     fn populate_tags(tc: &TestConfig) -> Result<()> {
         let conn = tc.database_conn()?;
@@ -104,25 +104,7 @@ mod test {
     }
 
     async fn add_example_feed(tc: &TestConfig) -> Result<i64> {
-        let client = tc.client()?;
-
-        // Add a new feed via the API
-        let url = tc.example_feed_url();
-        let resp = client
-            .post("http://localhost/v1/feeds/create")
-            .json(&add_feed::AddFeedRequest {
-                title: "my feed".to_string(),
-                url: url.clone(),
-            })
-            .send()
-            .await?;
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let feed_id = resp.json::<add_feed::AddFeedResponse>().await?.id;
-
-        // Wait a short period of time for the feed to get fetched
-        std::thread::sleep(Duration::from_millis(250));
-
-        Ok(feed_id)
+        tc.add_feed_from_url("my feed", tc.example_feed_url()).await
     }
 
     #[tokio::test]
@@ -754,6 +736,101 @@ mod test {
         assert!(exported_xml.contains("https://example.com/blog.xml"));
         // The "news" folder should appear in the export
         assert!(exported_xml.contains("news"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_feed_includes_atom_data() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+        let feed_id = tc
+            .add_feed_from_url("rich atom", tc.rich_atom_feed_url())
+            .await?;
+
+        let resp = client
+            .get(format!("http://localhost/v1/feeds/id/{}", feed_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+
+        assert!(body.get("rss").is_some(), "rss key should be present");
+        assert!(body["rss"].is_null(), "rss should be null for an atom feed");
+
+        let atom = body["atom"].as_object().expect("atom object present");
+        assert_eq!(atom["atom_language_tag"], "en-US");
+        assert_eq!(atom["rights"], "(c) 2026 Example Corp");
+        assert_eq!(atom["logo"], "http://example.com/logo.png");
+        assert_eq!(atom["icon"], "http://example.com/icon.png");
+
+        let gen_ = atom["generator"].as_object().expect("generator present");
+        assert_eq!(gen_["value"], "Example Generator");
+        assert_eq!(gen_["uri"], "https://example.com/gen");
+        assert_eq!(gen_["version"], "1.2");
+
+        assert_eq!(atom["authors"].as_array().unwrap().len(), 2);
+        assert_eq!(atom["contributors"].as_array().unwrap().len(), 2);
+        let cats = atom["categories"].as_array().unwrap();
+        assert_eq!(cats.len(), 2);
+        assert_eq!(cats[0]["term"], "t1");
+        assert_eq!(cats[0]["label"], "Label One");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_feed_rss_data_present_for_rss_feed() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+        let feed_id = tc
+            .add_feed_from_url("rich rss", tc.rich_rss_feed_url())
+            .await?;
+
+        let resp = client
+            .get(format!("http://localhost/v1/feeds/id/{}", feed_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+
+        assert!(
+            body["rss"].is_object(),
+            "rss sub-object should be present for an RSS feed, got: {:?}",
+            body["rss"]
+        );
+        assert!(
+            body["atom"].is_null(),
+            "atom sub-object should be null for an RSS feed, got: {:?}",
+            body["atom"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_feeds_does_not_include_format_data() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        tc.add_feed_from_url("rich atom", tc.rich_atom_feed_url())
+            .await?;
+        let client = tc.client()?;
+
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+
+        let feeds = body["feeds"].as_array().expect("feeds array");
+        assert_eq!(feeds.len(), 1);
+        assert!(
+            feeds[0].get("rss").is_none(),
+            "list endpoint leaked rss sub-object: {:?}",
+            feeds[0]
+        );
+        assert!(
+            feeds[0].get("atom").is_none(),
+            "list endpoint leaked atom sub-object: {:?}",
+            feeds[0]
+        );
 
         Ok(())
     }

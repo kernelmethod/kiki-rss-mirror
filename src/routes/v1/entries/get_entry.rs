@@ -1,3 +1,6 @@
+use crate::routes::v1::entries::format_data::{
+    load_atom_entry_data, load_rss_entry_data, AtomEntryData, RssEntryData,
+};
 use crate::server::AppState;
 use axum::{
     extract::{Path, State},
@@ -21,6 +24,12 @@ pub struct GetEntryResponse {
     pub title: String,
     pub url: String,
     pub content: Option<String>,
+    /// RSS-specific fields (description, author, enclosure, categories).
+    /// Present only for entries ingested from an RSS feed.
+    pub rss: Option<RssEntryData>,
+    /// Atom-specific fields (rights, authors, contributors, categories).
+    /// Present only for entries ingested from an Atom feed.
+    pub atom: Option<AtomEntryData>,
 }
 
 /// Get entry content
@@ -74,6 +83,8 @@ pub async fn get_entry(
                     title: row.get(6)?,
                     url: row.get(7)?,
                     content: row.get(8)?,
+                    rss: None,
+                    atom: None,
                 })
             })
             .map(Some)
@@ -84,6 +95,19 @@ pub async fn get_entry(
             .inspect_err(|e| {
                 event!(Level::ERROR, "failed to get entry: {:?}", e);
             })?;
+
+        let entry = match entry {
+            Some(mut e) => {
+                e.rss = load_rss_entry_data(&conn, e.id).inspect_err(|err| {
+                    event!(Level::ERROR, "failed to load rss_entry_data: {:?}", err);
+                })?;
+                e.atom = load_atom_entry_data(&conn, e.id).inspect_err(|err| {
+                    event!(Level::ERROR, "failed to load atom_entry_data: {:?}", err);
+                })?;
+                Some(e)
+            }
+            None => None,
+        };
 
         Ok::<Option<GetEntryResponse>, rusqlite::Error>(entry)
     })

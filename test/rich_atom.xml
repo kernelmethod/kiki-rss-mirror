@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en-US">
+  <title>Rich Atom Fixture</title>
+  <link href="http://example.com/atom" rel="self" type="application/atom+xml"/>
+  <link href="http://example.com/"/>
+  <id>urn:uuid:60a76c80-d399-11d9-b93C-0003939e0af6</id>
+  <updated>2024-11-27T12:00:00Z</updated>
+  <rights>(c) 2026 Example Corp</rights>
+  <generator uri="https://example.com/gen" version="1.2">Example Generator</generator>
+  <logo>http://example.com/logo.png</logo>
+  <icon>http://example.com/icon.png</icon>
+  <author>
+    <name>Feed Author One</name>
+  </author>
+  <author>
+    <name>Feed Author Two</name>
+  </author>
+  <contributor>
+    <name>Feed Contributor One</name>
+  </contributor>
+  <contributor>
+    <name>Feed Contributor Two</name>
+  </contributor>
+  <category term="t1" scheme="http://example.com/scheme" label="Label One"/>
+  <category term="t2" scheme="http://example.com/scheme" label="Label Two"/>
+  <entry>
+    <title>Entry With Rich Data</title>
+    <link href="http://example.com/entries/a"/>
+    <id>urn:uuid:1225c695-cfb8-4ebb-aaaa-80da344efa6a</id>
+    <published>2024-11-27T12:00:00Z</published>
+    <updated>2024-11-27T12:00:00Z</updated>
+    <rights>(c) 2026 Entry Author</rights>
+    <author>
+      <name>Entry Author One</name>
+    </author>
+    <author>
+      <name>Entry Author Two</name>
+    </author>
+    <contributor>
+      <name>Entry Contributor</name>
+    </contributor>
+    <category term="et1" scheme="http://example.com/escheme" label="Entry Label"/>
+    <summary>Entry A summary.</summary>
+    <content type="html">&lt;p&gt;Entry A body.&lt;/p&gt;</content>
+  </entry>
+  <entry>
+    <title>Bare Entry</title>
+    <link href="http://example.com/entries/b"/>
+    <id>urn:uuid:1225c695-cfb8-4ebb-bbbb-80da344efa6a</id>
+    <published>2024-06-16T10:00:00Z</published>
+    <updated>2024-06-16T10:00:00Z</updated>
+    <summary>Entry B summary.</summary>
+    <content type="html">&lt;p&gt;Entry B body.&lt;/p&gt;</content>
+  </entry>
+</feed>

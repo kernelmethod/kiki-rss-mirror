@@ -57,7 +57,6 @@ CREATE TABLE feeds (
     -- Defaults to 3 hours (10800 seconds).
     min_fetch_interval_seconds  INTEGER NOT NULL DEFAULT 10800
 );
-CREATE INDEX idx_feeds_syndication ON feeds(syndication_format);
 
 -- A list of the tags that are automatically assigned to entries from a given
 -- feed
@@ -115,7 +114,6 @@ CREATE TABLE entries (
     FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE SET NULL,
     FOREIGN KEY(source_id) REFERENCES entry_sources(id) ON DELETE SET NULL
 );
-CREATE INDEX idx_entry_syndication ON entries(syndication_format);
 CREATE UNIQUE INDEX idx_entry_guids ON entries(feed_id, guid);
 
 -- Table mapping entries to the tags that they belong to
@@ -135,17 +133,10 @@ CREATE INDEX idx_entry_tags_tag_id ON entry_tags(tag_id);
 --
 -- https://www.rssboard.org/rss-specification
 ---------------------------------------------------------------------------------
-CREATE TABLE rss_feed_data (
-    id      INTEGER PRIMARY KEY,
-    feed_id INTEGER,
-
-    FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE
-);
-CREATE INDEX idx_rss_feed_data ON rss_feed_data(feed_id);
-
+-- RSS-specific per-entry data. `entry_id` is the PK; there's a 1:1
+-- relationship with `entries`.
 CREATE TABLE rss_entry_data (
-    id              INTEGER PRIMARY KEY,
-    entry_id        INTEGER,
+    entry_id        INTEGER PRIMARY KEY,
     description     VARCHAR,
     comments        VARCHAR,
     author          VARCHAR,
@@ -157,15 +148,22 @@ CREATE TABLE rss_entry_data (
 
     FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE
 );
-CREATE INDEX idx_rss_entry_data ON rss_entry_data(entry_id);
 
+-- A single RSS entry may carry multiple <category> elements. Rows are
+-- uniquely keyed by (entry_id, category, domain) via the index below;
+-- SQLite's implicit rowid orders them by insertion for display.
 CREATE TABLE rss_categories (
-    entry_id        INTEGER PRIMARY KEY,
+    entry_id        INTEGER NOT NULL,
     category        VARCHAR NOT NULL,
     domain          VARCHAR,
 
     FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE
 );
+-- The composite unique index below has `entry_id` as its leftmost column,
+-- so it also serves `WHERE entry_id = ?` lookups and cascade-deletes — no
+-- separate single-column index is needed.
+CREATE UNIQUE INDEX idx_rss_categories_unique
+    ON rss_categories(entry_id, category, COALESCE(domain, ''));
 
 ---------------------------------------------------------------------------------
 -- Atom-related tables
@@ -173,10 +171,12 @@ CREATE TABLE rss_categories (
 -- https://www.rfc-editor.org/rfc/rfc4287
 ---------------------------------------------------------------------------------
 
--- Atom-specific feed data
+-- Atom-specific feed data. Holds feed-level fields (atom_uri,
+-- atom_language_tag); the atom_feed_* child tables FK directly to
+-- feeds(id), so this row is no longer a join-point.
 CREATE TABLE atom_feed_data (
     id      INTEGER PRIMARY KEY,
-    feed_id INTEGER,
+    feed_id INTEGER NOT NULL,
 
     -- atomCommonAttributes
     atom_uri            VARCHAR,
@@ -184,23 +184,14 @@ CREATE TABLE atom_feed_data (
 
     FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE
 );
-CREATE INDEX idx_atom_feed_data ON atom_feed_data(feed_id);
-
--- Atom-specific entry data
-CREATE TABLE atom_entry_data (
-    id          INTEGER PRIMARY KEY,
-    entry_id    INTEGER,
-
-    FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE
-);
-CREATE INDEX idx_atom_entry_data ON atom_entry_data(entry_id);
+CREATE UNIQUE INDEX idx_atom_feed_data ON atom_feed_data(feed_id);
 
 -- Atom-specific source data
 CREATE TABLE atom_source_data (
     id          INTEGER PRIMARY KEY,
     source_id   INTEGER,
 
-    FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+    FOREIGN KEY(source_id) REFERENCES entry_sources(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_atom_source_data ON atom_source_data(source_id);
 
@@ -209,14 +200,14 @@ CREATE TABLE atom_feed_rights (
     feed_id INTEGER PRIMARY KEY,
     rights  VARCHAR,
 
-    FOREIGN KEY(feed_id) REFERENCES atom_feed_data(id) ON DELETE CASCADE
+    FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE
 );
 
 CREATE TABLE atom_entry_rights (
     entry_id INTEGER PRIMARY KEY,
     rights   VARCHAR,
 
-    FOREIGN KEY(entry_id) REFERENCES atom_entry_data(id) ON DELETE CASCADE
+    FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE
 );
 
 -- Data for atom:generator elements
@@ -228,10 +219,11 @@ CREATE TABLE atom_feed_generators (
     atom_language_tag   VARCHAR,
 
     -- atom:generator
+    value               VARCHAR NOT NULL,
     uri                 VARCHAR,
     version             VARCHAR,
 
-    FOREIGN KEY(feed_id) REFERENCES atom_feed_data(id) ON DELETE CASCADE
+    FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE
 );
 
 -- Data for atom:logo elements
@@ -245,7 +237,7 @@ CREATE TABLE atom_feed_logos (
     -- atom:logo
     uri                 VARCHAR NOT NULL,
 
-    FOREIGN KEY(feed_id) REFERENCES atom_feed_data(id) ON DELETE CASCADE
+    FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE
 );
 
 -- Data for atom:icon elements
@@ -259,7 +251,7 @@ CREATE TABLE atom_feed_icons (
     -- atom:icon
     uri                 VARCHAR NOT NULL,
 
-    FOREIGN KEY(feed_id) REFERENCES atom_feed_data(id) ON DELETE CASCADE
+    FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE
 );
 
 -- Data for atom:category elements
@@ -282,57 +274,70 @@ CREATE TABLE atom_feed_categories (
     feed_id     INTEGER,
     category_id INTEGER,
 
-    FOREIGN KEY(feed_id) REFERENCES atom_feed_data(id) ON DELETE CASCADE,
+    FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
     FOREIGN KEY(category_id) REFERENCES atom_categories(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_atom_feed_categories ON atom_feed_categories(feed_id);
+CREATE INDEX idx_atom_feed_categories_category
+    ON atom_feed_categories(category_id);
 
 CREATE TABLE atom_entry_categories (
     entry_id    INTEGER,
     category_id INTEGER,
 
-    FOREIGN KEY(entry_id) REFERENCES atom_entry_data(id) ON DELETE CASCADE,
+    FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE,
     FOREIGN KEY(category_id) REFERENCES atom_categories(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_atom_entry_categories ON atom_entry_categories(entry_id);
+CREATE INDEX idx_atom_entry_categories_category
+    ON atom_entry_categories(category_id);
 
 -- Data for atom:author elements
 CREATE TABLE atom_feed_authors (
-    feed_id INTEGER PRIMARY KEY,
+    id      INTEGER PRIMARY KEY,
+    feed_id INTEGER NOT NULL,
     author  VARCHAR NOT NULL,
 
-    FOREIGN KEY(feed_id) REFERENCES atom_feed_data(id) ON DELETE CASCADE
+    FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE
 );
+CREATE INDEX idx_atom_feed_authors_feed ON atom_feed_authors(feed_id);
 
 CREATE TABLE atom_entry_authors (
-    entry_id INTEGER PRIMARY KEY,
-    author VARCHAR NOT NULL,
+    id       INTEGER PRIMARY KEY,
+    entry_id INTEGER NOT NULL,
+    author   VARCHAR NOT NULL,
 
-    FOREIGN KEY(entry_id) REFERENCES atom_entry_data(id) ON DELETE CASCADE
+    FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE
 );
+CREATE INDEX idx_atom_entry_authors_entry ON atom_entry_authors(entry_id);
 
 -- Data for atom:contributor elements
 CREATE TABLE atom_feed_contributors (
-    feed_id     INTEGER PRIMARY KEY,
+    id          INTEGER PRIMARY KEY,
+    feed_id     INTEGER NOT NULL,
     contributor VARCHAR NOT NULL,
 
-    FOREIGN KEY(feed_id) REFERENCES atom_feed_data(id) ON DELETE CASCADE
+    FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE
 );
+CREATE INDEX idx_atom_feed_contributors_feed ON atom_feed_contributors(feed_id);
 
 CREATE TABLE atom_entry_contributors (
-    entry_id    INTEGER PRIMARY KEY,
+    id          INTEGER PRIMARY KEY,
+    entry_id    INTEGER NOT NULL,
     contributor VARCHAR NOT NULL,
 
-    FOREIGN KEY(entry_id) REFERENCES atom_entry_data(id) ON DELETE CASCADE
+    FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE
 );
+CREATE INDEX idx_atom_entry_contributors_entry ON atom_entry_contributors(entry_id);
 
+-- Unions per-entry contributors with per-feed contributors expanded onto
+-- every entry of the feed.
 CREATE VIEW atom_entry_contributors_all AS
-SELECT entry_id, contributor FROM atom_feed_contributors
+SELECT entry_id, contributor FROM atom_entry_contributors
 UNION
 SELECT e.id AS entry_id, afc.contributor AS contributor
 FROM entries e
-JOIN atom_feed_contributors afc ON
-    e.feed_id = afc.feed_id;
+JOIN atom_feed_contributors afc ON e.feed_id = afc.feed_id;
 
 ---------------------------------------------------------------------------------
 -- Full-text search index over entries (FTS5, external content)
