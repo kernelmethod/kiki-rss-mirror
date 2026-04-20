@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -525,6 +526,8 @@ async fn retrieve_feed(
 ) -> Result<Option<Vec<u8>>> {
     let conn = pool.get()?;
 
+    let timeout = Duration::from_secs(crate::db::settings::get_feed_update_timeout_seconds(&conn)?);
+
     let mut current_url = feed_url.to_string();
     let mut had_permanent_redirect = false;
     let max_redirects = 10;
@@ -532,7 +535,7 @@ async fn retrieve_feed(
     let resp = 'redirect: {
         for _ in 0..=max_redirects {
             // Only send conditional headers on the first request
-            let mut request = client.get(&current_url);
+            let mut request = client.get(&current_url).timeout(timeout);
             if current_url == feed_url {
                 if let Some(etag) = etag {
                     request = request.header("If-None-Match", etag);

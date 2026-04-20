@@ -12,6 +12,10 @@ CREATE TABLE settings (
     type  TEXT
 );
 
+-- Default global settings.
+INSERT INTO settings (key, value, type)
+VALUES ('feed_update_timeout_seconds', '15', 'integer');
+
 CREATE TABLE tags (
     id      INTEGER PRIMARY KEY,
     name    VARCHAR UNIQUE NOT NULL

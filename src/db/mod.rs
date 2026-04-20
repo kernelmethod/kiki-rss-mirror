@@ -5,6 +5,7 @@ use std::path::Path;
 
 pub mod migrations;
 pub mod retention;
+pub mod settings;
 
 enum ConnectionType<'a> {
     DefaultConnection,
