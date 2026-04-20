@@ -1,4 +1,5 @@
 use crate::http::USER_AGENT;
+use crate::metrics::Metrics;
 use crate::scripting::{FeedEntry, ScriptRunner};
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -94,13 +96,19 @@ impl CacheControl {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TaskManagerCommand {
     RefreshFeed(i64),
     /// Run retention cleanup for the given feed.
     CleanupFeed(i64),
     /// Run retention cleanup across all feeds.
     CleanupAll,
+    /// Merge FTS5 index segments to improve search performance.
+    OptimizeFts,
+    /// Checkpoint the WAL file and refresh query-planner statistics.
+    WalCheckpointAnalyze,
+    /// Reclaim free pages via `PRAGMA incremental_vacuum`.
+    IncrementalVacuum,
 }
 
 /// Set of feed IDs currently being processed by workers.
@@ -137,6 +145,13 @@ impl Drop for InProgressGuard {
     }
 }
 
+/// Snapshot the current size of an `InProgressSet` for the
+/// `kiki_feeds_refresh_in_progress` gauge. Takes the lock briefly.
+fn in_progress_len(set: &InProgressSet) -> f64 {
+    let locked = set.lock().unwrap_or_else(|e| e.into_inner());
+    locked.len() as f64
+}
+
 /// Shared state for a pool of workers that process [`TaskManagerCommand`]s.
 ///
 /// Each worker pulls commands from a shared channel and maintains its own
@@ -150,6 +165,7 @@ struct Worker {
     token: CancellationToken,
     refresh_in_progress: InProgressSet,
     cleanup_in_progress: InProgressSet,
+    metrics: Arc<Metrics>,
 }
 
 /// Determine the number of worker tasks to spawn.
@@ -170,6 +186,7 @@ pub fn spawn_workers(
     token: CancellationToken,
     reload_tx: tokio::sync::watch::Sender<()>,
     num_workers: usize,
+    metrics: Arc<Metrics>,
 ) -> Vec<tokio::task::JoinHandle<Result<()>>> {
     let worker = Worker {
         rx,
@@ -178,6 +195,7 @@ pub fn spawn_workers(
         token,
         refresh_in_progress: Arc::new(Mutex::new(HashSet::new())),
         cleanup_in_progress: Arc::new(Mutex::new(HashSet::new())),
+        metrics,
     };
     let mut handles = Vec::with_capacity(num_workers);
 
@@ -205,7 +223,8 @@ async fn run_worker(
     // Each worker has its own script runner, built eagerly from the current
     // database state.  Rebuilt when a reload signal arrives via the watch channel.
     #[cfg(feature = "lua")]
-    let mut runner: Option<crate::scripting::lua::LuaScriptRunner> = build_runner(&w.pool);
+    let mut runner: Option<crate::scripting::lua::LuaScriptRunner> =
+        build_runner(&w.pool, &w.metrics);
 
     loop {
         // Check for a pending reload signal before processing the next command.
@@ -218,7 +237,7 @@ async fn run_worker(
                 "Worker {} reloading LuaScriptRunner from database",
                 worker_id
             );
-            runner = build_runner(&w.pool);
+            runner = build_runner(&w.pool, &w.metrics);
             info!("Worker {} LuaScriptRunner reloaded", worker_id);
         }
 
@@ -235,22 +254,35 @@ async fn run_worker(
                 #[cfg(feature = "lua")]
                 {
                     debug!("Worker {} reloading LuaScriptRunner from database", worker_id);
-                    runner = build_runner(&w.pool);
+                    runner = build_runner(&w.pool, &w.metrics);
                     info!("Worker {} LuaScriptRunner reloaded", worker_id);
                 }
                 continue;
             }
         };
 
+        w.metrics.inc_workers_busy();
+        let task_start = Instant::now();
+
         match command {
             TaskManagerCommand::RefreshFeed(feed_id) => {
                 let guard = match InProgressGuard::try_claim(&w.refresh_in_progress, feed_id) {
-                    Some(g) => g,
+                    Some(g) => {
+                        w.metrics
+                            .set_feeds_refresh_in_progress(in_progress_len(&w.refresh_in_progress));
+                        g
+                    }
                     None => {
                         debug!(
                             "Worker {}: feed {} already in progress, skipping refresh",
                             worker_id, feed_id
                         );
+                        w.metrics.record_task_processed(
+                            "refresh_feed",
+                            "skipped_in_progress",
+                            task_start.elapsed().as_secs_f64(),
+                        );
+                        w.metrics.dec_workers_busy();
                         continue;
                     }
                 };
@@ -261,29 +293,44 @@ async fn run_worker(
                 #[cfg(not(feature = "lua"))]
                 let script_runner: Option<&dyn ScriptRunner> = None;
 
-                let _ = refresh_feed(&client, feed_id, w.pool.clone(), script_runner)
-                    .await
-                    .inspect_err(|e| {
-                        error!(
-                            "An error occurred while refreshing feed {}: {:?}",
-                            feed_id, e
-                        );
-                        if let Ok(conn) = w.pool.get() {
-                            set_feed_error(
-                                &conn,
-                                feed_id,
-                                &FetchError::Other {
-                                    message: format!("{}", e),
-                                },
+                let outcome =
+                    match refresh_feed(&client, feed_id, w.pool.clone(), script_runner, &w.metrics)
+                        .await
+                    {
+                        Ok(()) => "ok",
+                        Err(e) => {
+                            error!(
+                                "An error occurred while refreshing feed {}: {:?}",
+                                feed_id, e
                             );
+                            if let Ok(conn) = w.pool.get() {
+                                set_feed_error(
+                                    &conn,
+                                    feed_id,
+                                    &FetchError::Other {
+                                        message: format!("{}", e),
+                                    },
+                                );
+                            }
+                            "error"
                         }
-                    });
+                    };
 
                 drop(guard);
+                w.metrics
+                    .set_feeds_refresh_in_progress(in_progress_len(&w.refresh_in_progress));
+
+                w.metrics.record_task_processed(
+                    "refresh_feed",
+                    outcome,
+                    task_start.elapsed().as_secs_f64(),
+                );
 
                 // Queue retention cleanup for this feed.
                 if let Err(e) = w.tx.try_send(TaskManagerCommand::CleanupFeed(feed_id)) {
                     warn!("Failed to queue cleanup for feed {}: {:?}", feed_id, e);
+                } else {
+                    w.metrics.record_task_enqueued("cleanup_feed");
                 }
             }
 
@@ -295,34 +342,165 @@ async fn run_worker(
                             "Worker {}: feed {} already in progress, skipping cleanup",
                             worker_id, feed_id
                         );
+                        w.metrics.record_task_processed(
+                            "cleanup_feed",
+                            "skipped_in_progress",
+                            task_start.elapsed().as_secs_f64(),
+                        );
+                        w.metrics.dec_workers_busy();
                         continue;
                     }
                 };
 
+                let cleanup_start = Instant::now();
+                let mut outcome = "ok";
                 if let Ok(conn) = w.pool.get() {
                     match crate::db::retention::cleanup_feed(&conn, feed_id) {
                         Ok(0) => {}
-                        Ok(n) => info!(
-                            "Retention cleanup deleted {} old entries for feed {}",
-                            n, feed_id
-                        ),
+                        Ok(n) => {
+                            info!(
+                                "Retention cleanup deleted {} old entries for feed {}",
+                                n, feed_id
+                            );
+                            w.metrics.record_retention_cleanup(
+                                "feed",
+                                cleanup_start.elapsed().as_secs_f64(),
+                                n as u64,
+                            );
+                        }
                         Err(e) => {
-                            warn!("Retention cleanup failed for feed {}: {:?}", feed_id, e)
+                            warn!("Retention cleanup failed for feed {}: {:?}", feed_id, e);
+                            outcome = "error";
                         }
                     }
+                } else {
+                    outcome = "error";
                 }
+
+                w.metrics.record_task_processed(
+                    "cleanup_feed",
+                    outcome,
+                    task_start.elapsed().as_secs_f64(),
+                );
             }
 
             TaskManagerCommand::CleanupAll => {
+                let cleanup_start = Instant::now();
+                let mut outcome = "ok";
                 if let Ok(conn) = w.pool.get() {
                     match crate::db::retention::cleanup_all(&conn) {
                         Ok(0) => {}
-                        Ok(n) => info!("Retention cleanup deleted {} entries", n),
-                        Err(e) => warn!("Retention cleanup failed: {:?}", e),
+                        Ok(n) => {
+                            info!("Retention cleanup deleted {} entries", n);
+                            w.metrics.record_retention_cleanup(
+                                "all",
+                                cleanup_start.elapsed().as_secs_f64(),
+                                n as u64,
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Retention cleanup failed: {:?}", e);
+                            outcome = "error";
+                        }
                     }
+                } else {
+                    outcome = "error";
                 }
+
+                w.metrics.record_task_processed(
+                    "cleanup_all",
+                    outcome,
+                    task_start.elapsed().as_secs_f64(),
+                );
+            }
+
+            TaskManagerCommand::OptimizeFts => {
+                run_maintenance(
+                    &w.pool,
+                    crate::db::task_queue::TASK_FTS_OPTIMIZE,
+                    "FTS5 optimize",
+                    |conn| {
+                        conn.execute(
+                            "INSERT INTO entries_fts(entries_fts) VALUES ('optimize')",
+                            [],
+                        )?;
+                        Ok(())
+                    },
+                );
+                w.metrics.record_task_processed(
+                    "optimize_fts",
+                    "ok",
+                    task_start.elapsed().as_secs_f64(),
+                );
+            }
+
+            TaskManagerCommand::WalCheckpointAnalyze => {
+                run_maintenance(
+                    &w.pool,
+                    crate::db::task_queue::TASK_WAL_CHECKPOINT_ANALYZE,
+                    "WAL checkpoint and ANALYZE",
+                    |conn| {
+                        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); ANALYZE;")?;
+                        Ok(())
+                    },
+                );
+                w.metrics.record_task_processed(
+                    "wal_checkpoint_analyze",
+                    "ok",
+                    task_start.elapsed().as_secs_f64(),
+                );
+            }
+
+            TaskManagerCommand::IncrementalVacuum => {
+                run_maintenance(
+                    &w.pool,
+                    crate::db::task_queue::TASK_INCREMENTAL_VACUUM,
+                    "incremental vacuum",
+                    |conn| {
+                        conn.execute_batch("PRAGMA incremental_vacuum;")?;
+                        Ok(())
+                    },
+                );
+                w.metrics.record_task_processed(
+                    "incremental_vacuum",
+                    "ok",
+                    task_start.elapsed().as_secs_f64(),
+                );
             }
         }
+
+        w.metrics.dec_workers_busy();
+    }
+}
+
+/// Run a maintenance operation and, on success, update its `task_queue`
+/// row so the schedule survives server restarts.
+pub(crate) fn run_maintenance<F>(
+    pool: &Pool<SqliteConnectionManager>,
+    task_type: &str,
+    label: &str,
+    op: F,
+) where
+    F: FnOnce(&PooledConnection<SqliteConnectionManager>) -> Result<()>,
+{
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                "{} skipped: failed to acquire DB connection: {:?}",
+                label, e
+            );
+            return;
+        }
+    };
+    match op(&conn) {
+        Ok(()) => {
+            info!("{} completed", label);
+            if let Err(e) = crate::db::task_queue::record_run(&conn, task_type) {
+                warn!("Failed to record {} run: {:?}", label, e);
+            }
+        }
+        Err(e) => warn!("{} failed: {:?}", label, e),
     }
 }
 
@@ -342,16 +520,25 @@ fn load_all_script_sources(
 #[cfg(feature = "lua")]
 fn build_runner(
     pool: &Pool<SqliteConnectionManager>,
+    metrics: &Metrics,
 ) -> Option<crate::scripting::lua::LuaScriptRunner> {
     match pool.get() {
         Ok(conn) => match load_all_script_sources(&conn) {
-            Ok(sources) => match crate::scripting::lua::LuaScriptRunner::new(&sources) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    warn!("failed to compile Lua scripts: {}", e);
-                    None
+            Ok(sources) => {
+                let count = sources.len() as f64;
+                match crate::scripting::lua::LuaScriptRunner::new(&sources) {
+                    Ok(r) => {
+                        metrics.set_scripts_loaded(count);
+                        Some(r)
+                    }
+                    Err(e) => {
+                        warn!("failed to compile Lua scripts: {}", e);
+                        metrics.record_script_compile_error();
+                        metrics.set_scripts_loaded(0.0);
+                        None
+                    }
                 }
-            },
+            }
             Err(e) => {
                 error!("failed to load script sources from database: {}", e);
                 None
@@ -412,17 +599,28 @@ pub(crate) async fn refresh_feed(
     feed_id: i64,
     pool: Pool<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
+    metrics: &Metrics,
 ) -> Result<()> {
+    let fetch_start = Instant::now();
+
     // Get the feed URL and headers from the database
     let conn = pool.get()?;
-    let (feed_url, header_etag, header_last_modified, header_expires, last_checked): (
+    let (
+        feed_url,
+        header_etag,
+        header_last_modified,
+        header_expires,
+        last_checked,
+        min_fetch_interval,
+    ): (
         String,
         Option<String>,
         Option<String>,
         Option<i64>,
         Option<i64>,
+        i64,
     ) = conn.query_row(
-        "SELECT url, header_etag, header_last_modified, header_expires, last_checked FROM feeds WHERE id = ?1",
+        "SELECT url, header_etag, header_last_modified, header_expires, last_checked, min_fetch_interval_seconds FROM feeds WHERE id = ?1",
         [feed_id],
         |row| {
             let url: String = row.get(0)?;
@@ -430,7 +628,8 @@ pub(crate) async fn refresh_feed(
             let last_modified: Option<String> = row.get(2)?;
             let expires: Option<i64> = row.get(3)?;
             let last_checked: Option<i64> = row.get(4)?;
-            Ok((url, etag, last_modified, expires, last_checked))
+            let min_fetch_interval: i64 = row.get(5)?;
+            Ok((url, etag, last_modified, expires, last_checked, min_fetch_interval))
         },
     )?;
 
@@ -445,6 +644,8 @@ pub(crate) async fn refresh_feed(
                     feed_id,
                     expires_dt.signed_duration_since(now).num_seconds()
                 );
+                metrics.record_feed_cache_hit("expires");
+                metrics.record_feed_fetch("cache_hit", fetch_start.elapsed().as_secs_f64());
                 return Ok(());
             }
         }
@@ -455,12 +656,14 @@ pub(crate) async fn refresh_feed(
         if let Some(last_checked_ts) = Utc.timestamp_opt(last_checked_ts, 0).single() {
             let now = Utc::now();
             let duration_since = now.signed_duration_since(last_checked_ts);
-            if duration_since.num_hours() < 3 {
+            if duration_since.num_seconds() < min_fetch_interval {
                 debug!(
                     "Feed {} was last checked {} seconds ago, skipping update",
                     feed_id,
                     duration_since.num_seconds()
                 );
+                metrics.record_feed_cache_hit("min_interval");
+                metrics.record_feed_fetch("cache_hit", fetch_start.elapsed().as_secs_f64());
                 return Ok(());
             }
         }
@@ -477,35 +680,55 @@ pub(crate) async fn refresh_feed(
             header_etag.as_deref(),
             header_last_modified.as_deref(),
             pool.clone(),
+            fetch_start,
+            metrics,
         )
         .await
-    }?;
+    };
+
+    let feed_content = match feed_content {
+        Ok(c) => c,
+        Err(e) => {
+            metrics.record_feed_fetch("other", fetch_start.elapsed().as_secs_f64());
+            return Err(e);
+        }
+    };
 
     let content = if let Some(content) = feed_content {
         content
     } else {
+        // retrieve_feed / retrieve_file_feed already recorded the outcome.
         return Ok(());
     };
 
     // Attempt to parse content as Atom, with fallback to RSS.
+    let parse_start = Instant::now();
     if let Ok(feed) = atom_syndication::Feed::read_from(&content[..]) {
-        process_atom_feed(feed_id, feed, conn, script_runner)?;
+        let entries = feed.entries.len() as u64;
+        metrics.record_feed_parse("atom", parse_start.elapsed().as_secs_f64(), entries);
+        process_atom_feed(feed_id, feed, conn, script_runner, metrics)?;
         clear_feed_error(&pool.get()?, feed_id);
+        metrics.record_feed_fetch("success", fetch_start.elapsed().as_secs_f64());
     } else if let Ok(channel) = rss::Channel::read_from(&content[..]) {
-        process_rss_feed(feed_id, channel, conn, script_runner)?;
+        let items = channel.items.len() as u64;
+        metrics.record_feed_parse("rss", parse_start.elapsed().as_secs_f64(), items);
+        process_rss_feed(feed_id, channel, conn, script_runner, metrics)?;
         clear_feed_error(&pool.get()?, feed_id);
+        metrics.record_feed_fetch("success", fetch_start.elapsed().as_secs_f64());
     } else {
         let fetch_err = FetchError::InvalidFeed {
             url: feed_url.clone(),
         };
         warn!("Feed {}: {}", feed_id, fetch_err);
         set_feed_error(&pool.get()?, feed_id, &fetch_err);
+        metrics.record_feed_fetch("invalid_feed", fetch_start.elapsed().as_secs_f64());
         return Ok(());
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn retrieve_feed(
     client: &reqwest::Client,
     feed_id: i64,
@@ -513,17 +736,22 @@ async fn retrieve_feed(
     etag: Option<&str>,
     last_modified: Option<&str>,
     pool: Pool<SqliteConnectionManager>,
+    fetch_start: Instant,
+    metrics: &Metrics,
 ) -> Result<Option<Vec<u8>>> {
     let conn = pool.get()?;
 
+    let timeout = Duration::from_secs(crate::db::settings::get_feed_update_timeout_seconds(&conn)?);
+
     let mut current_url = feed_url.to_string();
     let mut had_permanent_redirect = false;
+    let mut redirects: u64 = 0;
     let max_redirects = 10;
 
     let resp = 'redirect: {
         for _ in 0..=max_redirects {
             // Only send conditional headers on the first request
-            let mut request = client.get(&current_url);
+            let mut request = client.get(&current_url).timeout(timeout);
             if current_url == feed_url {
                 if let Some(etag) = etag {
                     request = request.header("If-None-Match", etag);
@@ -533,7 +761,15 @@ async fn retrieve_feed(
                 }
             }
 
-            let resp = request.send().await?;
+            let resp = match request.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let outcome = if e.is_timeout() { "timeout" } else { "other" };
+                    metrics.record_feed_fetch(outcome, fetch_start.elapsed().as_secs_f64());
+                    metrics.record_feed_redirects(redirects);
+                    return Err(e.into());
+                }
+            };
 
             if resp.status().is_redirection() && resp.status() != reqwest::StatusCode::NOT_MODIFIED
             {
@@ -555,6 +791,7 @@ async fn retrieve_feed(
                 // Resolve the Location against the current URL to handle relative redirects
                 let base = Url::parse(&current_url)?;
                 current_url = base.join(&location)?.to_string();
+                redirects += 1;
                 continue;
             }
 
@@ -569,8 +806,12 @@ async fn retrieve_feed(
             let conn = pool.get()?;
             set_feed_error(&conn, feed_id, &fetch_err);
         }
+        metrics.record_feed_fetch("too_many_redirects", fetch_start.elapsed().as_secs_f64());
+        metrics.record_feed_redirects(redirects);
         return Ok(None);
     };
+
+    metrics.record_feed_redirects(redirects);
 
     // Check if the feed was modified
     match resp.status() {
@@ -581,6 +822,8 @@ async fn retrieve_feed(
                 "UPDATE feeds SET last_checked = ?1 WHERE id = ?2",
                 (Utc::now().timestamp(), feed_id),
             )?;
+            metrics.record_feed_cache_hit("not_modified");
+            metrics.record_feed_fetch("not_modified", fetch_start.elapsed().as_secs_f64());
             return Ok(None);
         }
         reqwest::StatusCode::OK => { /* Do nothing */ }
@@ -592,6 +835,7 @@ async fn retrieve_feed(
             };
             warn!("Feed {}: {}", feed_id, fetch_err);
             set_feed_error(&conn, feed_id, &fetch_err);
+            metrics.record_feed_fetch("http_error", fetch_start.elapsed().as_secs_f64());
             return Ok(None);
         }
     }
@@ -663,6 +907,7 @@ async fn retrieve_feed(
     }
 
     let content = resp.bytes().await?;
+    metrics.record_feed_response_bytes(content.len() as u64);
     Ok(Some(content.to_vec()))
 }
 
@@ -689,9 +934,68 @@ fn retrieve_file_feed(
     Ok(Some(content))
 }
 
-/// Extract a [`FeedEntry`] from an Atom syndication entry.
-fn atom_entry_to_feed_entry(feed_id: i64, entry: atom_syndication::Entry) -> FeedEntry {
-    FeedEntry {
+/// Atom-specific feed-level data captured from a parsed feed.
+#[derive(Default)]
+struct AtomFeedIngestData {
+    atom_uri: Option<String>,
+    atom_language_tag: Option<String>,
+    rights: Option<String>,
+    generator: Option<atom_syndication::Generator>,
+    logo: Option<String>,
+    icon: Option<String>,
+    authors: Vec<String>,
+    contributors: Vec<String>,
+    categories: Vec<atom_syndication::Category>,
+}
+
+/// Atom-specific per-entry data captured from a parsed entry.
+#[derive(Default)]
+struct AtomEntryIngestData {
+    rights: Option<String>,
+    authors: Vec<String>,
+    contributors: Vec<String>,
+    categories: Vec<atom_syndication::Category>,
+}
+
+/// RSS-specific per-entry data captured from a parsed item.
+#[derive(Default)]
+struct RssEntryIngestData {
+    description: Option<String>,
+    comments: Option<String>,
+    author: Option<String>,
+    enclosure_url: Option<String>,
+    enclosure_length: Option<i64>,
+    enclosure_mime_type: Option<String>,
+    categories: Vec<rss::Category>,
+}
+
+fn extract_atom_feed_data(feed: &atom_syndication::Feed) -> AtomFeedIngestData {
+    AtomFeedIngestData {
+        atom_uri: feed.base.clone(),
+        atom_language_tag: feed.lang.clone(),
+        rights: feed.rights.as_ref().map(|r| r.value.clone()),
+        generator: feed.generator.clone(),
+        logo: feed.logo.clone(),
+        icon: feed.icon.clone(),
+        authors: feed.authors.iter().map(|p| p.name.clone()).collect(),
+        contributors: feed.contributors.iter().map(|p| p.name.clone()).collect(),
+        categories: feed.categories.clone(),
+    }
+}
+
+/// Extract both a [`FeedEntry`] and the Atom-specific sub-object from an
+/// Atom entry.
+fn atom_entry_to_parts(
+    feed_id: i64,
+    entry: atom_syndication::Entry,
+) -> (FeedEntry, AtomEntryIngestData) {
+    let ingest = AtomEntryIngestData {
+        rights: entry.rights.as_ref().map(|r| r.value.clone()),
+        authors: entry.authors.iter().map(|p| p.name.clone()).collect(),
+        contributors: entry.contributors.iter().map(|p| p.name.clone()).collect(),
+        categories: entry.categories.clone(),
+    };
+    let feed_entry = FeedEntry {
         feed_id,
         syndication_format: "atom".to_string(),
         guid: entry.id,
@@ -700,17 +1004,23 @@ fn atom_entry_to_feed_entry(feed_id: i64, entry: atom_syndication::Entry) -> Fee
         url: entry.links.into_iter().next().map(|l| l.href),
         content: entry.content.and_then(|c| c.value),
         tags: vec![],
-    }
+    };
+    (feed_entry, ingest)
 }
 
-/// Extract a [`FeedEntry`] from an RSS item.
-fn rss_item_to_feed_entry(feed_id: i64, item: rss::Item) -> FeedEntry {
+/// Extract both a [`FeedEntry`] and the RSS-specific sub-object from an
+/// RSS item.
+fn rss_item_to_parts(feed_id: i64, item: rss::Item) -> (FeedEntry, RssEntryIngestData) {
     let rss::Item {
         pub_date,
         guid,
         title,
         link,
         description,
+        author,
+        comments,
+        enclosure,
+        categories,
         ..
     } = item;
 
@@ -721,7 +1031,6 @@ fn rss_item_to_feed_entry(feed_id: i64, item: rss::Item) -> FeedEntry {
         .unwrap_or_else(|| Utc::now().timestamp());
 
     let guid = guid.map(|g| g.value).unwrap_or_else(|| {
-        // Generate a GUID if none exists
         format!(
             "rss-{}-{}",
             timestamp,
@@ -729,7 +1038,22 @@ fn rss_item_to_feed_entry(feed_id: i64, item: rss::Item) -> FeedEntry {
         )
     });
 
-    FeedEntry {
+    let (enclosure_url, enclosure_length, enclosure_mime_type) = match enclosure {
+        Some(e) => (Some(e.url), e.length.parse::<i64>().ok(), Some(e.mime_type)),
+        None => (None, None, None),
+    };
+
+    let ingest = RssEntryIngestData {
+        description: description.clone(),
+        comments,
+        author,
+        enclosure_url,
+        enclosure_length,
+        enclosure_mime_type,
+        categories,
+    };
+
+    let feed_entry = FeedEntry {
         feed_id,
         syndication_format: "rss".to_string(),
         guid,
@@ -738,14 +1062,214 @@ fn rss_item_to_feed_entry(feed_id: i64, item: rss::Item) -> FeedEntry {
         url: link,
         content: description,
         tags: vec![],
+    };
+    (feed_entry, ingest)
+}
+
+/// Upsert the single `atom_feed_data` row for `feed_id` and replace all
+/// atom_feed_* child rows (authors, contributors, rights, generator, logo,
+/// icon, categories). Children key directly on `feeds.id`, so the extra
+/// `atom_feed_data.id` is not needed anywhere outside the row itself.
+fn upsert_atom_feed_data(
+    tx: &rusqlite::Transaction,
+    feed_id: i64,
+    data: &AtomFeedIngestData,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO atom_feed_data (feed_id, atom_uri, atom_language_tag)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(feed_id) DO UPDATE SET
+             atom_uri = excluded.atom_uri,
+             atom_language_tag = excluded.atom_language_tag",
+        rusqlite::params![feed_id, data.atom_uri, data.atom_language_tag],
+    )?;
+
+    // Replace per-feed child rows. Rights/generator/logo/icon have a
+    // feed_id PRIMARY KEY — one-per-feed semantics — so we delete-and-
+    // reinsert to keep the logic uniform.
+    tx.execute("DELETE FROM atom_feed_rights WHERE feed_id = ?1", [feed_id])?;
+    if let Some(ref rights) = data.rights {
+        tx.execute(
+            "INSERT INTO atom_feed_rights (feed_id, rights) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, rights],
+        )?;
     }
+
+    tx.execute(
+        "DELETE FROM atom_feed_generators WHERE feed_id = ?1",
+        [feed_id],
+    )?;
+    if let Some(ref gen_) = data.generator {
+        tx.execute(
+            "INSERT INTO atom_feed_generators (feed_id, value, uri, version)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![feed_id, gen_.value, gen_.uri, gen_.version],
+        )?;
+    }
+
+    tx.execute("DELETE FROM atom_feed_logos WHERE feed_id = ?1", [feed_id])?;
+    if let Some(ref logo) = data.logo {
+        tx.execute(
+            "INSERT INTO atom_feed_logos (feed_id, uri) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, logo],
+        )?;
+    }
+
+    tx.execute("DELETE FROM atom_feed_icons WHERE feed_id = ?1", [feed_id])?;
+    if let Some(ref icon) = data.icon {
+        tx.execute(
+            "INSERT INTO atom_feed_icons (feed_id, uri) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, icon],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM atom_feed_authors WHERE feed_id = ?1",
+        [feed_id],
+    )?;
+    for author in &data.authors {
+        tx.execute(
+            "INSERT INTO atom_feed_authors (feed_id, author) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, author],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM atom_feed_contributors WHERE feed_id = ?1",
+        [feed_id],
+    )?;
+    for contributor in &data.contributors {
+        tx.execute(
+            "INSERT INTO atom_feed_contributors (feed_id, contributor) VALUES (?1, ?2)",
+            rusqlite::params![feed_id, contributor],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM atom_feed_categories WHERE feed_id = ?1",
+        [feed_id],
+    )?;
+    for cat in &data.categories {
+        tx.execute(
+            "INSERT INTO atom_categories (category, scheme, label)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![cat.term, cat.scheme, cat.label],
+        )?;
+        let cat_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO atom_feed_categories (feed_id, category_id)
+             VALUES (?1, ?2)",
+            rusqlite::params![feed_id, cat_id],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Insert the atom-specific child rows for a single entry. Children key
+/// directly on `entries.id` and are cleared by the `INSERT OR REPLACE INTO
+/// entries` CASCADE; we also delete defensively in case we're called on an
+/// entry that wasn't replaced (e.g. a script-filtered re-ingest).
+fn insert_atom_entry_data(
+    tx: &rusqlite::Transaction,
+    entry_id: i64,
+    data: &AtomEntryIngestData,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM atom_entry_rights WHERE entry_id = ?1",
+        [entry_id],
+    )?;
+    if let Some(ref rights) = data.rights {
+        tx.execute(
+            "INSERT INTO atom_entry_rights (entry_id, rights) VALUES (?1, ?2)",
+            rusqlite::params![entry_id, rights],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM atom_entry_authors WHERE entry_id = ?1",
+        [entry_id],
+    )?;
+    for author in &data.authors {
+        tx.execute(
+            "INSERT INTO atom_entry_authors (entry_id, author) VALUES (?1, ?2)",
+            rusqlite::params![entry_id, author],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM atom_entry_contributors WHERE entry_id = ?1",
+        [entry_id],
+    )?;
+    for contributor in &data.contributors {
+        tx.execute(
+            "INSERT INTO atom_entry_contributors (entry_id, contributor) VALUES (?1, ?2)",
+            rusqlite::params![entry_id, contributor],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM atom_entry_categories WHERE entry_id = ?1",
+        [entry_id],
+    )?;
+    for cat in &data.categories {
+        tx.execute(
+            "INSERT INTO atom_categories (category, scheme, label)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![cat.term, cat.scheme, cat.label],
+        )?;
+        let cat_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO atom_entry_categories (entry_id, category_id)
+             VALUES (?1, ?2)",
+            rusqlite::params![entry_id, cat_id],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Insert the RSS-specific child rows for a single entry.
+fn insert_rss_entry_data(
+    tx: &rusqlite::Transaction,
+    entry_id: i64,
+    data: &RssEntryIngestData,
+) -> Result<()> {
+    tx.execute("DELETE FROM rss_entry_data WHERE entry_id = ?1", [entry_id])?;
+    tx.execute(
+        "INSERT INTO rss_entry_data (
+            entry_id, description, comments, author,
+            enclosure_url, enclosure_length, enclosure_mime_type
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            entry_id,
+            data.description,
+            data.comments,
+            data.author,
+            data.enclosure_url,
+            data.enclosure_length,
+            data.enclosure_mime_type,
+        ],
+    )?;
+
+    tx.execute("DELETE FROM rss_categories WHERE entry_id = ?1", [entry_id])?;
+    for cat in &data.categories {
+        tx.execute(
+            "INSERT OR IGNORE INTO rss_categories (entry_id, category, domain)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![entry_id, cat.name, cat.domain],
+        )?;
+    }
+
+    Ok(())
 }
 
 fn process_atom_feed(
     feed_id: i64,
     feed: atom_syndication::Feed,
-    conn: PooledConnection<SqliteConnectionManager>,
+    mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
+    metrics: &Metrics,
 ) -> Result<()> {
     info!(
         "Successfully fetched Atom feed {} with {} items",
@@ -753,18 +1277,37 @@ fn process_atom_feed(
         feed.entries.len()
     );
 
+    let feed_data = extract_atom_feed_data(&feed);
+
+    {
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE feeds SET syndication_format = 'atom' WHERE id = ?1",
+            [feed_id],
+        )?;
+        upsert_atom_feed_data(&tx, feed_id, &feed_data)?;
+        tx.commit()?;
+    }
+
     for entry in feed.entries.into_iter() {
-        let feed_entry = atom_entry_to_feed_entry(feed_id, entry);
+        let (feed_entry, ingest) = atom_entry_to_parts(feed_id, entry);
 
         let feed_entry = if let Some(runner) = script_runner {
             let original = feed_entry.clone();
+            let script_start = Instant::now();
             match runner.process_entry(feed_entry) {
-                Ok(Some(e)) => e,
+                Ok(Some(e)) => {
+                    metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "ok");
+                    e
+                }
                 Ok(None) => {
+                    metrics
+                        .record_script_execution(script_start.elapsed().as_secs_f64(), "filtered");
                     debug!("atom entry filtered by script for feed {}", feed_id);
                     continue;
                 }
                 Err(e) => {
+                    metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "error");
                     warn!(
                         "script error processing atom entry for feed {}: {}; inserting unmodified",
                         feed_id, e
@@ -776,7 +1319,8 @@ fn process_atom_feed(
             feed_entry
         };
 
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO entries (
                 feed_id,
                 syndication_format,
@@ -796,6 +1340,16 @@ fn process_atom_feed(
             ],
         )?;
 
+        let entry_id: i64 = tx.query_row(
+            "SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2",
+            rusqlite::params![feed_id, feed_entry.guid],
+            |row| row.get(0),
+        )?;
+
+        insert_atom_entry_data(&tx, entry_id, &ingest)?;
+        tx.commit()?;
+        metrics.record_feed_entry_upserted("atom");
+
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
         }
@@ -807,8 +1361,9 @@ fn process_atom_feed(
 fn process_rss_feed(
     feed_id: i64,
     channel: rss::Channel,
-    conn: PooledConnection<SqliteConnectionManager>,
+    mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
+    metrics: &Metrics,
 ) -> Result<()> {
     info!(
         "Successfully fetched RSS feed {} with {} items",
@@ -816,18 +1371,30 @@ fn process_rss_feed(
         channel.items.len()
     );
 
+    conn.execute(
+        "UPDATE feeds SET syndication_format = 'rss' WHERE id = ?1",
+        [feed_id],
+    )?;
+
     for item in channel.items.into_iter() {
-        let feed_entry = rss_item_to_feed_entry(feed_id, item);
+        let (feed_entry, ingest) = rss_item_to_parts(feed_id, item);
 
         let feed_entry = if let Some(runner) = script_runner {
             let original = feed_entry.clone();
+            let script_start = Instant::now();
             match runner.process_entry(feed_entry) {
-                Ok(Some(e)) => e,
+                Ok(Some(e)) => {
+                    metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "ok");
+                    e
+                }
                 Ok(None) => {
+                    metrics
+                        .record_script_execution(script_start.elapsed().as_secs_f64(), "filtered");
                     debug!("rss entry filtered by script for feed {}", feed_id);
                     continue;
                 }
                 Err(e) => {
+                    metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "error");
                     warn!(
                         "script error processing rss entry for feed {}: {}; inserting unmodified",
                         feed_id, e
@@ -839,7 +1406,8 @@ fn process_rss_feed(
             feed_entry
         };
 
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO entries (
                 feed_id,
                 syndication_format,
@@ -858,6 +1426,16 @@ fn process_rss_feed(
                 feed_entry.content
             ],
         )?;
+
+        let entry_id: i64 = tx.query_row(
+            "SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2",
+            rusqlite::params![feed_id, feed_entry.guid],
+            |row| row.get(0),
+        )?;
+
+        insert_rss_entry_data(&tx, entry_id, &ingest)?;
+        tx.commit()?;
+        metrics.record_feed_entry_upserted("rss");
 
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;

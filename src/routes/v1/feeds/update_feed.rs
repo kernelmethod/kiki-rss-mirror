@@ -15,6 +15,8 @@ pub struct UpdateFeedRequest {
     pub title: Option<String>,
     pub url: Option<String>,
     pub description: Option<String>,
+    /// Minimum interval, in seconds, between fetches of this feed.
+    pub min_fetch_interval_seconds: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
@@ -23,6 +25,7 @@ pub struct UpdateFeedResponse {
     pub title: String,
     pub url: String,
     pub description: Option<String>,
+    pub min_fetch_interval_seconds: i64,
 }
 
 #[derive(Error, Debug)]
@@ -32,6 +35,9 @@ enum UpdateFeedTaskError {
 
     #[error("invalid update parameters")]
     InvalidUpdate,
+
+    #[error("min_fetch_interval_seconds must be positive")]
+    InvalidFetchInterval,
 
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
@@ -98,6 +104,14 @@ pub async fn update_feed(
             params.push(Box::new(description.clone()));
         }
 
+        if let Some(min_fetch_interval_seconds) = payload.min_fetch_interval_seconds {
+            if min_fetch_interval_seconds <= 0 {
+                return Err(UpdateFeedTaskError::InvalidFetchInterval);
+            }
+            updates.push("min_fetch_interval_seconds = ?".to_string());
+            params.push(Box::new(min_fetch_interval_seconds));
+        }
+
         if updates.is_empty() {
             // No updates provided
             return Err(UpdateFeedTaskError::InvalidUpdate);
@@ -116,7 +130,7 @@ pub async fn update_feed(
         // Retrieve the updated feed data
         let feed = conn
             .prepare(
-                "SELECT id, title, url, description
+                "SELECT id, title, url, description, min_fetch_interval_seconds
                 FROM feeds WHERE id = ?1 LIMIT 1",
             )
             .inspect_err(|e| {
@@ -128,6 +142,7 @@ pub async fn update_feed(
                     title: row.get(1)?,
                     url: row.get(2)?,
                     description: row.get(3)?,
+                    min_fetch_interval_seconds: row.get(4)?,
                 })
             })?;
 
@@ -146,6 +161,11 @@ pub async fn update_feed(
         Ok(Err(UpdateFeedTaskError::InvalidUpdate)) => {
             Err((StatusCode::BAD_REQUEST, "Invalid update parameters").into_response())
         }
+        Ok(Err(UpdateFeedTaskError::InvalidFetchInterval)) => Err((
+            StatusCode::BAD_REQUEST,
+            "min_fetch_interval_seconds must be positive",
+        )
+            .into_response()),
         Ok(Err(UpdateFeedTaskError::Database(_))) => {
             event!(Level::ERROR, "database error in update_feed");
             Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())

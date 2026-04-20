@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Rich RSS Fixture</title>
+    <link>http://example.com/</link>
+    <description>A feed that exercises RSS-specific fields.</description>
+    <language>en-us</language>
+    <lastBuildDate>Wed, 27 Nov 2024 00:00:00 +0000</lastBuildDate>
+    <atom:link href="http://example.com/feed.xml" rel="self" type="application/rss+xml"/>
+    <item>
+      <title>Item With Everything</title>
+      <link>http://example.com/items/1</link>
+      <pubDate>Wed, 27 Nov 2024 00:00:00 +0000</pubDate>
+      <guid>http://example.com/items/1</guid>
+      <description>A full-featured item.</description>
+      <author>alice@example.com (Alice)</author>
+      <comments>http://example.com/items/1/comments</comments>
+      <enclosure url="http://example.com/audio.mp3" length="12345" type="audio/mpeg"/>
+      <category domain="http://example.com/tax">tech</category>
+      <category domain="http://example.com/tax">news</category>
+    </item>
+    <item>
+      <title>Item With Description Only</title>
+      <link>http://example.com/items/2</link>
+      <pubDate>Tue, 26 Nov 2024 00:00:00 +0000</pubDate>
+      <guid>http://example.com/items/2</guid>
+      <description>An item with a description and a single bare category.</description>
+      <category>misc</category>
+    </item>
+    <item>
+      <title>Bare Item</title>
+      <link>http://example.com/items/3</link>
+      <pubDate>Mon, 25 Nov 2024 00:00:00 +0000</pubDate>
+      <guid>http://example.com/items/3</guid>
+    </item>
+  </channel>
+</rss>

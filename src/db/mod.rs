@@ -5,6 +5,8 @@ use std::path::Path;
 
 pub mod migrations;
 pub mod retention;
+pub mod settings;
+pub mod task_queue;
 
 enum ConnectionType<'a> {
     DefaultConnection,
@@ -141,7 +143,6 @@ mod tests {
             "atom_entry_categories",
             "atom_entry_contributors",
             "atom_entry_contributors_all",
-            "atom_entry_data",
             "atom_entry_rights",
             "atom_feed_authors",
             "atom_feed_categories",
@@ -166,10 +167,10 @@ mod tests {
             "migrations",
             "rss_categories",
             "rss_entry_data",
-            "rss_feed_data",
             "scripts",
             "settings",
             "tags",
+            "task_queue",
         ]
         .into_iter()
         .map(String::from)

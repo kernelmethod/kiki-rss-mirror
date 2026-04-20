@@ -386,6 +386,48 @@ impl TestConfig {
         format!("file://{}", p.into_os_string().into_string().unwrap())
     }
 
+    pub fn rich_rss_feed_url(&self) -> String {
+        let p = Self::test_data_path("rich_rss.xml");
+        format!("file://{}", p.into_os_string().into_string().unwrap())
+    }
+
+    pub fn rich_atom_feed_url(&self) -> String {
+        let p = Self::test_data_path("rich_atom.xml");
+        format!("file://{}", p.into_os_string().into_string().unwrap())
+    }
+
+    /// POST /v1/feeds/create with the given title+url, assert 201, wait for
+    /// the background worker to ingest, then return the new feed's id.
+    ///
+    /// Shared by the entry- and feed-route test modules.
+    pub async fn add_feed_from_url(&self, title: &str, url: String) -> Result<i64> {
+        #[derive(serde::Serialize)]
+        struct Req<'a> {
+            title: &'a str,
+            url: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            id: i64,
+        }
+
+        let client = self.client()?;
+        let resp = client
+            .post("http://localhost/v1/feeds/create")
+            .json(&Req { title, url })
+            .send()
+            .await?;
+        if resp.status() != reqwest::StatusCode::CREATED {
+            bail!(
+                "POST /v1/feeds/create returned unexpected status {:?}",
+                resp.status()
+            );
+        }
+        let id = resp.json::<Resp>().await?.id;
+        std::thread::sleep(Duration::from_millis(250));
+        Ok(id)
+    }
+
     pub fn config_dir(&self) -> &Path {
         self.td.path()
     }

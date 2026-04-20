@@ -40,6 +40,8 @@ pub async fn fetch_feed(State(state): State<AppState>, Path(id): Path<i64>) -> R
         return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to queue fetch").into_response();
     }
 
+    state.metrics.record_task_enqueued("refresh_feed");
+
     event!(
         Level::INFO,
         "initiated feed fetch request for feed id: {:?}",

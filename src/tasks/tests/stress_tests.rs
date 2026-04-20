@@ -175,7 +175,7 @@ async fn stress_concurrent_fetch_and_reads() -> Result<()> {
             let fid = feed_ids[i % feed_ids.len()];
             js.spawn(async move {
                 let resp = c
-                    .post(format!("{BASE}/v1/feeds/fetch/{fid}"))
+                    .post(format!("{BASE}/v1/feeds/refresh/{fid}"))
                     .send()
                     .await
                     .unwrap();
@@ -356,7 +356,7 @@ async fn stress_refresh_vs_cleanup_race() -> Result<()> {
         // Trigger initial fetches and wait
         for fid in &feed_ids {
             let resp = client
-                .post(format!("{BASE}/v1/feeds/fetch/{fid}"))
+                .post(format!("{BASE}/v1/feeds/refresh/{fid}"))
                 .send()
                 .await?;
             assert_eq!(resp.status(), 202);
@@ -376,7 +376,7 @@ async fn stress_refresh_vs_cleanup_race() -> Result<()> {
             let fid = feed_ids[i % feed_ids.len()];
             js.spawn(async move {
                 let resp = c
-                    .post(format!("{BASE}/v1/feeds/fetch/{fid}"))
+                    .post(format!("{BASE}/v1/feeds/refresh/{fid}"))
                     .send()
                     .await
                     .unwrap();
@@ -500,7 +500,7 @@ async fn stress_concurrent_crud_same_feed() -> Result<()> {
             let c = client.clone();
             js.spawn(async move {
                 let resp = c
-                    .post(format!("{BASE}/v1/feeds/fetch/{feed_id}"))
+                    .post(format!("{BASE}/v1/feeds/refresh/{feed_id}"))
                     .send()
                     .await
                     .unwrap();
@@ -621,7 +621,7 @@ async fn stress_script_reload_during_processing() -> Result<()> {
             let fid = feed_ids[i % feed_ids.len()];
             js.spawn(async move {
                 let resp = c
-                    .post(format!("{BASE}/v1/feeds/fetch/{fid}"))
+                    .post(format!("{BASE}/v1/feeds/refresh/{fid}"))
                     .send()
                     .await
                     .unwrap();
@@ -660,7 +660,7 @@ async fn stress_script_reload_during_processing() -> Result<()> {
 
         // Workers still functional
         let resp = client
-            .post(format!("{BASE}/v1/feeds/fetch/{}", feed_ids[0]))
+            .post(format!("{BASE}/v1/feeds/refresh/{}", feed_ids[0]))
             .send()
             .await?;
         assert_eq!(resp.status(), 202);
