@@ -3,6 +3,7 @@ mod lua_script_tests;
 
 mod asset_cache_tests;
 mod backoff_tests;
+mod cache_control_parse;
 mod cache_tests;
 mod fetch_error_tests;
 mod format_data_tests;

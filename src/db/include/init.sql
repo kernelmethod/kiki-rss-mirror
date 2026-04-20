@@ -79,6 +79,12 @@ CREATE TABLE feeds (
     -- time has passed.
     header_expires          INTEGER,
 
+    -- Unix timestamp until which the feed's last response is treated as
+    -- immutable per RFC 8246 (Cache-Control: immutable). While set and in
+    -- the future, conditional request headers (If-None-Match,
+    -- If-Modified-Since) are omitted and the feed is not refetched.
+    header_immutable_until  INTEGER,
+
     -- Most recent fetch error message, if any. Cleared on successful fetch.
     last_fetch_error        VARCHAR,
     -- Timestamp of the most recent fetch error.

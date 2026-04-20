@@ -415,8 +415,11 @@ async fn test_max_age_sets_expires() -> Result<()> {
         |row| row.get(0),
     )?;
     let expires = stored_expires.expect("header_expires should be set");
+    // Allow a small slack below the lower bound: corrected_max_age (RFC 9111
+    // §4.2.3) may subtract up to one second based on the response's auto-
+    // generated Date header rounding to the previous second.
     assert!(
-        expires >= before + 3600 && expires <= before + 3600 + 5,
+        expires >= before + 3595 && expires <= before + 3600 + 5,
         "header_expires should be approximately now + 3600, got offset {}",
         expires - before
     );
@@ -946,13 +949,389 @@ async fn test_304_resets_consecutive_failures_and_reschedules() -> Result<()> {
     )?;
     assert_eq!(failures, 0, "304 should reset consecutive_failures");
     let nf = next_fetch_at.expect("next_fetch_at should be set");
+    // Allow a small slack below the lower bound: the server's auto-injected
+    // Date header can round to the previous second, which `corrected_max_age`
+    // then subtracts from the declared max-age (RFC 9111 §4.2.3).
     assert!(
-        nf >= before + 600 && nf <= after + 600,
+        nf >= before + 595 && nf <= after + 600,
         "304 with max-age=600 should schedule ~600s out, got offset {}",
         nf - before
     );
 
     let s = state.lock().unwrap();
     assert_eq!(s.not_modified_count, 1);
+    Ok(())
+}
+
+/// Multiple `Cache-Control` header fields are combined per RFC 9110 §5.3:
+/// `max-age` from one header and `no-store` from the other should both
+/// apply, and `no-store` must win (clearing any stored freshness).
+#[tokio::test]
+async fn test_multiple_cache_control_headers_combine() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        cache_control: Some("max-age=3600".into()),
+        cache_control_extra: vec!["no-store".into()],
+        etag: Some("\"combine\"".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let (stored_etag, stored_expires): (Option<String>, Option<i64>) = conn.query_row(
+        "SELECT header_etag, header_expires FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert!(
+        stored_etag.is_none(),
+        "no-store from combined Cache-Control should clear etag"
+    );
+    assert!(
+        stored_expires.is_none(),
+        "no-store from combined Cache-Control should clear expires"
+    );
+    Ok(())
+}
+
+/// `Age: 300` with `max-age=600` should subtract the upstream age
+/// from the freshness lifetime (RFC 9111 §4.2.3).
+#[tokio::test]
+async fn test_age_header_reduces_max_age() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        cache_control: Some("max-age=600".into()),
+        age: Some(300),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+    let before = Utc::now().timestamp();
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let stored_expires: Option<i64> = conn.query_row(
+        "SELECT header_expires FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    let expires = stored_expires.expect("header_expires should be set");
+    // 600 - 300 = 300 seconds of remaining freshness.
+    assert!(
+        expires >= before + 290 && expires <= before + 310,
+        "Age header should subtract from max-age; got offset {}",
+        expires - before
+    );
+    Ok(())
+}
+
+/// A `Date` 60 seconds in the past should subtract 60s from `max-age`
+/// even without an explicit `Age` header (RFC 9111 §4.2.3).
+#[tokio::test]
+async fn test_date_skew_reduces_max_age() -> Result<()> {
+    let past_date = (Utc::now() - chrono::Duration::seconds(60))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        cache_control: Some("max-age=600".into()),
+        date: Some(past_date),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+    let before = Utc::now().timestamp();
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let stored_expires: Option<i64> = conn.query_row(
+        "SELECT header_expires FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    let expires = stored_expires.expect("header_expires should be set");
+    // 600 - 60 = 540 seconds of remaining freshness (±10s slack for test jitter).
+    assert!(
+        expires >= before + 530 && expires <= before + 550,
+        "Date in the past should subtract from max-age; got offset {}",
+        expires - before
+    );
+    Ok(())
+}
+
+/// `Pragma: no-cache` without any `Cache-Control` header should clear
+/// the freshness hint (RFC 9111 §5.4).
+#[tokio::test]
+async fn test_pragma_no_cache_without_cache_control() -> Result<()> {
+    let future_expires = (Utc::now() + chrono::Duration::hours(1))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        expires: Some(future_expires),
+        pragma: Some("no-cache".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+    let before = Utc::now().timestamp();
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let next_fetch_at: Option<i64> = conn.query_row(
+        "SELECT next_fetch_at FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    let nf = next_fetch_at.expect("next_fetch_at should be set");
+    // Pragma: no-cache should suppress the Expires hint, so the next fetch
+    // should fall back to min_fetch_interval (default 10800s) rather than
+    // being gated by the Expires header an hour out.
+    assert!(
+        nf - before > 3600,
+        "pragma no-cache should fall back to min_fetch_interval; got offset {}",
+        nf - before
+    );
+    Ok(())
+}
+
+/// `Pragma: no-cache` is ignored when `Cache-Control` is present
+/// (RFC 9111 §5.4 restricts the fallback to requests/responses with no
+/// Cache-Control).
+#[tokio::test]
+async fn test_pragma_ignored_when_cache_control_present() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        cache_control: Some("max-age=3600".into()),
+        pragma: Some("no-cache".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+    let before = Utc::now().timestamp();
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let stored_expires: Option<i64> = conn.query_row(
+        "SELECT header_expires FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    let expires = stored_expires.expect("header_expires should be set from max-age");
+    assert!(
+        expires >= before + 3500 && expires <= before + 3700,
+        "Cache-Control max-age should win over Pragma; got offset {}",
+        expires - before
+    );
+    Ok(())
+}
+
+/// `Cache-Control: immutable, max-age=3600` stores a future
+/// `header_immutable_until`, and the next refresh omits conditional
+/// request headers (RFC 8246).
+#[tokio::test]
+async fn test_immutable_skips_conditional_headers() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"imm\"".into()),
+        last_modified: Some("Sat, 01 Jan 2025 00:00:00 GMT".into()),
+        cache_control: Some("immutable, max-age=3600".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+    let before = Utc::now().timestamp();
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let stored_until: Option<i64> = conn.query_row(
+        "SELECT header_immutable_until FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    let until = stored_until.expect("header_immutable_until should be set");
+    assert!(
+        until >= before + 3500 && until <= before + 3700,
+        "header_immutable_until should be ~now+3600"
+    );
+
+    // Force a second fetch (the scheduler would otherwise gate us).
+    reset_last_checked(&conn, feed_id);
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let s = state.lock().unwrap();
+    assert_eq!(
+        s.if_none_match_count, 0,
+        "immutable response should suppress If-None-Match on the follow-up"
+    );
+    assert_eq!(
+        s.if_modified_since_count, 0,
+        "immutable response should suppress If-Modified-Since on the follow-up"
+    );
+    Ok(())
+}
+
+/// A 503 that carries `Cache-Control: stale-if-error=3600` must cap the
+/// backoff schedule at 3600 seconds so we retry before the grace window
+/// elapses (RFC 5861 §4).
+#[tokio::test]
+async fn test_stale_if_error_caps_backoff() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        fail_next: 1,
+        fail_status: 503,
+        cache_control: Some("stale-if-error=3600".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    // Pre-populate a long failure streak so the exponential backoff would
+    // otherwise push next_fetch_at well past one hour.
+    {
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "UPDATE feeds SET consecutive_failures = 10 WHERE id = ?1",
+            [feed_id],
+        )?;
+    }
+
+    let before = Utc::now().timestamp();
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let nf: i64 = conn
+        .query_row(
+            "SELECT next_fetch_at FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        nf <= before + 3600 + 10,
+        "stale-if-error=3600 must cap the schedule; got offset {}",
+        nf - before
+    );
+    Ok(())
+}
+
+/// The RFC 850 date format is still accepted for the `Expires` header
+/// (RFC 9110 §5.6.7).
+#[tokio::test]
+async fn test_expires_rfc850_format_is_parsed() -> Result<()> {
+    let future = Utc::now() + chrono::Duration::minutes(30);
+    let rfc850 = future.format("%A, %d-%b-%y %H:%M:%S GMT").to_string();
+
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        expires: Some(rfc850),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+    let before = Utc::now().timestamp();
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let stored: Option<i64> = conn.query_row(
+        "SELECT header_expires FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    let stored = stored.expect("header_expires should parse from RFC 850 format");
+    assert!(
+        stored >= before + 25 * 60 && stored <= before + 35 * 60,
+        "RFC 850 Expires should parse into a ~30min-future timestamp"
+    );
     Ok(())
 }

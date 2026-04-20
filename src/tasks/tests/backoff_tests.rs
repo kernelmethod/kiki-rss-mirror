@@ -142,6 +142,7 @@ fn test_compute_next_fetch_at_exponential_backoff() {
             FetchOutcome::TransientErr {
                 retry_after_ts: None,
                 consecutive_failures: failures,
+                stale_if_error_secs: None,
             },
             now,
             MIN_CADENCE,
@@ -165,6 +166,7 @@ fn test_compute_next_fetch_at_backoff_caps_at_max_backoff() {
         FetchOutcome::TransientErr {
             retry_after_ts: None,
             consecutive_failures: 20,
+            stale_if_error_secs: None,
         },
         now,
         MIN_CADENCE,

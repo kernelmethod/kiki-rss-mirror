@@ -1,6 +1,7 @@
 use crate::http::USER_AGENT;
 use crate::metrics::Metrics;
 use crate::scripting::{FeedEntry, ScriptRunner};
+use crate::tasks::cache::{corrected_max_age, extract_server_hints, parse_http_date, CacheControl};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use r2d2::{Pool, PooledConnection};
@@ -16,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 pub mod assets;
+mod cache;
 
 #[cfg(test)]
 mod tests;
@@ -110,9 +112,15 @@ enum FetchOutcome {
     /// 304 Not Modified.
     NotModified { server_hint_secs: Option<u64> },
     /// Transient error — eligible for exponential backoff.
+    ///
+    /// `stale_if_error_secs` carries the most recent
+    /// `Cache-Control: stale-if-error` value (RFC 5861 §4). When present, it
+    /// caps the computed backoff so we revalidate before the grace window
+    /// elapses.
     TransientErr {
         retry_after_ts: Option<i64>,
         consecutive_failures: u32,
+        stale_if_error_secs: Option<u64>,
     },
     /// Permanent error — wait the full backoff cap.
     PermanentErr,
@@ -149,15 +157,26 @@ fn compute_next_fetch_at(
         }
         FetchOutcome::TransientErr {
             retry_after_ts: Some(ts),
+            stale_if_error_secs,
             ..
-        } => ts,
+        } => {
+            // Don't wait past the stale-if-error window (RFC 5861 §4).
+            match stale_if_error_secs {
+                Some(s) => ts.min(now_ts.saturating_add(s as i64)),
+                None => ts,
+            }
+        }
         FetchOutcome::TransientErr {
             retry_after_ts: None,
             consecutive_failures,
+            stale_if_error_secs,
         } => {
             let shift = consecutive_failures.saturating_sub(1).min(63);
             let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-            let backoff = min_cadence.saturating_mul(multiplier);
+            let mut backoff = min_cadence.saturating_mul(multiplier);
+            if let Some(s) = stale_if_error_secs {
+                backoff = backoff.min(s);
+            }
             now_ts.saturating_add(backoff as i64)
         }
         FetchOutcome::PermanentErr => now_ts.saturating_add(max_backoff as i64),
@@ -166,43 +185,6 @@ fn compute_next_fetch_at(
     let floor = now_ts.saturating_add(min_cadence as i64);
     let ceiling = now_ts.saturating_add(max_backoff as i64);
     raw_next_ts.max(floor).min(ceiling)
-}
-
-/// Parsed `Cache-Control` directives relevant to the fetcher.
-struct CacheControl {
-    /// `max-age=N` — freshness lifetime in seconds.
-    max_age: Option<u64>,
-    /// `no-cache` — must revalidate; don't skip fetching.
-    no_cache: bool,
-    /// `no-store` — don't cache at all.
-    no_store: bool,
-}
-
-impl CacheControl {
-    /// Parse a `Cache-Control` header value into the directives we care about.
-    fn parse(header: &str) -> Self {
-        let mut cc = CacheControl {
-            max_age: None,
-            no_cache: false,
-            no_store: false,
-        };
-
-        for directive in header.split(',') {
-            let directive = directive.trim();
-            if directive.eq_ignore_ascii_case("no-cache") {
-                cc.no_cache = true;
-            } else if directive.eq_ignore_ascii_case("no-store") {
-                cc.no_store = true;
-            } else {
-                let lower = directive.to_ascii_lowercase();
-                if let Some(val) = lower.strip_prefix("max-age=") {
-                    cc.max_age = val.trim().parse::<u64>().ok();
-                }
-            }
-        }
-
-        cc
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -710,6 +692,7 @@ fn set_feed_error_with_schedule(
     feed_id: i64,
     fetch_error: &FetchError,
     retry_after_ts: Option<i64>,
+    stale_if_error_secs: Option<u64>,
     min_cadence: u64,
     max_backoff: u64,
     min_fetch_interval: u64,
@@ -751,6 +734,7 @@ fn set_feed_error_with_schedule(
             FetchOutcome::TransientErr {
                 retry_after_ts,
                 consecutive_failures: new_failures,
+                stale_if_error_secs,
             },
             retry_kind,
         )
@@ -823,6 +807,7 @@ fn set_feed_error(
         feed_id,
         fetch_error,
         None,
+        None,
         min_cadence,
         max_backoff,
         min_fetch_interval,
@@ -873,6 +858,7 @@ pub(crate) async fn refresh_feed(
         feed_url,
         header_etag,
         header_last_modified,
+        header_immutable_until,
         next_fetch_at,
         min_fetch_interval,
     ): (
@@ -880,17 +866,19 @@ pub(crate) async fn refresh_feed(
         Option<String>,
         Option<String>,
         Option<i64>,
+        Option<i64>,
         i64,
     ) = conn.query_row(
-        "SELECT url, header_etag, header_last_modified, next_fetch_at, min_fetch_interval_seconds FROM feeds WHERE id = ?1",
+        "SELECT url, header_etag, header_last_modified, header_immutable_until, next_fetch_at, min_fetch_interval_seconds FROM feeds WHERE id = ?1",
         [feed_id],
         |row| {
             let url: String = row.get(0)?;
             let etag: Option<String> = row.get(1)?;
             let last_modified: Option<String> = row.get(2)?;
-            let next_fetch_at: Option<i64> = row.get(3)?;
-            let min_fetch_interval: i64 = row.get(4)?;
-            Ok((url, etag, last_modified, next_fetch_at, min_fetch_interval))
+            let immutable_until: Option<i64> = row.get(3)?;
+            let next_fetch_at: Option<i64> = row.get(4)?;
+            let min_fetch_interval: i64 = row.get(5)?;
+            Ok((url, etag, last_modified, immutable_until, next_fetch_at, min_fetch_interval))
         },
     )?;
 
@@ -925,6 +913,7 @@ pub(crate) async fn refresh_feed(
             &feed_url,
             header_etag.as_deref(),
             header_last_modified.as_deref(),
+            header_immutable_until,
             pool.clone(),
             fetch_start,
             cfg,
@@ -974,6 +963,7 @@ pub(crate) async fn refresh_feed(
             feed_id,
             &fetch_err,
             None,
+            None,
             cfg.min_cadence,
             cfg.max_backoff,
             cfg.min_fetch_interval,
@@ -986,31 +976,6 @@ pub(crate) async fn refresh_feed(
     Ok(())
 }
 
-/// Extract a freshness hint (in seconds from now) from a response's
-/// `Cache-Control: max-age` or `Expires` header. Returns the shorter of the
-/// two when both are present; `max-age` takes precedence per RFC 7234.
-fn extract_server_hint_secs(resp_headers: &reqwest::header::HeaderMap, now_ts: i64) -> Option<u64> {
-    let cc = resp_headers
-        .get("cache-control")
-        .and_then(|h| h.to_str().ok())
-        .map(CacheControl::parse);
-
-    if let Some(ref cc) = cc {
-        if cc.no_store || cc.no_cache {
-            return None;
-        }
-        if let Some(max_age) = cc.max_age {
-            return Some(max_age);
-        }
-    }
-
-    resp_headers
-        .get("expires")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%a, %d %b %Y %H:%M:%S GMT").ok())
-        .map(|dt| (dt.and_utc().timestamp() - now_ts).max(0) as u64)
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn retrieve_feed(
     client: &reqwest::Client,
@@ -1018,6 +983,7 @@ async fn retrieve_feed(
     feed_url: &str,
     etag: Option<&str>,
     last_modified: Option<&str>,
+    immutable_until: Option<i64>,
     pool: Pool<SqliteConnectionManager>,
     fetch_start: Instant,
     cfg: SchedulerConfig,
@@ -1026,6 +992,13 @@ async fn retrieve_feed(
     let conn = pool.get()?;
 
     let timeout = Duration::from_secs(crate::db::settings::get_feed_update_timeout_seconds(&conn)?);
+
+    // RFC 8246: while a prior response advertised `immutable` and is still
+    // fresh, suppress conditional revalidation — the server has promised
+    // the representation won't change.
+    let skip_conditionals = immutable_until
+        .map(|until| Utc::now().timestamp() < until)
+        .unwrap_or(false);
 
     let mut current_url = feed_url.to_string();
     let mut had_permanent_redirect = false;
@@ -1036,7 +1009,7 @@ async fn retrieve_feed(
         for _ in 0..=max_redirects {
             // Only send conditional headers on the first request
             let mut request = client.get(&current_url).timeout(timeout);
-            if current_url == feed_url {
+            if current_url == feed_url && !skip_conditionals {
                 if let Some(etag) = etag {
                     request = request.header("If-None-Match", etag);
                 }
@@ -1057,6 +1030,7 @@ async fn retrieve_feed(
                         &conn,
                         feed_id,
                         &fetch_err,
+                        None,
                         None,
                         cfg.min_cadence,
                         cfg.max_backoff,
@@ -1105,6 +1079,7 @@ async fn retrieve_feed(
             feed_id,
             &fetch_err,
             None,
+            None,
             cfg.min_cadence,
             cfg.max_backoff,
             cfg.min_fetch_interval,
@@ -1122,9 +1097,11 @@ async fn retrieve_feed(
         reqwest::StatusCode::NOT_MODIFIED => {
             info!("Feed {} was not modified since last check", feed_id);
             let now_ts = Utc::now().timestamp();
-            let server_hint_secs = extract_server_hint_secs(resp.headers(), now_ts);
+            let hints = extract_server_hints(resp.headers(), now_ts);
             let next_fetch_at = compute_next_fetch_at(
-                FetchOutcome::NotModified { server_hint_secs },
+                FetchOutcome::NotModified {
+                    server_hint_secs: hints.hint_secs,
+                },
                 now_ts,
                 cfg.min_cadence,
                 cfg.max_backoff,
@@ -1165,11 +1142,16 @@ async fn retrieve_feed(
                 None
             };
 
+            // Honor Cache-Control: stale-if-error on the error response
+            // (RFC 5861 §4) so our backoff doesn't outlive the grace window.
+            let hints = extract_server_hints(resp.headers(), Utc::now().timestamp());
+
             set_feed_error_with_schedule(
                 &conn,
                 feed_id,
                 &fetch_err,
                 retry_after_ts,
+                hints.stale_if_error,
                 cfg.min_cadence,
                 cfg.max_backoff,
                 cfg.min_fetch_interval,
@@ -1199,47 +1181,63 @@ async fn retrieve_feed(
         .get("last-modified")
         .and_then(|h| h.to_str().ok());
 
-    // Parse the Expires header into a Unix timestamp so we can skip future
-    // fetches until the declared expiry time has passed.
+    // Parse the Expires header (RFC 9111 §5.3) into a Unix timestamp so we
+    // can skip future fetches until the declared expiry time has passed.
+    // Accepts all three HTTP-date formats (RFC 9110 §5.6.7).
     let mut expires: Option<i64> = resp
         .headers()
         .get("expires")
         .and_then(|h| h.to_str().ok())
-        .and_then(|s| {
-            chrono::NaiveDateTime::parse_from_str(s, "%a, %d %b %Y %H:%M:%S GMT")
-                .ok()
-                .map(|dt| dt.and_utc().timestamp())
-        });
+        .and_then(parse_http_date)
+        .map(|dt| dt.timestamp());
 
     let now_ts = Utc::now().timestamp();
 
-    // Derive the freshness hint before Cache-Control directives can mutate
+    // Derive freshness hints before Cache-Control directives mutate
     // `expires` — the hint reflects the server's original instruction.
-    let server_hint_secs = extract_server_hint_secs(resp.headers(), now_ts);
+    let hints = extract_server_hints(resp.headers(), now_ts);
 
-    // Parse Cache-Control and apply precedence rules (RFC 7234):
+    // Parse Cache-Control and apply precedence rules (RFC 9111 §5.2):
     // - no-store: clear all cache headers
     // - no-cache: allow conditional requests but never skip fetching
-    // - max-age: overrides Expires header
-    if let Some(cc) = resp
+    // - max-age: overrides Expires header (adjusted for upstream age per
+    //   RFC 9111 §4.2.3)
+    let cc_values: Vec<&str> = resp
         .headers()
-        .get("cache-control")
-        .and_then(|h| h.to_str().ok())
-        .map(CacheControl::parse)
-    {
-        if cc.no_store {
-            etag = None;
-            last_modified = None;
-            expires = None;
-        } else if cc.no_cache {
-            expires = None;
-        } else if let Some(max_age) = cc.max_age {
-            expires = Some(now_ts + max_age as i64);
-        }
+        .get_all("cache-control")
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .collect();
+    let cc = CacheControl::parse_many(&cc_values);
+    if cc.no_store {
+        etag = None;
+        last_modified = None;
+        expires = None;
+    } else if cc.no_cache {
+        expires = None;
+    } else if let Some(max_age) = cc.max_age {
+        let corrected = corrected_max_age(resp.headers(), max_age, now_ts);
+        expires = Some(now_ts + corrected as i64);
     }
 
+    // RFC 8246: while the response is fresh, skip conditional revalidation
+    // entirely. Only meaningful when paired with a positive max-age.
+    let immutable_until: Option<i64> = if hints.immutable {
+        hints.hint_secs.and_then(|s| {
+            if s > 0 {
+                Some(now_ts.saturating_add(s as i64))
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
     let next_fetch_at = compute_next_fetch_at(
-        FetchOutcome::Success { server_hint_secs },
+        FetchOutcome::Success {
+            server_hint_secs: hints.hint_secs,
+        },
         now_ts,
         cfg.min_cadence,
         cfg.max_backoff,
@@ -1251,12 +1249,21 @@ async fn retrieve_feed(
             header_etag = ?,
             header_last_modified = ?,
             header_expires = ?,
+            header_immutable_until = ?,
             last_checked = ?,
             next_fetch_at = ?,
             consecutive_failures = 0,
             retry_after_at = NULL
          WHERE id = ?",
-        (etag, last_modified, expires, now_ts, next_fetch_at, feed_id),
+        (
+            etag,
+            last_modified,
+            expires,
+            immutable_until,
+            now_ts,
+            next_fetch_at,
+            feed_id,
+        ),
     )?;
 
     metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
