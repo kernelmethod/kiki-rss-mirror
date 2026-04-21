@@ -1,3 +1,4 @@
+use crate::http::FeedAuthType;
 use crate::routes::v1::feeds::format_data::{
     load_atom_feed_data, load_rss_feed_data, AtomFeedData, RssFeedData,
 };
@@ -22,6 +23,21 @@ pub struct GetFeedResponse {
     pub last_checked: Option<String>,
     /// Minimum interval, in seconds, between fetches of this feed.
     pub min_fetch_interval_seconds: i64,
+    /// Current authentication scheme for this feed. Credentials themselves
+    /// are never returned — only the scheme in use.
+    pub auth_type: FeedAuthType,
+}
+
+/// Read the `auth_type` column at `idx` and decode it into a [`FeedAuthType`].
+///
+/// Unrecognized values fall back to [`FeedAuthType::None`] so a bad row
+/// doesn't take down an otherwise-working endpoint.
+pub(crate) fn read_auth_type_column(
+    row: &rusqlite::Row,
+    idx: usize,
+) -> rusqlite::Result<FeedAuthType> {
+    let raw: Option<String> = row.get(idx)?;
+    Ok(FeedAuthType::from_db(raw.as_deref()).unwrap_or_default())
 }
 
 /// Detail response for a single feed. Extends [`GetFeedResponse`] with
@@ -79,7 +95,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
     // statement on a blocking thread.
     let task_result = task::spawn_blocking(move || {
         let mut stmt = match conn.prepare(
-            "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at, min_fetch_interval_seconds
+            "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at, min_fetch_interval_seconds, auth_type
                 FROM feeds WHERE id = ?1 LIMIT 1",
         ) {
             Ok(s) => s,
@@ -89,6 +105,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
             }
         };
         let query_result = stmt.query_row([id], |row| {
+            let auth_type = read_auth_type_column(row, 8)?;
             let feed = GetFeedResponse {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -98,6 +115,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
                     chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
                 }),
                 min_fetch_interval_seconds: row.get(7)?,
+                auth_type,
             };
             let last_fetch_error = row
                 .get::<usize, Option<String>>(5)?

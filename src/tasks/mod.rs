@@ -1,4 +1,4 @@
-use crate::http::USER_AGENT;
+use crate::http::{FeedAuth, FeedAuthType, USER_AGENT};
 use crate::metrics::Metrics;
 use crate::scripting::{FeedEntry, ScriptRunner};
 use crate::tasks::cache::{corrected_max_age, extract_server_hints, parse_http_date, CacheControl};
@@ -80,6 +80,20 @@ impl FetchError {
             FetchError::InvalidFeed { .. } | FetchError::TooManyRedirects { .. } => false,
         }
     }
+}
+
+/// Return true if two URL strings share the same (scheme, host, port) origin.
+///
+/// Used to decide whether credentials intended for a feed's configured URL
+/// may be forwarded across a redirect. Parse failures are treated as "not
+/// same-origin" — we refuse to leak credentials to a URL we can't inspect.
+fn same_origin(a: &str, b: &str) -> bool {
+    let (Ok(ua), Ok(ub)) = (Url::parse(a), Url::parse(b)) else {
+        return false;
+    };
+    ua.scheme() == ub.scheme()
+        && ua.host_str() == ub.host_str()
+        && ua.port_or_known_default() == ub.port_or_known_default()
 }
 
 /// Parse an HTTP `Retry-After` header value into an absolute Unix timestamp.
@@ -857,6 +871,7 @@ struct FeedFetchRow {
     consecutive_failures: i64,
     next_fetch_at: Option<i64>,
     min_fetch_interval: i64,
+    auth: FeedAuth,
 }
 
 fn load_feed_fetch_row(
@@ -873,11 +888,23 @@ fn load_feed_fetch_row(
             last_full_refresh_at,
             consecutive_failures,
             next_fetch_at,
-            min_fetch_interval_seconds
+            min_fetch_interval_seconds,
+            auth_type,
+            auth_username,
+            auth_password,
+            auth_bearer_token
          FROM feeds
          WHERE id = ?1",
         [feed_id],
         |row| {
+            let auth_type_raw: Option<String> = row.get(9)?;
+            let auth_type = FeedAuthType::from_db(auth_type_raw.as_deref()).unwrap_or_else(|e| {
+                warn!(
+                    "Feed {}: invalid auth_type in database: {}; treating as 'none'",
+                    feed_id, e
+                );
+                FeedAuthType::None
+            });
             Ok(FeedFetchRow {
                 url: row.get(0)?,
                 header_etag: row.get(1)?,
@@ -888,6 +915,12 @@ fn load_feed_fetch_row(
                 consecutive_failures: row.get(6)?,
                 next_fetch_at: row.get(7)?,
                 min_fetch_interval: row.get(8)?,
+                auth: FeedAuth {
+                    auth_type,
+                    username: row.get(10)?,
+                    password: row.get(11)?,
+                    bearer_token: row.get(12)?,
+                },
             })
         },
     )?;
@@ -952,6 +985,7 @@ pub(crate) async fn refresh_feed(
             row.header_immutable_until,
             row.header_body_hash.as_deref(),
             force_conditionals_off,
+            &row.auth,
             pool.clone(),
             fetch_start,
             cfg,
@@ -1020,6 +1054,7 @@ async fn retrieve_feed(
     immutable_until: Option<i64>,
     stored_body_hash: Option<&str>,
     force_conditionals_off: bool,
+    auth: &FeedAuth,
     pool: Pool<SqliteConnectionManager>,
     fetch_start: Instant,
     cfg: SchedulerConfig,
@@ -1056,6 +1091,17 @@ async fn retrieve_feed(
                 if let Some(last_modified) = stored_last_modified {
                     request = request.header("If-Modified-Since", last_modified);
                 }
+            }
+            // Only forward credentials to the feed's configured origin. If a
+            // redirect took us cross-origin we intentionally drop them to
+            // avoid leaking secrets to an unrelated host.
+            if same_origin(feed_url, &current_url) {
+                request = auth.apply(request);
+            } else if auth.auth_type != FeedAuthType::None {
+                debug!(
+                    "Feed {}: dropping auth on cross-origin redirect to {}",
+                    feed_id, current_url
+                );
             }
 
             let resp = match request.send().await {

@@ -1,15 +1,35 @@
+use crate::http::{FeedAuth, FeedAuthType};
 use crate::server::AppState;
 use crate::tasks::TaskManagerCommand;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use tokio::task;
 use tracing::{event, Level};
 
 struct AddFeedQueryResult(i64);
 
-#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+#[derive(Default, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 pub struct AddFeedRequest {
     pub title: String,
     pub url: String,
+    /// Authentication scheme to apply when fetching this feed. One of
+    /// `"none"` (default), `"basic"`, or `"bearer"`. Omit or set to `"none"`
+    /// for unauthenticated feeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<FeedAuthType>,
+    /// Username for HTTP Basic auth. Required when `auth_type` is `"basic"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_username: Option<String>,
+    /// Password for HTTP Basic auth. Optional even for `"basic"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_password: Option<String>,
+    /// Token for HTTP Bearer auth. Required when `auth_type` is `"bearer"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_bearer_token: Option<String>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
@@ -26,6 +46,7 @@ pub struct AddFeedResponse {
     request_body = AddFeedRequest,
     responses(
         (status = 201, description = "Feed created successfully", body = AddFeedResponse),
+        (status = 400, description = "Invalid authentication parameters"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "feeds"
@@ -34,60 +55,69 @@ pub struct AddFeedResponse {
 pub async fn add_feed(
     State(state): State<AppState>,
     Json(payload): Json<AddFeedRequest>,
-) -> (StatusCode, Json<AddFeedResponse>) {
-    // Add a new feed instance to the database
+) -> Response {
+    let auth = FeedAuth {
+        auth_type: payload.auth_type.unwrap_or_default(),
+        username: payload.auth_username,
+        password: payload.auth_password,
+        bearer_token: payload.auth_bearer_token,
+    };
+    if let Err(e) = auth.validate() {
+        return (StatusCode::BAD_REQUEST, format!("{e}")).into_response();
+    }
+
     let conn = match state.conn_pool.get() {
         Ok(conn) => conn,
         Err(e) => {
             event!(Level::ERROR, "failed to get database connection: {:?}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AddFeedResponse { id: 0 }),
-            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
         }
     };
 
+    let title = payload.title;
+    let url = payload.url;
+
     // The rusqlite interface is synchronous so we must run the INSERT statement
     // on a blocking thread.
-    let task_result = task::spawn_blocking(move || {
-        let mut stmt =
-            match conn.prepare("INSERT INTO feeds (title, url) VALUES (?1, ?2) RETURNING id") {
-                Ok(s) => s,
-                Err(e) => {
-                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-                    let result = AddFeedResponse { id: 0 };
-                    return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(result)));
-                }
-            };
-        let insert_result = stmt.query_row([payload.title, payload.url], |row| {
-            Ok(AddFeedQueryResult(row.get(0)?))
-        });
-        match insert_result {
-            Ok(r) => Ok(r.0),
-            Err(e) => {
-                event!(
-                    Level::ERROR,
-                    "failure while adding new feed to database: {:?}",
-                    e
-                );
-                let result = AddFeedResponse { id: 0 };
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(result)))
-            }
-        }
+    let task_result = task::spawn_blocking(move || -> Result<i64, rusqlite::Error> {
+        let mut stmt = conn.prepare(
+            "INSERT INTO feeds
+                (title, url, auth_type, auth_username, auth_password, auth_bearer_token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             RETURNING id",
+        )?;
+        stmt.query_row(
+            rusqlite::params![
+                title,
+                url,
+                auth.auth_type.as_db(),
+                auth.username,
+                auth.password,
+                auth.bearer_token,
+            ],
+            |row| Ok(AddFeedQueryResult(row.get(0)?)),
+        )
+        .map(|r| r.0)
     })
     .await;
 
     let id = match task_result {
         Ok(Ok(id)) => id,
-        Ok(Err(resp)) => return resp,
+        Ok(Err(e)) => {
+            event!(
+                Level::ERROR,
+                "failure while adding new feed to database: {:?}",
+                e
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+        }
         Err(e) => {
             event!(
                 Level::ERROR,
                 "error waiting for blocking thread to run SQL query: {:?}",
                 e
             );
-            let result = AddFeedResponse { id: 0 };
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(result));
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
         }
     };
 
@@ -109,5 +139,5 @@ pub async fn add_feed(
         );
     }
 
-    (StatusCode::CREATED, Json(result))
+    (StatusCode::CREATED, Json(result)).into_response()
 }

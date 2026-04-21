@@ -71,6 +71,16 @@ pub struct FeedServerState {
     /// default test RSS payload. Lets a test flip content mid-run while
     /// keeping validator headers (`etag`, `last_modified`) fixed.
     pub body_override: Option<Vec<u8>>,
+    /// If set, requests that do not carry this exact `Authorization` header
+    /// value are answered with `401 Unauthorized`. Used to exercise
+    /// per-feed authentication.
+    pub require_authorization: Option<String>,
+    /// The most recent `Authorization` header observed by the server, if
+    /// any. Tests inspect this to assert that credentials were attached.
+    pub last_authorization: Option<String>,
+    /// Number of `401 Unauthorized` responses served due to missing or
+    /// mismatched `Authorization` headers.
+    pub unauthorized_count: usize,
 }
 
 /// Convenience alias for the shared, mutable feed-server state.
@@ -266,6 +276,20 @@ impl TestConfig {
         ) -> impl IntoResponse {
             let mut s = hs.config.lock().unwrap();
             s.request_count += 1;
+
+            let authorization = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            s.last_authorization = authorization.clone();
+
+            if let Some(expected) = s.require_authorization.clone() {
+                if authorization.as_deref() != Some(expected.as_str()) {
+                    s.unauthorized_count += 1;
+                    drop(s);
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+            }
 
             let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
             let if_modified_since = headers

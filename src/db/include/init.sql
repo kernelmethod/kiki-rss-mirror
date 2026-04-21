@@ -129,7 +129,19 @@ CREATE TABLE feeds (
     -- Unix timestamp (seconds) parsed from the most recent `Retry-After`
     -- response header, if any. Retained for observability; the scheduled
     -- retry time is folded into `next_fetch_at`.
-    retry_after_at          INTEGER
+    retry_after_at          INTEGER,
+
+    -- Per-feed authentication. `auth_type` is one of:
+    --   * NULL or 'none' — no authentication (default)
+    --   * 'basic'        — HTTP Basic auth (auth_username + auth_password)
+    --   * 'bearer'       — HTTP Bearer token (auth_bearer_token)
+    --
+    -- Credentials are stored in plaintext; restrict filesystem access to
+    -- the database file and treat it as sensitive.
+    auth_type               VARCHAR,
+    auth_username           VARCHAR,
+    auth_password           VARCHAR,
+    auth_bearer_token       VARCHAR
 );
 
 CREATE INDEX idx_feeds_next_fetch_at ON feeds(next_fetch_at);

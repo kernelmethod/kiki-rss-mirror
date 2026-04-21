@@ -1,4 +1,4 @@
-use crate::routes::v1::feeds::get_feed;
+use crate::routes::v1::feeds::get_feed::{self, read_auth_type_column};
 use crate::server::AppState;
 use axum::{
     extract::{Query, State},
@@ -77,13 +77,14 @@ pub async fn list_feeds(
 
         let feeds = conn
             .prepare(
-                "SELECT id, title, url, description, last_checked, min_fetch_interval_seconds
+                "SELECT id, title, url, description, last_checked, min_fetch_interval_seconds, auth_type
                 FROM feeds LIMIT ?1 OFFSET ?2",
             )
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
             .query_map([limit, offset], |row| {
+                let auth_type = read_auth_type_column(row, 6)?;
                 Ok(get_feed::GetFeedResponse {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -93,6 +94,7 @@ pub async fn list_feeds(
                         chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
                     }),
                     min_fetch_interval_seconds: row.get(5)?,
+                    auth_type,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
