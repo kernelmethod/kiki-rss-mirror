@@ -1335,3 +1335,149 @@ async fn test_expires_rfc850_format_is_parsed() -> Result<()> {
     );
     Ok(())
 }
+
+/// Set `force_refresh_after_secs` on the test database so the next forced
+/// refresh fires immediately.
+fn set_force_refresh_after_secs(conn: &rusqlite::Connection, secs: u64) {
+    conn.execute(
+        "UPDATE settings SET value = ?1 WHERE key = 'force_refresh_after_secs'",
+        rusqlite::params![secs.to_string()],
+    )
+    .unwrap();
+}
+
+/// A server that keeps returning the same `ETag` while silently changing
+/// the body should be flagged once the forced-refresh cadence elapses.
+#[tokio::test]
+async fn test_forced_refresh_detects_validator_lie() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let body_a = b"<rss version=\"2.0\"><channel><title>A</title></channel></rss>".to_vec();
+    let body_b = b"<rss version=\"2.0\"><channel><title>B</title></channel></rss>".to_vec();
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        body_override: Some(body_a.clone()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    // Force refresh should fire on the very next eligible fetch.
+    set_force_refresh_after_secs(&tc.database_conn()?, 0);
+
+    let metrics = super::test_metrics();
+
+    // First fetch: normal 200, records baseline body hash + last_full_refresh_at.
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &metrics,
+        &super::test_tx(),
+    )
+    .await?;
+
+    let expected_hash_a = blake3::hash(&body_a).to_hex().to_string();
+    let conn = tc.database_conn()?;
+    let (stored_hash, stored_refresh_at): (Option<String>, Option<i64>) = conn.query_row(
+        "SELECT header_body_hash, last_full_refresh_at FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(stored_hash.as_deref(), Some(expected_hash_a.as_str()));
+    assert!(stored_refresh_at.is_some());
+
+    // Now flip the body but keep the server's ETag identical — exactly the
+    // pathological case the forced refresh is supposed to catch.
+    {
+        let mut s = state.lock().unwrap();
+        s.body_override = Some(body_b.clone());
+    }
+    reset_last_checked(&conn, feed_id);
+
+    // Second fetch: force_refresh_after_secs=0 skips conditionals, so the
+    // server serves the new body under the old ETag.
+    refresh_feed(&client, feed_id, pool, None, &metrics, &super::test_tx()).await?;
+
+    let expected_hash_b = blake3::hash(&body_b).to_hex().to_string();
+    let stored_hash_after: Option<String> = conn.query_row(
+        "SELECT header_body_hash FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        stored_hash_after.as_deref(),
+        Some(expected_hash_b.as_str()),
+        "body hash should be updated to the newly-fetched body"
+    );
+
+    let s = state.lock().unwrap();
+    assert_eq!(
+        s.full_response_count, 2,
+        "both fetches should receive a full body (second one forced)"
+    );
+    assert_eq!(
+        s.if_none_match_count, 0,
+        "forced refresh must not send If-None-Match"
+    );
+    drop(s);
+
+    let rendered = metrics.render();
+    assert!(
+        rendered.contains("kiki_feed_validator_lie_total 1"),
+        "validator-lie counter should have been incremented exactly once; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("kiki_feed_forced_refresh_total{outcome=\"mismatch\"} 1"),
+        "forced-refresh counter should record the mismatch; got:\n{rendered}"
+    );
+
+    Ok(())
+}
+
+/// When a forced refresh confirms the server's body actually matches the
+/// stored hash, the validator-lie counter must stay silent.
+#[tokio::test]
+async fn test_forced_refresh_match_does_not_fire_lie() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let body = b"<rss version=\"2.0\"><channel><title>stable</title></channel></rss>".to_vec();
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        body_override: Some(body.clone()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+    set_force_refresh_after_secs(&tc.database_conn()?, 0);
+
+    let metrics = super::test_metrics();
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &metrics,
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    reset_last_checked(&conn, feed_id);
+
+    refresh_feed(&client, feed_id, pool, None, &metrics, &super::test_tx()).await?;
+
+    let rendered = metrics.render();
+    assert!(
+        !rendered.contains("kiki_feed_validator_lie_total 1"),
+        "validator-lie counter should stay at zero when body matches; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("kiki_feed_forced_refresh_total{outcome=\"match\"} 1"),
+        "forced-refresh counter should record the match; got:\n{rendered}"
+    );
+
+    Ok(())
+}

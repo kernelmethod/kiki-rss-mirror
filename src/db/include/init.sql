@@ -36,6 +36,13 @@ VALUES ('min_polling_cadence_seconds', '60', 'integer');
 INSERT INTO settings (key, value, type)
 VALUES ('max_feed_backoff_seconds', '86400', 'integer');
 
+-- How often, in seconds, to bypass conditional-request headers and force a
+-- full GET on a feed. Lets us detect servers that keep serving the same
+-- `ETag`/`Last-Modified` while the body has actually changed. Defaults to
+-- 7 days.
+INSERT INTO settings (key, value, type)
+VALUES ('force_refresh_after_secs', '604800', 'integer');
+
 -- Persistent record of when recurring background tasks last ran, so their
 -- schedules survive server restarts. Keyed by an opaque task name.
 CREATE TABLE task_queue (
@@ -73,6 +80,17 @@ CREATE TABLE feeds (
     last_checked            DATETIME,
     header_etag             VARCHAR,
     header_last_modified    VARCHAR,
+
+    -- Blake3 hex digest of the body returned by the most recent successful
+    -- 200 response. Paired with `last_full_refresh_at` to detect servers
+    -- that keep returning unchanged `ETag`/`Last-Modified` validators while
+    -- the body has actually changed.
+    header_body_hash        VARCHAR,
+
+    -- Unix timestamp of the most recent successful 200 response (forced or
+    -- conditional). Used to decide when to force another non-conditional
+    -- fetch for validator-lie detection.
+    last_full_refresh_at    INTEGER,
 
     -- Unix timestamp parsed from the HTTP Expires response header.
     -- When set, the fetcher will skip refreshing the feed until this

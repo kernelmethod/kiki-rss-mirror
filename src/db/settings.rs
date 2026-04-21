@@ -5,6 +5,7 @@ use rusqlite::Connection;
 const FEED_UPDATE_TIMEOUT_KEY: &str = "feed_update_timeout_seconds";
 const MIN_POLLING_CADENCE_KEY: &str = "min_polling_cadence_seconds";
 const MAX_FEED_BACKOFF_KEY: &str = "max_feed_backoff_seconds";
+const FORCE_REFRESH_AFTER_KEY: &str = "force_refresh_after_secs";
 
 fn read_u64_setting(conn: &Connection, key: &'static str) -> Result<u64> {
     let value: String = conn
@@ -39,4 +40,14 @@ pub fn get_min_polling_cadence_seconds(conn: &Connection) -> Result<u64> {
 /// applied to permanent errors, in seconds.
 pub fn get_max_feed_backoff_seconds(conn: &Connection) -> Result<u64> {
     read_u64_setting(conn, MAX_FEED_BACKOFF_KEY)
+}
+
+/// Returns how often (in seconds) the fetcher should bypass conditional
+/// request headers and force a full `GET` on a feed.
+///
+/// Used to catch servers that keep returning the same `ETag`/`Last-Modified`
+/// while the body has actually changed; pairing a forced 200 with the body
+/// hash stored on the last fetch lets us detect the mismatch.
+pub fn get_force_refresh_after_secs(conn: &Connection) -> Result<u64> {
+    read_u64_setting(conn, FORCE_REFRESH_AFTER_KEY)
 }

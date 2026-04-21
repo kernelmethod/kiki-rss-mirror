@@ -209,6 +209,20 @@ mod imp {
                     "Total times a feed fetch was skipped due to a cache directive, labeled by reason.",
                 ),
             );
+            r.describe_counter(
+                KeyName::from_const_str("kiki_feed_forced_refresh_total"),
+                None,
+                SharedString::const_str(
+                    "Total forced (non-conditional) feed fetches, labeled by whether the body matched the stored hash (`match`) or not (`mismatch`).",
+                ),
+            );
+            r.describe_counter(
+                KeyName::from_const_str("kiki_feed_validator_lie_total"),
+                None,
+                SharedString::const_str(
+                    "Total detected instances of a server returning unchanged ETag/Last-Modified validators alongside a changed response body.",
+                ),
+            );
             r.describe_histogram(
                 KeyName::from_const_str("kiki_feed_retry_scheduled_seconds"),
                 None,
@@ -461,6 +475,25 @@ mod imp {
                 "kiki_feed_cache_hits_total",
                 vec![Label::new("reason", reason)],
             );
+            self.recorder.register_counter(&key, &METADATA).increment(1);
+        }
+
+        /// Record a forced (non-conditional) feed refresh, labeled by
+        /// whether the freshly-fetched body matched the hash we stored on
+        /// the previous full 200 (`match`) or differed (`mismatch`).
+        pub fn record_feed_forced_refresh(&self, outcome: &'static str) {
+            let key = Key::from_parts(
+                "kiki_feed_forced_refresh_total",
+                vec![Label::new("outcome", outcome)],
+            );
+            self.recorder.register_counter(&key, &METADATA).increment(1);
+        }
+
+        /// Record a detected instance of a server returning unchanged
+        /// `ETag`/`Last-Modified` alongside a different body — i.e. the
+        /// validators are lying.
+        pub fn record_feed_validator_lie(&self) {
+            let key = Key::from_name("kiki_feed_validator_lie_total");
             self.recorder.register_counter(&key, &METADATA).increment(1);
         }
 
@@ -720,6 +753,10 @@ mod stub {
         pub fn record_feed_entry_upserted(&self, _format: &'static str) {}
         #[inline]
         pub fn record_feed_cache_hit(&self, _reason: &'static str) {}
+        #[inline]
+        pub fn record_feed_forced_refresh(&self, _outcome: &'static str) {}
+        #[inline]
+        pub fn record_feed_validator_lie(&self) {}
         #[inline]
         pub fn record_feed_retry_scheduled(&self, _source: &'static str, _seconds_until: f64) {}
         #[inline]

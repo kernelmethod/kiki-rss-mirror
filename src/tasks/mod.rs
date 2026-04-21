@@ -838,6 +838,60 @@ struct SchedulerConfig {
     min_cadence: u64,
     max_backoff: u64,
     min_fetch_interval: u64,
+    /// How often (seconds) to bypass conditional-request headers and force
+    /// a full `GET` so the fetcher can detect servers that keep returning
+    /// unchanged validators while the body has actually changed.
+    force_refresh_after: u64,
+}
+
+/// Snapshot of a `feeds` row loaded at the start of a refresh: the URL,
+/// cache validators, body fingerprint, and scheduling state that drive the
+/// fetch decision.
+struct FeedFetchRow {
+    url: String,
+    header_etag: Option<String>,
+    header_last_modified: Option<String>,
+    header_immutable_until: Option<i64>,
+    header_body_hash: Option<String>,
+    last_full_refresh_at: Option<i64>,
+    consecutive_failures: i64,
+    next_fetch_at: Option<i64>,
+    min_fetch_interval: i64,
+}
+
+fn load_feed_fetch_row(
+    conn: &PooledConnection<SqliteConnectionManager>,
+    feed_id: i64,
+) -> Result<FeedFetchRow> {
+    let row = conn.query_row(
+        "SELECT
+            url,
+            header_etag,
+            header_last_modified,
+            header_immutable_until,
+            header_body_hash,
+            last_full_refresh_at,
+            consecutive_failures,
+            next_fetch_at,
+            min_fetch_interval_seconds
+         FROM feeds
+         WHERE id = ?1",
+        [feed_id],
+        |row| {
+            Ok(FeedFetchRow {
+                url: row.get(0)?,
+                header_etag: row.get(1)?,
+                header_last_modified: row.get(2)?,
+                header_immutable_until: row.get(3)?,
+                header_body_hash: row.get(4)?,
+                last_full_refresh_at: row.get(5)?,
+                consecutive_failures: row.get(6)?,
+                next_fetch_at: row.get(7)?,
+                min_fetch_interval: row.get(8)?,
+            })
+        },
+    )?;
+    Ok(row)
 }
 
 /// Refresh the feed corresponding to the provided `feed_id`.
@@ -851,46 +905,28 @@ pub(crate) async fn refresh_feed(
 ) -> Result<()> {
     let fetch_start = Instant::now();
 
-    // Load the feed URL, conditional-request headers, scheduling state, and
-    // per-feed override all at once.
     let conn = pool.get()?;
-    let (
-        feed_url,
-        header_etag,
-        header_last_modified,
-        header_immutable_until,
-        next_fetch_at,
-        min_fetch_interval,
-    ): (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        i64,
-    ) = conn.query_row(
-        "SELECT url, header_etag, header_last_modified, header_immutable_until, next_fetch_at, min_fetch_interval_seconds FROM feeds WHERE id = ?1",
-        [feed_id],
-        |row| {
-            let url: String = row.get(0)?;
-            let etag: Option<String> = row.get(1)?;
-            let last_modified: Option<String> = row.get(2)?;
-            let immutable_until: Option<i64> = row.get(3)?;
-            let next_fetch_at: Option<i64> = row.get(4)?;
-            let min_fetch_interval: i64 = row.get(5)?;
-            Ok((url, etag, last_modified, immutable_until, next_fetch_at, min_fetch_interval))
-        },
-    )?;
+    let row = load_feed_fetch_row(&conn, feed_id)?;
 
     let cfg = SchedulerConfig {
         min_cadence: crate::db::settings::get_min_polling_cadence_seconds(&conn)?,
         max_backoff: crate::db::settings::get_max_feed_backoff_seconds(&conn)?,
-        min_fetch_interval: min_fetch_interval.max(0) as u64,
+        min_fetch_interval: row.min_fetch_interval.max(0) as u64,
+        force_refresh_after: crate::db::settings::get_force_refresh_after_secs(&conn)?,
     };
 
+    // Force a non-conditional refresh when enough time has passed since the
+    // last full 200, and only when the feed isn't currently in a failure
+    // streak (don't add bandwidth cost to a feed that's already struggling).
+    // First-time fetches are always full, so `None` just means "not yet,
+    // keep using conditionals once we have validators".
+    let now_ts = Utc::now().timestamp();
+    let force_conditionals_off = row.last_full_refresh_at.is_some_and(|t| {
+        row.consecutive_failures == 0 && now_ts.saturating_sub(t) as u64 >= cfg.force_refresh_after
+    });
+
     // Eligibility gate: a scheduled `next_fetch_at` in the future means skip.
-    if let Some(next_ts) = next_fetch_at {
-        let now_ts = Utc::now().timestamp();
+    if let Some(next_ts) = row.next_fetch_at {
         if now_ts < next_ts {
             debug!(
                 "Feed {} not yet eligible; next fetch in {} seconds",
@@ -904,16 +940,18 @@ pub(crate) async fn refresh_feed(
     }
 
     // Handle file:// URLs differently
-    let feed_content = if feed_url.starts_with("file://") {
-        retrieve_file_feed(&feed_url, feed_id, pool.clone(), cfg)
+    let feed_content = if row.url.starts_with("file://") {
+        retrieve_file_feed(&row.url, feed_id, pool.clone(), cfg)
     } else {
         retrieve_feed(
             client,
             feed_id,
-            &feed_url,
-            header_etag.as_deref(),
-            header_last_modified.as_deref(),
-            header_immutable_until,
+            &row.url,
+            row.header_etag.as_deref(),
+            row.header_last_modified.as_deref(),
+            row.header_immutable_until,
+            row.header_body_hash.as_deref(),
+            force_conditionals_off,
             pool.clone(),
             fetch_start,
             cfg,
@@ -922,19 +960,15 @@ pub(crate) async fn refresh_feed(
         .await
     };
 
-    let feed_content = match feed_content {
-        Ok(c) => c,
+    let content = match feed_content {
+        Ok(Some(c)) => c,
+        // `retrieve_feed` / `retrieve_file_feed` already recorded the outcome
+        // (e.g. 304 not-modified, HTTP error, skipped file) — nothing to parse.
+        Ok(None) => return Ok(()),
         Err(e) => {
             metrics.record_feed_fetch("other", fetch_start.elapsed().as_secs_f64());
             return Err(e);
         }
-    };
-
-    let content = if let Some(content) = feed_content {
-        content
-    } else {
-        // retrieve_feed / retrieve_file_feed already recorded the outcome.
-        return Ok(());
     };
 
     // Attempt to parse content as Atom, with fallback to RSS.
@@ -955,7 +989,7 @@ pub(crate) async fn refresh_feed(
         metrics.record_feed_fetch("success", fetch_start.elapsed().as_secs_f64());
     } else {
         let fetch_err = FetchError::InvalidFeed {
-            url: feed_url.clone(),
+            url: row.url.clone(),
         };
         warn!("Feed {}: {}", feed_id, fetch_err);
         set_feed_error_with_schedule(
@@ -981,9 +1015,11 @@ async fn retrieve_feed(
     client: &reqwest::Client,
     feed_id: i64,
     feed_url: &str,
-    etag: Option<&str>,
-    last_modified: Option<&str>,
+    stored_etag: Option<&str>,
+    stored_last_modified: Option<&str>,
     immutable_until: Option<i64>,
+    stored_body_hash: Option<&str>,
+    force_conditionals_off: bool,
     pool: Pool<SqliteConnectionManager>,
     fetch_start: Instant,
     cfg: SchedulerConfig,
@@ -995,7 +1031,8 @@ async fn retrieve_feed(
 
     // RFC 8246: while a prior response advertised `immutable` and is still
     // fresh, suppress conditional revalidation — the server has promised
-    // the representation won't change.
+    // the representation won't change. This also makes forced refresh a
+    // no-op inside the immutable window (no conditionals to suppress).
     let skip_conditionals = immutable_until
         .map(|until| Utc::now().timestamp() < until)
         .unwrap_or(false);
@@ -1007,13 +1044,16 @@ async fn retrieve_feed(
 
     let resp = 'redirect: {
         for _ in 0..=max_redirects {
-            // Only send conditional headers on the first request
+            // Only send conditional headers on the first request. Also
+            // suppress them when a forced (non-conditional) refresh is due,
+            // so the body-hash comparison below can tell us whether the
+            // server's validators have been honest.
             let mut request = client.get(&current_url).timeout(timeout);
-            if current_url == feed_url && !skip_conditionals {
-                if let Some(etag) = etag {
+            if current_url == feed_url && !skip_conditionals && !force_conditionals_off {
+                if let Some(etag) = stored_etag {
                     request = request.header("If-None-Match", etag);
                 }
-                if let Some(last_modified) = last_modified {
+                if let Some(last_modified) = stored_last_modified {
                     request = request.header("If-Modified-Since", last_modified);
                 }
             }
@@ -1174,12 +1214,19 @@ async fn retrieve_feed(
         )?;
     }
 
-    // Update the feed's headers in the database
-    let mut etag: Option<&str> = resp.headers().get("etag").and_then(|h| h.to_str().ok());
-    let mut last_modified: Option<&str> = resp
+    // Update the feed's headers in the database. Capture every header-
+    // derived value as owned data up front so we can consume `resp` for
+    // the body below without fighting the borrow checker.
+    let mut etag: Option<String> = resp
+        .headers()
+        .get("etag")
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string);
+    let mut last_modified: Option<String> = resp
         .headers()
         .get("last-modified")
-        .and_then(|h| h.to_str().ok());
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string);
 
     // Parse the Expires header (RFC 9111 §5.3) into a Unix timestamp so we
     // can skip future fetches until the declared expiry time has passed.
@@ -1209,6 +1256,7 @@ async fn retrieve_feed(
         .filter_map(|h| h.to_str().ok())
         .collect();
     let cc = CacheControl::parse_many(&cc_values);
+    let mut body_hash: Option<String>;
     if cc.no_store {
         etag = None;
         last_modified = None;
@@ -1244,22 +1292,71 @@ async fn retrieve_feed(
         cfg.min_fetch_interval,
     );
 
+    // Read the body now so we can hash it before persisting. Done before
+    // the UPDATE so a body-read failure leaves `feeds` untouched — we
+    // don't advertise a successful fetch we couldn't actually read.
+    let content = resp.bytes().await?;
+    metrics.record_feed_response_bytes(content.len() as u64);
+    body_hash = Some(blake3::hash(&content).to_hex().to_string());
+
+    // Don't persist a body-hash fingerprint for responses we've been told
+    // not to store (RFC 9111 §5.2.2 no-store).
+    if cc.no_store {
+        body_hash = None;
+    }
+
+    // Validator-lie detection. Only meaningful on a forced (non-
+    // conditional) refresh, since otherwise the server is free to return
+    // a body conditional on the validators we sent. A genuine content
+    // change also rotates `ETag` and/or `Last-Modified`; if the body
+    // differs from what we stored but neither validator budged, the
+    // server has been serving 304s (or stale validators) while the
+    // representation actually changed.
+    if force_conditionals_off {
+        let etag_unchanged = match (stored_etag, etag.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        let lm_unchanged = match (stored_last_modified, last_modified.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        let validators_unchanged = etag_unchanged || lm_unchanged;
+        let body_changed = match (stored_body_hash, body_hash.as_deref()) {
+            (Some(stored), Some(fresh)) => stored != fresh,
+            _ => false,
+        };
+
+        if validators_unchanged && body_changed {
+            warn!(
+                "Feed {} ({}): server returned unchanged ETag/Last-Modified but body hash differs; validators appear untrustworthy",
+                feed_id, feed_url
+            );
+            metrics.record_feed_validator_lie();
+        }
+        metrics.record_feed_forced_refresh(if body_changed { "mismatch" } else { "match" });
+    }
+
     conn.execute(
         "UPDATE feeds SET
             header_etag = ?,
             header_last_modified = ?,
             header_expires = ?,
             header_immutable_until = ?,
+            header_body_hash = ?,
+            last_full_refresh_at = ?,
             last_checked = ?,
             next_fetch_at = ?,
             consecutive_failures = 0,
             retry_after_at = NULL
          WHERE id = ?",
         (
-            etag,
-            last_modified,
+            etag.as_deref(),
+            last_modified.as_deref(),
             expires,
             immutable_until,
+            body_hash.as_deref(),
+            now_ts,
             now_ts,
             next_fetch_at,
             feed_id,
@@ -1268,8 +1365,6 @@ async fn retrieve_feed(
 
     metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
 
-    let content = resp.bytes().await?;
-    metrics.record_feed_response_bytes(content.len() as u64);
     Ok(Some(content.to_vec()))
 }
 

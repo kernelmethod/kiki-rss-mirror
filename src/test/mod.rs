@@ -67,6 +67,10 @@ pub struct FeedServerState {
     pub fail_next: usize,
     /// Status returned while `fail_next > 0`. Defaults to 503.
     pub fail_status: u16,
+    /// If set, this value is returned as the response body instead of the
+    /// default test RSS payload. Lets a test flip content mid-run while
+    /// keeping validator headers (`etag`, `last_modified`) fixed.
+    pub body_override: Option<Vec<u8>>,
 }
 
 /// Convenience alias for the shared, mutable feed-server state.
@@ -325,9 +329,10 @@ impl TestConfig {
             let date = s.date.clone();
             let pragma = s.pragma.clone();
             let content_encoding = s.content_encoding.clone();
+            let body_override = s.body_override.clone();
             drop(s);
 
-            let body = hs.rss_content.as_ref().clone();
+            let body = body_override.unwrap_or_else(|| hs.rss_content.as_ref().clone());
             let body = if let Some(ref encoding) = content_encoding {
                 compress_body(&body, encoding)
             } else {
