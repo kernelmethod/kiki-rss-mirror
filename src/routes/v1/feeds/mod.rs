@@ -836,6 +836,119 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_get_feed_exposes_last_fetch_error() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // Insert a feed with a stored fetch error directly, simulating a
+        // previously-failed refresh attempt.
+        let feed_id = {
+            let conn = tc.database_conn()?;
+            conn.execute(
+                "INSERT INTO feeds (title, url, last_fetch_error, last_fetch_error_at)
+                 VALUES (?, ?, ?, ?)",
+                rusqlite::params![
+                    "broken feed",
+                    "https://example.com/broken.xml",
+                    r#"{"type":"http_status","url":"https://example.com/broken.xml","status":503}"#,
+                    1700000000i64,
+                ],
+            )?;
+            conn.last_insert_rowid()
+        };
+
+        let resp = client
+            .get(format!("http://localhost/v1/feeds/id/{}", feed_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+
+        let err = body
+            .get("last_fetch_error")
+            .expect("last_fetch_error should be present");
+        assert_eq!(err["type"], "http_status");
+        assert_eq!(err["url"], "https://example.com/broken.xml");
+        assert_eq!(err["status"], 503);
+        assert!(
+            body.get("last_fetch_error_at")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "last_fetch_error_at should be a string: {:?}",
+            body.get("last_fetch_error_at")
+        );
+
+        // A successful refresh clears the error, and the single-feed
+        // response should then omit both error fields.
+        {
+            let conn = tc.database_conn()?;
+            conn.execute(
+                "UPDATE feeds SET last_fetch_error = NULL, last_fetch_error_at = NULL WHERE id = ?1",
+                [feed_id],
+            )?;
+        }
+
+        let resp = client
+            .get(format!("http://localhost/v1/feeds/id/{}", feed_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+        assert!(
+            body.get("last_fetch_error").is_none(),
+            "last_fetch_error should be omitted when null: {:?}",
+            body.get("last_fetch_error")
+        );
+        assert!(
+            body.get("last_fetch_error_at").is_none(),
+            "last_fetch_error_at should be omitted when null: {:?}",
+            body.get("last_fetch_error_at")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_feeds_does_not_expose_last_fetch_error() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // Insert a feed with a stored fetch error.
+        {
+            let conn = tc.database_conn()?;
+            conn.execute(
+                "INSERT INTO feeds (title, url, last_fetch_error, last_fetch_error_at)
+                 VALUES (?, ?, ?, ?)",
+                rusqlite::params![
+                    "broken feed",
+                    "https://example.com/broken.xml",
+                    r#"{"type":"http_status","url":"https://example.com/broken.xml","status":503}"#,
+                    1700000000i64,
+                ],
+            )?;
+        }
+
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+
+        let feeds = body["feeds"].as_array().expect("feeds array");
+        assert_eq!(feeds.len(), 1);
+        assert!(
+            feeds[0].get("last_fetch_error").is_none(),
+            "list endpoint leaked last_fetch_error: {:?}",
+            feeds[0]
+        );
+        assert!(
+            feeds[0].get("last_fetch_error_at").is_none(),
+            "list endpoint leaked last_fetch_error_at: {:?}",
+            feeds[0]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_feed_tags() -> Result<()> {
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;
