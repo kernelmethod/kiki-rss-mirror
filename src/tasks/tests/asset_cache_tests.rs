@@ -214,6 +214,86 @@ async fn asset_cache_disabled_skips_fetches() -> Result<()> {
     Ok(())
 }
 
+/// A feed that lies about the Content-Type (serving HTML for an `<img src>`)
+/// should not be cached: the allowlist rejects anything that isn't an image.
+#[tokio::test]
+async fn asset_cache_rejects_disallowed_content_type() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let data_dir = tc.config_dir().to_path_buf();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let base = format!("http://{}", addr);
+    let feed_body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>malicious</title>
+    <link>{base}/</link>
+    <description>d</description>
+    <item>
+      <title>html-in-img</title>
+      <link>{base}/article/1</link>
+      <guid isPermaLink="false">evil-1</guid>
+      <pubDate>Mon, 01 Jan 2024 00:00:00 GMT</pubDate>
+      <description>&lt;p&gt;&lt;img src="{base}/evil.png"&gt;&lt;/p&gt;</description>
+    </item>
+  </channel>
+</rss>"#
+    );
+    let feed_body = Arc::new(feed_body);
+    let feed_clone = feed_body.clone();
+    let app = Router::new()
+        .route(
+            "/feed.xml",
+            get(move || {
+                let body = feed_clone.as_ref().clone();
+                async move { ([("content-type", "application/rss+xml")], body) }
+            }),
+        )
+        .route(
+            "/evil.png",
+            get(|| async { ([("content-type", "text/html")], "<script>alert(1)</script>") }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+    let feed_url = format!("http://{}/feed.xml", addr);
+    let conn = tc.database_conn()?;
+    conn.execute(
+        "INSERT INTO feeds (title, url) VALUES ('evil', ?1)",
+        [&feed_url],
+    )?;
+    let feed_id = conn.last_insert_rowid();
+    drop(conn);
+
+    let client = reqwest::Client::builder()
+        .user_agent(crate::http::USER_AGENT)
+        .build()?;
+    let pool = make_pool(&tc.database_path())?;
+
+    let (tx, rx) = async_channel::bounded::<TaskManagerCommand>(64);
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &tx,
+    )
+    .await?;
+    while let Ok(cmd) = rx.try_recv() {
+        if let TaskManagerCommand::CacheEntryAssets { entry_id } = cmd {
+            super::super::cache_entry_assets(&client, &pool, &data_dir, entry_id).await?;
+        }
+    }
+
+    let conn = tc.database_conn()?;
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM feed_assets", [], |r| r.get(0))?;
+    assert_eq!(n, 0, "text/html asset should be rejected by allowlist");
+
+    Ok(())
+}
+
 /// Setting a max_bytes lower than the enclosure size causes inline eviction
 /// right after the over-cap insert.
 #[tokio::test]

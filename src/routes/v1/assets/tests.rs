@@ -50,6 +50,22 @@ async fn get_asset_returns_bytes_and_etag() -> Result<()> {
             .unwrap(),
         "image/png"
     );
+    assert_eq!(
+        resp.headers()
+            .get("x-content-type-options")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "inline"
+    );
     let etag = resp
         .headers()
         .get("etag")

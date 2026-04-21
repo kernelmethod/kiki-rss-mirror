@@ -40,6 +40,66 @@ impl AssetKind {
     }
 }
 
+/// Image MIME types we're willing to cache and serve. Deliberately excludes
+/// `image/svg+xml`: SVG is XML and can embed executable script, which would
+/// run when a browser navigates directly to the asset URL.
+const SAFE_IMAGE_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/avif",
+    "image/bmp",
+    "image/heic",
+    "image/heif",
+    "image/tiff",
+    "image/x-icon",
+    "image/vnd.microsoft.icon",
+];
+
+/// Parse a `Content-Type` header value into a normalized `type/subtype` form.
+///
+/// Strips media-type parameters (e.g. `; charset=utf-8`), trims whitespace,
+/// and lowercases. Returns `None` when the input is empty or doesn't match
+/// `type/subtype`.
+pub fn normalize_content_type(raw: &str) -> Option<String> {
+    let main = raw.split(';').next()?.trim();
+    let (ty, subty) = main.split_once('/')?;
+    let ty = ty.trim();
+    let subty = subty.trim();
+    if ty.is_empty()
+        || subty.is_empty()
+        || ty.chars().any(char::is_whitespace)
+        || subty.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(format!(
+        "{}/{}",
+        ty.to_ascii_lowercase(),
+        subty.to_ascii_lowercase()
+    ))
+}
+
+/// Whether a normalized MIME type is acceptable to cache for the given kind.
+///
+/// Inline images must match one of the safe raster image types. Enclosures
+/// additionally accept audio and video types plus a handful of common
+/// podcast-adjacent `application/*` types.
+pub fn is_allowed_content_type(normalized: &str, kind: AssetKind) -> bool {
+    if SAFE_IMAGE_TYPES.contains(&normalized) {
+        return true;
+    }
+    match kind {
+        AssetKind::InlineImg => false,
+        AssetKind::Enclosure => {
+            normalized.starts_with("audio/")
+                || normalized.starts_with("video/")
+                || matches!(normalized, "application/ogg" | "application/pdf")
+        }
+    }
+}
+
 /// Parse `content` as HTML and return every resolved `<img src>` URL whose
 /// scheme is `http(s)`. Relative URLs are resolved against `base`. Duplicates
 /// within a single entry are collapsed preserving first-seen order.
@@ -177,11 +237,20 @@ pub async fn cache_asset(
         return Ok(());
     }
 
-    let content_type = resp
+    let raw_content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .and_then(|v| v.to_str().ok());
+    let content_type = match raw_content_type.and_then(normalize_content_type) {
+        Some(ct) if is_allowed_content_type(&ct, kind) => ct,
+        _ => {
+            warn!(
+                "asset {} has disallowed or missing content-type {:?}, skipping",
+                asset_url, raw_content_type
+            );
+            return Ok(());
+        }
+    };
     let etag = resp
         .headers()
         .get(reqwest::header::ETAG)
@@ -241,7 +310,7 @@ pub async fn cache_asset(
                 &conn,
                 &hash,
                 &url_str,
-                content_type.as_deref(),
+                Some(content_type.as_str()),
                 size,
                 etag.as_deref(),
                 last_modified.as_deref(),
@@ -319,5 +388,65 @@ mod tests {
     fn asset_path_uses_shard() {
         let p = asset_path(Path::new("/tmp/data"), "abcdef1234");
         assert_eq!(p, PathBuf::from("/tmp/data/assets/ab/abcdef1234"));
+    }
+
+    #[test]
+    fn normalize_content_type_strips_params_and_lowercases() {
+        assert_eq!(
+            normalize_content_type("image/PNG").as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(
+            normalize_content_type("image/jpeg; charset=utf-8").as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            normalize_content_type("  Image/Jpeg ;boundary=x  ").as_deref(),
+            Some("image/jpeg")
+        );
+    }
+
+    #[test]
+    fn normalize_content_type_rejects_garbage() {
+        assert!(normalize_content_type("").is_none());
+        assert!(normalize_content_type("notatype").is_none());
+        assert!(normalize_content_type("image/").is_none());
+        assert!(normalize_content_type("/png").is_none());
+        // Internal whitespace inside a token is rejected.
+        assert!(normalize_content_type("image/pn g").is_none());
+    }
+
+    #[test]
+    fn inline_img_allowlist_rejects_html_and_svg() {
+        assert!(is_allowed_content_type("image/png", AssetKind::InlineImg));
+        assert!(is_allowed_content_type("image/jpeg", AssetKind::InlineImg));
+        assert!(is_allowed_content_type("image/webp", AssetKind::InlineImg));
+        assert!(!is_allowed_content_type("text/html", AssetKind::InlineImg));
+        assert!(!is_allowed_content_type(
+            "application/javascript",
+            AssetKind::InlineImg
+        ));
+        assert!(!is_allowed_content_type(
+            "image/svg+xml",
+            AssetKind::InlineImg
+        ));
+        assert!(!is_allowed_content_type("audio/mpeg", AssetKind::InlineImg));
+    }
+
+    #[test]
+    fn enclosure_allowlist_accepts_media_types() {
+        assert!(is_allowed_content_type("audio/mpeg", AssetKind::Enclosure));
+        assert!(is_allowed_content_type("audio/ogg", AssetKind::Enclosure));
+        assert!(is_allowed_content_type("video/mp4", AssetKind::Enclosure));
+        assert!(is_allowed_content_type("image/png", AssetKind::Enclosure));
+        assert!(is_allowed_content_type(
+            "application/pdf",
+            AssetKind::Enclosure
+        ));
+        assert!(!is_allowed_content_type("text/html", AssetKind::Enclosure));
+        assert!(!is_allowed_content_type(
+            "image/svg+xml",
+            AssetKind::Enclosure
+        ));
     }
 }

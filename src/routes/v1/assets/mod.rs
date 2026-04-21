@@ -115,6 +115,8 @@ pub async fn get_asset(
                 header::CACHE_CONTROL,
                 "public, max-age=604800, immutable".to_string(),
             ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (header::CONTENT_DISPOSITION, "inline".to_string()),
         ],
         bytes,
     )
