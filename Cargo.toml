@@ -77,6 +77,10 @@ tempdir = "0.3"
 [profile.release]
 lto = "thin"
 
+[profile.release-test]
+inherits = "release"
+lto = false
+
 [package.metadata.deb]
 maintainer = "kernelmethod"
 depends = "$auto"
