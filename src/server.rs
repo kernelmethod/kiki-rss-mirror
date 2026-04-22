@@ -1,6 +1,7 @@
 use crate::{
     db::migrations,
     routes,
+    scripting::ScriptRunnerHandle,
     tasks::{self, TaskManagerCommand},
 };
 use anyhow::{bail, Context, Error, Result};
@@ -43,6 +44,10 @@ pub struct SharedAppState {
     /// Root directory for on-disk state. Used to locate the cached asset
     /// filesystem under `{data_dir}/assets/`.
     pub data_dir: PathBuf,
+
+    /// Shared handle to the currently-installed scripting engine. Empty when the `lua`
+    /// feature is disabled or when no scripts have been loaded.
+    pub script_runner: ScriptRunnerHandle,
 }
 
 pub type AppState = Arc<SharedAppState>;
@@ -259,8 +264,30 @@ impl Server {
         // service workers can send tasks to the feed-fetcher workers.
         let (tx, rx) = async_channel::bounded(1024);
 
-        // Watch channel for broadcasting script-reload signals to all workers.
-        let (reload_tx, _) = tokio::sync::watch::channel(());
+        // Watch channel for broadcasting script-reload signals.
+        let (reload_tx, reload_rx) = tokio::sync::watch::channel(());
+
+        // Shared scripting engine handle; workers and HTTP handlers dispatch events
+        // through it.
+        let script_runner = ScriptRunnerHandle::empty();
+
+        // Build the initial runner and spawn the reloader task (lua feature only).
+        #[cfg(feature = "lua")]
+        {
+            tasks::reload_script_runner(&pool, &metrics, &script_runner);
+            tokio::spawn(tasks::run_script_reloader(
+                pool.clone(),
+                metrics.clone(),
+                script_runner.clone(),
+                reload_rx,
+                self.cancel_token.clone(),
+            ));
+        }
+        #[cfg(not(feature = "lua"))]
+        {
+            // `reload_rx` would otherwise be unused.
+            let _ = reload_rx;
+        }
 
         let num_workers = self.worker_count.unwrap_or_else(tasks::worker_count);
         debug!("Spawning {} task-manager workers", num_workers);
@@ -282,10 +309,10 @@ impl Server {
             tx.clone(),
             pool.clone(),
             self.cancel_token.clone(),
-            reload_tx.clone(),
             num_workers,
             metrics.clone(),
             self.data_dir.clone(),
+            script_runner.clone(),
         );
 
         tokio::spawn(metrics_sampler_loop(
@@ -354,6 +381,7 @@ impl Server {
                     self.cancel_token.clone(),
                     metrics.clone(),
                     self.data_dir.clone(),
+                    script_runner.clone(),
                 ));
             }
             ListenAddr::Tcp(port) => {
@@ -365,6 +393,7 @@ impl Server {
                     self.cancel_token.clone(),
                     metrics.clone(),
                     self.data_dir.clone(),
+                    script_runner.clone(),
                 ));
             }
         }
@@ -637,6 +666,7 @@ async fn uds_server(
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
     data_dir: PathBuf,
+    script_runner: ScriptRunnerHandle,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
         task_manager_tx: tx,
@@ -645,6 +675,7 @@ async fn uds_server(
         cancel_token: cancel_token.clone(),
         metrics: metrics.clone(),
         data_dir,
+        script_runner,
     });
     let app = routes::create_router(metrics).with_state(shared_state);
 
@@ -678,6 +709,7 @@ async fn tcp_server(
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
     data_dir: PathBuf,
+    script_runner: ScriptRunnerHandle,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
         task_manager_tx: tx,
@@ -686,6 +718,7 @@ async fn tcp_server(
         cancel_token: cancel_token.clone(),
         metrics: metrics.clone(),
         data_dir,
+        script_runner,
     });
     let app = routes::create_router(metrics).with_state(shared_state);
 

@@ -76,6 +76,8 @@ pub async fn add_feed(
 
     let title = payload.title;
     let url = payload.url;
+    let title_for_event = title.clone();
+    let url_for_event = url.clone();
 
     // The rusqlite interface is synchronous so we must run the INSERT statement
     // on a blocking thread.
@@ -123,6 +125,17 @@ pub async fn add_feed(
 
     event!(Level::INFO, "created new feed");
     let result = AddFeedResponse { id };
+
+    if let Some(runner) = state.script_runner.current() {
+        runner.dispatch_observe(
+            crate::scripting::Event::FeedAdded,
+            crate::scripting::EventPayload::Feed {
+                id,
+                url: url_for_event,
+                title: title_for_event,
+            },
+        );
+    }
 
     // Issue a command to the feed-fetch workers to make them fetch
     // the latest version of the feed.

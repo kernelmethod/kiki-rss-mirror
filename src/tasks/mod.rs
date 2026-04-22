@@ -1,6 +1,6 @@
 use crate::http::{FeedAuth, FeedAuthType, USER_AGENT};
 use crate::metrics::Metrics;
-use crate::scripting::{FeedEntry, ScriptRunner};
+use crate::scripting::{FeedEntry, ScriptRunner, ScriptRunnerHandle};
 use crate::tasks::cache::{corrected_max_age, extract_server_hints, parse_http_date, CacheControl};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -264,9 +264,9 @@ fn in_progress_len(set: &InProgressSet) -> f64 {
 
 /// Shared state for a pool of workers that process [`TaskManagerCommand`]s.
 ///
-/// Each worker pulls commands from a shared channel and maintains its own
-/// script runner. Separate in-progress sets prevent two workers from
-/// refreshing (or cleaning up) the same feed simultaneously.
+/// Workers pull commands from a shared channel and dispatch events through a
+/// server-wide [`ScriptRunnerHandle`]. Separate in-progress sets prevent two workers
+/// from refreshing (or cleaning up) the same feed simultaneously.
 #[derive(Clone)]
 struct Worker {
     rx: async_channel::Receiver<TaskManagerCommand>,
@@ -277,6 +277,7 @@ struct Worker {
     cleanup_in_progress: InProgressSet,
     metrics: Arc<Metrics>,
     data_dir: PathBuf,
+    script_runner: ScriptRunnerHandle,
 }
 
 /// Determine the number of worker tasks to spawn.
@@ -288,18 +289,18 @@ pub fn worker_count() -> usize {
 
 /// Spawn multiple worker tasks that pull from a shared channel.
 ///
-/// Each worker maintains its own `LuaScriptRunner` (when the `lua` feature is
-/// enabled) and subscribes to a `watch` channel for reload signals.
+/// All workers share a single [`ScriptRunnerHandle`]; reloads are handled centrally by
+/// a separate task that listens on `reload_rx` and swaps the runner inside the handle.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_workers(
     rx: async_channel::Receiver<TaskManagerCommand>,
     tx: async_channel::Sender<TaskManagerCommand>,
     pool: Pool<SqliteConnectionManager>,
     token: CancellationToken,
-    reload_tx: tokio::sync::watch::Sender<()>,
     num_workers: usize,
     metrics: Arc<Metrics>,
     data_dir: PathBuf,
+    script_runner: ScriptRunnerHandle,
 ) -> Vec<tokio::task::JoinHandle<Result<()>>> {
     let worker = Worker {
         rx,
@@ -310,51 +311,27 @@ pub fn spawn_workers(
         cleanup_in_progress: Arc::new(Mutex::new(HashSet::new())),
         metrics,
         data_dir,
+        script_runner,
     };
     let mut handles = Vec::with_capacity(num_workers);
 
     for worker_id in 0..num_workers {
         let worker = worker.clone();
-        let reload_rx = reload_tx.subscribe();
 
-        handles.push(tokio::spawn(run_worker(worker_id, worker, reload_rx)));
+        handles.push(tokio::spawn(run_worker(worker_id, worker)));
     }
 
     handles
 }
 
 /// A single worker loop that pulls commands from the shared channel.
-async fn run_worker(
-    worker_id: usize,
-    w: Worker,
-    mut reload_rx: tokio::sync::watch::Receiver<()>,
-) -> Result<()> {
+async fn run_worker(worker_id: usize, w: Worker) -> Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(USER_AGENT)
         .build()?;
 
-    // Each worker has its own script runner, built eagerly from the current
-    // database state.  Rebuilt when a reload signal arrives via the watch channel.
-    #[cfg(feature = "lua")]
-    let mut runner: Option<crate::scripting::lua::LuaScriptRunner> =
-        build_runner(&w.pool, &w.metrics);
-
     loop {
-        // Check for a pending reload signal before processing the next command.
-        #[cfg(feature = "lua")]
-        if reload_rx.has_changed().unwrap_or(false) {
-            // Mark the current value as seen so has_changed() returns false
-            // until the next send.
-            reload_rx.borrow_and_update();
-            debug!(
-                "Worker {} reloading LuaScriptRunner from database",
-                worker_id
-            );
-            runner = build_runner(&w.pool, &w.metrics);
-            info!("Worker {} LuaScriptRunner reloaded", worker_id);
-        }
-
         let command = tokio::select! {
             cmd = w.rx.recv() => {
                 match cmd {
@@ -363,16 +340,6 @@ async fn run_worker(
                 }
             }
             _ = w.token.cancelled() => return Ok(()),
-            _ = reload_rx.changed() => {
-                // A reload signal arrived while we were waiting for a command.
-                #[cfg(feature = "lua")]
-                {
-                    debug!("Worker {} reloading LuaScriptRunner from database", worker_id);
-                    runner = build_runner(&w.pool, &w.metrics);
-                    info!("Worker {} LuaScriptRunner reloaded", worker_id);
-                }
-                continue;
-            }
         };
 
         w.metrics.inc_workers_busy();
@@ -401,11 +368,8 @@ async fn run_worker(
                     }
                 };
 
-                #[cfg(feature = "lua")]
-                let script_runner: Option<&dyn ScriptRunner> =
-                    runner.as_ref().map(|r| r as &dyn ScriptRunner);
-                #[cfg(not(feature = "lua"))]
-                let script_runner: Option<&dyn ScriptRunner> = None;
+                let runner_snapshot = w.script_runner.current();
+                let script_runner: Option<&dyn ScriptRunner> = runner_snapshot.as_deref();
 
                 let outcome = match refresh_feed(
                     &client,
@@ -641,6 +605,50 @@ pub(crate) fn run_maintenance<F>(
     }
 }
 
+/// Dispatch `fetch.error` to the scripting engine, if one is installed.
+fn fire_fetch_error(
+    runner: Option<&dyn ScriptRunner>,
+    feed_id: i64,
+    kind: &'static str,
+    status: Option<u16>,
+    message: String,
+    retry_after: Option<i64>,
+) {
+    if let Some(r) = runner {
+        r.dispatch_observe(
+            crate::scripting::Event::FetchError,
+            crate::scripting::EventPayload::FetchError {
+                feed_id,
+                kind,
+                status,
+                message,
+                retry_after,
+            },
+        );
+    }
+}
+
+/// Dispatch `fetch.success` to the scripting engine, if one is installed.
+fn fire_fetch_success(
+    runner: Option<&dyn ScriptRunner>,
+    feed_id: i64,
+    status: u16,
+    url: String,
+    content_length: Option<u64>,
+) {
+    if let Some(r) = runner {
+        r.dispatch_observe(
+            crate::scripting::Event::FetchSuccess,
+            crate::scripting::EventPayload::FetchSuccess {
+                feed_id,
+                status,
+                url,
+                content_length,
+            },
+        );
+    }
+}
+
 /// Load all Lua script source texts from the database.
 #[cfg(feature = "lua")]
 fn load_all_script_sources(
@@ -651,42 +659,80 @@ fn load_all_script_sources(
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// Build a [`LuaScriptRunner`] from all scripts currently in the database.
+/// Build a fresh [`ScriptRunner`] from the current `scripts` table and install it in
+/// `handle`, replacing any previous runner.
 ///
-/// Returns `None` and logs a warning if the runner cannot be constructed.
+/// Logs and clears the handle if loading sources or compiling scripts fails.
 #[cfg(feature = "lua")]
-fn build_runner(
+pub fn reload_script_runner(
     pool: &Pool<SqliteConnectionManager>,
     metrics: &Metrics,
-) -> Option<crate::scripting::lua::LuaScriptRunner> {
-    match pool.get() {
-        Ok(conn) => match load_all_script_sources(&conn) {
-            Ok(sources) => {
-                let count = sources.len() as f64;
-                match crate::scripting::lua::LuaScriptRunner::new(&sources) {
-                    Ok(r) => {
-                        metrics.set_scripts_loaded(count);
-                        Some(r)
-                    }
-                    Err(e) => {
-                        warn!("failed to compile Lua scripts: {}", e);
-                        metrics.record_script_compile_error();
-                        metrics.set_scripts_loaded(0.0);
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                error!("failed to load script sources from database: {}", e);
-                None
-            }
-        },
+    handle: &ScriptRunnerHandle,
+) {
+    let conn = match pool.get() {
+        Ok(c) => c,
         Err(e) => {
             error!(
                 "failed to get DB connection while building script runner: {}",
                 e
             );
-            None
+            handle.set(None);
+            return;
+        }
+    };
+    let sources = match load_all_script_sources(&conn) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("failed to load script sources from database: {}", e);
+            handle.set(None);
+            return;
+        }
+    };
+    let count = sources.len() as f64;
+    match crate::scripting::lua::LuaScriptRunner::new(&sources) {
+        Ok(runner) => {
+            metrics.set_scripts_loaded(count);
+            handle.set(Some(Arc::new(runner) as Arc<dyn ScriptRunner>));
+        }
+        Err(e) => {
+            warn!("failed to compile Lua scripts: {}", e);
+            metrics.record_script_compile_error();
+            metrics.set_scripts_loaded(0.0);
+            handle.set(None);
+        }
+    }
+}
+
+/// Listen on `reload_rx` and rebuild the script runner each time a reload signal arrives.
+///
+/// Exits cleanly on cancellation or when the watch channel is closed.
+#[cfg(feature = "lua")]
+pub async fn run_script_reloader(
+    pool: Pool<SqliteConnectionManager>,
+    metrics: Arc<Metrics>,
+    handle: ScriptRunnerHandle,
+    mut reload_rx: tokio::sync::watch::Receiver<()>,
+    token: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            res = reload_rx.changed() => {
+                if res.is_err() {
+                    // Sender dropped — no more reloads possible.
+                    return;
+                }
+                debug!("Reloading script runner from database");
+                let pool = pool.clone();
+                let metrics = metrics.clone();
+                let handle = handle.clone();
+                // Compilation can be CPU-heavy; keep it off the async runtime.
+                let _ = tokio::task::spawn_blocking(move || {
+                    reload_script_runner(&pool, &metrics, &handle);
+                })
+                .await;
+                info!("Script runner reloaded");
+            }
+            _ = token.cancelled() => return,
         }
     }
 }
@@ -990,6 +1036,7 @@ pub(crate) async fn refresh_feed(
             fetch_start,
             cfg,
             metrics,
+            script_runner,
         )
         .await
     };
@@ -1037,6 +1084,14 @@ pub(crate) async fn refresh_feed(
             cfg.min_fetch_interval,
             metrics,
         );
+        fire_fetch_error(
+            script_runner,
+            feed_id,
+            "parse",
+            None,
+            format!("{}", fetch_err),
+            None,
+        );
         metrics.record_feed_fetch("invalid_feed", fetch_start.elapsed().as_secs_f64());
         return Ok(());
     }
@@ -1059,6 +1114,7 @@ async fn retrieve_feed(
     fetch_start: Instant,
     cfg: SchedulerConfig,
     metrics: &Metrics,
+    script_runner: Option<&dyn ScriptRunner>,
 ) -> Result<Option<Vec<u8>>> {
     let conn = pool.get()?;
 
@@ -1107,7 +1163,9 @@ async fn retrieve_feed(
             let resp = match request.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let outcome = if e.is_timeout() { "timeout" } else { "other" };
+                    let is_timeout = e.is_timeout();
+                    let metric_outcome = if is_timeout { "timeout" } else { "other" };
+                    let event_kind = if is_timeout { "timeout" } else { "network" };
                     let fetch_err = FetchError::Other {
                         message: format!("{}", e),
                     };
@@ -1123,7 +1181,15 @@ async fn retrieve_feed(
                         cfg.min_fetch_interval,
                         metrics,
                     );
-                    metrics.record_feed_fetch(outcome, fetch_start.elapsed().as_secs_f64());
+                    fire_fetch_error(
+                        script_runner,
+                        feed_id,
+                        event_kind,
+                        None,
+                        format!("{}", e),
+                        None,
+                    );
+                    metrics.record_feed_fetch(metric_outcome, fetch_start.elapsed().as_secs_f64());
                     metrics.record_feed_redirects(redirects);
                     return Ok(None);
                 }
@@ -1170,6 +1236,14 @@ async fn retrieve_feed(
             cfg.max_backoff,
             cfg.min_fetch_interval,
             metrics,
+        );
+        fire_fetch_error(
+            script_runner,
+            feed_id,
+            "too_many_redirects",
+            None,
+            format!("{}", fetch_err),
+            None,
         );
         metrics.record_feed_fetch("too_many_redirects", fetch_start.elapsed().as_secs_f64());
         metrics.record_feed_redirects(redirects);
@@ -1242,6 +1316,14 @@ async fn retrieve_feed(
                 cfg.max_backoff,
                 cfg.min_fetch_interval,
                 metrics,
+            );
+            fire_fetch_error(
+                script_runner,
+                feed_id,
+                "http",
+                Some(status_u16),
+                format!("{}", fetch_err),
+                retry_after_ts,
             );
             metrics.record_feed_fetch("http_error", fetch_start.elapsed().as_secs_f64());
             return Ok(None);
@@ -1410,6 +1492,14 @@ async fn retrieve_feed(
     )?;
 
     metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
+
+    fire_fetch_success(
+        script_runner,
+        feed_id,
+        200,
+        current_url.clone(),
+        Some(content.len() as u64),
+    );
 
     Ok(Some(content.to_vec()))
 }
@@ -1926,9 +2016,13 @@ fn process_atom_feed(
         let (feed_entry, ingest) = atom_entry_to_parts(feed_id, entry);
 
         let feed_entry = if let Some(runner) = script_runner {
+            runner.dispatch_observe(
+                crate::scripting::Event::EntryParsed,
+                crate::scripting::EventPayload::Entry(feed_entry.clone()),
+            );
             let original = feed_entry.clone();
             let script_start = Instant::now();
-            match runner.process_entry(feed_entry) {
+            match runner.dispatch_transform_entry(feed_entry) {
                 Ok(Some(e)) => {
                     metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "ok");
                     e
@@ -2015,9 +2109,13 @@ fn process_rss_feed(
         let (feed_entry, ingest) = rss_item_to_parts(feed_id, item);
 
         let feed_entry = if let Some(runner) = script_runner {
+            runner.dispatch_observe(
+                crate::scripting::Event::EntryParsed,
+                crate::scripting::EventPayload::Entry(feed_entry.clone()),
+            );
             let original = feed_entry.clone();
             let script_start = Instant::now();
-            match runner.process_entry(feed_entry) {
+            match runner.dispatch_transform_entry(feed_entry) {
                 Ok(Some(e)) => {
                     metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "ok");
                     e

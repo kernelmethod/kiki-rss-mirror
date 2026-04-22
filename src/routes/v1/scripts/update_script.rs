@@ -170,7 +170,7 @@ mod test {
             .post("http://localhost/v1/scripts/create")
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
-                text: "return function(entry) return entry end".to_string(),
+                text: "kiki.on(\"entry.ingest\", function(entry) return entry end)".to_string(),
                 kind: "user".to_string(),
             })
             .send()
@@ -178,7 +178,7 @@ mod test {
         assert_eq!(resp.status(), StatusCode::CREATED);
         let id = resp.json::<AddScriptResponse>().await?.id;
 
-        let new_text = "return function(entry) return nil end";
+        let new_text = "kiki.on(\"entry.ingest\", function(entry) return nil end)";
         let resp = client
             .put(format!("http://localhost/v1/scripts/id/{id}"))
             .json(&UpdateScriptRequest {
@@ -227,7 +227,7 @@ mod test {
             .post("http://localhost/v1/scripts/create")
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
-                text: "return function(entry) return entry end".to_string(),
+                text: "kiki.on(\"entry.ingest\", function(entry) return entry end)".to_string(),
                 kind: "user".to_string(),
             })
             .send()
@@ -263,7 +263,7 @@ mod test {
             .post("http://localhost/v1/scripts/create")
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
-                text: "return function(entry) return entry end".to_string(),
+                text: "kiki.on(\"entry.ingest\", function(entry) return entry end)".to_string(),
                 kind: "user".to_string(),
             })
             .send()
@@ -297,7 +297,7 @@ mod test {
             .put(format!("http://localhost/v1/scripts/id/{script_id}"))
             .json(&UpdateScriptRequest {
                 engine: None,
-                text: Some("return function(entry) return nil end".to_string()),
+                text: Some("kiki.on(\"entry.ingest\", function(entry) return nil end)".to_string()),
                 kind: None,
             })
             .send()

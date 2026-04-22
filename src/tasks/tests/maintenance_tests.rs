@@ -225,16 +225,15 @@ async fn maintenance_commands_end_to_end_via_worker() -> Result<()> {
 
     let (tx, rx) = async_channel::bounded(16);
     let token = CancellationToken::new();
-    let (reload_tx, _) = tokio::sync::watch::channel(());
     let handles = spawn_workers(
         rx,
         tx.clone(),
         pool.clone(),
         token.clone(),
-        reload_tx,
         1,
         std::sync::Arc::new(super::test_metrics()),
         std::path::PathBuf::from("."),
+        crate::scripting::ScriptRunnerHandle::empty(),
     );
 
     tx.send(TaskManagerCommand::OptimizeFts).await?;

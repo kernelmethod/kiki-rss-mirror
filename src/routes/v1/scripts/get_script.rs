@@ -81,7 +81,7 @@ mod test {
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;
 
-        let text = "return function(entry) return entry end";
+        let text = "kiki.on(\"entry.ingest\", function(entry) return entry end)";
 
         let resp = client
             .post("http://localhost/v1/scripts/create")

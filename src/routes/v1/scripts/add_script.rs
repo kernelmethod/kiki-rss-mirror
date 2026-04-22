@@ -94,7 +94,7 @@ mod test {
             .post("http://localhost/v1/scripts/create")
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
-                text: "return function(entry) return entry end".to_string(),
+                text: "kiki.on(\"entry.ingest\", function(entry) return entry end)".to_string(),
                 kind: "user".to_string(),
             })
             .send()
@@ -113,7 +113,7 @@ mod test {
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;
 
-        let text = "return function(entry) return entry end";
+        let text = "kiki.on(\"entry.ingest\", function(entry) return entry end)";
 
         client
             .post("http://localhost/v1/scripts/create")
@@ -147,7 +147,7 @@ mod test {
             .post("http://localhost/v1/scripts/create")
             .json(&AddScriptRequest {
                 engine: "lua".to_string(),
-                text: "return function(entry) return entry end".to_string(),
+                text: "kiki.on(\"entry.ingest\", function(entry) return entry end)".to_string(),
                 kind: "system".to_string(),
             })
             .send()
