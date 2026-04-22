@@ -167,6 +167,7 @@ mod test {
             .json(&AddFeedRequest {
                 title: "test feed".to_string(),
                 url: tc.example_feed_url(),
+                ..Default::default()
             })
             .send()
             .await?;
@@ -192,7 +193,7 @@ mod test {
         {
             let conn = tc.database_conn()?;
             conn.execute(
-                "UPDATE feeds SET last_checked = NULL WHERE id = ?1",
+                "UPDATE feeds SET last_checked = NULL, next_fetch_at = NULL WHERE id = ?1",
                 [feed_id],
             )?;
         }

@@ -277,6 +277,7 @@ mod test {
             .json(&AddFeedRequest {
                 title: "test feed".to_string(),
                 url: tc.example_feed_url(),
+                ..Default::default()
             })
             .send()
             .await?;

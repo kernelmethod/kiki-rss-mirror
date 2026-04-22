@@ -2,13 +2,9 @@
 set -e
 
 case "$1" in
-    remove|purge)
-        # Stop the service if running
-        if systemctl is-active --quiet kiki.service 2>/dev/null; then
-            systemctl stop kiki.service
-        fi
-        if systemctl is-enabled --quiet kiki.service 2>/dev/null; then
-            systemctl disable kiki.service
+    remove|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            deb-systemd-invoke stop kiki.service >/dev/null || true
         fi
         ;;
 esac

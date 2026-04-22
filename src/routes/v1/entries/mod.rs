@@ -1,5 +1,6 @@
 pub mod cleanup;
 pub mod delete_entry;
+pub mod entry_assets;
 pub mod entry_tags;
 pub mod format_data;
 pub mod get_entry;
@@ -8,6 +9,7 @@ pub mod search_entries;
 
 use cleanup::cleanup;
 use delete_entry::delete_entry;
+use entry_assets::list_entry_assets;
 use entry_tags::{get_entry_tags, set_entry_tags};
 use get_entry::get_entry;
 #[allow(unused_imports)]
@@ -27,6 +29,7 @@ pub fn create_router() -> Router<AppState> {
         .route("/search", post(search_entries))
         .route("/id/{id}", get(get_entry).delete(delete_entry))
         .route("/id/{id}/tags", get(get_entry_tags).put(set_entry_tags))
+        .route("/id/{id}/assets", get(list_entry_assets))
 }
 
 #[cfg(test)]
@@ -599,6 +602,110 @@ mod test {
             .collect();
         assert!(titles.contains(&"Breaking News Today"));
         assert!(titles.contains(&"Tech Review"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_tags_not_single() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // NOT sports — entries 1 (news+tech), 2 (science), 3 (tech+science)
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"tags": {"not": "sports"}}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 3);
+        let titles: Vec<&str> = body
+            .entries
+            .iter()
+            .map(|e| e.entry.title.as_str())
+            .collect();
+        assert!(titles.contains(&"Breaking News Today"));
+        assert!(titles.contains(&"Science Discovery"));
+        assert!(titles.contains(&"Tech Review"));
+        assert!(!titles.contains(&"Sports Update"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_tags_and_with_not() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // tech AND NOT news — entry 1 has tech+news (excluded),
+        // entry 3 has tech+science (included).
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({
+                "tags": {"and": ["tech", {"not": "news"}]}
+            }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].entry.title, "Tech Review");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_tags_not_or() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // NOT (news OR science) — entry 4 only (sports)
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({
+                "tags": {"not": {"or": ["news", "science"]}}
+            }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].entry.title, "Sports Update");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_tags_or_with_not() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+
+        // news OR NOT tech — entry 1 (news), entry 2 (science, no tech),
+        // entry 4 (sports, no tech). Entry 3 has tech (excluded).
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({
+                "tags": {"or": ["news", {"not": "tech"}]}
+            }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 3);
+        let titles: Vec<&str> = body
+            .entries
+            .iter()
+            .map(|e| e.entry.title.as_str())
+            .collect();
+        assert!(titles.contains(&"Breaking News Today"));
+        assert!(titles.contains(&"Science Discovery"));
+        assert!(titles.contains(&"Sports Update"));
+        assert!(!titles.contains(&"Tech Review"));
 
         Ok(())
     }

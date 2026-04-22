@@ -20,6 +20,28 @@ CREATE TABLE settings (
 -- Default global settings.
 INSERT INTO settings (key, value, type)
 VALUES ('feed_update_timeout_seconds', '15', 'integer');
+INSERT INTO settings (key, value, type)
+VALUES ('feed_asset_cache_enabled', 'true', 'boolean');
+INSERT INTO settings (key, value, type)
+VALUES ('feed_asset_cache_max_bytes', '1073741824', 'integer');
+
+-- Absolute floor on how often any single feed can be polled, in seconds.
+-- Caps the effect of a very low `max-age` or `Retry-After` value so a
+-- misbehaving server cannot trigger hyperpolling.
+INSERT INTO settings (key, value, type)
+VALUES ('min_polling_cadence_seconds', '60', 'integer');
+
+-- Cap on exponential backoff and the wait used for permanent errors,
+-- in seconds. Defaults to 24 hours.
+INSERT INTO settings (key, value, type)
+VALUES ('max_feed_backoff_seconds', '86400', 'integer');
+
+-- How often, in seconds, to bypass conditional-request headers and force a
+-- full GET on a feed. Lets us detect servers that keep serving the same
+-- `ETag`/`Last-Modified` while the body has actually changed. Defaults to
+-- 7 days.
+INSERT INTO settings (key, value, type)
+VALUES ('force_refresh_after_secs', '604800', 'integer');
 
 -- Persistent record of when recurring background tasks last ran, so their
 -- schedules survive server restarts. Keyed by an opaque task name.
@@ -59,20 +81,70 @@ CREATE TABLE feeds (
     header_etag             VARCHAR,
     header_last_modified    VARCHAR,
 
+    -- Blake3 hex digest of the body returned by the most recent successful
+    -- 200 response. Paired with `last_full_refresh_at` to detect servers
+    -- that keep returning unchanged `ETag`/`Last-Modified` validators while
+    -- the body has actually changed.
+    header_body_hash        VARCHAR,
+
+    -- Unix timestamp of the most recent successful 200 response (forced or
+    -- conditional). Used to decide when to force another non-conditional
+    -- fetch for validator-lie detection.
+    last_full_refresh_at    INTEGER,
+
     -- Unix timestamp parsed from the HTTP Expires response header.
     -- When set, the fetcher will skip refreshing the feed until this
     -- time has passed.
     header_expires          INTEGER,
+
+    -- Unix timestamp until which the feed's last response is treated as
+    -- immutable per RFC 8246 (Cache-Control: immutable). While set and in
+    -- the future, conditional request headers (If-None-Match,
+    -- If-Modified-Since) are omitted and the feed is not refetched.
+    header_immutable_until  INTEGER,
 
     -- Most recent fetch error message, if any. Cleared on successful fetch.
     last_fetch_error        VARCHAR,
     -- Timestamp of the most recent fetch error.
     last_fetch_error_at     DATETIME,
 
-    -- Minimum interval, in seconds, between fetches of this feed.
+    -- Minimum interval, in seconds, between fetches of this feed. Acts as
+    -- a ceiling on polling interval: even if the server advertises a
+    -- longer max-age, we will refresh at least this often. Also used as
+    -- the fallback interval when the server sends no cache hint.
     -- Defaults to 3 hours (10800 seconds).
-    min_fetch_interval_seconds  INTEGER NOT NULL DEFAULT 10800
+    min_fetch_interval_seconds  INTEGER NOT NULL DEFAULT 10800,
+
+    -- Unix timestamp (seconds) of the earliest moment this feed is
+    -- eligible for the next fetch. NULL means "fetch immediately" and is
+    -- the default for newly created feeds. Updated after every fetch
+    -- attempt (success, 304, or error) using server cache hints,
+    -- Retry-After, or exponential backoff.
+    next_fetch_at           INTEGER,
+
+    -- Number of consecutive transient failures. Reset to 0 on any
+    -- successful fetch (including 304). Drives exponential backoff.
+    consecutive_failures    INTEGER NOT NULL DEFAULT 0,
+
+    -- Unix timestamp (seconds) parsed from the most recent `Retry-After`
+    -- response header, if any. Retained for observability; the scheduled
+    -- retry time is folded into `next_fetch_at`.
+    retry_after_at          INTEGER,
+
+    -- Per-feed authentication. `auth_type` is one of:
+    --   * NULL or 'none' — no authentication (default)
+    --   * 'basic'        — HTTP Basic auth (auth_username + auth_password)
+    --   * 'bearer'       — HTTP Bearer token (auth_bearer_token)
+    --
+    -- Credentials are stored in plaintext; restrict filesystem access to
+    -- the database file and treat it as sensitive.
+    auth_type               VARCHAR,
+    auth_username           VARCHAR,
+    auth_password           VARCHAR,
+    auth_bearer_token       VARCHAR
 );
+
+CREATE INDEX idx_feeds_next_fetch_at ON feeds(next_fetch_at);
 
 -- A list of the tags that are automatically assigned to entries from a given
 -- feed
@@ -354,6 +426,34 @@ UNION
 SELECT e.id AS entry_id, afc.contributor AS contributor
 FROM entries e
 JOIN atom_feed_contributors afc ON e.feed_id = afc.feed_id;
+
+---------------------------------------------------------------------------------
+-- Cached feed assets (images, enclosures) fetched from entry content.
+---------------------------------------------------------------------------------
+
+CREATE TABLE feed_assets (
+    id               INTEGER PRIMARY KEY,
+    blake3           TEXT NOT NULL UNIQUE,
+    original_url     TEXT NOT NULL,
+    content_type     TEXT,
+    size_bytes       INTEGER NOT NULL,
+    cached_at        INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_accessed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    etag             TEXT,
+    last_modified    TEXT
+);
+CREATE INDEX idx_feed_assets_last_accessed ON feed_assets(last_accessed_at);
+CREATE INDEX idx_feed_assets_original_url  ON feed_assets(original_url);
+
+CREATE TABLE entry_assets (
+    entry_id INTEGER NOT NULL,
+    asset_id INTEGER NOT NULL,
+    kind     TEXT NOT NULL,
+    PRIMARY KEY (entry_id, asset_id),
+    FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE,
+    FOREIGN KEY (asset_id) REFERENCES feed_assets(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_entry_assets_asset ON entry_assets(asset_id);
 
 ---------------------------------------------------------------------------------
 -- Full-text search index over entries (FTS5, external content)

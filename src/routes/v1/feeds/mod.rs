@@ -172,6 +172,7 @@ mod test {
             .json(&add_feed::AddFeedRequest {
                 title: "test feed".to_string(),
                 url: "https://example.com/feed.xml".to_string(),
+                ..Default::default()
             })
             .send()
             .await?;
@@ -202,6 +203,7 @@ mod test {
             .json(&add_feed::AddFeedRequest {
                 title: "test feed".to_string(),
                 url: "https://example.com/feed.xml".to_string(),
+                ..Default::default()
             })
             .send()
             .await?;
@@ -339,6 +341,7 @@ mod test {
             .json(&add_feed::AddFeedRequest {
                 title: "original title".to_string(),
                 url: "https://example.com/feed.xml".to_string(),
+                ..Default::default()
             })
             .send()
             .await?;
@@ -362,6 +365,7 @@ mod test {
                 url: None,
                 description: Some("updated description".to_string()),
                 min_fetch_interval_seconds: Some(7200),
+                ..Default::default()
             })
             .send()
             .await?;
@@ -403,6 +407,7 @@ mod test {
                 url: None,
                 description: None,
                 min_fetch_interval_seconds: None,
+                ..Default::default()
             })
             .send()
             .await?;
@@ -418,6 +423,7 @@ mod test {
                 url: None,
                 description: None,
                 min_fetch_interval_seconds: None,
+                ..Default::default()
             })
             .send()
             .await?;
@@ -431,10 +437,189 @@ mod test {
                 url: None,
                 description: None,
                 min_fetch_interval_seconds: Some(0),
+                ..Default::default()
             })
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_feed_with_basic_auth() -> Result<()> {
+        use crate::http::FeedAuthType;
+
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        let resp = client
+            .post("http://localhost/v1/feeds/create")
+            .json(&add_feed::AddFeedRequest {
+                title: "private".into(),
+                url: "https://example.com/private.xml".into(),
+                auth_type: Some(FeedAuthType::Basic),
+                auth_username: Some("alice".into()),
+                auth_password: Some("hunter2".into()),
+                auth_bearer_token: None,
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let feed_id = resp.json::<add_feed::AddFeedResponse>().await?.id;
+
+        // Credentials should be stored exactly as provided.
+        let conn = tc.database_conn()?;
+        let (auth_type, username, password, bearer): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT auth_type, auth_username, auth_password, auth_bearer_token
+             FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(auth_type.as_deref(), Some("basic"));
+        assert_eq!(username.as_deref(), Some("alice"));
+        assert_eq!(password.as_deref(), Some("hunter2"));
+        assert_eq!(bearer, None);
+
+        // GET should surface auth_type but not credentials.
+        let resp = client
+            .get(format!("http://localhost/v1/feeds/id/{}", feed_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["auth_type"], "basic");
+        assert!(body.get("auth_username").is_none());
+        assert!(body.get("auth_password").is_none());
+        assert!(body.get("auth_bearer_token").is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_feed_rejects_invalid_auth() -> Result<()> {
+        use crate::http::FeedAuthType;
+
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // Basic auth without a username should 400.
+        let resp = client
+            .post("http://localhost/v1/feeds/create")
+            .json(&add_feed::AddFeedRequest {
+                title: "bad".into(),
+                url: "https://example.com/x.xml".into(),
+                auth_type: Some(FeedAuthType::Basic),
+                auth_username: None,
+                auth_password: Some("p".into()),
+                auth_bearer_token: None,
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Bearer auth without a token should 400.
+        let resp = client
+            .post("http://localhost/v1/feeds/create")
+            .json(&add_feed::AddFeedRequest {
+                title: "bad".into(),
+                url: "https://example.com/x.xml".into(),
+                auth_type: Some(FeedAuthType::Bearer),
+                auth_username: None,
+                auth_password: None,
+                auth_bearer_token: None,
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_feed_switches_auth_scheme() -> Result<()> {
+        use crate::http::FeedAuthType;
+
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // Create a feed using Basic auth.
+        let resp = client
+            .post("http://localhost/v1/feeds/create")
+            .json(&add_feed::AddFeedRequest {
+                title: "switch".into(),
+                url: "https://example.com/s.xml".into(),
+                auth_type: Some(FeedAuthType::Basic),
+                auth_username: Some("u".into()),
+                auth_password: Some("p".into()),
+                auth_bearer_token: None,
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let feed_id = resp.json::<add_feed::AddFeedResponse>().await?.id;
+
+        // Switch to Bearer; basic credentials should be cleared.
+        let resp = client
+            .put(format!("http://localhost/v1/feeds/id/{}", feed_id))
+            .json(&update_feed::UpdateFeedRequest {
+                auth_type: Some(FeedAuthType::Bearer),
+                auth_bearer_token: Some("tok".into()),
+                ..Default::default()
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<update_feed::UpdateFeedResponse>().await?;
+        assert_eq!(body.auth_type, FeedAuthType::Bearer);
+
+        let conn = tc.database_conn()?;
+        let (auth_type, username, password, bearer): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT auth_type, auth_username, auth_password, auth_bearer_token
+             FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(auth_type.as_deref(), Some("bearer"));
+        assert_eq!(username, None, "previous basic username should be cleared");
+        assert_eq!(password, None, "previous basic password should be cleared");
+        assert_eq!(bearer.as_deref(), Some("tok"));
+
+        // Clear auth entirely.
+        let resp = client
+            .put(format!("http://localhost/v1/feeds/id/{}", feed_id))
+            .json(&update_feed::UpdateFeedRequest {
+                auth_type: Some(FeedAuthType::None),
+                ..Default::default()
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (auth_type, username, password, bearer): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT auth_type, auth_username, auth_password, auth_bearer_token
+             FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(auth_type, None);
+        assert_eq!(username, None);
+        assert_eq!(password, None);
+        assert_eq!(bearer, None);
 
         Ok(())
     }
@@ -450,6 +635,7 @@ mod test {
             .json(&add_feed::AddFeedRequest {
                 title: "test feed".to_string(),
                 url: "https://example.com/feed.xml".to_string(),
+                ..Default::default()
             })
             .send()
             .await?;
@@ -829,6 +1015,119 @@ mod test {
         assert!(
             feeds[0].get("atom").is_none(),
             "list endpoint leaked atom sub-object: {:?}",
+            feeds[0]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_feed_exposes_last_fetch_error() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // Insert a feed with a stored fetch error directly, simulating a
+        // previously-failed refresh attempt.
+        let feed_id = {
+            let conn = tc.database_conn()?;
+            conn.execute(
+                "INSERT INTO feeds (title, url, last_fetch_error, last_fetch_error_at)
+                 VALUES (?, ?, ?, ?)",
+                rusqlite::params![
+                    "broken feed",
+                    "https://example.com/broken.xml",
+                    r#"{"type":"http_status","url":"https://example.com/broken.xml","status":503}"#,
+                    1700000000i64,
+                ],
+            )?;
+            conn.last_insert_rowid()
+        };
+
+        let resp = client
+            .get(format!("http://localhost/v1/feeds/id/{}", feed_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+
+        let err = body
+            .get("last_fetch_error")
+            .expect("last_fetch_error should be present");
+        assert_eq!(err["type"], "http_status");
+        assert_eq!(err["url"], "https://example.com/broken.xml");
+        assert_eq!(err["status"], 503);
+        assert!(
+            body.get("last_fetch_error_at")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "last_fetch_error_at should be a string: {:?}",
+            body.get("last_fetch_error_at")
+        );
+
+        // A successful refresh clears the error, and the single-feed
+        // response should then omit both error fields.
+        {
+            let conn = tc.database_conn()?;
+            conn.execute(
+                "UPDATE feeds SET last_fetch_error = NULL, last_fetch_error_at = NULL WHERE id = ?1",
+                [feed_id],
+            )?;
+        }
+
+        let resp = client
+            .get(format!("http://localhost/v1/feeds/id/{}", feed_id))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+        assert!(
+            body.get("last_fetch_error").is_none(),
+            "last_fetch_error should be omitted when null: {:?}",
+            body.get("last_fetch_error")
+        );
+        assert!(
+            body.get("last_fetch_error_at").is_none(),
+            "last_fetch_error_at should be omitted when null: {:?}",
+            body.get("last_fetch_error_at")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_feeds_does_not_expose_last_fetch_error() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // Insert a feed with a stored fetch error.
+        {
+            let conn = tc.database_conn()?;
+            conn.execute(
+                "INSERT INTO feeds (title, url, last_fetch_error, last_fetch_error_at)
+                 VALUES (?, ?, ?, ?)",
+                rusqlite::params![
+                    "broken feed",
+                    "https://example.com/broken.xml",
+                    r#"{"type":"http_status","url":"https://example.com/broken.xml","status":503}"#,
+                    1700000000i64,
+                ],
+            )?;
+        }
+
+        let resp = client.get("http://localhost/v1/feeds").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+
+        let feeds = body["feeds"].as_array().expect("feeds array");
+        assert_eq!(feeds.len(), 1);
+        assert!(
+            feeds[0].get("last_fetch_error").is_none(),
+            "list endpoint leaked last_fetch_error: {:?}",
+            feeds[0]
+        );
+        assert!(
+            feeds[0].get("last_fetch_error_at").is_none(),
+            "list endpoint leaked last_fetch_error_at: {:?}",
             feeds[0]
         );
 

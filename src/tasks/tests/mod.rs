@@ -1,10 +1,15 @@
 #[cfg(feature = "lua")]
 mod lua_script_tests;
 
+mod asset_cache_tests;
+mod auth_tests;
+mod backoff_tests;
+mod cache_control_parse;
 mod cache_tests;
 mod fetch_error_tests;
 mod format_data_tests;
 mod maintenance_tests;
+mod retry_after_tests;
 #[cfg(feature = "extra-tests")]
 mod stress_tests;
 
@@ -13,4 +18,14 @@ mod stress_tests;
 #[allow(dead_code, clippy::expect_used)]
 pub(crate) fn test_metrics() -> crate::metrics::Metrics {
     crate::metrics::Metrics::new().expect("build test metrics")
+}
+
+/// Build a throwaway task-manager sender for tests that call `refresh_feed`
+/// without caring about enqueued follow-up tasks. The paired receiver is
+/// dropped, so `try_send` fills to capacity and then fails silently — which
+/// is the behaviour `refresh_feed` already treats as non-fatal.
+#[allow(dead_code)]
+pub(crate) fn test_tx() -> async_channel::Sender<crate::tasks::TaskManagerCommand> {
+    let (tx, _rx) = async_channel::bounded(1024);
+    tx
 }

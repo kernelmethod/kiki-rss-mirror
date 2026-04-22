@@ -1,18 +1,23 @@
-use crate::http::USER_AGENT;
+use crate::http::{FeedAuth, FeedAuthType, USER_AGENT};
 use crate::metrics::Metrics;
 use crate::scripting::{FeedEntry, ScriptRunner};
+use crate::tasks::cache::{corrected_max_age, extract_server_hints, parse_http_date, CacheControl};
 use anyhow::Result;
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+pub mod assets;
+mod cache;
 
 #[cfg(test)]
 mod tests;
@@ -59,41 +64,141 @@ impl fmt::Display for FetchError {
     }
 }
 
-/// Parsed `Cache-Control` directives relevant to the fetcher.
-struct CacheControl {
-    /// `max-age=N` — freshness lifetime in seconds.
-    max_age: Option<u64>,
-    /// `no-cache` — must revalidate; don't skip fetching.
-    no_cache: bool,
-    /// `no-store` — don't cache at all.
-    no_store: bool,
+impl FetchError {
+    /// Classify a fetch failure as transient (worth retrying with backoff) or
+    /// permanent (wait the full backoff cap before the next attempt).
+    ///
+    /// Transient: 408 Request Timeout, 429 Too Many Requests, any 5xx,
+    /// network/timeout errors (`Other`).
+    /// Permanent: other 4xx statuses, malformed feed bodies, redirect loops.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            FetchError::HttpStatus { status, .. } => {
+                matches!(*status, 408 | 429) || (500..=599).contains(status)
+            }
+            FetchError::Other { .. } => true,
+            FetchError::InvalidFeed { .. } | FetchError::TooManyRedirects { .. } => false,
+        }
+    }
 }
 
-impl CacheControl {
-    /// Parse a `Cache-Control` header value into the directives we care about.
-    fn parse(header: &str) -> Self {
-        let mut cc = CacheControl {
-            max_age: None,
-            no_cache: false,
-            no_store: false,
-        };
+/// Return true if two URL strings share the same (scheme, host, port) origin.
+///
+/// Used to decide whether credentials intended for a feed's configured URL
+/// may be forwarded across a redirect. Parse failures are treated as "not
+/// same-origin" — we refuse to leak credentials to a URL we can't inspect.
+fn same_origin(a: &str, b: &str) -> bool {
+    let (Ok(ua), Ok(ub)) = (Url::parse(a), Url::parse(b)) else {
+        return false;
+    };
+    ua.scheme() == ub.scheme()
+        && ua.host_str() == ub.host_str()
+        && ua.port_or_known_default() == ub.port_or_known_default()
+}
 
-        for directive in header.split(',') {
-            let directive = directive.trim();
-            if directive.eq_ignore_ascii_case("no-cache") {
-                cc.no_cache = true;
-            } else if directive.eq_ignore_ascii_case("no-store") {
-                cc.no_store = true;
-            } else {
-                let lower = directive.to_ascii_lowercase();
-                if let Some(val) = lower.strip_prefix("max-age=") {
-                    cc.max_age = val.trim().parse::<u64>().ok();
-                }
+/// Parse an HTTP `Retry-After` header value into an absolute Unix timestamp.
+///
+/// RFC 7231 §7.1.3 allows either a non-negative integer delta-seconds or an
+/// HTTP-date. Returns `None` if the value cannot be parsed.
+fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<i64> {
+    let trimmed = value.trim();
+
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(now.timestamp().saturating_add(secs as i64));
+    }
+
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%a, %d %b %Y %H:%M:%S GMT") {
+        return Some(dt.and_utc().timestamp());
+    }
+
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(trimmed) {
+        return Some(dt.timestamp());
+    }
+
+    None
+}
+
+/// Outcome of a fetch attempt, used to compute the next eligibility time.
+#[derive(Debug, Clone, Copy)]
+enum FetchOutcome {
+    /// Fresh 200 OK or a file:// read.
+    Success { server_hint_secs: Option<u64> },
+    /// 304 Not Modified.
+    NotModified { server_hint_secs: Option<u64> },
+    /// Transient error — eligible for exponential backoff.
+    ///
+    /// `stale_if_error_secs` carries the most recent
+    /// `Cache-Control: stale-if-error` value (RFC 5861 §4). When present, it
+    /// caps the computed backoff so we revalidate before the grace window
+    /// elapses.
+    TransientErr {
+        retry_after_ts: Option<i64>,
+        consecutive_failures: u32,
+        stale_if_error_secs: Option<u64>,
+    },
+    /// Permanent error — wait the full backoff cap.
+    PermanentErr,
+}
+
+/// Compute the Unix timestamp at which a feed is next eligible to be fetched.
+///
+/// Rules (all results clamped to `[now + min_cadence, now + max_backoff]`):
+/// - `Success` / `NotModified`: use `min(server_hint, min_fetch_interval)`
+///   when a hint is present; otherwise use `min_fetch_interval`. The per-feed
+///   `min_fetch_interval` is a ceiling, so we never wait longer than it.
+/// - `TransientErr` with `Retry-After`: honor the server's deadline.
+/// - `TransientErr` without `Retry-After`: exponential backoff
+///   `min_cadence * 2^(consecutive_failures - 1)`.
+/// - `PermanentErr`: wait the full `max_backoff`.
+fn compute_next_fetch_at(
+    outcome: FetchOutcome,
+    now_ts: i64,
+    min_cadence: u64,
+    max_backoff: u64,
+    min_fetch_interval: u64,
+) -> i64 {
+    let min_cadence = min_cadence.max(1);
+    let max_backoff = max_backoff.max(min_cadence);
+
+    let raw_next_ts: i64 = match outcome {
+        FetchOutcome::Success { server_hint_secs }
+        | FetchOutcome::NotModified { server_hint_secs } => {
+            let interval = match server_hint_secs {
+                Some(hint) => hint.min(min_fetch_interval),
+                None => min_fetch_interval,
+            };
+            now_ts.saturating_add(interval as i64)
+        }
+        FetchOutcome::TransientErr {
+            retry_after_ts: Some(ts),
+            stale_if_error_secs,
+            ..
+        } => {
+            // Don't wait past the stale-if-error window (RFC 5861 §4).
+            match stale_if_error_secs {
+                Some(s) => ts.min(now_ts.saturating_add(s as i64)),
+                None => ts,
             }
         }
+        FetchOutcome::TransientErr {
+            retry_after_ts: None,
+            consecutive_failures,
+            stale_if_error_secs,
+        } => {
+            let shift = consecutive_failures.saturating_sub(1).min(63);
+            let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+            let mut backoff = min_cadence.saturating_mul(multiplier);
+            if let Some(s) = stale_if_error_secs {
+                backoff = backoff.min(s);
+            }
+            now_ts.saturating_add(backoff as i64)
+        }
+        FetchOutcome::PermanentErr => now_ts.saturating_add(max_backoff as i64),
+    };
 
-        cc
-    }
+    let floor = now_ts.saturating_add(min_cadence as i64);
+    let ceiling = now_ts.saturating_add(max_backoff as i64);
+    raw_next_ts.max(floor).min(ceiling)
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +208,11 @@ pub enum TaskManagerCommand {
     CleanupFeed(i64),
     /// Run retention cleanup across all feeds.
     CleanupAll,
+    /// Download and cache the external assets referenced by an entry
+    /// (inline images plus any enclosure).
+    CacheEntryAssets {
+        entry_id: i64,
+    },
     /// Merge FTS5 index segments to improve search performance.
     OptimizeFts,
     /// Checkpoint the WAL file and refresh query-planner statistics.
@@ -166,6 +276,7 @@ struct Worker {
     refresh_in_progress: InProgressSet,
     cleanup_in_progress: InProgressSet,
     metrics: Arc<Metrics>,
+    data_dir: PathBuf,
 }
 
 /// Determine the number of worker tasks to spawn.
@@ -179,6 +290,7 @@ pub fn worker_count() -> usize {
 ///
 /// Each worker maintains its own `LuaScriptRunner` (when the `lua` feature is
 /// enabled) and subscribes to a `watch` channel for reload signals.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_workers(
     rx: async_channel::Receiver<TaskManagerCommand>,
     tx: async_channel::Sender<TaskManagerCommand>,
@@ -187,6 +299,7 @@ pub fn spawn_workers(
     reload_tx: tokio::sync::watch::Sender<()>,
     num_workers: usize,
     metrics: Arc<Metrics>,
+    data_dir: PathBuf,
 ) -> Vec<tokio::task::JoinHandle<Result<()>>> {
     let worker = Worker {
         rx,
@@ -196,6 +309,7 @@ pub fn spawn_workers(
         refresh_in_progress: Arc::new(Mutex::new(HashSet::new())),
         cleanup_in_progress: Arc::new(Mutex::new(HashSet::new())),
         metrics,
+        data_dir,
     };
     let mut handles = Vec::with_capacity(num_workers);
 
@@ -293,28 +407,35 @@ async fn run_worker(
                 #[cfg(not(feature = "lua"))]
                 let script_runner: Option<&dyn ScriptRunner> = None;
 
-                let outcome =
-                    match refresh_feed(&client, feed_id, w.pool.clone(), script_runner, &w.metrics)
-                        .await
-                    {
-                        Ok(()) => "ok",
-                        Err(e) => {
-                            error!(
-                                "An error occurred while refreshing feed {}: {:?}",
-                                feed_id, e
+                let outcome = match refresh_feed(
+                    &client,
+                    feed_id,
+                    w.pool.clone(),
+                    script_runner,
+                    &w.metrics,
+                    &w.tx,
+                )
+                .await
+                {
+                    Ok(()) => "ok",
+                    Err(e) => {
+                        error!(
+                            "An error occurred while refreshing feed {}: {:?}",
+                            feed_id, e
+                        );
+                        if let Ok(conn) = w.pool.get() {
+                            set_feed_error(
+                                &conn,
+                                feed_id,
+                                &FetchError::Other {
+                                    message: format!("{}", e),
+                                },
+                                &w.metrics,
                             );
-                            if let Ok(conn) = w.pool.get() {
-                                set_feed_error(
-                                    &conn,
-                                    feed_id,
-                                    &FetchError::Other {
-                                        message: format!("{}", e),
-                                    },
-                                );
-                            }
-                            "error"
                         }
-                    };
+                        "error"
+                    }
+                };
 
                 drop(guard);
                 w.metrics
@@ -409,6 +530,22 @@ async fn run_worker(
 
                 w.metrics.record_task_processed(
                     "cleanup_all",
+                    outcome,
+                    task_start.elapsed().as_secs_f64(),
+                );
+            }
+
+            TaskManagerCommand::CacheEntryAssets { entry_id } => {
+                let outcome =
+                    match cache_entry_assets(&client, &w.pool, &w.data_dir, entry_id).await {
+                        Ok(()) => "ok",
+                        Err(e) => {
+                            warn!("failed caching assets for entry {}: {:?}", entry_id, e);
+                            "error"
+                        }
+                    };
+                w.metrics.record_task_processed(
+                    "cache_entry_assets",
                     outcome,
                     task_start.elapsed().as_secs_f64(),
                 );
@@ -554,13 +691,26 @@ fn build_runner(
     }
 }
 
-/// Record a fetch error for a feed in the database.
+/// Record a fetch error for a feed in the database and reschedule the next
+/// fetch attempt.
 ///
-/// The error is serialized to JSON for structured storage.
-fn set_feed_error(
+/// `retry_after_ts` is the absolute Unix timestamp parsed from the
+/// server-provided `Retry-After` header (if any). It takes precedence over
+/// computed exponential backoff for transient errors.
+///
+/// The `consecutive_failures` column is incremented atomically; the rescheduled
+/// `next_fetch_at` is computed from that new streak length.
+#[allow(clippy::too_many_arguments)]
+fn set_feed_error_with_schedule(
     conn: &PooledConnection<SqliteConnectionManager>,
     feed_id: i64,
     fetch_error: &FetchError,
+    retry_after_ts: Option<i64>,
+    stale_if_error_secs: Option<u64>,
+    min_cadence: u64,
+    max_backoff: u64,
+    min_fetch_interval: u64,
+    metrics: &Metrics,
 ) {
     let json = match serde_json::to_string(fetch_error) {
         Ok(j) => j,
@@ -572,25 +722,209 @@ fn set_feed_error(
             return;
         }
     };
+
+    let now_ts = Utc::now().timestamp();
+    let is_transient = fetch_error.is_transient();
+
+    // Read the current failure count so we can compute the new streak length
+    // without a race window. Default to 0 if the row is somehow missing.
+    let current_failures: u32 = conn
+        .query_row(
+            "SELECT consecutive_failures FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v.max(0) as u32)
+        .unwrap_or(0);
+    let new_failures = current_failures.saturating_add(1);
+
+    let (outcome, retry_kind): (FetchOutcome, &'static str) = if is_transient {
+        let retry_kind = if retry_after_ts.is_some() {
+            "retry_after"
+        } else {
+            "backoff"
+        };
+        (
+            FetchOutcome::TransientErr {
+                retry_after_ts,
+                consecutive_failures: new_failures,
+                stale_if_error_secs,
+            },
+            retry_kind,
+        )
+    } else {
+        (FetchOutcome::PermanentErr, "permanent")
+    };
+
+    let next_fetch_at = compute_next_fetch_at(
+        outcome,
+        now_ts,
+        min_cadence,
+        max_backoff,
+        min_fetch_interval,
+    );
+
     if let Err(e) = conn.execute(
-        "UPDATE feeds SET last_fetch_error = ?1, last_fetch_error_at = ?2 WHERE id = ?3",
-        (&json, Utc::now().timestamp(), feed_id),
+        "UPDATE feeds SET
+            last_fetch_error = ?1,
+            last_fetch_error_at = ?2,
+            retry_after_at = ?3,
+            consecutive_failures = consecutive_failures + 1,
+            next_fetch_at = ?4
+         WHERE id = ?5",
+        (&json, now_ts, retry_after_ts, next_fetch_at, feed_id),
     ) {
         error!(
             "Failed to persist fetch error for feed {}: {:?}",
             feed_id, e
         );
+        return;
     }
+
+    metrics.record_feed_retry_scheduled(retry_kind, (next_fetch_at - now_ts) as f64);
+    metrics.record_feed_consecutive_failures(new_failures);
 }
 
-/// Clear any previously recorded fetch error for a feed.
+/// Back-compat wrapper around [`set_feed_error_with_schedule`] for callsites
+/// that don't have a `Retry-After` timestamp and need to read the tuning
+/// settings themselves. Looks them up from the database.
+fn set_feed_error(
+    conn: &PooledConnection<SqliteConnectionManager>,
+    feed_id: i64,
+    fetch_error: &FetchError,
+    metrics: &Metrics,
+) {
+    let (min_cadence, max_backoff) = match (
+        crate::db::settings::get_min_polling_cadence_seconds(conn),
+        crate::db::settings::get_max_feed_backoff_seconds(conn),
+    ) {
+        (Ok(c), Ok(b)) => (c, b),
+        _ => {
+            error!(
+                "Failed to read scheduler settings while recording error for feed {}",
+                feed_id
+            );
+            return;
+        }
+    };
+    let min_fetch_interval = conn
+        .query_row(
+            "SELECT min_fetch_interval_seconds FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v.max(0) as u64)
+        .unwrap_or(10800);
+
+    set_feed_error_with_schedule(
+        conn,
+        feed_id,
+        fetch_error,
+        None,
+        None,
+        min_cadence,
+        max_backoff,
+        min_fetch_interval,
+        metrics,
+    );
+}
+
+/// Clear any previously recorded fetch error for a feed and reset the failure
+/// streak counter.
 fn clear_feed_error(conn: &PooledConnection<SqliteConnectionManager>, feed_id: i64) {
     if let Err(e) = conn.execute(
-        "UPDATE feeds SET last_fetch_error = NULL, last_fetch_error_at = NULL WHERE id = ?1",
+        "UPDATE feeds SET
+            last_fetch_error = NULL,
+            last_fetch_error_at = NULL,
+            retry_after_at = NULL,
+            consecutive_failures = 0
+         WHERE id = ?1",
         (feed_id,),
     ) {
         error!("Failed to clear fetch error for feed {}: {:?}", feed_id, e);
     }
+}
+
+/// Settings controlling the fetch scheduler, read together so `refresh_feed`
+/// and its helpers don't hit the database separately.
+#[derive(Debug, Clone, Copy)]
+struct SchedulerConfig {
+    min_cadence: u64,
+    max_backoff: u64,
+    min_fetch_interval: u64,
+    /// How often (seconds) to bypass conditional-request headers and force
+    /// a full `GET` so the fetcher can detect servers that keep returning
+    /// unchanged validators while the body has actually changed.
+    force_refresh_after: u64,
+}
+
+/// Snapshot of a `feeds` row loaded at the start of a refresh: the URL,
+/// cache validators, body fingerprint, and scheduling state that drive the
+/// fetch decision.
+struct FeedFetchRow {
+    url: String,
+    header_etag: Option<String>,
+    header_last_modified: Option<String>,
+    header_immutable_until: Option<i64>,
+    header_body_hash: Option<String>,
+    last_full_refresh_at: Option<i64>,
+    consecutive_failures: i64,
+    next_fetch_at: Option<i64>,
+    min_fetch_interval: i64,
+    auth: FeedAuth,
+}
+
+fn load_feed_fetch_row(
+    conn: &PooledConnection<SqliteConnectionManager>,
+    feed_id: i64,
+) -> Result<FeedFetchRow> {
+    let row = conn.query_row(
+        "SELECT
+            url,
+            header_etag,
+            header_last_modified,
+            header_immutable_until,
+            header_body_hash,
+            last_full_refresh_at,
+            consecutive_failures,
+            next_fetch_at,
+            min_fetch_interval_seconds,
+            auth_type,
+            auth_username,
+            auth_password,
+            auth_bearer_token
+         FROM feeds
+         WHERE id = ?1",
+        [feed_id],
+        |row| {
+            let auth_type_raw: Option<String> = row.get(9)?;
+            let auth_type = FeedAuthType::from_db(auth_type_raw.as_deref()).unwrap_or_else(|e| {
+                warn!(
+                    "Feed {}: invalid auth_type in database: {}; treating as 'none'",
+                    feed_id, e
+                );
+                FeedAuthType::None
+            });
+            Ok(FeedFetchRow {
+                url: row.get(0)?,
+                header_etag: row.get(1)?,
+                header_last_modified: row.get(2)?,
+                header_immutable_until: row.get(3)?,
+                header_body_hash: row.get(4)?,
+                last_full_refresh_at: row.get(5)?,
+                consecutive_failures: row.get(6)?,
+                next_fetch_at: row.get(7)?,
+                min_fetch_interval: row.get(8)?,
+                auth: FeedAuth {
+                    auth_type,
+                    username: row.get(10)?,
+                    password: row.get(11)?,
+                    bearer_token: row.get(12)?,
+                },
+            })
+        },
+    )?;
+    Ok(row)
 }
 
 /// Refresh the feed corresponding to the provided `feed_id`.
@@ -600,105 +934,75 @@ pub(crate) async fn refresh_feed(
     pool: Pool<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
+    task_tx: &async_channel::Sender<TaskManagerCommand>,
 ) -> Result<()> {
     let fetch_start = Instant::now();
 
-    // Get the feed URL and headers from the database
     let conn = pool.get()?;
-    let (
-        feed_url,
-        header_etag,
-        header_last_modified,
-        header_expires,
-        last_checked,
-        min_fetch_interval,
-    ): (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        i64,
-    ) = conn.query_row(
-        "SELECT url, header_etag, header_last_modified, header_expires, last_checked, min_fetch_interval_seconds FROM feeds WHERE id = ?1",
-        [feed_id],
-        |row| {
-            let url: String = row.get(0)?;
-            let etag: Option<String> = row.get(1)?;
-            let last_modified: Option<String> = row.get(2)?;
-            let expires: Option<i64> = row.get(3)?;
-            let last_checked: Option<i64> = row.get(4)?;
-            let min_fetch_interval: i64 = row.get(5)?;
-            Ok((url, etag, last_modified, expires, last_checked, min_fetch_interval))
-        },
-    )?;
+    let row = load_feed_fetch_row(&conn, feed_id)?;
 
-    // If the server provided an Expires header, respect it: skip fetching
-    // until the declared expiry time has passed.
-    if let Some(expires_ts) = header_expires {
-        if let Some(expires_dt) = Utc.timestamp_opt(expires_ts, 0).single() {
-            let now = Utc::now();
-            if now < expires_dt {
-                debug!(
-                    "Feed {} has not yet expired (expires in {} seconds), skipping update",
-                    feed_id,
-                    expires_dt.signed_duration_since(now).num_seconds()
-                );
-                metrics.record_feed_cache_hit("expires");
-                metrics.record_feed_fetch("cache_hit", fetch_start.elapsed().as_secs_f64());
-                return Ok(());
-            }
-        }
-    }
+    let cfg = SchedulerConfig {
+        min_cadence: crate::db::settings::get_min_polling_cadence_seconds(&conn)?,
+        max_backoff: crate::db::settings::get_max_feed_backoff_seconds(&conn)?,
+        min_fetch_interval: row.min_fetch_interval.max(0) as u64,
+        force_refresh_after: crate::db::settings::get_force_refresh_after_secs(&conn)?,
+    };
 
-    // Check if the feed was last updated recently
-    if let Some(last_checked_ts) = last_checked {
-        if let Some(last_checked_ts) = Utc.timestamp_opt(last_checked_ts, 0).single() {
-            let now = Utc::now();
-            let duration_since = now.signed_duration_since(last_checked_ts);
-            if duration_since.num_seconds() < min_fetch_interval {
-                debug!(
-                    "Feed {} was last checked {} seconds ago, skipping update",
-                    feed_id,
-                    duration_since.num_seconds()
-                );
-                metrics.record_feed_cache_hit("min_interval");
-                metrics.record_feed_fetch("cache_hit", fetch_start.elapsed().as_secs_f64());
-                return Ok(());
-            }
+    // Force a non-conditional refresh when enough time has passed since the
+    // last full 200, and only when the feed isn't currently in a failure
+    // streak (don't add bandwidth cost to a feed that's already struggling).
+    // First-time fetches are always full, so `None` just means "not yet,
+    // keep using conditionals once we have validators".
+    let now_ts = Utc::now().timestamp();
+    let force_conditionals_off = row.last_full_refresh_at.is_some_and(|t| {
+        row.consecutive_failures == 0 && now_ts.saturating_sub(t) as u64 >= cfg.force_refresh_after
+    });
+
+    // Eligibility gate: a scheduled `next_fetch_at` in the future means skip.
+    if let Some(next_ts) = row.next_fetch_at {
+        if now_ts < next_ts {
+            debug!(
+                "Feed {} not yet eligible; next fetch in {} seconds",
+                feed_id,
+                next_ts - now_ts
+            );
+            metrics.record_feed_cache_hit("next_fetch_at");
+            metrics.record_feed_fetch("cache_hit", fetch_start.elapsed().as_secs_f64());
+            return Ok(());
         }
     }
 
     // Handle file:// URLs differently
-    let feed_content = if feed_url.starts_with("file://") {
-        retrieve_file_feed(&feed_url, feed_id, pool.clone())
+    let feed_content = if row.url.starts_with("file://") {
+        retrieve_file_feed(&row.url, feed_id, pool.clone(), cfg)
     } else {
         retrieve_feed(
             client,
             feed_id,
-            &feed_url,
-            header_etag.as_deref(),
-            header_last_modified.as_deref(),
+            &row.url,
+            row.header_etag.as_deref(),
+            row.header_last_modified.as_deref(),
+            row.header_immutable_until,
+            row.header_body_hash.as_deref(),
+            force_conditionals_off,
+            &row.auth,
             pool.clone(),
             fetch_start,
+            cfg,
             metrics,
         )
         .await
     };
 
-    let feed_content = match feed_content {
-        Ok(c) => c,
+    let content = match feed_content {
+        Ok(Some(c)) => c,
+        // `retrieve_feed` / `retrieve_file_feed` already recorded the outcome
+        // (e.g. 304 not-modified, HTTP error, skipped file) — nothing to parse.
+        Ok(None) => return Ok(()),
         Err(e) => {
             metrics.record_feed_fetch("other", fetch_start.elapsed().as_secs_f64());
             return Err(e);
         }
-    };
-
-    let content = if let Some(content) = feed_content {
-        content
-    } else {
-        // retrieve_feed / retrieve_file_feed already recorded the outcome.
-        return Ok(());
     };
 
     // Attempt to parse content as Atom, with fallback to RSS.
@@ -706,21 +1010,33 @@ pub(crate) async fn refresh_feed(
     if let Ok(feed) = atom_syndication::Feed::read_from(&content[..]) {
         let entries = feed.entries.len() as u64;
         metrics.record_feed_parse("atom", parse_start.elapsed().as_secs_f64(), entries);
-        process_atom_feed(feed_id, feed, conn, script_runner, metrics)?;
+        let inserted = process_atom_feed(feed_id, feed, conn, script_runner, metrics)?;
+        enqueue_asset_caching(task_tx, metrics, &inserted);
         clear_feed_error(&pool.get()?, feed_id);
         metrics.record_feed_fetch("success", fetch_start.elapsed().as_secs_f64());
     } else if let Ok(channel) = rss::Channel::read_from(&content[..]) {
         let items = channel.items.len() as u64;
         metrics.record_feed_parse("rss", parse_start.elapsed().as_secs_f64(), items);
-        process_rss_feed(feed_id, channel, conn, script_runner, metrics)?;
+        let inserted = process_rss_feed(feed_id, channel, conn, script_runner, metrics)?;
+        enqueue_asset_caching(task_tx, metrics, &inserted);
         clear_feed_error(&pool.get()?, feed_id);
         metrics.record_feed_fetch("success", fetch_start.elapsed().as_secs_f64());
     } else {
         let fetch_err = FetchError::InvalidFeed {
-            url: feed_url.clone(),
+            url: row.url.clone(),
         };
         warn!("Feed {}: {}", feed_id, fetch_err);
-        set_feed_error(&pool.get()?, feed_id, &fetch_err);
+        set_feed_error_with_schedule(
+            &pool.get()?,
+            feed_id,
+            &fetch_err,
+            None,
+            None,
+            cfg.min_cadence,
+            cfg.max_backoff,
+            cfg.min_fetch_interval,
+            metrics,
+        );
         metrics.record_feed_fetch("invalid_feed", fetch_start.elapsed().as_secs_f64());
         return Ok(());
     }
@@ -733,15 +1049,28 @@ async fn retrieve_feed(
     client: &reqwest::Client,
     feed_id: i64,
     feed_url: &str,
-    etag: Option<&str>,
-    last_modified: Option<&str>,
+    stored_etag: Option<&str>,
+    stored_last_modified: Option<&str>,
+    immutable_until: Option<i64>,
+    stored_body_hash: Option<&str>,
+    force_conditionals_off: bool,
+    auth: &FeedAuth,
     pool: Pool<SqliteConnectionManager>,
     fetch_start: Instant,
+    cfg: SchedulerConfig,
     metrics: &Metrics,
 ) -> Result<Option<Vec<u8>>> {
     let conn = pool.get()?;
 
     let timeout = Duration::from_secs(crate::db::settings::get_feed_update_timeout_seconds(&conn)?);
+
+    // RFC 8246: while a prior response advertised `immutable` and is still
+    // fresh, suppress conditional revalidation — the server has promised
+    // the representation won't change. This also makes forced refresh a
+    // no-op inside the immutable window (no conditionals to suppress).
+    let skip_conditionals = immutable_until
+        .map(|until| Utc::now().timestamp() < until)
+        .unwrap_or(false);
 
     let mut current_url = feed_url.to_string();
     let mut had_permanent_redirect = false;
@@ -750,24 +1079,53 @@ async fn retrieve_feed(
 
     let resp = 'redirect: {
         for _ in 0..=max_redirects {
-            // Only send conditional headers on the first request
+            // Only send conditional headers on the first request. Also
+            // suppress them when a forced (non-conditional) refresh is due,
+            // so the body-hash comparison below can tell us whether the
+            // server's validators have been honest.
             let mut request = client.get(&current_url).timeout(timeout);
-            if current_url == feed_url {
-                if let Some(etag) = etag {
+            if current_url == feed_url && !skip_conditionals && !force_conditionals_off {
+                if let Some(etag) = stored_etag {
                     request = request.header("If-None-Match", etag);
                 }
-                if let Some(last_modified) = last_modified {
+                if let Some(last_modified) = stored_last_modified {
                     request = request.header("If-Modified-Since", last_modified);
                 }
+            }
+            // Only forward credentials to the feed's configured origin. If a
+            // redirect took us cross-origin we intentionally drop them to
+            // avoid leaking secrets to an unrelated host.
+            if same_origin(feed_url, &current_url) {
+                request = auth.apply(request);
+            } else if auth.auth_type != FeedAuthType::None {
+                debug!(
+                    "Feed {}: dropping auth on cross-origin redirect to {}",
+                    feed_id, current_url
+                );
             }
 
             let resp = match request.send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let outcome = if e.is_timeout() { "timeout" } else { "other" };
+                    let fetch_err = FetchError::Other {
+                        message: format!("{}", e),
+                    };
+                    warn!("Feed {}: {}", feed_id, fetch_err);
+                    set_feed_error_with_schedule(
+                        &conn,
+                        feed_id,
+                        &fetch_err,
+                        None,
+                        None,
+                        cfg.min_cadence,
+                        cfg.max_backoff,
+                        cfg.min_fetch_interval,
+                        metrics,
+                    );
                     metrics.record_feed_fetch(outcome, fetch_start.elapsed().as_secs_f64());
                     metrics.record_feed_redirects(redirects);
-                    return Err(e.into());
+                    return Ok(None);
                 }
             };
 
@@ -802,10 +1160,17 @@ async fn retrieve_feed(
             url: feed_url.to_string(),
         };
         warn!("Feed {}: {}", feed_id, fetch_err);
-        {
-            let conn = pool.get()?;
-            set_feed_error(&conn, feed_id, &fetch_err);
-        }
+        set_feed_error_with_schedule(
+            &conn,
+            feed_id,
+            &fetch_err,
+            None,
+            None,
+            cfg.min_cadence,
+            cfg.max_backoff,
+            cfg.min_fetch_interval,
+            metrics,
+        );
         metrics.record_feed_fetch("too_many_redirects", fetch_start.elapsed().as_secs_f64());
         metrics.record_feed_redirects(redirects);
         return Ok(None);
@@ -817,24 +1182,67 @@ async fn retrieve_feed(
     match resp.status() {
         reqwest::StatusCode::NOT_MODIFIED => {
             info!("Feed {} was not modified since last check", feed_id);
-            // Update last_checked timestamp in database
+            let now_ts = Utc::now().timestamp();
+            let hints = extract_server_hints(resp.headers(), now_ts);
+            let next_fetch_at = compute_next_fetch_at(
+                FetchOutcome::NotModified {
+                    server_hint_secs: hints.hint_secs,
+                },
+                now_ts,
+                cfg.min_cadence,
+                cfg.max_backoff,
+                cfg.min_fetch_interval,
+            );
             conn.execute(
-                "UPDATE feeds SET last_checked = ?1 WHERE id = ?2",
-                (Utc::now().timestamp(), feed_id),
+                "UPDATE feeds SET
+                    last_checked = ?1,
+                    next_fetch_at = ?2,
+                    consecutive_failures = 0,
+                    retry_after_at = NULL
+                 WHERE id = ?3",
+                (now_ts, next_fetch_at, feed_id),
             )?;
             metrics.record_feed_cache_hit("not_modified");
+            metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
             metrics.record_feed_fetch("not_modified", fetch_start.elapsed().as_secs_f64());
             return Ok(None);
         }
         reqwest::StatusCode::OK => { /* Do nothing */ }
         // For other status codes, log an issue and stop processing
         status => {
+            let status_u16 = status.as_u16();
             let fetch_err = FetchError::HttpStatus {
                 url: feed_url.to_string(),
-                status: status.as_u16(),
+                status: status_u16,
             };
             warn!("Feed {}: {}", feed_id, fetch_err);
-            set_feed_error(&conn, feed_id, &fetch_err);
+
+            // Parse Retry-After for 429 Too Many Requests and 503 Service
+            // Unavailable. Other statuses don't carry retry hints.
+            let retry_after_ts = if status_u16 == 429 || status_u16 == 503 {
+                resp.headers()
+                    .get("retry-after")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| parse_retry_after(s, Utc::now()))
+            } else {
+                None
+            };
+
+            // Honor Cache-Control: stale-if-error on the error response
+            // (RFC 5861 §4) so our backoff doesn't outlive the grace window.
+            let hints = extract_server_hints(resp.headers(), Utc::now().timestamp());
+
+            set_feed_error_with_schedule(
+                &conn,
+                feed_id,
+                &fetch_err,
+                retry_after_ts,
+                hints.stale_if_error,
+                cfg.min_cadence,
+                cfg.max_backoff,
+                cfg.min_fetch_interval,
+                metrics,
+            );
             metrics.record_feed_fetch("http_error", fetch_start.elapsed().as_secs_f64());
             return Ok(None);
         }
@@ -852,62 +1260,157 @@ async fn retrieve_feed(
         )?;
     }
 
-    // Update the feed's headers in the database
-    let mut etag: Option<&str> = resp.headers().get("etag").and_then(|h| h.to_str().ok());
-    let mut last_modified: Option<&str> = resp
+    // Update the feed's headers in the database. Capture every header-
+    // derived value as owned data up front so we can consume `resp` for
+    // the body below without fighting the borrow checker.
+    let mut etag: Option<String> = resp
+        .headers()
+        .get("etag")
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string);
+    let mut last_modified: Option<String> = resp
         .headers()
         .get("last-modified")
-        .and_then(|h| h.to_str().ok());
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string);
 
-    // Parse the Expires header into a Unix timestamp so we can skip future
-    // fetches until the declared expiry time has passed.
+    // Parse the Expires header (RFC 9111 §5.3) into a Unix timestamp so we
+    // can skip future fetches until the declared expiry time has passed.
+    // Accepts all three HTTP-date formats (RFC 9110 §5.6.7).
     let mut expires: Option<i64> = resp
         .headers()
         .get("expires")
         .and_then(|h| h.to_str().ok())
-        .and_then(|s| {
-            chrono::NaiveDateTime::parse_from_str(s, "%a, %d %b %Y %H:%M:%S GMT")
-                .ok()
-                .map(|dt| dt.and_utc().timestamp())
-        });
+        .and_then(parse_http_date)
+        .map(|dt| dt.timestamp());
 
-    // Parse Cache-Control and apply precedence rules (RFC 7234):
+    let now_ts = Utc::now().timestamp();
+
+    // Derive freshness hints before Cache-Control directives mutate
+    // `expires` — the hint reflects the server's original instruction.
+    let hints = extract_server_hints(resp.headers(), now_ts);
+
+    // Parse Cache-Control and apply precedence rules (RFC 9111 §5.2):
     // - no-store: clear all cache headers
     // - no-cache: allow conditional requests but never skip fetching
-    // - max-age: overrides Expires header
-    if let Some(cc) = resp
+    // - max-age: overrides Expires header (adjusted for upstream age per
+    //   RFC 9111 §4.2.3)
+    let cc_values: Vec<&str> = resp
         .headers()
-        .get("cache-control")
-        .and_then(|h| h.to_str().ok())
-        .map(CacheControl::parse)
-    {
-        if cc.no_store {
-            etag = None;
-            last_modified = None;
-            expires = None;
-        } else if cc.no_cache {
-            expires = None;
-        } else if let Some(max_age) = cc.max_age {
-            expires = Some(Utc::now().timestamp() + max_age as i64);
-        }
+        .get_all("cache-control")
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .collect();
+    let cc = CacheControl::parse_many(&cc_values);
+    let mut body_hash: Option<String>;
+    if cc.no_store {
+        etag = None;
+        last_modified = None;
+        expires = None;
+    } else if cc.no_cache {
+        expires = None;
+    } else if let Some(max_age) = cc.max_age {
+        let corrected = corrected_max_age(resp.headers(), max_age, now_ts);
+        expires = Some(now_ts + corrected as i64);
     }
 
-    {
-        let params = (
-            etag,
-            last_modified,
-            expires,
-            Utc::now().timestamp(),
-            feed_id,
-        );
-        conn.execute(
-            "UPDATE feeds SET header_etag = ?, header_last_modified = ?, header_expires = ?, last_checked = ? WHERE id = ?",
-            params,
-        )?;
-    }
+    // RFC 8246: while the response is fresh, skip conditional revalidation
+    // entirely. Only meaningful when paired with a positive max-age.
+    let immutable_until: Option<i64> = if hints.immutable {
+        hints.hint_secs.and_then(|s| {
+            if s > 0 {
+                Some(now_ts.saturating_add(s as i64))
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
 
+    let next_fetch_at = compute_next_fetch_at(
+        FetchOutcome::Success {
+            server_hint_secs: hints.hint_secs,
+        },
+        now_ts,
+        cfg.min_cadence,
+        cfg.max_backoff,
+        cfg.min_fetch_interval,
+    );
+
+    // Read the body now so we can hash it before persisting. Done before
+    // the UPDATE so a body-read failure leaves `feeds` untouched — we
+    // don't advertise a successful fetch we couldn't actually read.
     let content = resp.bytes().await?;
     metrics.record_feed_response_bytes(content.len() as u64);
+    body_hash = Some(blake3::hash(&content).to_hex().to_string());
+
+    // Don't persist a body-hash fingerprint for responses we've been told
+    // not to store (RFC 9111 §5.2.2 no-store).
+    if cc.no_store {
+        body_hash = None;
+    }
+
+    // Validator-lie detection. Only meaningful on a forced (non-
+    // conditional) refresh, since otherwise the server is free to return
+    // a body conditional on the validators we sent. A genuine content
+    // change also rotates `ETag` and/or `Last-Modified`; if the body
+    // differs from what we stored but neither validator budged, the
+    // server has been serving 304s (or stale validators) while the
+    // representation actually changed.
+    if force_conditionals_off {
+        let etag_unchanged = match (stored_etag, etag.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        let lm_unchanged = match (stored_last_modified, last_modified.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        let validators_unchanged = etag_unchanged || lm_unchanged;
+        let body_changed = match (stored_body_hash, body_hash.as_deref()) {
+            (Some(stored), Some(fresh)) => stored != fresh,
+            _ => false,
+        };
+
+        if validators_unchanged && body_changed {
+            warn!(
+                "Feed {} ({}): server returned unchanged ETag/Last-Modified but body hash differs; validators appear untrustworthy",
+                feed_id, feed_url
+            );
+            metrics.record_feed_validator_lie();
+        }
+        metrics.record_feed_forced_refresh(if body_changed { "mismatch" } else { "match" });
+    }
+
+    conn.execute(
+        "UPDATE feeds SET
+            header_etag = ?,
+            header_last_modified = ?,
+            header_expires = ?,
+            header_immutable_until = ?,
+            header_body_hash = ?,
+            last_full_refresh_at = ?,
+            last_checked = ?,
+            next_fetch_at = ?,
+            consecutive_failures = 0,
+            retry_after_at = NULL
+         WHERE id = ?",
+        (
+            etag.as_deref(),
+            last_modified.as_deref(),
+            expires,
+            immutable_until,
+            body_hash.as_deref(),
+            now_ts,
+            now_ts,
+            next_fetch_at,
+            feed_id,
+        ),
+    )?;
+
+    metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
+
     Ok(Some(content.to_vec()))
 }
 
@@ -915,6 +1418,7 @@ fn retrieve_file_feed(
     feed_url: &str,
     feed_id: i64,
     pool: Pool<SqliteConnectionManager>,
+    cfg: SchedulerConfig,
 ) -> Result<Option<Vec<u8>>> {
     let conn = pool.get()?;
 
@@ -925,10 +1429,26 @@ fn retrieve_file_feed(
     let content = std::fs::read(file_path)
         .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file_path, e))?;
 
-    // Update the last_checked timestamp in the database
+    // File-backed feeds have no cache headers; schedule using the per-feed
+    // interval (clamped to the global floor and ceiling).
+    let now_ts = Utc::now().timestamp();
+    let next_fetch_at = compute_next_fetch_at(
+        FetchOutcome::Success {
+            server_hint_secs: None,
+        },
+        now_ts,
+        cfg.min_cadence,
+        cfg.max_backoff,
+        cfg.min_fetch_interval,
+    );
     conn.execute(
-        "UPDATE feeds SET last_checked = ?1 WHERE id = ?2",
-        (Utc::now().timestamp(), feed_id),
+        "UPDATE feeds SET
+            last_checked = ?1,
+            next_fetch_at = ?2,
+            consecutive_failures = 0,
+            retry_after_at = NULL
+         WHERE id = ?3",
+        (now_ts, next_fetch_at, feed_id),
     )?;
 
     Ok(Some(content))
@@ -1264,13 +1784,125 @@ fn insert_rss_entry_data(
     Ok(())
 }
 
+/// Download and cache the external assets referenced by an entry.
+///
+/// Runs in an async worker: looks up the entry's post-script `content` HTML
+/// plus its feed URL and any RSS enclosure, extracts `<img src>` URLs, and
+/// delegates each to [`assets::cache_asset`]. Individual asset failures are
+/// logged and skipped.
+pub(crate) async fn cache_entry_assets(
+    client: &reqwest::Client,
+    pool: &Pool<SqliteConnectionManager>,
+    data_dir: &std::path::Path,
+    entry_id: i64,
+) -> Result<()> {
+    #[derive(Debug)]
+    struct EntryCtx {
+        content: Option<String>,
+        base: Option<String>,
+        enclosure_url: Option<String>,
+    }
+
+    let ctx = {
+        let conn = pool.get()?;
+        if !crate::db::assets::get_cache_enabled(&conn)? {
+            return Ok(());
+        }
+        let row = conn
+            .query_row(
+                "SELECT e.content, f.url, e.url, red.enclosure_url
+                 FROM entries e
+                 LEFT JOIN feeds f ON f.id = e.feed_id
+                 LEFT JOIN rss_entry_data red ON red.entry_id = e.id
+                 WHERE e.id = ?1",
+                [entry_id],
+                |row| {
+                    let content: Option<String> = row.get(0)?;
+                    let feed_url: Option<String> = row.get(1)?;
+                    let entry_url: Option<String> = row.get(2)?;
+                    let enclosure_url: Option<String> = row.get(3)?;
+                    // Prefer the entry URL as the resolution base; fall back
+                    // to the feed URL so relative URLs still work when the
+                    // entry URL is empty.
+                    let base = entry_url.filter(|s| !s.is_empty()).or(feed_url);
+                    Ok(EntryCtx {
+                        content,
+                        base,
+                        enclosure_url,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        match row {
+            Some(r) => r,
+            None => return Ok(()),
+        }
+    };
+
+    let base = match ctx.base.as_deref().and_then(|s| Url::parse(s).ok()) {
+        Some(u) => u,
+        None => {
+            debug!(
+                "entry {} has no resolvable base URL; skipping asset cache",
+                entry_id
+            );
+            return Ok(());
+        }
+    };
+
+    // Inline images from the entry's HTML content.
+    if let Some(content) = ctx.content.as_deref() {
+        for url in assets::extract_asset_urls(content, &base) {
+            if let Err(e) = assets::cache_asset(
+                client,
+                pool,
+                data_dir,
+                &url,
+                entry_id,
+                assets::AssetKind::InlineImg,
+            )
+            .await
+            {
+                warn!("cache_asset failed for {}: {:?}", url, e);
+            }
+        }
+    }
+
+    // RSS enclosure, when present.
+    if let Some(enc) = ctx.enclosure_url.as_deref() {
+        if let Some(url) = Url::parse(enc)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+        {
+            if let Err(e) = assets::cache_asset(
+                client,
+                pool,
+                data_dir,
+                &url,
+                entry_id,
+                assets::AssetKind::Enclosure,
+            )
+            .await
+            {
+                warn!("cache_asset failed for enclosure {}: {:?}", url, e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn process_atom_feed(
     feed_id: i64,
     feed: atom_syndication::Feed,
     mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
-) -> Result<()> {
+) -> Result<Vec<i64>> {
     info!(
         "Successfully fetched Atom feed {} with {} items",
         feed_id,
@@ -1289,6 +1921,7 @@ fn process_atom_feed(
         tx.commit()?;
     }
 
+    let mut inserted_entry_ids: Vec<i64> = Vec::new();
     for entry in feed.entries.into_iter() {
         let (feed_entry, ingest) = atom_entry_to_parts(feed_id, entry);
 
@@ -1349,13 +1982,14 @@ fn process_atom_feed(
         insert_atom_entry_data(&tx, entry_id, &ingest)?;
         tx.commit()?;
         metrics.record_feed_entry_upserted("atom");
+        inserted_entry_ids.push(entry_id);
 
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
         }
     }
 
-    Ok(())
+    Ok(inserted_entry_ids)
 }
 
 fn process_rss_feed(
@@ -1364,7 +1998,7 @@ fn process_rss_feed(
     mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
-) -> Result<()> {
+) -> Result<Vec<i64>> {
     info!(
         "Successfully fetched RSS feed {} with {} items",
         feed_id,
@@ -1376,6 +2010,7 @@ fn process_rss_feed(
         [feed_id],
     )?;
 
+    let mut inserted_entry_ids: Vec<i64> = Vec::new();
     for item in channel.items.into_iter() {
         let (feed_entry, ingest) = rss_item_to_parts(feed_id, item);
 
@@ -1436,13 +2071,32 @@ fn process_rss_feed(
         insert_rss_entry_data(&tx, entry_id, &ingest)?;
         tx.commit()?;
         metrics.record_feed_entry_upserted("rss");
+        inserted_entry_ids.push(entry_id);
 
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
         }
     }
 
-    Ok(())
+    Ok(inserted_entry_ids)
+}
+
+/// Enqueue a [`TaskManagerCommand::CacheEntryAssets`] for each of the given
+/// entry IDs. Best-effort: a full or closed queue is logged and ignored.
+fn enqueue_asset_caching(
+    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    metrics: &Metrics,
+    entry_ids: &[i64],
+) {
+    for &entry_id in entry_ids {
+        match task_tx.try_send(TaskManagerCommand::CacheEntryAssets { entry_id }) {
+            Ok(()) => metrics.record_task_enqueued("cache_entry_assets"),
+            Err(e) => debug!(
+                "failed to queue CacheEntryAssets for entry {}: {:?}",
+                entry_id, e
+            ),
+        }
+    }
 }
 
 /// Resolve and sync the script-provided tags for a newly inserted database entry.

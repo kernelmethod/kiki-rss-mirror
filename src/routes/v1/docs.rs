@@ -54,6 +54,7 @@ use utoipa::OpenApi;
             crate::routes::v1::feeds::format_data::RssFeedData,
             crate::routes::v1::feeds::format_data::AtomFeedData,
             crate::routes::v1::feeds::format_data::AtomGenerator,
+            crate::tasks::FetchError,
             crate::routes::v1::feeds::update_feed::UpdateFeedRequest,
             crate::routes::v1::feeds::update_feed::UpdateFeedResponse,
             crate::routes::v1::feeds::fetch_all_feeds::FetchAllFeedsResponse,

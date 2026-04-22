@@ -54,6 +54,15 @@ mod imp {
 
     const REDIRECT_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 5.0, 10.0];
 
+    // Seconds-until-next-fetch buckets: covers the 60s floor through the
+    // 24h default backoff cap.
+    const SCHEDULE_BUCKETS: &[f64] = &[
+        60.0, 300.0, 900.0, 3_600.0, 10_800.0, 21_600.0, 43_200.0, 86_400.0,
+    ];
+
+    // Consecutive-failure streak length buckets.
+    const FAILURE_STREAK_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 5.0, 10.0, 20.0];
+
     static METADATA: Metadata<'static> =
         Metadata::new("kiki_rss::metrics", metrics::Level::INFO, None);
 
@@ -92,6 +101,14 @@ mod imp {
                 .set_buckets_for_metric(
                     Matcher::Full("kiki_feed_redirects".to_string()),
                     REDIRECT_BUCKETS,
+                )?
+                .set_buckets_for_metric(
+                    Matcher::Full("kiki_feed_retry_scheduled_seconds".to_string()),
+                    SCHEDULE_BUCKETS,
+                )?
+                .set_buckets_for_metric(
+                    Matcher::Full("kiki_feed_consecutive_failures".to_string()),
+                    FAILURE_STREAK_BUCKETS,
                 )?
                 .set_buckets_for_metric(
                     Matcher::Full("kiki_task_duration_seconds".to_string()),
@@ -190,6 +207,34 @@ mod imp {
                 None,
                 SharedString::const_str(
                     "Total times a feed fetch was skipped due to a cache directive, labeled by reason.",
+                ),
+            );
+            r.describe_counter(
+                KeyName::from_const_str("kiki_feed_forced_refresh_total"),
+                None,
+                SharedString::const_str(
+                    "Total forced (non-conditional) feed fetches, labeled by whether the body matched the stored hash (`match`) or not (`mismatch`).",
+                ),
+            );
+            r.describe_counter(
+                KeyName::from_const_str("kiki_feed_validator_lie_total"),
+                None,
+                SharedString::const_str(
+                    "Total detected instances of a server returning unchanged ETag/Last-Modified validators alongside a changed response body.",
+                ),
+            );
+            r.describe_histogram(
+                KeyName::from_const_str("kiki_feed_retry_scheduled_seconds"),
+                None,
+                SharedString::const_str(
+                    "Seconds until the next scheduled fetch attempt, labeled by the hint source (cache_hint, retry_after, backoff, permanent).",
+                ),
+            );
+            r.describe_histogram(
+                KeyName::from_const_str("kiki_feed_consecutive_failures"),
+                None,
+                SharedString::const_str(
+                    "Length of the consecutive-failure streak at the moment a transient error was recorded.",
                 ),
             );
 
@@ -433,6 +478,47 @@ mod imp {
             self.recorder.register_counter(&key, &METADATA).increment(1);
         }
 
+        /// Record a forced (non-conditional) feed refresh, labeled by
+        /// whether the freshly-fetched body matched the hash we stored on
+        /// the previous full 200 (`match`) or differed (`mismatch`).
+        pub fn record_feed_forced_refresh(&self, outcome: &'static str) {
+            let key = Key::from_parts(
+                "kiki_feed_forced_refresh_total",
+                vec![Label::new("outcome", outcome)],
+            );
+            self.recorder.register_counter(&key, &METADATA).increment(1);
+        }
+
+        /// Record a detected instance of a server returning unchanged
+        /// `ETag`/`Last-Modified` alongside a different body — i.e. the
+        /// validators are lying.
+        pub fn record_feed_validator_lie(&self) {
+            let key = Key::from_name("kiki_feed_validator_lie_total");
+            self.recorder.register_counter(&key, &METADATA).increment(1);
+        }
+
+        /// Record the gap, in seconds, between now and the scheduled next
+        /// fetch for a feed. `source` identifies why the schedule was
+        /// chosen (`cache_hint`, `retry_after`, `backoff`, or `permanent`).
+        pub fn record_feed_retry_scheduled(&self, source: &'static str, seconds_until: f64) {
+            let key = Key::from_parts(
+                "kiki_feed_retry_scheduled_seconds",
+                vec![Label::new("source", source)],
+            );
+            self.recorder
+                .register_histogram(&key, &METADATA)
+                .record(seconds_until.max(0.0));
+        }
+
+        /// Record the length of the consecutive-failure streak at the moment
+        /// a transient error was persisted.
+        pub fn record_feed_consecutive_failures(&self, count: u32) {
+            let key = Key::from_name("kiki_feed_consecutive_failures");
+            self.recorder
+                .register_histogram(&key, &METADATA)
+                .record(count as f64);
+        }
+
         // ----- Task queue -----
 
         pub fn record_task_enqueued(&self, task_type: &'static str) {
@@ -667,6 +753,14 @@ mod stub {
         pub fn record_feed_entry_upserted(&self, _format: &'static str) {}
         #[inline]
         pub fn record_feed_cache_hit(&self, _reason: &'static str) {}
+        #[inline]
+        pub fn record_feed_forced_refresh(&self, _outcome: &'static str) {}
+        #[inline]
+        pub fn record_feed_validator_lie(&self) {}
+        #[inline]
+        pub fn record_feed_retry_scheduled(&self, _source: &'static str, _seconds_until: f64) {}
+        #[inline]
+        pub fn record_feed_consecutive_failures(&self, _count: u32) {}
 
         // ----- Task queue -----
 

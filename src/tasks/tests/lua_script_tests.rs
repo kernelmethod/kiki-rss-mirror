@@ -62,6 +62,7 @@ async fn integration_filter_script_drops_all_entries() -> Result<()> {
         pool,
         Some(&runner as &dyn ScriptRunner),
         &super::test_metrics(),
+        &super::test_tx(),
     )
     .await?;
 
@@ -97,6 +98,7 @@ async fn integration_modify_script_changes_titles() -> Result<()> {
         pool,
         Some(&runner as &dyn ScriptRunner),
         &super::test_metrics(),
+        &super::test_tx(),
     )
     .await?;
 
@@ -138,6 +140,7 @@ async fn integration_tagging_script_adds_tags() -> Result<()> {
         pool,
         Some(&runner as &dyn ScriptRunner),
         &super::test_metrics(),
+        &super::test_tx(),
     )
     .await?;
 
@@ -218,6 +221,7 @@ async fn integration_filter_script_prevents_tagging_script() -> Result<()> {
         pool,
         Some(&runner as &dyn ScriptRunner),
         &super::test_metrics(),
+        &super::test_tx(),
     )
     .await?;
 

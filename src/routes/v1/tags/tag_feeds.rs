@@ -1,4 +1,4 @@
-use crate::routes::v1::feeds::get_feed::GetFeedResponse;
+use crate::routes::v1::feeds::get_feed::{read_auth_type_column, GetFeedResponse};
 use crate::server::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -94,7 +94,7 @@ pub async fn tag_feeds(
 
         let feeds = conn
             .prepare(
-                "SELECT f.id, f.title, f.url, f.description, f.last_checked, f.last_fetch_error, f.last_fetch_error_at, f.min_fetch_interval_seconds
+                "SELECT f.id, f.title, f.url, f.description, f.last_checked, f.min_fetch_interval_seconds, f.auth_type
                  FROM feeds f
                  INNER JOIN feed_tags ft ON ft.feed_id = f.id
                  WHERE ft.tag_id = ?1
@@ -104,6 +104,7 @@ pub async fn tag_feeds(
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
             .query_map(rusqlite::params![id, limit, offset], |row| {
+                let auth_type = read_auth_type_column(row, 6)?;
                 Ok(GetFeedResponse {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -112,13 +113,8 @@ pub async fn tag_feeds(
                     last_checked: row.get::<usize, Option<i64>>(4)?.and_then(|ts| {
                         chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
                     }),
-                    last_fetch_error: row
-                        .get::<usize, Option<String>>(5)?
-                        .and_then(|s| serde_json::from_str(&s).ok()),
-                    last_fetch_error_at: row.get::<usize, Option<i64>>(6)?.and_then(|ts| {
-                        chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
-                    }),
-                    min_fetch_interval_seconds: row.get(7)?,
+                    min_fetch_interval_seconds: row.get(5)?,
+                    auth_type,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

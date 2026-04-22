@@ -1,3 +1,4 @@
+use crate::http::FeedAuthType;
 use crate::routes::v1::feeds::format_data::{
     load_atom_feed_data, load_rss_feed_data, AtomFeedData, RssFeedData,
 };
@@ -20,24 +21,41 @@ pub struct GetFeedResponse {
     pub description: Option<String>,
     /// Last checked time in RFC3339 format.
     pub last_checked: Option<String>,
-    /// Most recent fetch error, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_fetch_error: Option<FetchError>,
-    /// Time of the most recent fetch error in RFC3339 format.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_fetch_error_at: Option<String>,
     /// Minimum interval, in seconds, between fetches of this feed.
     pub min_fetch_interval_seconds: i64,
+    /// Current authentication scheme for this feed. Credentials themselves
+    /// are never returned — only the scheme in use.
+    pub auth_type: FeedAuthType,
 }
 
-/// Detail response for a single feed. Extends [`GetFeedResponse`] with the
-/// format-specific sub-objects that are only returned by the single-feed
-/// endpoint (`GET /v1/feeds/id/{id}`) — the list endpoint still returns
+/// Read the `auth_type` column at `idx` and decode it into a [`FeedAuthType`].
+///
+/// Unrecognized values fall back to [`FeedAuthType::None`] so a bad row
+/// doesn't take down an otherwise-working endpoint.
+pub(crate) fn read_auth_type_column(
+    row: &rusqlite::Row,
+    idx: usize,
+) -> rusqlite::Result<FeedAuthType> {
+    let raw: Option<String> = row.get(idx)?;
+    Ok(FeedAuthType::from_db(raw.as_deref()).unwrap_or_default())
+}
+
+/// Detail response for a single feed. Extends [`GetFeedResponse`] with
+/// fields that are only returned by the single-feed endpoint
+/// (`GET /v1/feeds/id/{id}`) — the list endpoints still return
 /// `GetFeedResponse` alone.
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 pub struct GetFeedDetailResponse {
     #[serde(flatten)]
     pub feed: GetFeedResponse,
+    /// Most recent fetch error, if any. Omitted when the most recent fetch
+    /// succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fetch_error: Option<FetchError>,
+    /// Time of the most recent fetch error in RFC3339 format. Omitted when
+    /// the most recent fetch succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fetch_error_at: Option<String>,
     /// RSS-specific feed-level data. Present only when the feed is ingested
     /// as RSS.
     pub rss: Option<RssFeedData>,
@@ -77,7 +95,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
     // statement on a blocking thread.
     let task_result = task::spawn_blocking(move || {
         let mut stmt = match conn.prepare(
-            "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at, min_fetch_interval_seconds
+            "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at, min_fetch_interval_seconds, auth_type
                 FROM feeds WHERE id = ?1 LIMIT 1",
         ) {
             Ok(s) => s,
@@ -87,7 +105,8 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
             }
         };
         let query_result = stmt.query_row([id], |row| {
-            let resp = GetFeedResponse {
+            let auth_type = read_auth_type_column(row, 8)?;
+            let feed = GetFeedResponse {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 url: row.get(2)?,
@@ -95,17 +114,18 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
                 last_checked: row.get::<usize, Option<i64>>(4)?.and_then(|ts| {
                     chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
                 }),
-                last_fetch_error: row
-                    .get::<usize, Option<String>>(5)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                last_fetch_error_at: row.get::<usize, Option<i64>>(6)?.and_then(|ts| {
-                    chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
-                }),
                 min_fetch_interval_seconds: row.get(7)?,
+                auth_type,
             };
-            Ok(resp)
+            let last_fetch_error = row
+                .get::<usize, Option<String>>(5)?
+                .and_then(|s| serde_json::from_str(&s).ok());
+            let last_fetch_error_at = row.get::<usize, Option<i64>>(6)?.and_then(|ts| {
+                chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
+            });
+            Ok((feed, last_fetch_error, last_fetch_error_at))
         });
-        let feed = match query_result {
+        let (feed, last_fetch_error, last_fetch_error_at) = match query_result {
             Ok(f) => f,
             Err(_e) => return (StatusCode::NOT_FOUND, "Feed not found").into_response(),
         };
@@ -126,7 +146,13 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
             }
         };
 
-        let detail = GetFeedDetailResponse { feed, rss, atom };
+        let detail = GetFeedDetailResponse {
+            feed,
+            last_fetch_error,
+            last_fetch_error_at,
+            rss,
+            atom,
+        };
         (StatusCode::OK, Json(detail)).into_response()
     })
     .await;

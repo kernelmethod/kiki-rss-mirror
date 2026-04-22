@@ -30,7 +30,15 @@ async fn refresh_feed_at_url(tc: &crate::test::TestConfig, url: String) -> Resul
         .build()?;
     let pool = make_pool(&tc.database_path())?;
 
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
     Ok(feed_id)
 }
 
@@ -315,13 +323,29 @@ async fn re_ingest_does_not_duplicate() -> Result<()> {
         .build()?;
     let pool = make_pool(&tc.database_path())?;
 
-    refresh_feed(&client, feed_id, pool.clone(), None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     // Clear last_checked so the second refresh is not skipped.
     tc.database_conn()?
         .execute("UPDATE feeds SET last_checked = NULL", [])?;
 
-    refresh_feed(&client, feed_id, pool, None, &super::test_metrics()).await?;
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
 
     let conn = tc.database_conn()?;
     let afd_count: i64 = conn.query_row(

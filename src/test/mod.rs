@@ -39,6 +39,16 @@ pub struct FeedServerState {
     pub expires: Option<String>,
     /// If set, the server includes a `Cache-Control` response header with this value.
     pub cache_control: Option<String>,
+    /// Additional `Cache-Control` header instances appended after
+    /// `cache_control`. Used to simulate servers that emit the header
+    /// multiple times (RFC 9110 §5.3).
+    pub cache_control_extra: Vec<String>,
+    /// If set, included as an `Age` response header (RFC 9111 §5.1).
+    pub age: Option<u64>,
+    /// If set, included as a `Date` response header (RFC 9110 §6.6.1).
+    pub date: Option<String>,
+    /// If set, included as a `Pragma` response header (RFC 9111 §5.4).
+    pub pragma: Option<String>,
     /// If set, the server compresses response bodies using this encoding
     /// (e.g. `"gzip"` or `"deflate"`) and includes the `Content-Encoding` header.
     pub content_encoding: Option<String>,
@@ -48,6 +58,29 @@ pub struct FeedServerState {
     pub full_response_count: usize,
     /// Number of 304 Not Modified responses served.
     pub not_modified_count: usize,
+    /// Number of requests observed to carry an `If-None-Match` header.
+    pub if_none_match_count: usize,
+    /// Number of requests observed to carry an `If-Modified-Since` header.
+    pub if_modified_since_count: usize,
+    /// Force the next `fail_next` responses to return this HTTP status
+    /// instead of the normal success/304 response. Decremented on each use.
+    pub fail_next: usize,
+    /// Status returned while `fail_next > 0`. Defaults to 503.
+    pub fail_status: u16,
+    /// If set, this value is returned as the response body instead of the
+    /// default test RSS payload. Lets a test flip content mid-run while
+    /// keeping validator headers (`etag`, `last_modified`) fixed.
+    pub body_override: Option<Vec<u8>>,
+    /// If set, requests that do not carry this exact `Authorization` header
+    /// value are answered with `401 Unauthorized`. Used to exercise
+    /// per-feed authentication.
+    pub require_authorization: Option<String>,
+    /// The most recent `Authorization` header observed by the server, if
+    /// any. Tests inspect this to assert that credentials were attached.
+    pub last_authorization: Option<String>,
+    /// Number of `401 Unauthorized` responses served due to missing or
+    /// mismatched `Authorization` headers.
+    pub unauthorized_count: usize,
 }
 
 /// Convenience alias for the shared, mutable feed-server state.
@@ -244,10 +277,48 @@ impl TestConfig {
             let mut s = hs.config.lock().unwrap();
             s.request_count += 1;
 
+            let authorization = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            s.last_authorization = authorization.clone();
+
+            if let Some(expected) = s.require_authorization.clone() {
+                if authorization.as_deref() != Some(expected.as_str()) {
+                    s.unauthorized_count += 1;
+                    drop(s);
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+            }
+
             let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
             let if_modified_since = headers
                 .get("if-modified-since")
                 .and_then(|v| v.to_str().ok());
+            if if_none_match.is_some() {
+                s.if_none_match_count += 1;
+            }
+            if if_modified_since.is_some() {
+                s.if_modified_since_count += 1;
+            }
+
+            // Forced-failure branch: return the configured error status
+            // without invoking the usual 200/304 logic.
+            if s.fail_next > 0 {
+                s.fail_next -= 1;
+                let status_u16 = if s.fail_status == 0 {
+                    503
+                } else {
+                    s.fail_status
+                };
+                let cache_control = s.cache_control.clone();
+                let cache_control_extra = s.cache_control_extra.clone();
+                drop(s);
+                let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
+                let mut response = status.into_response();
+                append_cache_control_headers(&mut response, &cache_control, &cache_control_extra);
+                return response;
+            }
 
             let etag_match = s
                 .etag
@@ -262,7 +333,12 @@ impl TestConfig {
 
             if etag_match || lm_match {
                 s.not_modified_count += 1;
-                return StatusCode::NOT_MODIFIED.into_response();
+                let cache_control = s.cache_control.clone();
+                let cache_control_extra = s.cache_control_extra.clone();
+                drop(s);
+                let mut response = StatusCode::NOT_MODIFIED.into_response();
+                append_cache_control_headers(&mut response, &cache_control, &cache_control_extra);
+                return response;
             }
 
             s.full_response_count += 1;
@@ -272,10 +348,15 @@ impl TestConfig {
             let last_modified = s.last_modified.clone();
             let expires = s.expires.clone();
             let cache_control = s.cache_control.clone();
+            let cache_control_extra = s.cache_control_extra.clone();
+            let age = s.age;
+            let date = s.date.clone();
+            let pragma = s.pragma.clone();
             let content_encoding = s.content_encoding.clone();
+            let body_override = s.body_override.clone();
             drop(s);
 
-            let body = hs.rss_content.as_ref().clone();
+            let body = body_override.unwrap_or_else(|| hs.rss_content.as_ref().clone());
             let body = if let Some(ref encoding) = content_encoding {
                 compress_body(&body, encoding)
             } else {
@@ -301,10 +382,21 @@ impl TestConfig {
                     .headers_mut()
                     .insert(axum::http::header::EXPIRES, exp.parse().unwrap());
             }
-            if let Some(ref cc) = cache_control {
+            append_cache_control_headers(&mut response, &cache_control, &cache_control_extra);
+            if let Some(age) = age {
                 response
                     .headers_mut()
-                    .insert(axum::http::header::CACHE_CONTROL, cc.parse().unwrap());
+                    .insert(axum::http::header::AGE, age.to_string().parse().unwrap());
+            }
+            if let Some(ref d) = date {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::DATE, d.parse().unwrap());
+            }
+            if let Some(ref p) = pragma {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::PRAGMA, p.parse().unwrap());
             }
             if let Some(ref enc) = content_encoding {
                 response
@@ -312,6 +404,26 @@ impl TestConfig {
                     .insert(axum::http::header::CONTENT_ENCODING, enc.parse().unwrap());
             }
             response
+        }
+
+        /// Append `Cache-Control` values to a response. Emits one header
+        /// line per value using `append`, so multiple values surface as
+        /// distinct header fields (RFC 9110 §5.3).
+        fn append_cache_control_headers(
+            response: &mut axum::response::Response,
+            primary: &Option<String>,
+            extras: &[String],
+        ) {
+            if let Some(ref cc) = primary {
+                response
+                    .headers_mut()
+                    .append(axum::http::header::CACHE_CONTROL, cc.parse().unwrap());
+            }
+            for extra in extras {
+                response
+                    .headers_mut()
+                    .append(axum::http::header::CACHE_CONTROL, extra.parse().unwrap());
+            }
         }
 
         let handler_state = HandlerState {

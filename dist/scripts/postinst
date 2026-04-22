@@ -19,5 +19,21 @@ case "$1" in
 
         # Initialize the database (idempotent — skips if already set up)
         su -s /bin/sh kiki -c '/usr/bin/kiki init --check /var/lib/kiki'
+
+        # Register the unit with systemd, enable it on first install,
+        # and start (or restart on upgrade) the service.
+        if [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload >/dev/null || true
+            if deb-systemd-helper --quiet was-enabled kiki.service; then
+                deb-systemd-helper enable kiki.service >/dev/null || true
+            else
+                deb-systemd-helper update-state kiki.service >/dev/null || true
+            fi
+            if [ -z "$2" ]; then
+                deb-systemd-invoke start kiki.service >/dev/null || true
+            else
+                deb-systemd-invoke restart kiki.service >/dev/null || true
+            fi
+        fi
         ;;
 esac

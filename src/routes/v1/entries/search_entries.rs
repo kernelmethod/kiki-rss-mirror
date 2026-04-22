@@ -33,6 +33,11 @@ pub enum TagExpr {
     /// At least one must match (OR semantics).
     #[serde(rename = "or")]
     Or(Vec<TagFilter>),
+    /// Entries that do NOT match the inner expression. Entries with no tags
+    /// are considered non-matching for the inner expression and are therefore
+    /// included.
+    #[serde(rename = "not")]
+    Not(Box<TagFilter>),
 }
 
 /// Request body for the entry search endpoint.
@@ -175,12 +180,17 @@ fn tag_filter_to_sql(
                 let mut conditions = Vec::new();
                 let mut current_idx = idx;
                 for f in filters {
-                    let (cond, next_idx) = tag_filter_to_sql(f, params, current_idx)?;
+                    let (cond, next_idx) = build_tag_condition(f, params, current_idx)?;
                     conditions.push(cond);
                     current_idx = next_idx;
                 }
                 let sql = format!("({})", conditions.join(" AND "));
                 Ok((sql, current_idx))
+            }
+            TagExpr::Not(inner) => {
+                let (cond, next_idx) = build_tag_condition(inner, params, idx)?;
+                let sql = format!("NOT ({})", cond);
+                Ok((sql, next_idx))
             }
         },
     }
@@ -200,7 +210,7 @@ fn collect_or_leaves(
                 }
                 collect_or_leaves(inner, out)?;
             }
-            TagFilter::Expr(TagExpr::And(_)) => {
+            TagFilter::Expr(TagExpr::And(_)) | TagFilter::Expr(TagExpr::Not(_)) => {
                 return Err(SearchEntriesError::EmptyTagFilter);
             }
         }
@@ -220,11 +230,15 @@ fn build_tag_condition(
         if filters.is_empty() {
             return Err(SearchEntriesError::EmptyTagFilter);
         }
-        // Check if any child is an AND expression
-        let has_nested_and = filters
-            .iter()
-            .any(|f| matches!(f, TagFilter::Expr(TagExpr::And(_))));
-        if has_nested_and {
+        // Check if any child is an AND or NOT expression (those can't be
+        // folded into a single `IN (...)` clause).
+        let needs_per_child = filters.iter().any(|f| {
+            matches!(
+                f,
+                TagFilter::Expr(TagExpr::And(_)) | TagFilter::Expr(TagExpr::Not(_))
+            )
+        });
+        if needs_per_child {
             let mut conditions = Vec::new();
             let mut current_idx = idx;
             for f in filters {
