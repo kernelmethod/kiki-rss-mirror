@@ -7,8 +7,10 @@ Type=simple
 User=kiki
 Group=kiki
 WorkingDirectory=/var/lib/kiki
+RuntimeDirectory=kiki
+RuntimeDirectoryMode=0750
 ExecStartPre=/usr/bin/kiki init --check /var/lib/kiki
-ExecStart=/usr/bin/kiki serve -p 8080
+ExecStart=/usr/bin/kiki serve --uds /run/kiki/kiki.sock
 Restart=on-failure
 RestartSec=5
 
