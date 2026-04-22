@@ -72,6 +72,12 @@ fn service_file_path() -> Result<PathBuf> {
 }
 
 /// Generate the systemd unit file contents.
+///
+/// The emitted unit layers systemd's process-hardening directives
+/// (see systemd.exec(5)) on top of the in-process Landlock + seccomp
+/// filters that `kiki serve` installs at startup. Directives that would
+/// conflict with user-level execution (e.g. `PrivateUsers=yes`,
+/// `ProtectHome=yes`) are deliberately omitted.
 fn generate_unit_file(binary: &str, data_dir: &str, listen_args: &str) -> String {
     format!(
         "\
@@ -86,6 +92,27 @@ ExecStartPre={binary} init --auto --check
 ExecStart={binary} serve{listen_args}
 Restart=on-failure
 RestartSec=5
+
+# Hardening — see systemd.exec(5)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths={data_dir}
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @module @debug @cpu-emulation @obsolete @raw-io @keyring
+UMask=0077
 
 [Install]
 WantedBy=default.target

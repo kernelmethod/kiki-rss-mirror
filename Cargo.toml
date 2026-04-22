@@ -64,6 +64,10 @@ reqwest = { version = "0.13", default-features = false, features = ["native-tls"
 [target.'cfg(target_env = "musl")'.dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+
 [dev-dependencies]
 flate2 = "1"
 itertools = "0.14"

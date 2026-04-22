@@ -8,6 +8,7 @@ pub mod docs;
 pub mod http;
 pub mod metrics;
 pub mod routes;
+pub mod sandbox;
 pub mod server;
 pub mod tasks;
 
