@@ -164,7 +164,7 @@ pub fn asset_path(data_dir: &Path, blake3: &str) -> PathBuf {
 }
 
 /// Write `bytes` atomically to the asset path for `blake3`.
-fn write_asset_file(data_dir: &Path, blake3: &str, bytes: &[u8]) -> Result<PathBuf> {
+pub fn write_asset_file(data_dir: &Path, blake3: &str, bytes: &[u8]) -> Result<PathBuf> {
     let final_path = asset_path(data_dir, blake3);
     let parent = final_path
         .parent()
