@@ -1,8 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use super::super::scripting::load_all_script_sources;
 use super::super::*;
+use crate::scripting::ScriptRunner;
 use crate::test::TestBuilder;
 use anyhow::Result;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 
 fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {

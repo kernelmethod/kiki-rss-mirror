@@ -4,6 +4,7 @@ use super::super::*;
 use crate::http::{FeedAuth, FeedAuthType};
 use crate::test::{FeedServerState, SharedFeedServerState, TestBuilder};
 use anyhow::Result;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use std::sync::{Arc, Mutex};
 

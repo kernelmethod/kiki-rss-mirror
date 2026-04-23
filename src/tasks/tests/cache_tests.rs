@@ -3,6 +3,8 @@
 use super::super::*;
 use crate::test::{FeedServerState, SharedFeedServerState, TestBuilder};
 use anyhow::Result;
+use chrono::Utc;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use std::sync::{Arc, Mutex};
 

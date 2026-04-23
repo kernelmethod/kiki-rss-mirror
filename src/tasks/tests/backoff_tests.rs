@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use super::super::*;
+use super::super::backoff::{compute_next_fetch_at, FetchOutcome};
+use super::super::FetchError;
 
 const MIN_CADENCE: u64 = 60;
 const MAX_BACKOFF: u64 = 86_400;
