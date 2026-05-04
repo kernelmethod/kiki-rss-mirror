@@ -2,13 +2,24 @@ use crate::sandbox::{self, SandboxConfig};
 use crate::server;
 use anyhow::{Context, Result};
 use clap::Args;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 #[derive(Args)]
 pub struct ServeArgs {
-    /// Listen on a localhost TCP port
+    /// Listen on a TCP port
     #[arg(short, long, conflicts_with = "socket_path")]
     port: Option<u16>,
+
+    /// IP address to bind the TCP listener to. Only meaningful with --port.
+    #[arg(
+        short = 'b',
+        long,
+        default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST),
+        requires = "port",
+        conflicts_with = "socket_path",
+    )]
+    bind: IpAddr,
 
     /// Path to the Unix domain socket [default: ./kiki.sock]
     #[arg(short = 'u', long = "uds", conflicts_with = "port")]
@@ -57,7 +68,7 @@ impl ServeArgs {
 
         let mut builder = server::ServerBuilder::new(&db_path).autofetch();
         builder = match (self.port, &uds_path) {
-            (Some(port), _) => builder.port(port),
+            (Some(port), _) => builder.bind_addr(SocketAddr::new(self.bind, port)),
             (None, Some(path)) => builder.socket_path(path),
             (None, None) => builder.socket_path(&default_socket),
         };

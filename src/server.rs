@@ -9,6 +9,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use std::{
     fs,
+    net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -56,8 +57,8 @@ pub type AppState = Arc<SharedAppState>;
 pub enum ListenAddr {
     /// Listen on a Unix domain socket at the given path.
     Uds(PathBuf),
-    /// Listen on a localhost TCP port.
-    Tcp(u16),
+    /// Listen on a TCP socket address.
+    Tcp(SocketAddr),
 }
 
 pub struct ServerBuilder<'a> {
@@ -84,8 +85,8 @@ impl<'a> ServerBuilder<'a> {
         self
     }
 
-    pub fn port(mut self, port: u16) -> Self {
-        self.listen_addr = Some(ListenAddr::Tcp(port));
+    pub fn bind_addr(mut self, addr: SocketAddr) -> Self {
+        self.listen_addr = Some(ListenAddr::Tcp(addr));
         self
     }
 
@@ -384,9 +385,9 @@ impl Server {
                     script_runner.clone(),
                 ));
             }
-            ListenAddr::Tcp(port) => {
+            ListenAddr::Tcp(addr) => {
                 tokio::spawn(tcp_server(
-                    port,
+                    addr,
                     tx.clone(),
                     reload_tx.clone(),
                     pool.clone(),
@@ -702,7 +703,7 @@ async fn uds_server(
 /// Parent function for the TCP web worker threads.
 #[allow(clippy::too_many_arguments)]
 async fn tcp_server(
-    port: u16,
+    addr: SocketAddr,
     tx: async_channel::Sender<TaskManagerCommand>,
     reload_tx: tokio::sync::watch::Sender<()>,
     pool: r2d2::Pool<SqliteConnectionManager>,
@@ -722,12 +723,11 @@ async fn tcp_server(
     });
     let app = routes::create_router(metrics).with_state(shared_state);
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(addr)
         .await
-        .with_context(|| format!("Unable to bind to TCP port {}", port))?;
+        .with_context(|| format!("Unable to bind to TCP address {}", addr))?;
 
-    tracing::info!("Listening on http://127.0.0.1:{}", port);
+    tracing::info!("Listening on http://{}", addr);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(cancel_token.cancelled_owned())
