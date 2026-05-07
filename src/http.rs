@@ -13,6 +13,7 @@ pub const USER_AGENT: &str = concat!(
 /// [`FeedAuthType::from_db`] / [`FeedAuthType::as_db`]. `None` and `"none"`
 /// both deserialize to [`FeedAuthType::None`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum FeedAuthType {
     /// No authentication is applied to the fetch request.

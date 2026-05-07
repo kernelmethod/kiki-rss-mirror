@@ -16,6 +16,7 @@ pub struct RetentionResponse {
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct RetentionRequest {
     pub max_age_days: Option<i64>,
 }

@@ -4,6 +4,7 @@ use tokio::task;
 use tracing::{event, Level};
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct AddScriptRequest {
     pub engine: String,
     pub text: String,

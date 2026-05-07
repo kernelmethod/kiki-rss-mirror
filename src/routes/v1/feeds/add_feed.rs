@@ -13,6 +13,7 @@ use tracing::{event, Level};
 struct AddFeedQueryResult(i64);
 
 #[derive(Default, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct AddFeedRequest {
     pub title: String,
     pub url: String,

@@ -14,6 +14,7 @@ use tracing::{event, Level};
 use crate::routes::v1::tags::list_tags::TagResponse;
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct SetEntryTagsRequest {
     pub tag_ids: Vec<i64>,
 }

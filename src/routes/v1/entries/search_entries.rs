@@ -13,7 +13,8 @@ use tokio::task;
 use tracing::{event, Level};
 
 /// A tag filter expression supporting AND/OR combinations.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 #[schema(no_recursion)]
 pub enum TagFilter {
@@ -24,7 +25,8 @@ pub enum TagFilter {
 }
 
 /// Boolean tag expression.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 #[schema(no_recursion)]
 pub enum TagExpr {
     /// All of these must match (AND semantics).
@@ -41,7 +43,8 @@ pub enum TagExpr {
 }
 
 /// Request body for the entry search endpoint.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct SearchEntriesRequest {
     /// Tag filter expression. Supports AND/OR combinations.
     pub tags: Option<TagFilter>,

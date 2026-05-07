@@ -12,6 +12,7 @@ use tracing::{event, Level};
 use super::list_scripts::ScriptResponse;
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct UpdateScriptRequest {
     pub engine: Option<String>,
     pub text: Option<String>,
