@@ -17,7 +17,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli", "lua", "systemd", "api-docs", "metrics"]
+default = ["cli", "lua", "systemd", "api-docs", "metrics", "mcp"]
 cli = ["clap"]
 lua = ["mlua"]
 systemd = []
