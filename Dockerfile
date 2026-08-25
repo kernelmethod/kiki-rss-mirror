@@ -46,12 +46,13 @@ RUN apt-get update \
 COPY --from=builder /build/target/release/kiki /usr/local/bin/kiki
 COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-# kiki serve is hardcoded to look for ./kiki.db, so the working directory
-# must be the volume mount.
+# KIKI_HOME below is where every kiki subcommand looks for its data; the
+# working directory matches it so relative paths in `docker exec` behave
+# sensibly.
 WORKDIR /data
 VOLUME ["/data"]
 
-ENV KIKI_DATA_DIR=/data \
+ENV KIKI_HOME=/data \
     KIKI_BIND=0.0.0.0 \
     KIKI_PORT=8000
 

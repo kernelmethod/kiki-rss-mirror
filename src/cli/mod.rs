@@ -1,5 +1,6 @@
 pub mod init;
 pub mod migrate;
+pub mod paths;
 pub mod serve;
 
 #[cfg(feature = "api-docs")]

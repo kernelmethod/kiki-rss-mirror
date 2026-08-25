@@ -1,6 +1,10 @@
 # User-level systemd service for Kiki RSS
 # Preferred: run `kiki service install` instead of copying this manually.
 # Manual install: copy to ~/.config/systemd/user/kiki.service
+#
+# A user service stops when the user's last session ends, which also removes
+# $XDG_RUNTIME_DIR and the socket inside it. Run `loginctl enable-linger $USER`
+# to keep kiki running between logins.
 
 [Unit]
 Description=Kiki RSS feed aggregator (user)
@@ -9,7 +13,18 @@ After=default.target
 [Service]
 Type=simple
 WorkingDirectory=%h/.local/share/kiki
-ExecStartPre=/usr/bin/kiki init --auto --check
+
+# With no $KIKI_HOME set, `kiki serve` resolves the platform data directory
+# for its database and defaults its socket to $XDG_RUNTIME_DIR/kiki/kiki.sock,
+# which ProtectSystem=strict below would otherwise leave read-only.
+# RuntimeDirectory= also has systemd create it with the right mode and clean it
+# up on stop. To run out of a different directory, set Environment=KIKI_HOME=...
+# instead — the socket then lives in that directory and this stanza is
+# unnecessary.
+RuntimeDirectory=kiki
+RuntimeDirectoryMode=0700
+
+ExecStartPre=/usr/bin/kiki init --check %h/.local/share/kiki
 ExecStart=/usr/bin/kiki serve
 Restart=on-failure
 RestartSec=5

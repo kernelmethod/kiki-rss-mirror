@@ -1,3 +1,4 @@
+use crate::cli::paths::{self, Env};
 use crate::db::ConnectionBuilder;
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -21,14 +22,20 @@ fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Returns the platform-default data directory for Kiki.
+/// Returns the directory Kiki treats as its home.
+///
+/// `$KIKI_HOME` if set, otherwise the platform data directory:
 ///
 /// - Linux: `$XDG_DATA_HOME/kiki/` (defaults to `~/.local/share/kiki/`)
 /// - macOS: `~/Library/Application Support/kiki/`
 /// - Windows: `%APPDATA%\kiki\`
+///
+/// # Errors
+///
+/// Returns an error if neither is available. See
+/// [`paths::default_data_dir`].
 pub(crate) fn default_directory() -> Result<PathBuf> {
-    let base = dirs::data_dir().context("unable to determine platform data directory")?;
-    Ok(base.join("kiki"))
+    paths::default_data_dir(&Env::from_process())
 }
 
 #[derive(Args)]
@@ -37,7 +44,8 @@ pub struct InitArgs {
     #[arg(conflicts_with = "auto")]
     directory: Option<PathBuf>,
 
-    /// Use the platform-default data directory
+    /// Use Kiki's default directory ($KIKI_HOME, or the platform data
+    /// directory)
     #[arg(long)]
     auto: bool,
 
@@ -53,8 +61,8 @@ pub struct InitArgs {
 impl InitArgs {
     /// Create an `InitArgs` equivalent to `kiki init --auto --check`.
     ///
-    /// This initializes the platform-default data directory if it hasn't been
-    /// set up yet, and is a no-op otherwise.
+    /// This initializes Kiki's default directory if it hasn't been set up
+    /// yet, and is a no-op otherwise.
     pub(crate) fn auto_with_check() -> Self {
         Self {
             directory: None,
@@ -65,20 +73,44 @@ impl InitArgs {
     }
 
     /// Resolve the target directory from the provided arguments.
+    ///
+    /// A bare `kiki init` with `$KIKI_HOME` set needs no `--auto`: the
+    /// environment has already named the directory, and asking for the flag
+    /// as well would be ceremony.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no directory was given, `--auto` was not passed,
+    /// and `$KIKI_HOME` is unset.
     fn resolve_directory(&self) -> Result<PathBuf> {
+        self.resolve_directory_in(&Env::from_process())
+    }
+
+    /// [`resolve_directory`](Self::resolve_directory) against an explicit
+    /// environment.
+    fn resolve_directory_in(&self, env: &Env) -> Result<PathBuf> {
         if self.auto {
-            default_directory()
-        } else if let Some(ref dir) = self.directory {
-            Ok(dir.clone())
-        } else {
-            bail!("please provide a directory or use --auto for the platform default")
+            return paths::default_data_dir(env);
         }
+
+        if let Some(ref dir) = self.directory {
+            return Ok(dir.clone());
+        }
+
+        if env.kiki_home.is_some() {
+            return paths::default_data_dir(env);
+        }
+
+        bail!(
+            "please provide a directory, set $KIKI_HOME, or use --auto for the platform \
+             default"
+        )
     }
 
     /// Run the `init` subcommand
     pub fn run(&self) -> Result<()> {
         let directory = self.resolve_directory()?;
-        let db_path = Path::new(&directory).join("kiki.db");
+        let db_path = Path::new(&directory).join(paths::DB_FILE_NAME);
         if db_path.exists() {
             if self.check {
                 // Kiki has already been configured
@@ -182,31 +214,67 @@ mod test {
         Ok(())
     }
 
-    /// Test that `--auto` resolves to a path under the platform data directory.
-    #[test]
-    fn test_auto() -> Result<()> {
-        let args = InitArgs {
+    /// An `InitArgs` with every flag at its default.
+    fn auto_args() -> InitArgs {
+        InitArgs {
             directory: None,
             auto: true,
             check: false,
             force: false,
+        }
+    }
+
+    /// Test that `--auto` resolves to a path under the platform data directory.
+    #[test]
+    fn test_auto() -> Result<()> {
+        let platform = PathBuf::from("/home/rey/.local/share/kiki");
+        let env = Env {
+            platform_data_dir: Some(platform.clone()),
+            ..Env::default()
         };
-        let resolved = args.resolve_directory()?;
-        let data_dir = dirs::data_dir()
-            .ok_or_else(|| anyhow::anyhow!("platform should have a data directory"))?;
-        assert_eq!(resolved, data_dir.join("kiki"));
+        assert_eq!(auto_args().resolve_directory_in(&env)?, platform);
         Ok(())
     }
 
-    /// Test that providing neither a directory nor `--auto` returns an error.
+    /// `$KIKI_HOME` displaces the platform data directory under `--auto`.
+    #[test]
+    fn test_auto_prefers_kiki_home() -> Result<()> {
+        let env = Env {
+            kiki_home: Some(PathBuf::from("/srv/kiki")),
+            platform_data_dir: Some(PathBuf::from("/home/rey/.local/share/kiki")),
+            ..Env::default()
+        };
+        assert_eq!(
+            auto_args().resolve_directory_in(&env)?,
+            Path::new("/srv/kiki")
+        );
+        Ok(())
+    }
+
+    /// With `$KIKI_HOME` set, a bare `kiki init` needs no `--auto`: the
+    /// environment has already named the directory.
+    #[test]
+    fn test_kiki_home_needs_no_auto() -> Result<()> {
+        let env = Env {
+            kiki_home: Some(PathBuf::from("/srv/kiki")),
+            ..Env::default()
+        };
+        let args = InitArgs {
+            auto: false,
+            ..auto_args()
+        };
+        assert_eq!(args.resolve_directory_in(&env)?, Path::new("/srv/kiki"));
+        Ok(())
+    }
+
+    /// Test that providing neither a directory, nor `--auto`, nor
+    /// `$KIKI_HOME` returns an error.
     #[test]
     fn test_no_directory_no_auto() {
         let args = InitArgs {
-            directory: None,
             auto: false,
-            check: false,
-            force: false,
+            ..auto_args()
         };
-        assert!(args.resolve_directory().is_err());
+        assert!(args.resolve_directory_in(&Env::default()).is_err());
     }
 }

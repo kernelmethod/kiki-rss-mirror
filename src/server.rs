@@ -8,9 +8,12 @@ use anyhow::{bail, Context, Error, Result};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use std::{
-    fs,
+    fs, io,
     net::SocketAddr,
-    os::unix::fs::PermissionsExt,
+    os::unix::{
+        fs::{FileTypeExt, PermissionsExt},
+        net::UnixStream,
+    },
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -366,14 +369,7 @@ impl Server {
 
         match self.listen_addr {
             ListenAddr::Uds(socket_path) => {
-                if socket_path.exists() {
-                    fs::remove_file(&socket_path).with_context(|| {
-                        format!(
-                            "Unable to delete existing socket file from {:?}",
-                            socket_path
-                        )
-                    })?;
-                }
+                claim_socket_path(&socket_path)?;
                 tokio::spawn(uds_server(
                     socket_path,
                     tx.clone(),
@@ -657,6 +653,80 @@ async fn shutdown_signal(token: CancellationToken) {
     }
 }
 
+/// Claim `socket_path` for this server, clearing a stale socket file left
+/// behind by a previous run.
+///
+/// A socket file outlives the process that bound it, so `bind(2)` reports
+/// `EADDRINUSE` whether the path belongs to a live server or is merely
+/// stale. Deleting it unconditionally resolves that in the worst way: a
+/// second server started against the same path would silently steal it from
+/// the first, leaving the first running but unreachable. Probing with
+/// `connect(2)` tells the two cases apart:
+///
+/// * the connection succeeds — another server is listening, and this one
+///   must not displace it;
+/// * `ECONNREFUSED` — nothing is listening, so the file is stale and safe to
+///   unlink;
+/// * the path does not exist — there is nothing to do.
+///
+/// This is what makes the per-user default socket path a single-instance
+/// guard: the second `kiki serve` fails with a clear message instead of
+/// quietly taking over.
+///
+/// # Errors
+///
+/// Returns an error if another server is already listening on `socket_path`,
+/// if the path exists but is not a socket, or if a stale socket file cannot
+/// be inspected or removed.
+///
+/// # Examples
+///
+/// ```ignore
+/// // A path nothing has ever bound is claimed without doing anything.
+/// claim_socket_path(Path::new("/run/user/1000/kiki/kiki.sock"))?;
+/// ```
+fn claim_socket_path(socket_path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("Unable to inspect existing socket file at {socket_path:?}")
+            })
+        }
+    };
+
+    if !metadata.file_type().is_socket() {
+        bail!(
+            "{} already exists and is not a socket; refusing to remove it. Pass \
+             --uds to listen somewhere else.",
+            socket_path.display()
+        );
+    }
+
+    match UnixStream::connect(socket_path) {
+        Ok(_) => bail!(
+            "another Kiki server is already listening on {}. Stop it first, or pass \
+             --uds to listen somewhere else.",
+            socket_path.display()
+        ),
+        // Nothing is accepting connections, so the file is a leftover. The
+        // NotFound case is a race with another process cleaning up the same
+        // stale socket, which leaves us with exactly what we wanted anyway.
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+            debug!("removing stale socket file at {:?}", socket_path);
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("Unable to probe existing socket at {socket_path:?}"))
+        }
+    }
+
+    fs::remove_file(socket_path)
+        .with_context(|| format!("Unable to delete stale socket file at {socket_path:?}"))
+}
+
 /// Parent function for the Unix domain socket web worker threads.
 #[allow(clippy::too_many_arguments)]
 async fn uds_server(
@@ -760,6 +830,62 @@ mod test {
             .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
         Ok(r2d2::Pool::new(manager)?)
+    }
+
+    /// Nothing at the path means nothing to clean up.
+    #[test]
+    fn claim_socket_path_accepts_an_unused_path() -> Result<()> {
+        let td = tempdir::TempDir::new("kiki_")?;
+        claim_socket_path(&td.path().join("kiki.sock"))?;
+        Ok(())
+    }
+
+    /// A socket file whose server is gone is stale, and gets cleared.
+    #[test]
+    fn claim_socket_path_removes_a_stale_socket() -> Result<()> {
+        let td = tempdir::TempDir::new("kiki_")?;
+        let path = td.path().join("kiki.sock");
+
+        // Dropping the listener closes the socket but leaves its file behind,
+        // which is exactly the state a killed server leaves the path in.
+        let listener = std::os::unix::net::UnixListener::bind(&path)?;
+        drop(listener);
+        assert!(path.exists());
+
+        claim_socket_path(&path)?;
+        assert!(!path.exists(), "stale socket file should have been removed");
+
+        Ok(())
+    }
+
+    /// A socket someone is still listening on belongs to a live server, and
+    /// must not be stolen from it.
+    #[test]
+    fn claim_socket_path_refuses_a_live_socket() -> Result<()> {
+        let td = tempdir::TempDir::new("kiki_")?;
+        let path = td.path().join("kiki.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path)?;
+
+        assert!(claim_socket_path(&path).is_err());
+        assert!(
+            path.exists(),
+            "a live server's socket must be left in place"
+        );
+
+        Ok(())
+    }
+
+    /// Whatever a non-socket file at the path is, it is not ours to delete.
+    #[test]
+    fn claim_socket_path_refuses_to_remove_a_regular_file() -> Result<()> {
+        let td = tempdir::TempDir::new("kiki_")?;
+        let path = td.path().join("kiki.sock");
+        fs::write(&path, b"not a socket")?;
+
+        assert!(claim_socket_path(&path).is_err());
+        assert!(path.exists());
+
+        Ok(())
     }
 
     /// Ensure that we can start and stop the server without a panic.
