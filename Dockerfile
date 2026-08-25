@@ -1,14 +1,12 @@
 # syntax=docker/dockerfile:1.7
 
-# Build stage: compile the kiki binary against glibc + OpenSSL.
-# rusqlite (bundled) and mlua (vendored) compile their own C deps; reqwest
-# uses native-tls on non-musl targets, which needs libssl-dev at build time.
+# Build stage: compile the kiki binary against glibc.
+# rusqlite (bundled) and mlua (vendored) compile their own C deps; TLS is
+# rustls on every target, so no system OpenSSL is needed at build time.
 FROM rust:1-trixie AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        pkg-config \
-        libssl-dev \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -33,10 +31,11 @@ RUN touch src/main.rs src/lib.rs \
 # Runtime stage: minimal Debian with just the libs the binary links against.
 FROM debian:trixie-slim
 
+# ca-certificates only: rustls reads the system trust store via
+# rustls-platform-verifier, but nothing links libssl any more.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
-        libssl3 \
         tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 1000 kiki \

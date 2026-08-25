@@ -109,3 +109,53 @@ fn parent_or_cwd(p: &std::path::Path) -> PathBuf {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Wrapper so the `Args`-derived [`ServeArgs`] can be exercised
+    /// through real argv parsing, covering the flag names too.
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        serve: ServeArgs,
+    }
+
+    fn config_from(argv: &[&str]) -> SandboxConfig {
+        let cli = TestCli::parse_from(std::iter::once("kiki").chain(argv.iter().copied()));
+        let socket = PathBuf::from("./kiki.sock");
+        let socket_path = if cli.serve.port.is_some() {
+            None
+        } else {
+            Some(socket)
+        };
+        build_sandbox_config(
+            &PathBuf::from("./kiki.db"),
+            socket_path.as_deref(),
+            &cli.serve,
+        )
+    }
+
+    #[test]
+    fn uds_mode_grants_the_socket_directory() {
+        let config = config_from(&[]);
+        assert_eq!(config.data_dir, PathBuf::from("."));
+        assert_eq!(config.socket_dir, Some(PathBuf::from(".")));
+    }
+
+    #[test]
+    fn tcp_mode_grants_no_socket_directory() {
+        let config = config_from(&["--port", "8000"]);
+        assert_eq!(config.data_dir, PathBuf::from("."));
+        assert_eq!(config.socket_dir, None);
+    }
+
+    #[test]
+    fn seccomp_log_only_flag_reaches_the_config() {
+        assert!(!config_from(&[]).log_only);
+        assert!(config_from(&["--seccomp-log-only"]).log_only);
+    }
+}

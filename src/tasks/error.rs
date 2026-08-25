@@ -17,6 +17,9 @@ pub enum FetchError {
     /// The maximum number of redirects was exceeded.
     #[serde(rename = "too_many_redirects")]
     TooManyRedirects { url: String },
+    /// The response body exceeded the maximum feed size and was not read.
+    #[serde(rename = "body_too_large")]
+    BodyTooLarge { url: String, limit: u64 },
     /// A network or other unexpected error occurred.
     #[serde(rename = "other")]
     Other { message: String },
@@ -38,6 +41,13 @@ impl fmt::Display for FetchError {
             FetchError::TooManyRedirects { url } => {
                 write!(f, "Exceeded maximum redirects while fetching {}", url)
             }
+            FetchError::BodyTooLarge { url, limit } => {
+                write!(
+                    f,
+                    "Response body from {} exceeds the {}-byte feed size limit",
+                    url, limit
+                )
+            }
             FetchError::Other { message } => write!(f, "{}", message),
         }
     }
@@ -49,14 +59,17 @@ impl FetchError {
     ///
     /// Transient: 408 Request Timeout, 429 Too Many Requests, any 5xx,
     /// network/timeout errors (`Other`).
-    /// Permanent: other 4xx statuses, malformed feed bodies, redirect loops.
+    /// Permanent: other 4xx statuses, malformed feed bodies, redirect
+    /// loops, oversized bodies.
     pub fn is_transient(&self) -> bool {
         match self {
             FetchError::HttpStatus { status, .. } => {
                 matches!(*status, 408 | 429) || (500..=599).contains(status)
             }
             FetchError::Other { .. } => true,
-            FetchError::InvalidFeed { .. } | FetchError::TooManyRedirects { .. } => false,
+            FetchError::InvalidFeed { .. }
+            | FetchError::TooManyRedirects { .. }
+            | FetchError::BodyTooLarge { .. } => false,
         }
     }
 }

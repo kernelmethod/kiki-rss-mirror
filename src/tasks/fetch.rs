@@ -1,4 +1,4 @@
-use crate::http::{FeedAuth, FeedAuthType};
+use crate::http::{read_body_capped, CappedBody, FeedAuth, FeedAuthType};
 use crate::metrics::Metrics;
 use crate::scripting::ScriptRunner;
 use crate::tasks::backoff::{
@@ -233,6 +233,10 @@ async fn retrieve_feed(
     let conn = pool.get()?;
 
     let timeout = Duration::from_secs(crate::db::settings::get_feed_update_timeout_seconds(&conn)?);
+
+    // Read per fetch, like the timeout above, so an operator changing the
+    // cap does not have to restart the server for it to take effect.
+    let max_feed_bytes = crate::db::settings::get_max_feed_bytes(&conn)?;
 
     // RFC 8246: while a prior response advertised `immutable` and is still
     // fresh, suppress conditional revalidation — the server has promised
@@ -537,7 +541,41 @@ async fn retrieve_feed(
     // Read the body now so we can hash it before persisting. Done before
     // the UPDATE so a body-read failure leaves `feeds` untouched — we
     // don't advertise a successful fetch we couldn't actually read.
-    let content = resp.bytes().await?;
+    //
+    // The read is capped: a feed server that streams an unbounded body
+    // would otherwise buffer straight into an OOM, and the request
+    // timeout is no defence against a fast sender.
+    let content = match read_body_capped(resp, max_feed_bytes).await? {
+        CappedBody::Complete(bytes) => bytes,
+        CappedBody::TooLarge { seen } => {
+            let fetch_err = FetchError::BodyTooLarge {
+                url: current_url.clone(),
+                limit: max_feed_bytes,
+            };
+            warn!("Feed {}: {} (saw {} bytes)", feed_id, fetch_err, seen);
+            set_feed_error_with_schedule(
+                &conn,
+                feed_id,
+                &fetch_err,
+                None,
+                None,
+                cfg.min_cadence,
+                cfg.max_backoff,
+                cfg.min_fetch_interval,
+                metrics,
+            );
+            fire_fetch_error(
+                script_runner,
+                feed_id,
+                "body_too_large",
+                None,
+                format!("{}", fetch_err),
+                None,
+            );
+            metrics.record_feed_fetch("body_too_large", fetch_start.elapsed().as_secs_f64());
+            return Ok(None);
+        }
+    };
     metrics.record_feed_response_bytes(content.len() as u64);
     body_hash = Some(blake3::hash(&content).to_hex().to_string());
 

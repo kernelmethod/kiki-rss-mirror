@@ -90,7 +90,7 @@ impl InitArgs {
             }
 
             fs::remove_file(&db_path)
-                .with_context(|| format!("unable to delete database file at {:#?}", &db_path))?;
+                .with_context(|| format!("unable to delete database file at {:#?}", db_path))?;
         }
 
         fs::create_dir_all(&directory)
@@ -101,7 +101,7 @@ impl InitArgs {
             .at_path(&db_path)
             .create()
             .build()
-            .with_context(|| format!("failed to create database in {:?}", &db_path))?;
+            .with_context(|| format!("failed to create database in {:?}", db_path))?;
         restrict_permissions(&db_path, 0o660)?;
 
         println!("Initialized Kiki in {}", directory.display());

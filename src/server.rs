@@ -241,7 +241,7 @@ impl Server {
         let pool = r2d2::Pool::new(manager).with_context(|| {
             format!(
                 "Unable to open connection pool to database at {:?}",
-                &self.db_path
+                self.db_path
             )
         })?;
 
@@ -370,7 +370,7 @@ impl Server {
                     fs::remove_file(&socket_path).with_context(|| {
                         format!(
                             "Unable to delete existing socket file from {:?}",
-                            &socket_path
+                            socket_path
                         )
                     })?;
                 }
@@ -681,12 +681,12 @@ async fn uds_server(
     let app = routes::create_router(metrics, shared_state.clone()).with_state(shared_state);
 
     let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("Unable to bind to Unix socket at {:?}", &socket_path))?;
+        .with_context(|| format!("Unable to bind to Unix socket at {:?}", socket_path))?;
 
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o660)).with_context(|| {
         format!(
             "Unable to set permissions on Unix socket at {:?}",
-            &socket_path
+            socket_path
         )
     })?;
 

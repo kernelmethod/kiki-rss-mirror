@@ -22,7 +22,7 @@ impl MigrateArgs {
                 .at_path(&self.database)
                 .read_write()
                 .build()
-                .with_context(|| format!("failed to open database at {:?}", &self.database))?;
+                .with_context(|| format!("failed to open database at {:?}", self.database))?;
 
             let pending = migrations::pending_migrations(&conn)?;
             if pending.is_empty() {
@@ -38,7 +38,7 @@ impl MigrateArgs {
                 .at_path(&self.database)
                 .read_write()
                 .build()
-                .with_context(|| format!("failed to open database at {:?}", &self.database))?;
+                .with_context(|| format!("failed to open database at {:?}", self.database))?;
 
             let count = migrations::run_pending_migrations(&mut conn)?;
             if count == 0 {

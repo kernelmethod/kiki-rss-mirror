@@ -440,3 +440,119 @@ async fn test_network_error_transient_with_backoff() -> Result<()> {
     assert!(stored.is_transient());
     Ok(())
 }
+
+/// A response body larger than the configured `max_feed_bytes` is
+/// abandoned mid-read: no entries are inserted and a `BodyTooLarge` error
+/// is stored. Exercises the setting rather than the seeded default, so a
+/// regression that hardcodes the cap fails here.
+#[tokio::test]
+async fn test_body_too_large_error_honours_the_configured_cap() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+
+    // Well under the 32 MiB default, so only a cap read from the settings
+    // table can reject this body.
+    const CAP: u64 = 4096;
+    let oversized = "x".repeat((CAP as usize) * 4);
+
+    let app = Router::new().route(
+        "/feed",
+        get(move || {
+            let body = oversized.clone();
+            async move { ([("content-type", "application/rss+xml")], body) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+    let feed_url = format!("http://{}/feed", addr);
+    let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
+
+    {
+        let conn = tc.database_conn()?;
+        crate::db::settings::set_max_feed_bytes(&conn, CAP)?;
+    }
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let entry_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(entry_count, 0, "oversized body should not produce entries");
+
+    let (error, error_at) = read_stored_error(&conn, feed_id)?;
+    assert_eq!(
+        error,
+        Some(FetchError::BodyTooLarge {
+            url: feed_url.clone(),
+            limit: CAP,
+        }),
+    );
+    assert!(error_at.is_some());
+
+    Ok(())
+}
+
+/// A body that fits under a raised cap is ingested normally, confirming the
+/// cap is a ceiling rather than an unconditional rejection.
+#[tokio::test]
+async fn test_body_within_configured_cap_is_ingested() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+
+    let rss = std::fs::read_to_string(crate::test::TestConfig::test_data_path("example.xml"))?;
+    let app = Router::new().route(
+        "/feed",
+        get(move || {
+            let body = rss.clone();
+            async move { ([("content-type", "application/rss+xml")], body) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+    let feed_url = format!("http://{}/feed", addr);
+    let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
+
+    {
+        let conn = tc.database_conn()?;
+        crate::db::settings::set_max_feed_bytes(&conn, 8 * 1024 * 1024)?;
+    }
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let entry_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    assert!(
+        entry_count > 0,
+        "feed under the cap should have been ingested"
+    );
+
+    let (error, _) = read_stored_error(&conn, feed_id)?;
+    assert_eq!(error, None);
+
+    Ok(())
+}

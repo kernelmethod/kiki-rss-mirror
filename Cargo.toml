@@ -40,7 +40,7 @@ clap = { version = "4.5", features = ["cargo", "derive"], optional = true }
 quick-xml = { version = "0.37", features = ["serialize", "escape-html"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.27"
-reqwest = { version = "0.13", default-features = false, features = ["json", "gzip", "deflate", "brotli", "zstd"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "gzip", "deflate", "brotli", "zstd", "rustls"] }
 rss = "2.0"
 rusqlite = { version = "0.34", features = ["bundled", "functions"] }
 serde = { version = "1.0", features = ["serde_derive"] }
@@ -63,18 +63,13 @@ schemars = { version = "1.0", optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 
-[target.'cfg(not(target_env = "musl"))'.dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
-
-[target.'cfg(target_env = "musl")'.dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 seccompiler = "0.5"
 
 [dev-dependencies]
 flate2 = "1"
+http = "1"
 itertools = "0.14"
 serial_test = "3.4"
 tempdir = "0.3"

@@ -35,6 +35,7 @@ use crate::routes::v1::entries::search_entries::SearchEntriesRequest;
 use crate::routes::v1::feeds::add_feed::AddFeedRequest;
 use crate::routes::v1::scripts::add_script::AddScriptRequest;
 use crate::routes::v1::settings::assets::AssetCacheSettingsRequest;
+use crate::routes::v1::settings::feed_fetch::FeedFetchSettingsRequest;
 use crate::routes::v1::settings::retention::RetentionRequest;
 use crate::routes::v1::tags::create_tag::CreateTagRequest;
 use crate::server::AppState;
@@ -643,6 +644,26 @@ impl KikiMcp {
         Parameters(body): Parameters<AssetCacheSettingsRequest>,
     ) -> Result<CallToolResult, McpError> {
         self.dispatch_json(Method::PUT, "/settings/asset-cache", Some(&body))
+            .await
+    }
+
+    /// Get the feed fetch settings (max_feed_bytes).
+    #[tool(description = "Get the feed fetch settings (max_feed_bytes).")]
+    async fn get_feed_fetch_settings(&self) -> Result<CallToolResult, McpError> {
+        self.dispatch_json::<()>(Method::GET, "/settings/feed-fetch", None)
+            .await
+    }
+
+    /// Update the feed fetch settings (max_feed_bytes).
+    #[tool(
+        description = "Update the feed fetch settings (max_feed_bytes: largest feed response \
+                       body, in bytes, to read into memory)."
+    )]
+    async fn update_feed_fetch_settings(
+        &self,
+        Parameters(body): Parameters<FeedFetchSettingsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch_json(Method::PUT, "/settings/feed-fetch", Some(&body))
             .await
     }
 }
