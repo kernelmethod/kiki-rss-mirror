@@ -30,6 +30,11 @@ pub enum Commands {
     #[cfg(feature = "systemd")]
     Service(cli::service::ServiceArgs),
 
+    /// Internal: run the sandboxed Lua script host. Spawned by `serve`.
+    #[cfg(all(unix, feature = "lua"))]
+    #[command(name = kiki_rss::process::script_host::SUBCOMMAND, hide = true)]
+    ScriptHost(cli::script_host::ScriptHostArgs),
+
     /// Print the version of Kiki
     Version,
 }
@@ -45,6 +50,8 @@ impl Commands {
             Commands::Docs(args) => args.run(),
             #[cfg(feature = "systemd")]
             Commands::Service(args) => args.run(),
+            #[cfg(all(unix, feature = "lua"))]
+            Commands::ScriptHost(args) => args.run(),
             Commands::Version => {
                 println!("kiki {}", env!("CARGO_PKG_VERSION"));
                 Ok(())

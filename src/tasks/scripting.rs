@@ -30,7 +30,7 @@ pub(super) fn fire_fetch_error(
             crate::scripting::Event::FetchError,
             crate::scripting::EventPayload::FetchError {
                 feed_id,
-                kind,
+                kind: kind.into(),
                 status,
                 message,
                 retry_after,
@@ -73,12 +73,21 @@ pub(super) fn load_all_script_sources(
 /// Build a fresh [`ScriptRunner`] from the current `scripts` table and install it in
 /// `handle`, replacing any previous runner.
 ///
+/// When `host` carries a sandboxed script host, the sources are shipped to that child
+/// process and `handle` receives a [`SubprocessScriptRunner`] that forwards to it; the
+/// VM is rebuilt inside the child, so no respawn is needed. Otherwise the VM is built
+/// in this process, which is the path the library tests and `--no-script-isolation`
+/// take.
+///
 /// Logs and clears the handle if loading sources or compiling scripts fails.
+///
+/// [`SubprocessScriptRunner`]: crate::process::script_host::SubprocessScriptRunner
 #[cfg(feature = "lua")]
 pub fn reload_script_runner(
     pool: &Pool<SqliteConnectionManager>,
     metrics: &Metrics,
     handle: &ScriptRunnerHandle,
+    host: &crate::process::ScriptHostHandle,
 ) {
     let conn = match pool.get() {
         Ok(c) => c,
@@ -99,11 +108,63 @@ pub fn reload_script_runner(
             return;
         }
     };
+
+    // A runner with no handlers behaves exactly like no runner at all —
+    // every dispatch site skips a `None` — so with no scripts installed,
+    // install nothing. For the isolated host that also spares every
+    // ingested entry two IPC round trips that could only ever be no-ops.
+    // The host is still told, so it drops any VM left over from scripts
+    // that have since been deleted.
+    let empty = sources.is_empty();
+
+    #[cfg(all(unix, feature = "lua"))]
+    if let Some(host) = host {
+        use crate::process::script_host::SubprocessScriptRunner;
+
+        match host.reload(sources) {
+            Ok(loaded) => {
+                metrics.set_scripts_loaded(loaded as f64);
+                handle.set(if empty {
+                    None
+                } else {
+                    Some(Arc::new(SubprocessScriptRunner::new(host.clone()))
+                        as Arc<dyn ScriptRunner>)
+                });
+            }
+            Err(e) if host.is_alive() => {
+                // The host answered, it just could not compile what we
+                // sent. Scripts stay off until the operator fixes them,
+                // and a later reload will be picked up normally.
+                warn!("script host failed to compile Lua scripts: {}", e);
+                metrics.record_script_compile_error();
+                metrics.set_scripts_loaded(0.0);
+                handle.set(None);
+            }
+            Err(e) => {
+                // The channel itself is gone. Nothing can bring it back:
+                // the server denied itself `execve` when it sandboxed.
+                error!(
+                    "script host is gone ({}); scripting is disabled until the server restarts",
+                    e
+                );
+                metrics.set_scripts_loaded(0.0);
+                handle.set(None);
+            }
+        }
+        return;
+    }
+
+    // No isolated host: compile into a VM in this process.
+    let _ = host;
     let count = sources.len() as f64;
     match crate::scripting::lua::LuaScriptRunner::new(&sources) {
         Ok(runner) => {
             metrics.set_scripts_loaded(count);
-            handle.set(Some(Arc::new(runner) as Arc<dyn ScriptRunner>));
+            handle.set(if empty {
+                None
+            } else {
+                Some(Arc::new(runner) as Arc<dyn ScriptRunner>)
+            });
         }
         Err(e) => {
             warn!("failed to compile Lua scripts: {}", e);
@@ -122,6 +183,7 @@ pub async fn run_script_reloader(
     pool: Pool<SqliteConnectionManager>,
     metrics: Arc<Metrics>,
     handle: ScriptRunnerHandle,
+    host: crate::process::ScriptHostHandle,
     mut reload_rx: tokio::sync::watch::Receiver<()>,
     token: CancellationToken,
 ) {
@@ -136,9 +198,12 @@ pub async fn run_script_reloader(
                 let pool = pool.clone();
                 let metrics = metrics.clone();
                 let handle = handle.clone();
-                // Compilation can be CPU-heavy; keep it off the async runtime.
+                let host = host.clone();
+                // Compilation can be CPU-heavy — and, with an isolated host, is a
+                // blocking round trip to another process. Either way, keep it off
+                // the async runtime.
                 let _ = tokio::task::spawn_blocking(move || {
-                    reload_script_runner(&pool, &metrics, &handle);
+                    reload_script_runner(&pool, &metrics, &handle, &host);
                 })
                 .await;
                 info!("Script runner reloaded");

@@ -8,3 +8,6 @@ pub mod docs;
 
 #[cfg(feature = "systemd")]
 pub mod service;
+
+#[cfg(all(unix, feature = "lua"))]
+pub mod script_host;

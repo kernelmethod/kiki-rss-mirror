@@ -54,16 +54,28 @@
 //!
 //! # Sandboxing
 //!
-//! The Lua VM is created with a restricted standard library. Only `string`, `table`, `math`,
-//! `os` (with dangerous functions removed), `tostring`, `tonumber`, `type`, `pairs`, `ipairs`,
-//! `select`, and `unpack` are available, plus the `kiki` table exposing `on` and `log`.
-//! Filesystem access, process execution, and module loading are blocked. Scripts run under a
+//! Two layers, in different address spaces.
+//!
+//! Inside the VM: a restricted standard library. Only `string`, `table`, `math`, `os` (with
+//! dangerous functions removed), `tostring`, `tonumber`, `type`, `pairs`, `ipairs`, `select`,
+//! and `unpack` are available, plus the `kiki` table exposing `on` and `log`. Filesystem
+//! access, process execution, and module loading are blocked. Scripts run under a
 //! per-invocation time budget and a VM-wide memory limit (see the `lua` sub-module for the
 //! concrete values).
+//!
+//! Around the VM: by default `kiki serve` does not host the VM at all. It runs in a separate,
+//! more tightly sandboxed process that holds no database handle, no filesystem access, and no
+//! sockets beyond the one it talks to the server over — so a VM escape lands somewhere with
+//! nothing worth having. See [`crate::process::script_host`]. The trait below is the boundary
+//! that makes this substitutable: [`lua::LuaScriptRunner`] runs the VM here,
+//! [`crate::process::script_host::SubprocessScriptRunner`] forwards to the child, and callers
+//! cannot tell the difference.
 
 #[cfg(feature = "lua")]
 pub mod lua;
 
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 
 /// Represents a feed entry at the scripting boundary.
@@ -72,7 +84,7 @@ use std::sync::{Arc, RwLock};
 /// (`feed_id`, `syndication_format`, `guid`) are read-only from the script's perspective —
 /// any changes made to them in a script are ignored when converting back from the scripting
 /// layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedEntry {
     /// ID of the feed this entry belongs to.
     pub feed_id: i64,
@@ -94,7 +106,7 @@ pub struct FeedEntry {
 }
 
 /// The set of server events that scripts may subscribe to via `kiki.on(name, handler)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Event {
     /// Fires per-entry during feed refresh, after parsing and before insertion. Handlers
     /// may transform or filter the entry by returning a modified table or `nil`.
@@ -140,7 +152,7 @@ impl Event {
 }
 
 /// Payload variants carried alongside an [`Event`] when dispatched to scripts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventPayload {
     /// Used for [`Event::EntryIngest`] and [`Event::EntryParsed`].
     Entry(FeedEntry),
@@ -155,7 +167,11 @@ pub enum EventPayload {
     FetchError {
         feed_id: i64,
         /// One of `"http"`, `"timeout"`, `"network"`, `"too_many_redirects"`, `"parse"`.
-        kind: &'static str,
+        ///
+        /// A [`Cow`] rather than a `&'static str` so the payload survives a
+        /// round trip through the script host's IPC channel, where it is
+        /// rebuilt from owned data.
+        kind: Cow<'static, str>,
         status: Option<u16>,
         message: String,
         retry_after: Option<i64>,

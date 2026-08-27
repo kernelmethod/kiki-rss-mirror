@@ -70,6 +70,7 @@ pub struct ServerBuilder<'a> {
     autofetch: bool,
     single_threaded: bool,
     worker_count: Option<usize>,
+    script_host: crate::process::ScriptHostHandle,
 }
 
 impl<'a> ServerBuilder<'a> {
@@ -80,6 +81,7 @@ impl<'a> ServerBuilder<'a> {
             autofetch: false,
             single_threaded: false,
             worker_count: None,
+            script_host: None,
         }
     }
 
@@ -110,6 +112,17 @@ impl<'a> ServerBuilder<'a> {
         self
     }
 
+    /// Dispatch script events to an already-spawned, sandboxed script
+    /// host instead of a Lua VM in this process.
+    ///
+    /// The host must be spawned by the caller, before it installs its own
+    /// sandbox — see [`crate::process`]. Passing `None` keeps the
+    /// in-process VM, which is what the library-level tests use.
+    pub fn script_host(mut self, host: crate::process::ScriptHostHandle) -> Self {
+        self.script_host = host;
+        self
+    }
+
     pub fn build(self) -> Server {
         let listen_addr = self
             .listen_addr
@@ -131,6 +144,7 @@ impl<'a> ServerBuilder<'a> {
             autofetch: self.autofetch,
             single_threaded: self.single_threaded,
             worker_count: self.worker_count,
+            script_host: self.script_host,
             cancel_token: CancellationToken::new(),
         }
     }
@@ -179,6 +193,10 @@ pub struct Server {
 
     /// Override the number of feed-fetcher worker tasks.
     worker_count: Option<usize>,
+
+    /// Sandboxed script host to dispatch script events to, if one was
+    /// spawned. `None` runs Lua in this process.
+    script_host: crate::process::ScriptHostHandle,
 
     /// A [`CancellationToken`] used to indicate that the server should
     /// be killed.
@@ -278,19 +296,23 @@ impl Server {
         // Build the initial runner and spawn the reloader task (lua feature only).
         #[cfg(feature = "lua")]
         {
-            tasks::reload_script_runner(&pool, &metrics, &script_runner);
+            tasks::reload_script_runner(&pool, &metrics, &script_runner, &self.script_host);
             tokio::spawn(tasks::run_script_reloader(
                 pool.clone(),
                 metrics.clone(),
                 script_runner.clone(),
+                self.script_host.clone(),
                 reload_rx,
                 self.cancel_token.clone(),
             ));
         }
         #[cfg(not(feature = "lua"))]
         {
-            // `reload_rx` would otherwise be unused.
+            // Without the `lua` feature there is nothing to reload and
+            // no script host to dispatch to; both would otherwise read
+            // as dead code.
             let _ = reload_rx;
+            let _ = &self.script_host;
         }
 
         let num_workers = self.worker_count.unwrap_or_else(tasks::worker_count);

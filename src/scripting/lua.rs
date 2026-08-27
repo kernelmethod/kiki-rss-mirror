@@ -152,7 +152,7 @@ fn payload_to_lua(lua: &Lua, payload: EventPayload) -> LuaResult<LuaValue> {
         } => {
             let t = lua.create_table()?;
             t.set("feed_id", feed_id)?;
-            t.set("kind", kind)?;
+            t.set("kind", kind.as_ref())?;
             t.set("status", status)?;
             t.set("message", message)?;
             t.set("retry_after", retry_after)?;

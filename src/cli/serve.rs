@@ -1,6 +1,8 @@
 use crate::cli::paths::{self, Env};
 use crate::sandbox::{self, SandboxConfig};
 use crate::server;
+#[cfg(all(unix, feature = "lua"))]
+use anyhow::anyhow;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::fs;
@@ -59,6 +61,17 @@ pub struct ServeArgs {
     /// unexpected SIGSYS in production. Landlock is unaffected.
     #[arg(long)]
     seccomp_log_only: bool,
+
+    /// Run Lua scripts inside the server process instead of an isolated
+    /// child process.
+    ///
+    /// Scripts are the only code Kiki executes that it did not ship, and
+    /// the isolated host holds no database handle, no filesystem access,
+    /// and no sockets. Turning this on puts the Lua VM back in the same
+    /// address space as the database.
+    #[cfg(all(unix, feature = "lua"))]
+    #[arg(long)]
+    no_script_isolation: bool,
 }
 
 impl ServeArgs {
@@ -94,6 +107,12 @@ impl ServeArgs {
             Listener::Tcp(_) => None,
         };
 
+        // Spawn the script host *before* the sandbox goes up: every
+        // profile denies `execve`, so this is the last moment at which
+        // the server can start a child process at all.
+        #[cfg(all(unix, feature = "lua"))]
+        let script_host = self.spawn_script_host()?;
+
         if !self.no_sandbox {
             let config = build_sandbox_config(&db_path, socket_dir, self);
             sandbox::apply(&config).context("failed to install sandbox")?;
@@ -105,6 +124,10 @@ impl ServeArgs {
         }
 
         let mut builder = server::ServerBuilder::new(&db_path).autofetch();
+        #[cfg(all(unix, feature = "lua"))]
+        {
+            builder = builder.script_host(script_host);
+        }
         builder = match &listener {
             Listener::Uds(path) => builder.socket_path(path),
             Listener::Tcp(addr) => builder.bind_addr(*addr),
@@ -125,6 +148,34 @@ impl ServeArgs {
     ///
     /// Returns an error if the resolved socket path is too long to fit in a
     /// Unix socket address.
+    /// Start the isolated Lua script host, unless the operator opted out.
+    ///
+    /// A spawn failure is fatal rather than a silent fall back to the
+    /// in-process VM: quietly running user scripts next to the database
+    /// because a `fork` failed would be a security downgrade nobody
+    /// asked for. The error names the flag that makes it explicit.
+    #[cfg(all(unix, feature = "lua"))]
+    fn spawn_script_host(&self) -> Result<crate::process::ScriptHostHandle> {
+        use crate::process::script_host::ScriptHost;
+        use std::sync::Arc;
+
+        if self.no_script_isolation {
+            tracing::warn!(
+                "script isolation disabled via --no-script-isolation; Lua runs in the \
+                 server process, with the same database and filesystem access it has"
+            );
+            return Ok(None);
+        }
+
+        let host = ScriptHost::spawn(self.seccomp_log_only, self.no_sandbox).map_err(|e| {
+            anyhow!(
+                "failed to start the isolated Lua script host: {e:#}. Pass \
+                 --no-script-isolation to run scripts in the server process instead."
+            )
+        })?;
+        Ok(Some(Arc::new(host)))
+    }
+
     fn resolve_listener(&self, data_dir: &paths::DataDir, env: &Env) -> Result<Listener> {
         match self.port {
             Some(port) => Ok(Listener::Tcp(SocketAddr::new(self.bind, port))),
@@ -176,11 +227,7 @@ fn build_sandbox_config(
     socket_dir: Option<PathBuf>,
     args: &ServeArgs,
 ) -> SandboxConfig {
-    SandboxConfig {
-        data_dir: parent_or_cwd(db_path),
-        socket_dir,
-        log_only: args.seccomp_log_only,
-    }
+    SandboxConfig::server(parent_or_cwd(db_path), socket_dir, args.seccomp_log_only)
 }
 
 /// Return the parent directory of `p`, treating a relative path with no
@@ -194,9 +241,10 @@ fn parent_or_cwd(p: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::sandbox::SandboxProfile;
     use clap::Parser;
     use tempdir::TempDir;
 
@@ -241,18 +289,32 @@ mod tests {
         config_from_env(argv, &Env::default()).unwrap()
     }
 
+    /// Unpack the server profile, failing the test if `serve` somehow
+    /// built any other one.
+    fn server_paths(config: &SandboxConfig) -> (&PathBuf, &Option<PathBuf>) {
+        match &config.profile {
+            SandboxProfile::Server {
+                data_dir,
+                socket_dir,
+            } => (data_dir, socket_dir),
+            _ => panic!("serve must build a Server profile"),
+        }
+    }
+
     #[test]
     fn uds_mode_grants_the_socket_directory() {
         let config = config_from(&[]);
-        assert_eq!(config.data_dir, PathBuf::from("/data"));
-        assert_eq!(config.socket_dir, Some(PathBuf::from("/data")));
+        let (data_dir, socket_dir) = server_paths(&config);
+        assert_eq!(data_dir, &PathBuf::from("/data"));
+        assert_eq!(socket_dir, &Some(PathBuf::from("/data")));
     }
 
     #[test]
     fn tcp_mode_grants_no_socket_directory() {
         let config = config_from(&["--port", "8000"]);
-        assert_eq!(config.data_dir, PathBuf::from("/data"));
-        assert_eq!(config.socket_dir, None);
+        let (data_dir, socket_dir) = server_paths(&config);
+        assert_eq!(data_dir, &PathBuf::from("/data"));
+        assert_eq!(socket_dir, &None);
     }
 
     #[test]
@@ -272,10 +334,8 @@ mod tests {
         };
         let config = config_from_env(&[], &env)?;
 
-        assert_eq!(
-            config.socket_dir,
-            Some(PathBuf::from("/run/user/1000/kiki"))
-        );
+        let (_, socket_dir) = server_paths(&config);
+        assert_eq!(socket_dir, &Some(PathBuf::from("/run/user/1000/kiki")));
         Ok(())
     }
 
@@ -380,5 +440,24 @@ mod tests {
     #[test]
     fn relative_socket_path_resolves_against_the_current_directory() {
         assert_eq!(parent_or_cwd(Path::new("kiki.sock")), Path::new("."));
+    }
+
+    /// Script isolation is the default; opting out has to be explicit.
+    #[cfg(all(unix, feature = "lua"))]
+    #[test]
+    fn script_isolation_is_on_unless_opted_out() {
+        assert!(!parse(&[]).no_script_isolation);
+        assert!(parse(&["--no-script-isolation"]).no_script_isolation);
+    }
+
+    /// `--no-script-isolation` returns no handle, so the server falls
+    /// back to the in-process VM rather than half-wiring an absent child.
+    #[cfg(all(unix, feature = "lua"))]
+    #[test]
+    fn opting_out_yields_no_script_host() {
+        let handle = parse(&["--no-script-isolation"])
+            .spawn_script_host()
+            .expect("opting out must not fail");
+        assert!(handle.is_none());
     }
 }
