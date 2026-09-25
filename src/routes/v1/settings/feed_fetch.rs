@@ -18,7 +18,6 @@ pub struct FeedFetchSettingsResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
-#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct FeedFetchSettingsRequest {
     /// Largest feed response body, in bytes, to read into memory. Must be
     /// greater than zero. Leave `null` to keep the current value.

@@ -13,7 +13,7 @@
 //! show up as the subprocess dying with SIGSYS before a request can
 //! complete, surfaced via [`Kiki::assert_still_running`].
 
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "cli"))]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -25,14 +25,9 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use kiki_rss::process::script_host;
 use tempdir::TempDir;
 
 const KIKI_BIN: &str = env!("CARGO_BIN_EXE_kiki");
-
-/// A script that stamps every ingested entry's title, so a test can tell
-/// from the API alone whether the handler actually ran.
-const TITLE_STAMPING_SCRIPT: &str = r#"kiki.on("entry.ingest", function(entry) entry.title = "[scripted] " .. entry.title; return entry end)"#;
 
 // --------------------------------------------------------------------
 // Kiki subprocess harness
@@ -152,98 +147,6 @@ impl Kiki {
             );
         }
     }
-
-    /// PIDs of this server's script host children, read out of /proc.
-    ///
-    /// The isolation is only real if the Lua VM is somewhere else, so
-    /// the tests check the process tree rather than taking the log's
-    /// word for it.
-    fn script_host_pids(&mut self) -> Vec<u32> {
-        let server_pid = self.child.as_ref().expect("child").id();
-        child_pids_matching(server_pid, script_host::SUBCOMMAND)
-    }
-
-    /// Block until `kiki_scripts_loaded` reaches `n`, so a test never
-    /// races a reload that is still in flight.
-    fn wait_for_scripts_loaded(&mut self, n: u64, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        loop {
-            self.assert_still_running();
-            let metrics = self.get("/metrics");
-            let last = String::from_utf8_lossy(&metrics.body).into_owned();
-            if metric_value(&last, "kiki_scripts_loaded") == Some(n as f64) {
-                return;
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "kiki_scripts_loaded never reached {n} within {timeout:?}; \
-                     last /metrics response:\n{last}"
-                );
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-}
-
-/// Read a bare (unlabelled) gauge out of a Prometheus exposition body.
-fn metric_value(body: &str, name: &str) -> Option<f64> {
-    body.lines()
-        .filter(|l| !l.starts_with('#'))
-        .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
-}
-
-/// Scan /proc for children of `parent` whose command line contains
-/// `needle`.
-fn child_pids_matching(parent: u32, needle: &str) -> Vec<u32> {
-    let mut found = Vec::new();
-    let entries = match std::fs::read_dir("/proc") {
-        Ok(e) => e,
-        Err(_) => return found,
-    };
-    for entry in entries.flatten() {
-        let pid: u32 = match entry.file_name().to_string_lossy().parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let ppid = status
-            .lines()
-            .find_map(|l| l.strip_prefix("PPid:"))
-            .and_then(|v| v.trim().parse::<u32>().ok());
-        if ppid != Some(parent) {
-            continue;
-        }
-        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-        if String::from_utf8_lossy(&cmdline).contains(needle) {
-            found.push(pid);
-        }
-    }
-    found
-}
-
-/// Read the `Seccomp` mode out of a process's /proc status. `2` is
-/// `SECCOMP_MODE_FILTER`.
-fn seccomp_mode(pid: u32) -> Option<u32> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("Seccomp:"))
-        .and_then(|v| v.trim().parse().ok())
-}
-
-/// Poll until `pid` is gone, or the deadline passes.
-fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !Path::new(&format!("/proc/{pid}")).exists() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    !Path::new(&format!("/proc/{pid}")).exists()
 }
 
 impl Drop for Kiki {
@@ -498,205 +401,309 @@ fn no_sandbox_flag_still_runs() {
 // Script host isolation
 // --------------------------------------------------------------------
 
-/// Add a script and wait for the reloaded runner to report it loaded.
-fn install_script(kiki: &mut Kiki, source: &str) {
-    let body = serde_json::json!({
-        "engine": "lua",
-        "text": source,
-        "kind": "user",
-    });
-    kiki.post_json("/v1/scripts/create", &body.to_string())
-        .assert_success();
-    kiki.post_json("/v1/scripts/reload", "").assert_success();
-    kiki.wait_for_scripts_loaded(1, Duration::from_secs(10));
-}
+#[cfg(all(feature = "lua", feature = "metrics"))]
+mod script_isolation {
+    use super::*;
+    use kiki_rss::process::script_host;
 
-/// Refresh `feed_id` and poll until an entry shows up, returning its
-/// title.
-fn refresh_and_read_title(kiki: &mut Kiki, feed_id: i64) -> String {
-    kiki.post_json(&format!("/v1/feeds/refresh/{feed_id}"), "")
-        .assert_success();
+    /// A script that stamps every ingested entry's title, so a test can tell
+    /// from the API alone whether the handler actually ran.
+    const TITLE_STAMPING_SCRIPT: &str = r#"kiki.on("entry.ingest", function(entry) entry.title = "[scripted] " .. entry.title; return entry end)"#;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        kiki.assert_still_running();
-        let entries = kiki.get("/v1/entries?limit=5").assert_success();
-        let json = entries.json();
-        if let Some(title) = json["entries"][0]["title"].as_str() {
-            return title.to_string();
+    impl Kiki {
+        /// PIDs of this server's script host children, read out of /proc.
+        ///
+        /// The isolation is only real if the Lua VM is somewhere else, so
+        /// the tests check the process tree rather than taking the log's
+        /// word for it.
+        fn script_host_pids(&mut self) -> Vec<u32> {
+            let server_pid = self.child.as_ref().expect("child").id();
+            child_pids_matching(server_pid, script_host::SUBCOMMAND)
         }
-        if Instant::now() >= deadline {
-            panic!(
-                "no entry appeared after refresh; last response: {}",
-                entries.body_str()
-            );
+
+        /// Block until `kiki_scripts_loaded` reaches `n`, so a test never
+        /// races a reload that is still in flight.
+        fn wait_for_scripts_loaded(&mut self, n: u64, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            loop {
+                self.assert_still_running();
+                let metrics = self.get("/metrics");
+                let last = String::from_utf8_lossy(&metrics.body).into_owned();
+                if metric_value(&last, "kiki_scripts_loaded") == Some(n as f64) {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    panic!(
+                        "kiki_scripts_loaded never reached {n} within {timeout:?}; \
+                         last /metrics response:\n{last}"
+                    );
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
         }
-        thread::sleep(Duration::from_millis(200));
     }
-}
 
-/// Create a feed pointing at `addr` and return its id.
-fn create_local_feed(kiki: &mut Kiki, addr: SocketAddr) -> i64 {
-    let created = kiki
-        .post_json(
-            "/v1/feeds/create",
-            &format!(r#"{{"title":"scripted","url":"http://{addr}/feed.xml"}}"#),
-        )
-        .assert_success();
-    created.json()["id"].as_i64().expect("id")
-}
+    /// Read a bare (unlabelled) gauge out of a Prometheus exposition body.
+    fn metric_value(body: &str, name: &str) -> Option<f64> {
+        body.lines()
+            .filter(|l| !l.starts_with('#'))
+            .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
+    }
 
-/// The headline property: by default the Lua VM lives in a child
-/// process, not in the server.
-#[test]
-fn scripts_run_in_a_separate_process_by_default() {
-    let mut kiki = Kiki::spawn(&[]);
-    let hosts = kiki.script_host_pids();
-    assert_eq!(
-        hosts.len(),
-        1,
-        "expected exactly one `{}` child of the server, found {hosts:?}",
-        script_host::SUBCOMMAND
-    );
-    kiki.assert_still_running();
-    kiki.shutdown();
-}
+    /// Scan /proc for children of `parent` whose command line contains
+    /// `needle`.
+    fn child_pids_matching(parent: u32, needle: &str) -> Vec<u32> {
+        let mut found = Vec::new();
+        let entries = match std::fs::read_dir("/proc") {
+            Ok(e) => e,
+            Err(_) => return found,
+        };
+        for entry in entries.flatten() {
+            let pid: u32 = match entry.file_name().to_string_lossy().parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let ppid = status
+                .lines()
+                .find_map(|l| l.strip_prefix("PPid:"))
+                .and_then(|v| v.trim().parse::<u32>().ok());
+            if ppid != Some(parent) {
+                continue;
+            }
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            if String::from_utf8_lossy(&cmdline).contains(needle) {
+                found.push(pid);
+            }
+        }
+        found
+    }
 
-/// The child must survive installing its own, tighter sandbox — a
-/// regression there would show up as no seccomp filter, or as a host
-/// that died before it could answer anything.
-#[test]
-fn the_script_host_installs_its_own_seccomp_filter() {
-    let mut kiki = Kiki::spawn(&[]);
-    let host = *kiki
-        .script_host_pids()
-        .first()
-        .expect("a script host child");
+    /// Read the `Seccomp` mode out of a process's /proc status. `2` is
+    /// `SECCOMP_MODE_FILTER`.
+    fn seccomp_mode(pid: u32) -> Option<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Seccomp:"))
+            .and_then(|v| v.trim().parse().ok())
+    }
 
-    // 2 is SECCOMP_MODE_FILTER. The server's own filter is installed
-    // separately; this asserts the child got one of its own.
-    assert_eq!(
-        seccomp_mode(host),
-        Some(2),
-        "script host pid {host} is not running under a seccomp filter"
-    );
-    kiki.assert_still_running();
-    kiki.shutdown();
-}
+    /// Poll until `pid` is gone, or the deadline passes.
+    fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        !Path::new(&format!("/proc/{pid}")).exists()
+    }
 
-/// End to end: a script registered through the API transforms a real
-/// entry, with the VM in the sandboxed child and the database in the
-/// server. This is the test that fails if anything in the IPC path —
-/// framing, serialisation, the child's sandbox — is wrong.
-#[test]
-fn an_isolated_script_transforms_an_ingested_entry() {
-    let (addr, _server) = spawn_local_rss_server();
-    let mut kiki = Kiki::spawn(&[]);
+    /// Add a script and wait for the reloaded runner to report it loaded.
+    fn install_script(kiki: &mut Kiki, source: &str) {
+        let body = serde_json::json!({
+            "engine": "lua",
+            "text": source,
+            "kind": "user",
+        });
+        kiki.post_json("/v1/scripts/create", &body.to_string())
+            .assert_success();
+        kiki.post_json("/v1/scripts/reload", "").assert_success();
+        kiki.wait_for_scripts_loaded(1, Duration::from_secs(10));
+    }
 
-    install_script(&mut kiki, TITLE_STAMPING_SCRIPT);
-    assert_eq!(kiki.script_host_pids().len(), 1);
+    /// Refresh `feed_id` and poll until an entry shows up, returning its
+    /// title.
+    fn refresh_and_read_title(kiki: &mut Kiki, feed_id: i64) -> String {
+        kiki.post_json(&format!("/v1/feeds/refresh/{feed_id}"), "")
+            .assert_success();
 
-    let feed_id = create_local_feed(&mut kiki, addr);
-    let title = refresh_and_read_title(&mut kiki, feed_id);
-    assert!(
-        title.starts_with("[scripted] "),
-        "entry title was not transformed by the isolated script host: {title:?}"
-    );
-    kiki.shutdown();
-}
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            kiki.assert_still_running();
+            let entries = kiki.get("/v1/entries?limit=5").assert_success();
+            let json = entries.json();
+            if let Some(title) = json["entries"][0]["title"].as_str() {
+                return title.to_string();
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "no entry appeared after refresh; last response: {}",
+                    entries.body_str()
+                );
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
 
-/// `--no-script-isolation` is the documented escape hatch: no child, and
-/// scripts still work. If this passes while the test above fails, the
-/// problem is in the IPC layer rather than in the scripting engine.
-#[test]
-fn no_script_isolation_runs_lua_in_the_server_process() {
-    let (addr, _server) = spawn_local_rss_server();
-    let mut kiki = Kiki::spawn(&["--no-script-isolation"]);
+    /// Create a feed pointing at `addr` and return its id.
+    fn create_local_feed(kiki: &mut Kiki, addr: SocketAddr) -> i64 {
+        let created = kiki
+            .post_json(
+                "/v1/feeds/create",
+                &format!(r#"{{"title":"scripted","url":"http://{addr}/feed.xml"}}"#),
+            )
+            .assert_success();
+        created.json()["id"].as_i64().expect("id")
+    }
 
-    assert!(
-        kiki.script_host_pids().is_empty(),
-        "--no-script-isolation must not spawn a script host"
-    );
+    /// The headline property: by default the Lua VM lives in a child
+    /// process, not in the server.
+    #[test]
+    fn scripts_run_in_a_separate_process_by_default() {
+        let mut kiki = Kiki::spawn(&[]);
+        let hosts = kiki.script_host_pids();
+        assert_eq!(
+            hosts.len(),
+            1,
+            "expected exactly one `{}` child of the server, found {hosts:?}",
+            script_host::SUBCOMMAND
+        );
+        kiki.assert_still_running();
+        kiki.shutdown();
+    }
 
-    install_script(&mut kiki, TITLE_STAMPING_SCRIPT);
-    let feed_id = create_local_feed(&mut kiki, addr);
-    let title = refresh_and_read_title(&mut kiki, feed_id);
-    assert!(
-        title.starts_with("[scripted] "),
-        "in-process script did not transform the entry: {title:?}"
-    );
-    kiki.shutdown();
-}
+    /// The child must survive installing its own, tighter sandbox — a
+    /// regression there would show up as no seccomp filter, or as a host
+    /// that died before it could answer anything.
+    #[test]
+    fn the_script_host_installs_its_own_seccomp_filter() {
+        let mut kiki = Kiki::spawn(&[]);
+        let host = *kiki
+            .script_host_pids()
+            .first()
+            .expect("a script host child");
 
-/// A reload swaps the child's VM in place rather than respawning it —
-/// the server cannot spawn anything once its sandbox is up, so a reload
-/// that needed a new process would silently stop working.
-#[test]
-fn reloading_scripts_reuses_the_same_host_process() {
-    let (addr, _server) = spawn_local_rss_server();
-    let mut kiki = Kiki::spawn(&[]);
+        // 2 is SECCOMP_MODE_FILTER. The server's own filter is installed
+        // separately; this asserts the child got one of its own.
+        assert_eq!(
+            seccomp_mode(host),
+            Some(2),
+            "script host pid {host} is not running under a seccomp filter"
+        );
+        kiki.assert_still_running();
+        kiki.shutdown();
+    }
 
-    install_script(&mut kiki, TITLE_STAMPING_SCRIPT);
-    let before = kiki.script_host_pids();
+    /// End to end: a script registered through the API transforms a real
+    /// entry, with the VM in the sandboxed child and the database in the
+    /// server. This is the test that fails if anything in the IPC path —
+    /// framing, serialisation, the child's sandbox — is wrong.
+    #[test]
+    fn an_isolated_script_transforms_an_ingested_entry() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&[]);
 
-    kiki.post_json("/v1/scripts/reload", "").assert_success();
-    kiki.wait_for_scripts_loaded(1, Duration::from_secs(10));
+        install_script(&mut kiki, TITLE_STAMPING_SCRIPT);
+        assert_eq!(kiki.script_host_pids().len(), 1);
 
-    let after = kiki.script_host_pids();
-    assert_eq!(
-        before, after,
-        "a script reload must not respawn the host process"
-    );
+        let feed_id = create_local_feed(&mut kiki, addr);
+        let title = refresh_and_read_title(&mut kiki, feed_id);
+        assert!(
+            title.starts_with("[scripted] "),
+            "entry title was not transformed by the isolated script host: {title:?}"
+        );
+        kiki.shutdown();
+    }
 
-    // And the reloaded runner still works.
-    let feed_id = create_local_feed(&mut kiki, addr);
-    let title = refresh_and_read_title(&mut kiki, feed_id);
-    assert!(title.starts_with("[scripted] "), "title was {title:?}");
-    kiki.shutdown();
-}
+    /// `--no-script-isolation` is the documented escape hatch: no child, and
+    /// scripts still work. If this passes while the test above fails, the
+    /// problem is in the IPC layer rather than in the scripting engine.
+    #[test]
+    fn no_script_isolation_runs_lua_in_the_server_process() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&["--no-script-isolation"]);
 
-/// The host must not outlive the server that spawned it.
-#[test]
-fn the_script_host_exits_with_the_server() {
-    let mut kiki = Kiki::spawn(&[]);
-    let host = *kiki
-        .script_host_pids()
-        .first()
-        .expect("a script host child");
-    kiki.shutdown();
+        assert!(
+            kiki.script_host_pids().is_empty(),
+            "--no-script-isolation must not spawn a script host"
+        );
 
-    assert!(
-        wait_for_exit(host, Duration::from_secs(5)),
-        "script host pid {host} outlived the server"
-    );
-}
+        install_script(&mut kiki, TITLE_STAMPING_SCRIPT);
+        let feed_id = create_local_feed(&mut kiki, addr);
+        let title = refresh_and_read_title(&mut kiki, feed_id);
+        assert!(
+            title.starts_with("[scripted] "),
+            "in-process script did not transform the entry: {title:?}"
+        );
+        kiki.shutdown();
+    }
 
-/// A broken script must not take the host down with it: the failure is
-/// reported over IPC, the entry passes through unmodified, and the
-/// child keeps serving.
-#[test]
-fn a_failing_script_leaves_the_host_running() {
-    let (addr, _server) = spawn_local_rss_server();
-    let mut kiki = Kiki::spawn(&[]);
+    /// A reload swaps the child's VM in place rather than respawning it —
+    /// the server cannot spawn anything once its sandbox is up, so a reload
+    /// that needed a new process would silently stop working.
+    #[test]
+    fn reloading_scripts_reuses_the_same_host_process() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&[]);
 
-    install_script(
-        &mut kiki,
-        r#"kiki.on("entry.ingest", function(entry) error("boom") end)"#,
-    );
-    let before = kiki.script_host_pids();
+        install_script(&mut kiki, TITLE_STAMPING_SCRIPT);
+        let before = kiki.script_host_pids();
 
-    let feed_id = create_local_feed(&mut kiki, addr);
-    let title = refresh_and_read_title(&mut kiki, feed_id);
-    assert!(
-        !title.is_empty(),
-        "a failing handler must not drop the entry"
-    );
+        kiki.post_json("/v1/scripts/reload", "").assert_success();
+        kiki.wait_for_scripts_loaded(1, Duration::from_secs(10));
 
-    assert_eq!(
-        before,
-        kiki.script_host_pids(),
-        "a script error must not kill the host process"
-    );
-    kiki.assert_still_running();
-    kiki.shutdown();
+        let after = kiki.script_host_pids();
+        assert_eq!(
+            before, after,
+            "a script reload must not respawn the host process"
+        );
+
+        // And the reloaded runner still works.
+        let feed_id = create_local_feed(&mut kiki, addr);
+        let title = refresh_and_read_title(&mut kiki, feed_id);
+        assert!(title.starts_with("[scripted] "), "title was {title:?}");
+        kiki.shutdown();
+    }
+
+    /// The host must not outlive the server that spawned it.
+    #[test]
+    fn the_script_host_exits_with_the_server() {
+        let mut kiki = Kiki::spawn(&[]);
+        let host = *kiki
+            .script_host_pids()
+            .first()
+            .expect("a script host child");
+        kiki.shutdown();
+
+        assert!(
+            wait_for_exit(host, Duration::from_secs(5)),
+            "script host pid {host} outlived the server"
+        );
+    }
+
+    /// A broken script must not take the host down with it: the failure is
+    /// reported over IPC, the entry passes through unmodified, and the
+    /// child keeps serving.
+    #[test]
+    fn a_failing_script_leaves_the_host_running() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&[]);
+
+        install_script(
+            &mut kiki,
+            r#"kiki.on("entry.ingest", function(entry) error("boom") end)"#,
+        );
+        let before = kiki.script_host_pids();
+
+        let feed_id = create_local_feed(&mut kiki, addr);
+        let title = refresh_and_read_title(&mut kiki, feed_id);
+        assert!(
+            !title.is_empty(),
+            "a failing handler must not drop the entry"
+        );
+
+        assert_eq!(
+            before,
+            kiki.script_host_pids(),
+            "a script error must not kill the host process"
+        );
+        kiki.assert_still_running();
+        kiki.shutdown();
+    }
 }
