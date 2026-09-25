@@ -69,12 +69,14 @@ itertools = "0.14"
 serial_test = "3.4"
 tempdir = "0.3"
 
+[profile.dev]
+incremental = true
+opt-level = 2
+debug = true
+
 [profile.release]
 lto = "thin"
-
-[profile.release-test]
-inherits = "release"
-lto = false
+strip = true
 
 [package.metadata.deb]
 maintainer = "kernelmethod"
