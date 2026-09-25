@@ -139,15 +139,6 @@ impl ServeArgs {
             .map_err(|_| anyhow::anyhow!("panic in server thread"))?
     }
 
-    /// Resolve where the server should listen.
-    ///
-    /// `--port` selects TCP; otherwise the server listens on a Unix domain
-    /// socket whose path is resolved by [`paths::resolve_socket_path`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the resolved socket path is too long to fit in a
-    /// Unix socket address.
     /// Start the isolated Lua script host, unless the operator opted out.
     ///
     /// A spawn failure is fatal rather than a silent fall back to the
@@ -176,6 +167,15 @@ impl ServeArgs {
         Ok(Some(Arc::new(host)))
     }
 
+    /// Resolve where the server should listen.
+    ///
+    /// `--port` selects TCP; otherwise the server listens on a Unix domain
+    /// socket whose path is resolved by [`paths::resolve_socket_path`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the resolved socket path is too long to fit in a
+    /// Unix socket address.
     fn resolve_listener(&self, data_dir: &paths::DataDir, env: &Env) -> Result<Listener> {
         match self.port {
             Some(port) => Ok(Listener::Tcp(SocketAddr::new(self.bind, port))),
