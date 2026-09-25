@@ -37,7 +37,7 @@ async fn api_fallback() -> (StatusCode, &'static str) {
     (StatusCode::NOT_FOUND, "Not Found")
 }
 
-pub fn create_router(metrics: Arc<Metrics>, state: AppState) -> Router<AppState> {
+pub fn create_router(metrics: Arc<Metrics>) -> Router<AppState> {
     let router = Router::new().nest("/v1/", v1::create_router());
 
     #[cfg(feature = "api-docs")]
@@ -59,19 +59,6 @@ pub fn create_router(metrics: Arc<Metrics>, state: AppState) -> Router<AppState>
     // unused; silence the warning explicitly.
     #[cfg(not(feature = "metrics"))]
     let _ = metrics;
-
-    #[cfg(feature = "mcp")]
-    let router = {
-        let cancel_token = state.cancel_token.clone();
-        router.nest_service(
-            "/mcp",
-            crate::mcp::create_mcp_router(state.clone(), cancel_token),
-        )
-    };
-
-    // When the `mcp` feature is disabled, `state` is unused here.
-    #[cfg(not(feature = "mcp"))]
-    let _ = state;
 
     router.fallback(api_fallback).layer((
         TraceLayer::new_for_http(),

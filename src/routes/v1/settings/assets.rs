@@ -19,7 +19,6 @@ pub struct AssetCacheSettingsResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
-#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct AssetCacheSettingsRequest {
     pub enabled: Option<bool>,
     pub max_bytes: Option<i64>,

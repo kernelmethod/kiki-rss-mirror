@@ -12,7 +12,6 @@ use tokio::task;
 use tracing::{event, Level};
 
 #[derive(Default, Serialize, Deserialize, utoipa::ToSchema)]
-#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct UpdateFeedRequest {
     pub title: Option<String>,
     pub url: Option<String>,

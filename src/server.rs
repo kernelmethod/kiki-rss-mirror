@@ -770,7 +770,7 @@ async fn uds_server(
         data_dir,
         script_runner,
     });
-    let app = routes::create_router(metrics, shared_state.clone()).with_state(shared_state);
+    let app = routes::create_router(metrics).with_state(shared_state);
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Unable to bind to Unix socket at {:?}", socket_path))?;
@@ -813,7 +813,7 @@ async fn tcp_server(
         data_dir,
         script_runner,
     });
-    let app = routes::create_router(metrics, shared_state.clone()).with_state(shared_state);
+    let app = routes::create_router(metrics).with_state(shared_state);
 
     let listener = TcpListener::bind(addr)
         .await

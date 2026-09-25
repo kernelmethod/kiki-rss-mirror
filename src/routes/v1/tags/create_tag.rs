@@ -11,7 +11,6 @@ use tokio::task;
 use tracing::{event, Level};
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
-#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct CreateTagRequest {
     pub name: String,
 }
