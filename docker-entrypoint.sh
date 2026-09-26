@@ -13,18 +13,23 @@ if [ -n "${KIKI_DATA_DIR:-}" ]; then
 fi
 
 : "${KIKI_HOME:=/data}"
-: "${KIKI_BIND:=0.0.0.0}"
-: "${KIKI_PORT:=8000}"
 
-# Every kiki subcommand resolves its paths out of $KIKI_HOME.
+# Every kiki subcommand resolves its paths out of $KIKI_HOME, which is set
+# here rather than inherited, so it has to be exported. ($KIKI_RUNTIME_DIR
+# and $KIKI_SOCKET are honoured too, but `docker run -e` already exports
+# those.)
+#
+# Kiki serves over a Unix socket only, so with none of them set the socket
+# lands at $KIKI_HOME/kiki.sock — inside the /data volume, where the host
+# reaches it through a bind mount.
 export KIKI_HOME
 
 # Idempotent: --check is a no-op when kiki.db already exists.
-kiki init --check "$KIKI_HOME"
+kiki init --check
 
 if [ "${1:-serve}" = "serve" ]; then
     shift 2>/dev/null || true
-    exec kiki serve --bind "$KIKI_BIND" --port "$KIKI_PORT" "$@"
+    exec kiki serve "$@"
 fi
 
 exec kiki "$@"

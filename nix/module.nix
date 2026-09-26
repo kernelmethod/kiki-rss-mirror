@@ -9,16 +9,14 @@ in
 
     package = lib.mkPackageOption pkgs "kiki" { };
 
-    port = lib.mkOption {
-      type = lib.types.nullOr lib.types.port;
-      default = null;
-      description = "TCP port to listen on. Mutually exclusive with unixSocket.";
-    };
-
     unixSocket = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
+      type = lib.types.path;
       default = "/run/kiki/kiki.sock";
-      description = "Path to Unix domain socket. Set to null to use TCP port instead.";
+      description = ''
+        Path to the Unix domain socket kiki serves on. kiki does not listen
+        on TCP; put a reverse proxy in front of this socket to expose it
+        over the network.
+      '';
     };
 
     dataDir = lib.mkOption {
@@ -41,11 +39,6 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = [{
-      assertion = !(cfg.port != null && cfg.unixSocket != null);
-      message = "services.kiki: port and unixSocket are mutually exclusive.";
-    }];
-
     users.users.${cfg.user} = {
       isSystemUser = true;
       group = cfg.group;
@@ -70,16 +63,9 @@ in
         User = cfg.user;
         Group = cfg.group;
         WorkingDirectory = cfg.dataDir;
-        RuntimeDirectory = lib.mkIf (cfg.unixSocket != null) "kiki";
-        ExecStartPre = "${cfg.package}/bin/kiki init --check ${cfg.dataDir}";
-        ExecStart =
-          let
-            listenFlag =
-              if cfg.port != null then "-p ${toString cfg.port}"
-              else if cfg.unixSocket != null then "-u ${cfg.unixSocket}"
-              else "";
-          in
-          "${cfg.package}/bin/kiki serve ${listenFlag}";
+        RuntimeDirectory = "kiki";
+        ExecStartPre = "${cfg.package}/bin/kiki init --check";
+        ExecStart = "${cfg.package}/bin/kiki serve -u ${cfg.unixSocket}";
         Restart = "on-failure";
         RestartSec = 5;
       };

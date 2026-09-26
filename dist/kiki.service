@@ -10,7 +10,7 @@ WorkingDirectory=/var/lib/kiki
 RuntimeDirectory=kiki
 RuntimeDirectoryMode=0750
 Environment=KIKI_HOME=/var/lib/kiki
-ExecStartPre=/usr/bin/kiki init --check /var/lib/kiki
+ExecStartPre=/usr/bin/kiki init --check
 ExecStart=/usr/bin/kiki serve --uds /run/kiki/kiki.sock
 Restart=on-failure
 RestartSec=5

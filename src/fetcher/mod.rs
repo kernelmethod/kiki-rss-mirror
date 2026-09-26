@@ -14,7 +14,7 @@
 //! places the work actually happens in, so callers do not change.
 //!
 //! Everything that crosses the process boundary is plain data, and all of
-//! it is `Serialize` + `Deserialize` so it can be framed as JSON.
+//! it is `Serialize` + `Deserialize` so it can be sent over the IPC channel.
 
 pub mod parse;
 pub mod retrieve;

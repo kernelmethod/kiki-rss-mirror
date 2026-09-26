@@ -1,6 +1,6 @@
 [package]
 name = "kiki-rss"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2021"
 description = "An RSS feed aggregator"
 license = "MIT"
@@ -44,6 +44,8 @@ rss = "2.0"
 rusqlite = { version = "0.34", features = ["bundled", "functions"] }
 serde = { version = "1.0", features = ["serde_derive"] }
 serde_json = "1.0"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+serde_bytes = "0.11"
 metrics = { version = "0.24", optional = true }
 metrics-exporter-prometheus = { version = "0.17", default-features = false, optional = true }
 mlua = { version = "0.10", features = ["lua54", "vendored", "send"], optional = true }
@@ -61,6 +63,10 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 seccompiler = "0.5"
+
+# musl's malloc is slow under contention, so musl builds use mimalloc instead.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"
 
 [dev-dependencies]
 flate2 = "1"
@@ -116,7 +122,7 @@ post_install_script = """
 # Create and set ownership on data directory
 install -d -m 0750 -o kiki -g kiki /var/lib/kiki
 # Initialize the database (idempotent)
-su -s /bin/sh kiki -c '/usr/bin/kiki init --check /var/lib/kiki'
+su -s /bin/sh kiki -c 'KIKI_HOME=/var/lib/kiki /usr/bin/kiki init --check'
 # Reload systemd and enable service
 systemctl daemon-reload
 """

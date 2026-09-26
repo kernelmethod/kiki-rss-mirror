@@ -97,11 +97,11 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
             data_dir,
             socket_dir,
         } => {
+            // The socket usually lives in the data directory, in which case
+            // the one rule already covers it.
             let mut rw_paths: Vec<PathBuf> = vec![data_dir.clone()];
-            if let Some(d) = socket_dir {
-                if !rw_paths.iter().any(|p| paths_equal(p, d)) {
-                    rw_paths.push(d.clone());
-                }
+            if !paths_equal(data_dir, socket_dir) {
+                rw_paths.push(socket_dir.clone());
             }
             let ro_paths: Vec<PathBuf> = existing(RO_RESOLVER_PATHS)
                 .chain(existing(RO_TLS_PATHS))
@@ -421,7 +421,7 @@ mod tests {
     fn server_profile_grants_data_and_socket_dirs() {
         let (rw, _) = landlock_paths(&SandboxProfile::Server {
             data_dir: PathBuf::from("/var/lib/kiki"),
-            socket_dir: Some(PathBuf::from("/run/kiki")),
+            socket_dir: PathBuf::from("/run/kiki"),
         });
         assert_eq!(
             rw,
@@ -433,7 +433,7 @@ mod tests {
     fn server_profile_deduplicates_identical_dirs() {
         let (rw, _) = landlock_paths(&SandboxProfile::Server {
             data_dir: PathBuf::from("/var/lib/kiki"),
-            socket_dir: Some(PathBuf::from("/var/lib/kiki")),
+            socket_dir: PathBuf::from("/var/lib/kiki"),
         });
         assert_eq!(rw, vec![PathBuf::from("/var/lib/kiki")]);
     }

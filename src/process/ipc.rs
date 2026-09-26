@@ -1,8 +1,14 @@
-//! Length-prefixed framing for inter-process messages, and the script
-//! host's message types.
+//! Length-prefixed framing for inter-process messages, the codec for
+//! their bodies, and the script host's message types.
 //!
 //! Frames are a little-endian `u32` byte count followed by that many
-//! bytes of JSON. Both directions cap the frame size: the parent because a
+//! bytes of [postcard]-encoded message, written with [`encode`] and read
+//! with [`decode`]. Postcard is compact and not self-describing: fields
+//! are written in declaration order with no names, and enum variants by
+//! index. That is safe here because both ends of every channel are the
+//! same binary, so the message types can never disagree.
+//!
+//! Both directions cap the frame size: the parent because a
 //! compromised child must not be able to drive it into an allocation it
 //! cannot afford, and the child for symmetry. The script host channel uses
 //! [`MAX_FRAME_BYTES`]; the feed fetcher channel, which carries whole
@@ -17,7 +23,7 @@
 //! multiplexed instead; see [`crate::process::feed_fetcher`].
 
 use crate::scripting::{Event, EventPayload, FeedEntry};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -25,7 +31,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 ///
 /// Entries carry a feed's `content` field, which is capped upstream by
 /// the `max_feed_bytes` setting; 8 MiB leaves generous room for a single
-/// entry plus its JSON encoding without letting one message balloon the
+/// entry plus its encoding without letting one message balloon the
 /// peer's memory.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
@@ -64,6 +70,77 @@ pub enum HostResponse {
     /// entry passes through unmodified, matching the in-process
     /// runner's contract.
     Failed { message: String },
+}
+
+/// Why a frame body could not be encoded or decoded.
+#[derive(Debug, thiserror::Error)]
+pub enum CodecError {
+    /// The message could not be encoded, or the frame does not hold a
+    /// valid encoding of the expected type.
+    #[error(transparent)]
+    Postcard(#[from] postcard::Error),
+
+    /// The frame held a valid message followed by bytes that belong to
+    /// no message.
+    #[error("{0} unexpected bytes after the message")]
+    TrailingBytes(usize),
+}
+
+/// Encode `msg` as a frame body.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::process::ipc::{decode, encode, HostResponse};
+///
+/// let body = encode(&HostResponse::Reloaded { loaded: 2 })?;
+/// let back: HostResponse = decode(&body)?;
+/// assert!(matches!(back, HostResponse::Reloaded { loaded: 2 }));
+/// # Ok::<(), kiki_rss::process::ipc::CodecError>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns [`CodecError::Postcard`] if `msg`'s `Serialize` impl fails.
+/// The size limit is not checked here; the `write_frame` functions
+/// enforce it.
+pub fn encode<T: Serialize + ?Sized>(msg: &T) -> Result<Vec<u8>, CodecError> {
+    Ok(postcard::to_stdvec(msg)?)
+}
+
+/// Decode a frame body written by [`encode`].
+///
+/// The whole frame must be consumed: leftover bytes mean the peer and
+/// this side disagree about the message, which is treated as corruption.
+///
+/// # Errors
+///
+/// Returns [`CodecError::Postcard`] if `frame` is not a valid encoding of
+/// `T`, and [`CodecError::TrailingBytes`] if it is followed by anything.
+pub fn decode<T: DeserializeOwned>(frame: &[u8]) -> Result<T, CodecError> {
+    let (msg, rest) = postcard::take_from_bytes(frame)?;
+    if rest.is_empty() {
+        Ok(msg)
+    } else {
+        Err(CodecError::TrailingBytes(rest.len()))
+    }
+}
+
+/// Decode only the start of a frame body, ignoring whatever follows.
+///
+/// Because postcard writes fields in declaration order, a type that
+/// mirrors a message's variants and its leading fields can pick those out
+/// without touching the rest of the frame — which is how the feed
+/// fetcher's supervisor reads request ids out of frames that may carry
+/// megabytes of feed. The mirror's variants must be declared in the same
+/// order as the message's.
+///
+/// # Errors
+///
+/// Returns [`CodecError::Postcard`] if the start of `frame` is not a valid
+/// encoding of `T`.
+pub fn decode_prefix<T: DeserializeOwned>(frame: &[u8]) -> Result<T, CodecError> {
+    Ok(postcard::take_from_bytes(frame)?.0)
 }
 
 /// Write `payload` as a single length-prefixed frame.
@@ -279,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn requests_and_responses_survive_a_json_round_trip() {
+    fn requests_and_responses_survive_a_round_trip() {
         let entry = FeedEntry {
             feed_id: 7,
             syndication_format: "rss".to_string(),
@@ -294,8 +371,8 @@ mod tests {
         let req = HostRequest::TransformEntry {
             entry: entry.clone(),
         };
-        let encoded = serde_json::to_vec(&req).unwrap();
-        let decoded: HostRequest = serde_json::from_slice(&encoded).unwrap();
+        let encoded = encode(&req).unwrap();
+        let decoded: HostRequest = decode(&encoded).unwrap();
         match decoded {
             HostRequest::TransformEntry { entry: e } => {
                 assert_eq!(e.guid, entry.guid);
@@ -305,8 +382,8 @@ mod tests {
         }
 
         let resp = HostResponse::Entry { entry: Some(entry) };
-        let encoded = serde_json::to_vec(&resp).unwrap();
-        let decoded: HostResponse = serde_json::from_slice(&encoded).unwrap();
+        let encoded = encode(&resp).unwrap();
+        let decoded: HostResponse = decode(&encoded).unwrap();
         assert!(matches!(decoded, HostResponse::Entry { entry: Some(_) }));
     }
 
@@ -325,8 +402,8 @@ mod tests {
             event: Event::FetchError,
             payload,
         };
-        let encoded = serde_json::to_vec(&req).unwrap();
-        let decoded: HostRequest = serde_json::from_slice(&encoded).unwrap();
+        let encoded = encode(&req).unwrap();
+        let decoded: HostRequest = decode(&encoded).unwrap();
         match decoded {
             HostRequest::Observe {
                 event,
@@ -337,5 +414,33 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn trailing_bytes_are_refused() {
+        let mut encoded = encode(&HostResponse::Ack).unwrap();
+        encoded.push(0);
+        let err = decode::<HostResponse>(&encoded).unwrap_err();
+        assert!(matches!(err, CodecError::TrailingBytes(1)), "got {err:?}");
+    }
+
+    #[test]
+    fn garbage_is_refused() {
+        assert!(decode::<HostResponse>(b"").is_err());
+        assert!(decode::<HostResponse>(&[0xff]).is_err());
+        assert!(decode::<HostRequest>(b"{\"Reload\":{\"sources\":[]}}").is_err());
+    }
+
+    #[test]
+    fn a_prefix_can_be_decoded_on_its_own() {
+        #[derive(Deserialize)]
+        enum Mirror {
+            Reloaded { loaded: usize },
+        }
+        let encoded = encode(&HostResponse::Reloaded { loaded: 3 }).unwrap();
+        let mut padded = encoded.clone();
+        padded.extend_from_slice(b"ignored");
+        let Mirror::Reloaded { loaded } = decode_prefix(&padded).unwrap();
+        assert_eq!(loaded, 3);
     }
 }

@@ -6,46 +6,23 @@ use anyhow::anyhow;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-/// Where the server will listen, resolved from the CLI arguments and the
-/// process environment.
-#[derive(Debug, Clone)]
-enum Listener {
-    /// A Unix domain socket at the given path.
-    Uds(PathBuf),
-
-    /// A TCP socket address.
-    Tcp(SocketAddr),
-}
-
+/// Arguments for the `kiki serve` subcommand.
+///
+/// Kiki serves over a Unix domain socket and nothing else. A socket is
+/// reachable only by processes that can reach its path, which is access
+/// control the server does not have to implement, authenticate, or get
+/// right; a TCP listener has none of that. Put a reverse proxy in front to
+/// expose Kiki over the network, and let it own the TLS and authentication
+/// that job needs.
 #[derive(Args)]
 pub struct ServeArgs {
-    /// Listen on a TCP port
-    #[arg(short, long, conflicts_with = "socket_path")]
-    port: Option<u16>,
-
-    /// IP address to bind the TCP listener to. Only meaningful with --port.
-    #[arg(
-        short = 'b',
-        long,
-        default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST),
-        requires = "port",
-        conflicts_with = "socket_path",
-    )]
-    bind: IpAddr,
-
     /// Path to the Unix domain socket
-    /// [default: $KIKI_SOCKET, $KIKI_HOME/kiki.sock, or
-    /// $XDG_RUNTIME_DIR/kiki/kiki.sock]
-    #[arg(
-        short = 'u',
-        long = "uds",
-        value_name = "PATH",
-        conflicts_with = "port"
-    )]
+    /// [default: $KIKI_SOCKET, $KIKI_RUNTIME_DIR/kiki.sock,
+    /// $KIKI_HOME/kiki.sock, or $XDG_RUNTIME_DIR/kiki/kiki.sock]
+    #[arg(short = 'u', long = "uds", value_name = "PATH")]
     socket_path: Option<PathBuf>,
 
     /// Disable the OS-level sandbox (Landlock + seccomp-bpf on Linux).
@@ -83,9 +60,8 @@ impl ServeArgs {
         let data_dir = paths::resolve_data_dir(&env)?;
         if !data_dir.path.is_dir() {
             bail!(
-                "no Kiki data directory at {}; run `kiki init {}` to create one, or set \
-                 $KIKI_HOME",
-                data_dir.path.display(),
+                "no Kiki data directory at {}; run `kiki init` to create one, or set \
+                 $KIKI_HOME to point Kiki somewhere else",
                 data_dir.path.display(),
             );
         }
@@ -96,16 +72,13 @@ impl ServeArgs {
             "using data directory"
         );
 
-        let listener = self.resolve_listener(&data_dir, &env)?;
+        let socket_path = self.resolve_socket_path(&data_dir, &env)?;
 
         // The socket's parent directory has to exist before the sandbox is
         // installed: Landlock rules can only be attached to paths that
         // already exist, and once the ruleset is in force the process can no
         // longer create the directory itself.
-        let socket_dir = match &listener {
-            Listener::Uds(path) => Some(ensure_socket_dir(path)?),
-            Listener::Tcp(_) => None,
-        };
+        let socket_dir = ensure_socket_dir(&socket_path)?;
 
         // Spawn the children *before* the sandbox goes up: every profile
         // denies `execve`, so this is the last moment at which the server
@@ -126,15 +99,12 @@ impl ServeArgs {
 
         let mut builder = server::ServerBuilder::new(&db_path)
             .autofetch()
-            .feed_fetcher(feed_fetcher);
+            .feed_fetcher(feed_fetcher)
+            .socket_path(&socket_path);
         #[cfg(all(unix, feature = "lua"))]
         {
             builder = builder.script_host(script_host);
         }
-        builder = match &listener {
-            Listener::Uds(path) => builder.socket_path(path),
-            Listener::Tcp(addr) => builder.bind_addr(*addr),
-        };
         let server = builder.build();
 
         std::thread::spawn(|| server.run())
@@ -191,24 +161,17 @@ impl ServeArgs {
         Ok(Some(Arc::new(host)))
     }
 
-    /// Resolve where the server should listen.
-    ///
-    /// `--port` selects TCP; otherwise the server listens on a Unix domain
-    /// socket whose path is resolved by [`paths::resolve_socket_path`].
+    /// Resolve the path of the socket the server should listen on, as
+    /// [`paths::resolve_socket_path`] defines it.
     ///
     /// # Errors
     ///
     /// Returns an error if the resolved socket path is too long to fit in a
     /// Unix socket address.
-    fn resolve_listener(&self, data_dir: &paths::DataDir, env: &Env) -> Result<Listener> {
-        match self.port {
-            Some(port) => Ok(Listener::Tcp(SocketAddr::new(self.bind, port))),
-            None => {
-                let path = paths::resolve_socket_path(self.socket_path.as_deref(), data_dir, env);
-                paths::validate_socket_path(&path)?;
-                Ok(Listener::Uds(path))
-            }
-        }
+    fn resolve_socket_path(&self, data_dir: &paths::DataDir, env: &Env) -> Result<PathBuf> {
+        let path = paths::resolve_socket_path(self.socket_path.as_deref(), data_dir, env);
+        paths::validate_socket_path(&path)?;
+        Ok(path)
     }
 }
 
@@ -244,13 +207,9 @@ fn ensure_socket_dir(socket_path: &Path) -> Result<PathBuf> {
 /// The sandbox needs read-write access to:
 ///   * the directory containing the SQLite database (which also contains
 ///     the `assets/` cache tree), and
-///   * the parent directory of the Unix socket, if the server is
-///     listening on a UDS (so the socket file can be created/unlinked).
-fn build_sandbox_config(
-    db_path: &Path,
-    socket_dir: Option<PathBuf>,
-    args: &ServeArgs,
-) -> SandboxConfig {
+///   * the parent directory of the Unix socket, so the socket file can be
+///     created and unlinked.
+fn build_sandbox_config(db_path: &Path, socket_dir: PathBuf, args: &ServeArgs) -> SandboxConfig {
     SandboxConfig::server(parent_or_cwd(db_path), socket_dir, args.seccomp_log_only)
 }
 
@@ -284,6 +243,34 @@ mod tests {
         TestCli::parse_from(std::iter::once("kiki").chain(argv.iter().copied())).serve
     }
 
+    fn try_parse(argv: &[&str]) -> Result<ServeArgs, clap::Error> {
+        Ok(TestCli::try_parse_from(std::iter::once("kiki").chain(argv.iter().copied()))?.serve)
+    }
+
+    /// Kiki serves over a Unix socket only: the TCP flags are gone, and
+    /// asking for one is an error rather than a silently ignored argument.
+    #[test]
+    fn the_tcp_flags_are_rejected() {
+        for argv in [
+            vec!["--port", "8000"],
+            vec!["-p", "8000"],
+            vec!["--bind", "0.0.0.0"],
+            vec!["-b", "0.0.0.0"],
+        ] {
+            assert!(try_parse(&argv).is_err(), "{argv:?} should no longer parse");
+        }
+    }
+
+    /// The socket flag still parses under both spellings.
+    #[test]
+    fn the_uds_flag_still_parses() -> Result<()> {
+        for argv in [vec!["--uds", "/tmp/k.sock"], vec!["-u", "/tmp/k.sock"]] {
+            let args = try_parse(&argv)?;
+            assert_eq!(args.socket_path.as_deref(), Some(Path::new("/tmp/k.sock")));
+        }
+        Ok(())
+    }
+
     /// A data directory nobody named — the platform default, which is what
     /// leaves the socket to the runtime directory.
     fn platform_dir() -> paths::DataDir {
@@ -298,10 +285,7 @@ mod tests {
     fn config_from_env(argv: &[&str], env: &Env) -> Result<SandboxConfig> {
         let args = parse(argv);
         let data_dir = platform_dir();
-        let socket_dir = match args.resolve_listener(&data_dir, env)? {
-            Listener::Uds(path) => Some(parent_or_cwd(&path)),
-            Listener::Tcp(_) => None,
-        };
+        let socket_dir = parent_or_cwd(&args.resolve_socket_path(&data_dir, env)?);
         Ok(build_sandbox_config(
             &data_dir.path.join(paths::DB_FILE_NAME),
             socket_dir,
@@ -315,7 +299,7 @@ mod tests {
 
     /// Unpack the server profile, failing the test if `serve` somehow
     /// built any other one.
-    fn server_paths(config: &SandboxConfig) -> (&PathBuf, &Option<PathBuf>) {
+    fn server_paths(config: &SandboxConfig) -> (&PathBuf, &PathBuf) {
         match &config.profile {
             SandboxProfile::Server {
                 data_dir,
@@ -326,19 +310,11 @@ mod tests {
     }
 
     #[test]
-    fn uds_mode_grants_the_socket_directory() {
+    fn the_socket_directory_is_granted() {
         let config = config_from(&[]);
         let (data_dir, socket_dir) = server_paths(&config);
         assert_eq!(data_dir, &PathBuf::from("/data"));
-        assert_eq!(socket_dir, &Some(PathBuf::from("/data")));
-    }
-
-    #[test]
-    fn tcp_mode_grants_no_socket_directory() {
-        let config = config_from(&["--port", "8000"]);
-        let (data_dir, socket_dir) = server_paths(&config);
-        assert_eq!(data_dir, &PathBuf::from("/data"));
-        assert_eq!(socket_dir, &None);
+        assert_eq!(socket_dir, &PathBuf::from("/data"));
     }
 
     #[test]
@@ -359,29 +335,48 @@ mod tests {
         let config = config_from_env(&[], &env)?;
 
         let (_, socket_dir) = server_paths(&config);
-        assert_eq!(socket_dir, &Some(PathBuf::from("/run/user/1000/kiki")));
+        assert_eq!(socket_dir, &PathBuf::from("/run/user/1000/kiki"));
+        Ok(())
+    }
+
+    /// The same holds for a runtime directory named by `$KIKI_RUNTIME_DIR`:
+    /// the sandbox grants it, and without the `kiki/` subdirectory the
+    /// platform default would have added.
+    #[test]
+    fn uds_mode_grants_a_named_runtime_dir() -> Result<()> {
+        let env = Env {
+            kiki_runtime_dir: Some(PathBuf::from("/run/kiki")),
+            runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..Env::default()
+        };
+        let config = config_from_env(&[], &env)?;
+
+        let (data_dir, socket_dir) = server_paths(&config);
+        assert_eq!(data_dir, &PathBuf::from("/data"));
+        assert_eq!(socket_dir, &PathBuf::from("/run/kiki"));
         Ok(())
     }
 
     #[test]
-    fn port_selects_a_tcp_listener() -> Result<()> {
-        let listener =
-            parse(&["--port", "8000"]).resolve_listener(&platform_dir(), &Env::default())?;
-        assert!(matches!(listener, Listener::Tcp(addr) if addr.port() == 8000));
+    fn default_socket_honours_kiki_runtime_dir() -> Result<()> {
+        let env = Env {
+            kiki_runtime_dir: Some(PathBuf::from("/run/kiki")),
+            runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..Env::default()
+        };
+        let socket = parse(&[]).resolve_socket_path(&platform_dir(), &env)?;
+        assert_eq!(socket, Path::new("/run/kiki/kiki.sock"));
         Ok(())
     }
 
     #[test]
-    fn default_listener_is_a_socket_in_the_runtime_dir() -> Result<()> {
+    fn default_socket_is_in_the_runtime_dir() -> Result<()> {
         let env = Env {
             runtime_dir: Some(PathBuf::from("/run/user/1000")),
             ..Env::default()
         };
-        let listener = parse(&[]).resolve_listener(&platform_dir(), &env)?;
-        assert!(
-            matches!(&listener, Listener::Uds(p) if p == Path::new("/run/user/1000/kiki/kiki.sock")),
-            "unexpected listener: {listener:?}"
-        );
+        let socket = parse(&[]).resolve_socket_path(&platform_dir(), &env)?;
+        assert_eq!(socket, Path::new("/run/user/1000/kiki/kiki.sock"));
         Ok(())
     }
 
@@ -391,12 +386,9 @@ mod tests {
             runtime_dir: Some(PathBuf::from("/run/user/1000")),
             ..Env::default()
         };
-        let listener =
-            parse(&["--uds", "/tmp/elsewhere.sock"]).resolve_listener(&platform_dir(), &env)?;
-        assert!(
-            matches!(&listener, Listener::Uds(p) if p == Path::new("/tmp/elsewhere.sock")),
-            "unexpected listener: {listener:?}"
-        );
+        let socket =
+            parse(&["--uds", "/tmp/elsewhere.sock"]).resolve_socket_path(&platform_dir(), &env)?;
+        assert_eq!(socket, Path::new("/tmp/elsewhere.sock"));
         Ok(())
     }
 
@@ -414,12 +406,9 @@ mod tests {
             path: PathBuf::from("/srv/kiki"),
             source: paths::DataDirSource::KikiHome,
         };
-        let listener = args.resolve_listener(&data_dir, &env)?;
+        let socket = args.resolve_socket_path(&data_dir, &env)?;
 
-        assert!(
-            matches!(&listener, Listener::Uds(p) if p == Path::new("/srv/kiki/kiki.sock")),
-            "unexpected listener: {listener:?}"
-        );
+        assert_eq!(socket, Path::new("/srv/kiki/kiki.sock"));
         Ok(())
     }
 
@@ -427,7 +416,7 @@ mod tests {
     fn an_over_long_socket_path_is_rejected() {
         let long = format!("/{}/kiki.sock", "a".repeat(paths::MAX_SOCKET_PATH_LEN));
         assert!(parse(&["--uds", &long])
-            .resolve_listener(&platform_dir(), &Env::default())
+            .resolve_socket_path(&platform_dir(), &Env::default())
             .is_err());
     }
 

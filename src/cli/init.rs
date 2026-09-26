@@ -38,17 +38,15 @@ pub(crate) fn default_directory() -> Result<PathBuf> {
     paths::default_data_dir(&Env::from_process())
 }
 
+/// Arguments for the `kiki init` subcommand.
+///
+/// `kiki init` takes no directory. It always sets up
+/// [`default_directory`] — `$KIKI_HOME` when that is set, and the platform
+/// data directory otherwise — so there is only ever one answer to where
+/// Kiki lives, and every other subcommand resolves it the same way. To
+/// initialize somewhere else, name it with `$KIKI_HOME`.
 #[derive(Args)]
 pub struct InitArgs {
-    /// The directory that Kiki's files should be set up in
-    #[arg(conflicts_with = "auto")]
-    directory: Option<PathBuf>,
-
-    /// Use Kiki's default directory ($KIKI_HOME, or the platform data
-    /// directory)
-    #[arg(long)]
-    auto: bool,
-
     /// Do nothing if Kiki has already been configured
     #[arg(short, long, conflicts_with = "force")]
     check: bool,
@@ -59,58 +57,31 @@ pub struct InitArgs {
 }
 
 impl InitArgs {
-    /// Create an `InitArgs` equivalent to `kiki init --auto --check`.
+    /// Create an `InitArgs` equivalent to `kiki init --check`.
     ///
-    /// This initializes Kiki's default directory if it hasn't been set up
-    /// yet, and is a no-op otherwise.
-    pub(crate) fn auto_with_check() -> Self {
+    /// This initializes Kiki's directory if it hasn't been set up yet, and
+    /// is a no-op otherwise.
+    pub(crate) fn with_check() -> Self {
         Self {
-            directory: None,
-            auto: true,
             check: true,
             force: false,
         }
     }
 
-    /// Resolve the target directory from the provided arguments.
-    ///
-    /// A bare `kiki init` with `$KIKI_HOME` set needs no `--auto`: the
-    /// environment has already named the directory, and asking for the flag
-    /// as well would be ceremony.
+    /// Run the `init` subcommand.
     ///
     /// # Errors
     ///
-    /// Returns an error if no directory was given, `--auto` was not passed,
-    /// and `$KIKI_HOME` is unset.
-    fn resolve_directory(&self) -> Result<PathBuf> {
-        self.resolve_directory_in(&Env::from_process())
-    }
-
-    /// [`resolve_directory`](Self::resolve_directory) against an explicit
-    /// environment.
-    fn resolve_directory_in(&self, env: &Env) -> Result<PathBuf> {
-        if self.auto {
-            return paths::default_data_dir(env);
-        }
-
-        if let Some(ref dir) = self.directory {
-            return Ok(dir.clone());
-        }
-
-        if env.kiki_home.is_some() {
-            return paths::default_data_dir(env);
-        }
-
-        bail!(
-            "please provide a directory, set $KIKI_HOME, or use --auto for the platform \
-             default"
-        )
-    }
-
-    /// Run the `init` subcommand
+    /// Returns an error if the target directory cannot be determined, if a
+    /// database is already present and neither `--check` nor `--force` was
+    /// passed, or if the directory or database cannot be created.
     pub fn run(&self) -> Result<()> {
-        let directory = self.resolve_directory()?;
-        let db_path = Path::new(&directory).join(paths::DB_FILE_NAME);
+        self.run_in(&default_directory()?)
+    }
+
+    /// [`run`](Self::run) against an explicit directory.
+    fn run_in(&self, directory: &Path) -> Result<()> {
+        let db_path = directory.join(paths::DB_FILE_NAME);
         if db_path.exists() {
             if self.check {
                 // Kiki has already been configured
@@ -125,9 +96,9 @@ impl InitArgs {
                 .with_context(|| format!("unable to delete database file at {:#?}", db_path))?;
         }
 
-        fs::create_dir_all(&directory)
+        fs::create_dir_all(directory)
             .with_context(|| format!("unable to create directory {directory:?}"))?;
-        restrict_permissions(&directory, 0o750)?;
+        restrict_permissions(directory, 0o750)?;
 
         ConnectionBuilder::default()
             .at_path(&db_path)
@@ -148,34 +119,26 @@ mod test {
     use anyhow::Result;
     use tempdir::TempDir;
 
+    /// An `InitArgs` with every flag at its default.
+    fn args() -> InitArgs {
+        InitArgs {
+            check: false,
+            force: false,
+        }
+    }
+
     /// Test the `--check` flag for `kiki init`.
     #[test]
     fn test_check() -> Result<()> {
         let td = TempDir::new("kiki_")?;
-        let path = PathBuf::from(td.path());
+        let path = td.path();
+        assert!(args().run_in(path).is_ok());
+        assert!(args().run_in(path).is_err());
         assert!((InitArgs {
-            directory: Some(path.clone()),
-            auto: false,
-            check: false,
-            force: false
-        })
-        .run()
-        .is_ok());
-        assert!((InitArgs {
-            directory: Some(path.clone()),
-            auto: false,
-            check: false,
-            force: false
-        })
-        .run()
-        .is_err());
-        assert!((InitArgs {
-            directory: Some(path.clone()),
-            auto: false,
             check: true,
-            force: false
+            ..args()
         })
-        .run()
+        .run_in(path)
         .is_ok());
 
         Ok(())
@@ -185,96 +148,40 @@ mod test {
     #[test]
     fn test_force() -> Result<()> {
         let td = TempDir::new("kiki_")?;
-        let path = PathBuf::from(td.path());
+        let path = td.path();
+        assert!(args().run_in(path).is_ok());
+        assert!(args().run_in(path).is_err());
         assert!((InitArgs {
-            directory: Some(path.clone()),
-            auto: false,
-            check: false,
-            force: false
+            force: true,
+            ..args()
         })
-        .run()
-        .is_ok());
-        assert!((InitArgs {
-            directory: Some(path.clone()),
-            auto: false,
-            check: false,
-            force: false
-        })
-        .run()
-        .is_err());
-        assert!((InitArgs {
-            directory: Some(path.clone()),
-            auto: false,
-            check: false,
-            force: true
-        })
-        .run()
+        .run_in(path)
         .is_ok());
 
         Ok(())
     }
 
-    /// An `InitArgs` with every flag at its default.
-    fn auto_args() -> InitArgs {
-        InitArgs {
-            directory: None,
-            auto: true,
-            check: false,
-            force: false,
-        }
-    }
-
-    /// Test that `--auto` resolves to a path under the platform data directory.
+    /// `with_check` is `kiki init --check`, so it leaves an existing
+    /// database alone rather than failing on it.
     #[test]
-    fn test_auto() -> Result<()> {
-        let platform = PathBuf::from("/home/rey/.local/share/kiki");
-        let env = Env {
-            platform_data_dir: Some(platform.clone()),
-            ..Env::default()
-        };
-        assert_eq!(auto_args().resolve_directory_in(&env)?, platform);
+    fn test_with_check_is_idempotent() -> Result<()> {
+        let td = TempDir::new("kiki_")?;
+        let path = td.path();
+        assert!(InitArgs::with_check().run_in(path).is_ok());
+        assert!(InitArgs::with_check().run_in(path).is_ok());
+
         Ok(())
     }
 
-    /// `$KIKI_HOME` displaces the platform data directory under `--auto`.
+    /// `kiki init` creates the directory it was pointed at, rather than
+    /// requiring it to exist already.
     #[test]
-    fn test_auto_prefers_kiki_home() -> Result<()> {
-        let env = Env {
-            kiki_home: Some(PathBuf::from("/srv/kiki")),
-            platform_data_dir: Some(PathBuf::from("/home/rey/.local/share/kiki")),
-            ..Env::default()
-        };
-        assert_eq!(
-            auto_args().resolve_directory_in(&env)?,
-            Path::new("/srv/kiki")
-        );
-        Ok(())
-    }
+    fn test_creates_a_missing_directory() -> Result<()> {
+        let td = TempDir::new("kiki_")?;
+        let path = td.path().join("nested").join("home");
+        assert!(args().run_in(&path).is_ok());
+        assert!(path.join(paths::DB_FILE_NAME).exists());
 
-    /// With `$KIKI_HOME` set, a bare `kiki init` needs no `--auto`: the
-    /// environment has already named the directory.
-    #[test]
-    fn test_kiki_home_needs_no_auto() -> Result<()> {
-        let env = Env {
-            kiki_home: Some(PathBuf::from("/srv/kiki")),
-            ..Env::default()
-        };
-        let args = InitArgs {
-            auto: false,
-            ..auto_args()
-        };
-        assert_eq!(args.resolve_directory_in(&env)?, Path::new("/srv/kiki"));
         Ok(())
-    }
-
-    /// Test that providing neither a directory, nor `--auto`, nor
-    /// `$KIKI_HOME` returns an error.
-    #[test]
-    fn test_no_directory_no_auto() {
-        let args = InitArgs {
-            auto: false,
-            ..auto_args()
-        };
-        assert!(args.resolve_directory_in(&Env::default()).is_err());
     }
 }

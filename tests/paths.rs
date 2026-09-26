@@ -34,7 +34,7 @@ fn init_home() -> (TempDir, PathBuf) {
 
     let status = Command::new(KIKI_BIN)
         .arg("init")
-        .arg(&home)
+        .env("KIKI_HOME", &home)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -91,8 +91,8 @@ fn wait_for_failure(mut child: Child) -> String {
     stderr
 }
 
-/// `$KIKI_HOME` alone is enough for `kiki init` — no `--auto`, no directory
-/// argument — and `kiki migrate` then finds the same database from an
+/// `kiki init` takes no arguments at all: `$KIKI_HOME` says where the
+/// database goes, and `kiki migrate` then finds the same one from an
 /// unrelated working directory.
 #[test]
 fn kiki_home_governs_init_and_migrate() {
@@ -175,8 +175,8 @@ fn a_second_server_refuses_to_steal_the_socket() {
     );
 }
 
-/// The socket goes wherever the data directory was named, so the original
-/// `kiki init . && kiki serve` workflow still puts it at `./kiki.sock` — even
+/// The socket goes wherever the data directory was named, so serving from a
+/// directory that already holds a database puts it at `./kiki.sock` — even
 /// with a perfectly good runtime directory available.
 #[test]
 fn a_data_dir_named_by_the_current_directory_holds_the_socket() {
@@ -209,6 +209,104 @@ fn a_data_dir_named_by_the_current_directory_holds_the_socket() {
         !runtime.join("kiki").exists(),
         "the socket should not have gone to the runtime directory"
     );
+}
+
+/// `$KIKI_RUNTIME_DIR` takes the socket out of Kiki's home and into the
+/// directory it names — directly inside it, with no `kiki/` subdirectory —
+/// while the database stays put.
+#[test]
+fn kiki_runtime_dir_holds_the_socket() {
+    let (_td, home) = init_home();
+
+    let runtime = home.join("rundir");
+    let socket = runtime.join("kiki.sock");
+
+    let mut child = Command::new(KIKI_BIN)
+        .arg("serve")
+        .env("KIKI_HOME", &home)
+        .env("KIKI_RUNTIME_DIR", &runtime)
+        .env_remove("KIKI_SOCKET")
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn kiki serve");
+
+    wait_until_listening(&socket, &mut child);
+    let _guard = Server(child);
+
+    assert!(
+        home.join("kiki.db").exists(),
+        "the database stays in $KIKI_HOME"
+    );
+    assert!(
+        !home.join("kiki.sock").exists(),
+        "the socket should have left $KIKI_HOME"
+    );
+    assert!(
+        !runtime.join("kiki").exists(),
+        "$KIKI_RUNTIME_DIR should get no `kiki/` subdirectory"
+    );
+
+    // A runtime directory Kiki has to create is owner-only: the socket
+    // carries no authentication, so reachability is the access control.
+    assert_eq!(
+        std::fs::metadata(&runtime)
+            .expect("stat runtime dir")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
+/// With no `$KIKI_RUNTIME_DIR`, the socket still defaults under
+/// `$XDG_RUNTIME_DIR` — in a `kiki/` subdirectory, since that one is shared
+/// with every other application.
+#[test]
+fn xdg_runtime_dir_is_the_default_and_gets_a_subdirectory() {
+    let td = TempDir::new("kiki-paths-test").expect("create tempdir");
+    let xdg_data = td.path().join("data");
+    let runtime = td.path().join("run");
+    let elsewhere = td.path().join("elsewhere");
+    std::fs::create_dir(&runtime).expect("create runtime dir");
+    std::fs::create_dir(&elsewhere).expect("create dir");
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+        .expect("chmod runtime dir");
+
+    // Run from a directory with no kiki.db, so nobody names a data
+    // directory and the runtime-directory default applies.
+    let status = Command::new(KIKI_BIN)
+        .arg("init")
+        .current_dir(&elsewhere)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env_remove("KIKI_HOME")
+        .env_remove("KIKI_RUNTIME_DIR")
+        .env_remove("KIKI_SOCKET")
+        .stdout(Stdio::null())
+        .status()
+        .expect("spawn kiki init");
+    assert!(status.success(), "kiki init failed: {status:?}");
+
+    let socket = runtime.join("kiki").join("kiki.sock");
+    let mut child = Command::new(KIKI_BIN)
+        .arg("serve")
+        .current_dir(&elsewhere)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("KIKI_HOME")
+        .env_remove("KIKI_RUNTIME_DIR")
+        .env_remove("KIKI_SOCKET")
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn kiki serve");
+
+    wait_until_listening(&socket, &mut child);
+    let _guard = Server(child);
+
+    assert!(xdg_data.join("kiki").join("kiki.db").exists());
 }
 
 /// A socket file left behind by a killed server is stale, not occupied, and

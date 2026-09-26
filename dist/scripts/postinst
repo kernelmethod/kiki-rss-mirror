@@ -18,7 +18,7 @@ case "$1" in
         install -d -m 0750 -o kiki -g kiki /var/lib/kiki
 
         # Initialize the database (idempotent — skips if already set up)
-        su -s /bin/sh kiki -c '/usr/bin/kiki init --check /var/lib/kiki'
+        su -s /bin/sh kiki -c 'KIKI_HOME=/var/lib/kiki /usr/bin/kiki init --check'
 
         # Register the unit with systemd, enable it on first install,
         # and start (or restart on upgrade) the service.

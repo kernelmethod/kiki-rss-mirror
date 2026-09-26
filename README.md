@@ -9,7 +9,7 @@ power a reader.
 Start a Kiki server with
 
 ```bash
-cargo run --release -- init --auto
+cargo run --release -- init
 cargo run --release -- serve
 ```
 
@@ -58,16 +58,45 @@ curl \
 
 Both are per-user, so one server runs per user with no configuration needed.
 
-`$KIKI_HOME` moves all of it. Every subcommand honours it, and the socket
-lives in the directory alongside the database:
+Two environment variables name these directly. Each *is* the directory —
+neither gets a `kiki/` subdirectory appended, unlike the shared platform
+locations they replace:
+
+| | Names |
+| --- | --- |
+| `$KIKI_HOME` | Kiki's home: the database and cached assets |
+| `$KIKI_RUNTIME_DIR` | Kiki's runtime directory: the socket |
+
+`$KIKI_HOME` alone moves the whole instance, socket included — a directory
+Kiki was pointed at keeps the socket too:
 
 ```bash
 export KIKI_HOME=/srv/kiki
 kiki init && kiki serve   # /srv/kiki/kiki.db, /srv/kiki/kiki.sock
 ```
 
-Serving from a directory that already holds a `kiki.db` uses that directory
-the same way, so `kiki init . && kiki serve` keeps its socket at `./kiki.sock`.
+`$KIKI_RUNTIME_DIR` alone splits the socket back out, wherever the database
+happens to live:
 
-To place the socket on its own, pass `--uds PATH` or set `$KIKI_SOCKET`;
-`--port PORT` and `--bind ADDR` listen on TCP instead.
+```bash
+export KIKI_RUNTIME_DIR=/run/kiki
+kiki serve   # ~/.local/share/kiki/kiki.db, /run/kiki/kiki.sock
+```
+
+Set both and each goes where it was told. `kiki init` takes no arguments —
+it always sets up `$KIKI_HOME` when that is set, and the platform data
+directory otherwise.
+
+Serving from a directory that already holds a `kiki.db` uses that directory
+the same way, so `cd`-ing into one and running `kiki serve` keeps its socket
+at `./kiki.sock` unless `$KIKI_RUNTIME_DIR` says otherwise.
+
+To pin the socket to an exact path rather than a directory, pass
+`--uds PATH` or set `$KIKI_SOCKET`; both beat `$KIKI_RUNTIME_DIR`.
+
+Kiki serves over a Unix socket and nothing else — it does not listen on
+TCP. A socket is reachable only by processes that can reach its path, which
+is access control Kiki does not have to implement or authenticate. To expose
+it over the network, put a reverse proxy in front of the socket and let that
+own the TLS and authentication the job needs; nginx spells it
+`proxy_pass http://unix:/run/user/1000/kiki/kiki.sock:;`.

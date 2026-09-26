@@ -49,7 +49,7 @@ impl Kiki {
 
         let init_status = Command::new(KIKI_BIN)
             .arg("init")
-            .arg(dir.path())
+            .env("KIKI_HOME", dir.path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
