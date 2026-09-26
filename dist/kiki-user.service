@@ -53,7 +53,9 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
-SystemCallFilter=@system-service
+# @sandbox (landlock_* and seccomp) lets kiki install its own sandbox;
+# @system-service alone doesn't include it.
+SystemCallFilter=@system-service @sandbox
 SystemCallFilter=~@privileged @resources @mount @swap @reboot @module @debug @cpu-emulation @obsolete @raw-io @keyring
 UMask=0077
 

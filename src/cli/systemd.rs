@@ -141,7 +141,7 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
-SystemCallFilter=@system-service
+SystemCallFilter=@system-service @sandbox
 SystemCallFilter=~@privileged @resources @mount @swap @reboot @module @debug @cpu-emulation @obsolete @raw-io @keyring
 UMask=0077
 
@@ -365,5 +365,15 @@ mod test {
 
         assert!(unit
             .contains("ExecStartPre=\"/usr/bin/kiki\" init --check \"/home/ada lovelace/kiki\"\n"));
+    }
+
+    /// `kiki serve` installs its own Landlock and seccomp filters on startup.
+    /// Those syscalls live in `@sandbox`, not `@system-service`, and a
+    /// syscall outside the allowlist gets the process killed with SIGSYS.
+    #[test]
+    fn syscall_filter_allows_installing_the_sandbox() {
+        let unit = generate_unit_file("/usr/bin/kiki", DATA_DIR, false, None);
+
+        assert!(unit.contains("SystemCallFilter=@system-service @sandbox\n"));
     }
 }
