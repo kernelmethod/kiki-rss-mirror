@@ -54,7 +54,7 @@
 //!
 //! Parent and child talk over an anonymous `SOCK_STREAM` socket pair
 //! created before the fork, which the child inherits on [`CHILD_FD`].
-//! Messages are length-prefixed JSON frames (see [`ipc`]). Neither child
+//! Messages are length-prefixed postcard frames (see [`ipc`]). Neither child
 //! can open a Unix socket to connect elsewhere, so its parent is the only
 //! local process it can ever talk to.
 

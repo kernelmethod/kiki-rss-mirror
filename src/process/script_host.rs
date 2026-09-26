@@ -35,7 +35,9 @@
 //! **unmodified** rather than dropping it, which is the contract the
 //! in-process runner already documents.
 
-use crate::process::ipc::{read_frame, write_frame, HostRequest, HostResponse, MAX_FRAME_BYTES};
+use crate::process::ipc::{
+    decode, encode, read_frame, write_frame, HostRequest, HostResponse, MAX_FRAME_BYTES,
+};
 use crate::scripting::{Event, EventPayload, FeedEntry, ScriptRunner};
 use anyhow::{Context, Result};
 use std::io;
@@ -241,8 +243,8 @@ impl Drop for ScriptHost {
 /// Failures before the first byte goes out are [`HostError::Failed`], not
 /// [`HostError::Io`] — see [`HostError::is_fatal`].
 fn exchange(stream: &mut UnixStream, request: &HostRequest) -> Result<HostResponse, HostError> {
-    let encoded = serde_json::to_vec(request)
-        .map_err(|e| HostError::Failed(format!("could not encode request: {e}")))?;
+    let encoded =
+        encode(request).map_err(|e| HostError::Failed(format!("could not encode request: {e}")))?;
     if encoded.len() > MAX_FRAME_BYTES {
         return Err(HostError::Failed(format!(
             "request of {} bytes exceeds the {} byte frame limit",
@@ -252,8 +254,7 @@ fn exchange(stream: &mut UnixStream, request: &HostRequest) -> Result<HostRespon
     }
     write_frame(stream, &encoded)?;
     let frame = read_frame(stream)?;
-    serde_json::from_slice(&frame)
-        .map_err(|e| HostError::Protocol(format!("decoding response: {e}")))
+    decode(&frame).map_err(|e| HostError::Protocol(format!("decoding response: {e}")))
 }
 
 /// A [`ScriptRunner`] that forwards every dispatch to the script host
@@ -356,14 +357,14 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
             }
         };
 
-        let response = match serde_json::from_slice::<HostRequest>(&frame) {
+        let response = match decode::<HostRequest>(&frame) {
             Ok(request) => serve(&mut runner, request),
             Err(e) => HostResponse::Failed {
                 message: format!("undecodable request: {e}"),
             },
         };
 
-        let encoded = match serde_json::to_vec(&response) {
+        let encoded = match encode(&response) {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "script host: could not encode a response, exiting");

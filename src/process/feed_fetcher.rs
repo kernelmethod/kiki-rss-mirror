@@ -63,7 +63,8 @@ use crate::fetcher::{
     MAX_REDIRECTS,
 };
 use crate::process::ipc::{
-    read_frame_async, read_frame_limited, write_frame_async, write_frame_limited,
+    decode, decode_prefix, encode, read_frame_async, read_frame_limited, write_frame_async,
+    write_frame_limited,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -91,10 +92,11 @@ pub const HOST_FD_ENV: &str = "KIKI_FEED_FETCHER_FD";
 /// Largest frame either side will write or accept.
 ///
 /// A response carries a whole parsed feed, whose body is capped upstream
-/// by the `max_feed_bytes` setting (32 MiB by default). JSON escaping can
-/// grow that several-fold in the worst case, so the cap here is a
-/// multiple of the default; a reply that still does not fit is turned
-/// into an error by the worker rather than sent.
+/// by the `max_feed_bytes` setting (32 MiB by default); a `Parse` request
+/// carries a `file://` body, which is not capped at all. Postcard adds
+/// only a few bytes of overhead per field, so the cap here is a multiple
+/// of the default to leave room for raised settings; a reply that still
+/// does not fit is turned into an error by the worker rather than sent.
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 
 /// Extra time the server allows past the fetch's own timeouts before it
@@ -170,7 +172,12 @@ pub enum Job {
     Fetch(FetchSpec),
 
     /// Parse a body the server read itself (a `file://` feed).
-    Parse { feed_id: i64, body: Vec<u8> },
+    Parse {
+        feed_id: i64,
+        /// Encoded as one length and the raw bytes, not byte by byte.
+        #[serde(with = "serde_bytes")]
+        body: Vec<u8>,
+    },
 }
 
 /// A message from the fetcher back to the server.
@@ -197,6 +204,11 @@ pub enum JobResult {
 
 /// Just the id of a message, for the supervisor, which needs to know what
 /// is outstanding but has no reason to decode the rest.
+///
+/// Every message puts its id first, so [`decode_prefix`] reads it and
+/// stops. The `Peek*` enums below mirror [`ToFetcher`] and [`FromFetcher`]
+/// and must list their variants in the same order, since variants are
+/// encoded by index.
 #[derive(Deserialize)]
 struct IdOnly {
     id: u64,
@@ -217,17 +229,16 @@ enum PeekFrom {
 }
 
 fn peek_to(frame: &[u8]) -> Option<PeekTo> {
-    serde_json::from_slice(frame).ok()
+    decode_prefix(frame).ok()
 }
 
 fn peek_from(frame: &[u8]) -> Option<PeekFrom> {
-    serde_json::from_slice(frame).ok()
+    decode_prefix(frame).ok()
 }
 
 /// Encode a frame the server sends, or fail the way a bad request does.
 fn encode_to(msg: &ToFetcher) -> Result<Vec<u8>, FetcherError> {
-    serde_json::to_vec(msg)
-        .map_err(|e| FetcherError::Unavailable(format!("could not encode request: {e}")))
+    encode(msg).map_err(|e| FetcherError::Unavailable(format!("could not encode request: {e}")))
 }
 
 // ------------------------------------------------------------------
@@ -373,7 +384,7 @@ impl FeedFetcherHost {
                         return;
                     }
                 };
-                match serde_json::from_slice(&frame) {
+                match decode(&frame) {
                     Ok(FromFetcher::Response(r)) => reader_pending.complete(r.id, r.result),
                     Ok(FromFetcher::Resolve { id, host }) => lookups.submit(id, host),
                     Err(e) => {
@@ -652,7 +663,7 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
                     message: "the fetcher worker exited while handling this feed".into(),
                 },
             });
-            let encoded = serde_json::to_vec(&response).context("encoding a failure response")?;
+            let encoded = encode(&response).context("encoding a failure response")?;
             if write_frame_limited(&mut server, &encoded, MAX_FRAME_BYTES).is_err() {
                 return Ok(());
             }
@@ -867,7 +878,7 @@ async fn serve(stream: UnixStream) -> Result<()> {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e).context("reading a request"),
         };
-        let request = match serde_json::from_slice(&frame) {
+        let request = match decode(&frame) {
             Ok(ToFetcher::Request(r)) => r,
             Ok(ToFetcher::Resolved { id, result }) => {
                 resolver.pending.complete(id, result);
@@ -919,7 +930,7 @@ impl reqwest::dns::Resolve for ServerResolver {
                 .pending
                 .register()
                 .ok_or("the worker is shutting down")?;
-            let frame = serde_json::to_vec(&FromFetcher::Resolve {
+            let frame = encode(&FromFetcher::Resolve {
                 id,
                 host: host.clone(),
             })?;
@@ -948,12 +959,12 @@ async fn run_job(client: reqwest::Client, job: Job) -> JobResult {
 
 /// Encode a response, replacing it with a failure if it cannot be sent.
 fn encode_response(id: u64, result: JobResult) -> Vec<u8> {
-    let encoded = serde_json::to_vec(&FromFetcher::Response(Response { id, result }))
+    let encoded = encode(&FromFetcher::Response(Response { id, result }))
         .map_err(|e| format!("could not encode the response: {e}"))
         .and_then(|v| {
             if v.len() > MAX_FRAME_BYTES {
                 Err(format!(
-                    "the parsed feed is {} bytes as JSON, over the {} byte frame limit",
+                    "the parsed feed is {} bytes encoded, over the {} byte frame limit",
                     v.len(),
                     MAX_FRAME_BYTES
                 ))
@@ -969,7 +980,7 @@ fn encode_response(id: u64, result: JobResult) -> Vec<u8> {
                 result: JobResult::Failed { message },
             });
             // A bare id and a short string always encode.
-            serde_json::to_vec(&fallback).unwrap_or_default()
+            encode(&fallback).unwrap_or_default()
         }
     }
 }
@@ -1023,6 +1034,39 @@ mod tests {
         let outcome = host.parse(7, b"not xml".to_vec()).await.unwrap();
         assert!(outcome.feed.is_none());
         assert!(host.is_alive());
+    }
+
+    /// A `file://` body is not capped by `max_feed_bytes`, and used to
+    /// cost about four bytes per byte on the wire; one well over a quarter
+    /// of the frame limit must still reach the worker.
+    #[tokio::test]
+    async fn large_parse_bodies_fit_in_a_frame() {
+        let body = vec![b'x'; MAX_FRAME_BYTES / 3];
+        let host = host_with_in_thread_worker();
+        let outcome = host.parse(7, body).await.unwrap();
+        assert!(outcome.feed.is_none());
+        assert!(host.is_alive());
+    }
+
+    #[test]
+    fn parse_bodies_are_encoded_as_raw_bytes() {
+        let body = vec![0xffu8; 4096];
+        let encoded = encode(&ToFetcher::Request(Request {
+            id: u64::MAX,
+            job: Job::Parse {
+                feed_id: i64::MIN,
+                body: body.clone(),
+            },
+        }))
+        .unwrap();
+        assert!(encoded.len() <= body.len() + 32, "{} bytes", encoded.len());
+        match decode(&encoded).unwrap() {
+            ToFetcher::Request(Request {
+                job: Job::Parse { body: decoded, .. },
+                ..
+            }) => assert_eq!(decoded, body),
+            other => panic!("wrong message: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1093,7 +1137,7 @@ mod tests {
             },
         );
         assert!(encoded.len() < MAX_FRAME_BYTES);
-        let decoded: FromFetcher = serde_json::from_slice(&encoded).unwrap();
+        let decoded: FromFetcher = decode(&encoded).unwrap();
         match decoded {
             FromFetcher::Response(r) => {
                 assert_eq!(r.id, 9);
@@ -1105,7 +1149,7 @@ mod tests {
 
     #[test]
     fn kinds_and_ids_can_be_read_without_decoding_the_body() {
-        let frame = serde_json::to_vec(&ToFetcher::Request(Request {
+        let frame = encode(&ToFetcher::Request(Request {
             id: 42,
             job: Job::Parse {
                 feed_id: 1,
@@ -1118,7 +1162,7 @@ mod tests {
             Some(PeekTo::Request(IdOnly { id: 42 }))
         ));
 
-        let frame = serde_json::to_vec(&ToFetcher::Resolved {
+        let frame = encode(&ToFetcher::Resolved {
             id: 7,
             result: Ok(vec!["127.0.0.1:0".parse().unwrap()]),
         })
@@ -1128,7 +1172,7 @@ mod tests {
             Some(PeekTo::Resolved(IdOnly { id: 7 }))
         ));
 
-        let frame = serde_json::to_vec(&FromFetcher::Resolve {
+        let frame = encode(&FromFetcher::Resolve {
             id: 3,
             host: "example.com".into(),
         })
@@ -1138,8 +1182,22 @@ mod tests {
             Some(PeekFrom::Resolve(IdOnly { id: 3 }))
         ));
 
-        assert!(peek_to(b"{}").is_none());
-        assert!(peek_from(b"{\"id\":1}").is_none());
+        let frame = encode(&FromFetcher::Response(Response {
+            id: 11,
+            result: JobResult::Failed {
+                message: "gone".into(),
+            },
+        }))
+        .unwrap();
+        assert!(matches!(
+            peek_from(&frame),
+            Some(PeekFrom::Response(IdOnly { id: 11 }))
+        ));
+
+        // An empty frame, and a variant index neither side defines.
+        assert!(peek_to(b"").is_none());
+        assert!(peek_to(&[2, 1]).is_none());
+        assert!(peek_from(&[2, 1]).is_none());
     }
 
     #[test]
