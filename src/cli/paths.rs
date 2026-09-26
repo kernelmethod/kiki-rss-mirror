@@ -1,7 +1,7 @@
 //! Resolution of the filesystem locations Kiki uses.
 //!
 //! Every subcommand resolves its paths through this module, so `kiki init`,
-//! `kiki serve`, `kiki migrate`, and `kiki service` all agree on where Kiki
+//! `kiki serve`, `kiki migrate`, and `kiki systemd` all agree on where Kiki
 //! lives without having to be told twice.
 //!
 //! Kiki keeps two kinds of state, and they belong in two different places:
@@ -152,7 +152,7 @@ pub fn runtime_dir_is_usable(dir: &Path) -> bool {
 /// otherwise: `$KIKI_HOME` if set, else the platform per-user data directory
 /// (`~/.local/share/kiki` and friends).
 ///
-/// This is the location `kiki init --auto` creates and `kiki service`
+/// This is the location `kiki init --auto` creates and `kiki systemd`
 /// installs a unit against. It deliberately does *not* consider the current
 /// directory — those commands name a well-known location, and picking one up
 /// from wherever the shell happens to be sitting would be a surprise.
@@ -451,7 +451,7 @@ mod test {
     }
 
     /// Unlike [`resolve_data_dir`], the default location ignores the current
-    /// directory: `init --auto` and `service install` name a well-known
+    /// directory: `init --auto` and `systemd install` name a well-known
     /// place, not wherever the shell happens to be.
     #[test]
     fn default_data_dir_ignores_the_current_directory() -> Result<()> {

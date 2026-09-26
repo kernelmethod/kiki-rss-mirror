@@ -1,5 +1,5 @@
 # User-level systemd service for Kiki RSS
-# Preferred: run `kiki service install` instead of copying this manually.
+# Preferred: run `kiki systemd install` instead of copying this manually.
 # Manual install: copy to ~/.config/systemd/user/kiki.service
 #
 # A user service stops when the user's last session ends, which also removes

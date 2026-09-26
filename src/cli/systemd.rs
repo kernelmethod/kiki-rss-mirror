@@ -10,15 +10,15 @@ use crate::cli::paths::Env;
 
 const SERVICE_NAME: &str = "kiki.service";
 
-/// Arguments for the `kiki service` subcommand.
+/// Arguments for the `kiki systemd` subcommand.
 #[derive(Args)]
-pub struct ServiceArgs {
+pub struct SystemdArgs {
     #[command(subcommand)]
-    command: ServiceCommands,
+    command: SystemdCommands,
 }
 
 #[derive(Subcommand)]
-enum ServiceCommands {
+enum SystemdCommands {
     /// Install a user-level systemd service for kiki
     Install(InstallArgs),
 
@@ -55,13 +55,13 @@ struct UninstallArgs {
     keep_data: bool,
 }
 
-impl ServiceArgs {
-    /// Run the selected service subcommand.
+impl SystemdArgs {
+    /// Run the selected systemd subcommand.
     pub fn run(&self) -> Result<()> {
         match &self.command {
-            ServiceCommands::Install(args) => install(args),
-            ServiceCommands::Uninstall(args) => uninstall(args),
-            ServiceCommands::Status => status(),
+            SystemdCommands::Install(args) => install(args),
+            SystemdCommands::Uninstall(args) => uninstall(args),
+            SystemdCommands::Status => status(),
         }
     }
 }

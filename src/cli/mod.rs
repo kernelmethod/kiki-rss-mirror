@@ -7,7 +7,7 @@ pub mod serve;
 pub mod docs;
 
 #[cfg(feature = "systemd")]
-pub mod service;
+pub mod systemd;
 
 #[cfg(unix)]
 pub mod child;
