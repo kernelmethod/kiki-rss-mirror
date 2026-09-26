@@ -7,7 +7,9 @@ use crate::scripting::ScriptRunner;
 use crate::tasks::backoff::{
     compute_next_fetch_at, defer_past_skipped, parse_retry_after, FetchOutcome, SchedulerConfig,
 };
-use crate::tasks::cache::{corrected_max_age, extract_server_hints, parse_http_date, CacheControl};
+use crate::tasks::cache::{
+    corrected_max_age, extract_server_hints, parse_http_date, CacheControl, ServerHints,
+};
 use crate::tasks::command::TaskManagerCommand;
 use crate::tasks::error::FetchError;
 use crate::tasks::error_recording::{clear_feed_error, set_feed_error_with_schedule};
@@ -17,6 +19,7 @@ use anyhow::Result;
 use chrono::Utc;
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
+use reqwest::header::HeaderMap;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -27,6 +30,7 @@ struct FeedFetchRow {
     url: String,
     header_etag: Option<String>,
     header_last_modified: Option<String>,
+    header_expires: Option<i64>,
     header_immutable_until: Option<i64>,
     header_body_hash: Option<String>,
     last_full_refresh_at: Option<i64>,
@@ -61,7 +65,8 @@ fn load_feed_fetch_row(
             feed_ttl_seconds,
             feed_update_interval_seconds,
             feed_skip_hours,
-            feed_skip_days
+            feed_skip_days,
+            header_expires
          FROM feeds
          WHERE id = ?1",
         [feed_id],
@@ -96,6 +101,7 @@ fn load_feed_fetch_row(
                     skip_hours: row.get::<_, i64>(15)? as u32,
                     skip_days: row.get::<_, i64>(16)? as u8,
                 },
+                header_expires: row.get(17)?,
             })
         },
     )?;
@@ -354,7 +360,9 @@ fn record_fetch_reply(
             metrics.record_feed_redirects(redirects);
             info!("Feed {} was not modified since last check", feed_id);
             let now_ts = Utc::now().timestamp();
-            let hints = extract_server_hints(&headers.to_header_map(), now_ts);
+            let headers = headers.to_header_map();
+            let hints = extract_server_hints(&headers, now_ts);
+            let cache = revalidated_cache_state(row, &headers, &hints, now_ts);
             let next_fetch_at = schedule_success(
                 FetchOutcome::NotModified {
                     server_hint_secs: hints.hint_secs.or(row.feed_hints.refresh_hint_secs()),
@@ -365,12 +373,24 @@ fn record_fetch_reply(
             );
             conn.execute(
                 "UPDATE feeds SET
-                    last_checked = ?1,
-                    next_fetch_at = ?2,
+                    header_etag = ?1,
+                    header_last_modified = ?2,
+                    header_expires = ?3,
+                    header_immutable_until = ?4,
+                    last_checked = ?5,
+                    next_fetch_at = ?6,
                     consecutive_failures = 0,
                     retry_after_at = NULL
-                 WHERE id = ?3",
-                (now_ts, next_fetch_at, feed_id),
+                 WHERE id = ?7",
+                rusqlite::params![
+                    cache.etag,
+                    cache.last_modified,
+                    cache.expires,
+                    cache.immutable_until,
+                    now_ts,
+                    next_fetch_at,
+                    feed_id,
+                ],
             )?;
             metrics.record_feed_cache_hit("not_modified");
             metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
@@ -454,65 +474,15 @@ fn record_fetch_reply(
         )?;
     }
 
-    let mut etag: Option<String> = headers
-        .get("etag")
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_string);
-    let mut last_modified: Option<String> = headers
-        .get("last-modified")
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_string);
-
-    // Parse the Expires header (RFC 9111 §5.3) into a Unix timestamp so we
-    // can skip future fetches until the declared expiry time has passed.
-    // Accepts all three HTTP-date formats (RFC 9110 §5.6.7).
-    let mut expires: Option<i64> = headers
-        .get("expires")
-        .and_then(|h| h.to_str().ok())
-        .and_then(parse_http_date)
-        .map(|dt| dt.timestamp());
-
     let now_ts = Utc::now().timestamp();
-
-    // Derive freshness hints before Cache-Control directives mutate
-    // `expires` — the hint reflects the server's original instruction.
     let hints = extract_server_hints(&headers, now_ts);
-
-    // Parse Cache-Control and apply precedence rules (RFC 9111 §5.2):
-    // - no-store: clear all cache headers
-    // - no-cache: allow conditional requests but never skip fetching
-    // - max-age: overrides Expires header (adjusted for upstream age per
-    //   RFC 9111 §4.2.3)
-    let cc_values: Vec<&str> = headers
-        .get_all("cache-control")
-        .iter()
-        .filter_map(|h| h.to_str().ok())
-        .collect();
-    let cc = CacheControl::parse_many(&cc_values);
-    if cc.no_store {
-        etag = None;
-        last_modified = None;
-        expires = None;
-    } else if cc.no_cache {
-        expires = None;
-    } else if let Some(max_age) = cc.max_age {
-        let corrected = corrected_max_age(&headers, max_age, now_ts);
-        expires = Some(now_ts + corrected as i64);
-    }
-
-    // RFC 8246: while the response is fresh, skip conditional revalidation
-    // entirely. Only meaningful when paired with a positive max-age.
-    let immutable_until: Option<i64> = if hints.immutable {
-        hints.hint_secs.and_then(|s| {
-            if s > 0 {
-                Some(now_ts.saturating_add(s as i64))
-            } else {
-                None
-            }
-        })
-    } else {
-        None
-    };
+    let CacheState {
+        etag,
+        last_modified,
+        expires,
+        immutable_until,
+        no_store,
+    } = cache_state(&headers, &hints, now_ts);
 
     // Refresh hints from the feed document. A body that did not parse
     // leaves the previously stored ones in force.
@@ -536,7 +506,7 @@ fn record_fetch_reply(
 
     // Don't persist a body-hash fingerprint for responses we've been told
     // not to store (RFC 9111 §5.2.2 no-store).
-    let body_hash: Option<String> = if cc.no_store { None } else { Some(body_hash) };
+    let body_hash: Option<String> = if no_store { None } else { Some(body_hash) };
 
     // Validator-lie detection. Only meaningful on a forced (non-
     // conditional) refresh, since otherwise the server is free to return
@@ -612,6 +582,114 @@ fn record_fetch_reply(
     fire_fetch_success(rec.script_runner, feed_id, 200, final_url, Some(body_len));
 
     Ok(Some(parsed))
+}
+
+/// The cache validators and freshness state stored on a feed row, derived
+/// from one response's headers.
+struct CacheState {
+    etag: Option<String>,
+    last_modified: Option<String>,
+    /// Absolute expiry: `max-age` (age-corrected) or else `Expires`.
+    expires: Option<i64>,
+    /// End of an RFC 8246 `immutable` window.
+    immutable_until: Option<i64>,
+    /// `Cache-Control: no-store` was present.
+    no_store: bool,
+}
+
+/// Derive the cache state to store from a response's headers.
+///
+/// `hints` must be [`extract_server_hints`] of the same headers at
+/// `now_ts`. Applies the Cache-Control precedence rules (RFC 9111 §5.2):
+/// `no-store` clears everything, `no-cache` clears the expiry but keeps the
+/// validators for conditional requests, and `max-age` overrides `Expires`
+/// after the RFC 9111 §4.2.3 age correction.
+fn cache_state(headers: &HeaderMap, hints: &ServerHints, now_ts: i64) -> CacheState {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string)
+    };
+    let mut etag = header("etag");
+    let mut last_modified = header("last-modified");
+
+    // Accepts all three HTTP-date formats (RFC 9110 §5.6.7).
+    let mut expires: Option<i64> = header("expires")
+        .as_deref()
+        .and_then(parse_http_date)
+        .map(|dt| dt.timestamp());
+
+    let cc_values: Vec<&str> = headers
+        .get_all("cache-control")
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .collect();
+    let cc = CacheControl::parse_many(&cc_values);
+    if cc.no_store {
+        etag = None;
+        last_modified = None;
+        expires = None;
+    } else if cc.no_cache {
+        expires = None;
+    } else if let Some(max_age) = cc.max_age {
+        let corrected = corrected_max_age(headers, max_age, now_ts);
+        expires = Some(now_ts + corrected as i64);
+    }
+
+    // RFC 8246: while the response is fresh, skip conditional revalidation
+    // entirely. Only meaningful when paired with a positive max-age.
+    let immutable_until = hints
+        .hint_secs
+        .filter(|&s| hints.immutable && s > 0)
+        .map(|s| now_ts.saturating_add(s as i64));
+
+    CacheState {
+        etag,
+        last_modified,
+        expires,
+        immutable_until,
+        no_store: cc.no_store,
+    }
+}
+
+/// The cache state to store after a `304 Not Modified`.
+///
+/// A 304 freshens the stored response: header fields it carries replace
+/// the stored ones, and fields it omits keep their stored values
+/// (RFC 9111 §4.3.4). So a server that rotates its `ETag` or
+/// `Last-Modified` on a 304 has the new validator sent next time, and one
+/// that re-sends `Cache-Control: immutable` opens a new immutable window.
+/// `no-store` on the 304 still clears everything.
+fn revalidated_cache_state(
+    row: &FeedFetchRow,
+    headers: &HeaderMap,
+    hints: &ServerHints,
+    now_ts: i64,
+) -> CacheState {
+    let fresh = cache_state(headers, hints, now_ts);
+    if fresh.no_store {
+        return fresh;
+    }
+    let carries_freshness =
+        headers.contains_key("cache-control") || headers.contains_key("expires");
+    CacheState {
+        etag: fresh.etag.or_else(|| row.header_etag.clone()),
+        last_modified: fresh
+            .last_modified
+            .or_else(|| row.header_last_modified.clone()),
+        expires: if carries_freshness {
+            fresh.expires
+        } else {
+            row.header_expires
+        },
+        immutable_until: if carries_freshness {
+            fresh.immutable_until
+        } else {
+            row.header_immutable_until
+        },
+        no_store: false,
+    }
 }
 
 /// Convert seconds to SQLite's integer type; an absurd `<ttl>` saturates

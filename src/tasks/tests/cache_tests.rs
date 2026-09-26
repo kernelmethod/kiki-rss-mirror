@@ -1483,3 +1483,229 @@ async fn test_forced_refresh_match_does_not_fire_lie() -> Result<()> {
 
     Ok(())
 }
+
+/// Read the stored `(header_etag, header_last_modified)` for a feed.
+fn stored_validators(
+    conn: &rusqlite::Connection,
+    feed_id: i64,
+) -> (Option<String>, Option<String>) {
+    conn.query_row(
+        "SELECT header_etag, header_last_modified FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap()
+}
+
+/// Fetch once to store validators, then make the feed eligible again.
+async fn fetch_and_reset(
+    tc: &crate::test::TestConfig,
+    client: &reqwest::Client,
+    feed_id: i64,
+    pool: &r2d2::Pool<SqliteConnectionManager>,
+) -> Result<()> {
+    refresh_feed(
+        client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+    reset_last_checked(&tc.database_conn()?, feed_id);
+    Ok(())
+}
+
+/// A 304 that carries a new `ETag` replaces the stored one (RFC 9111
+/// §4.3.4), and the new value is what the next request revalidates with.
+#[tokio::test]
+async fn test_304_rotated_etag_is_stored_and_sent() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+
+    // The server revalidates "v1" but announces "v2" on the 304.
+    state.lock().unwrap().not_modified_etag = Some("\"v2\"".into());
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    assert_eq!(state.lock().unwrap().not_modified_count, 1);
+    assert_eq!(
+        stored_validators(&tc.database_conn()?, feed_id)
+            .0
+            .as_deref(),
+        Some("\"v2\"")
+    );
+
+    // From now on the server only recognizes "v2".
+    {
+        let mut s = state.lock().unwrap();
+        s.etag = Some("\"v2\"".into());
+        s.not_modified_etag = None;
+    }
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    let s = state.lock().unwrap();
+    assert_eq!(s.last_if_none_match.as_deref(), Some("\"v2\""));
+    assert_eq!(
+        s.not_modified_count, 2,
+        "the rotated ETag should revalidate"
+    );
+    assert_eq!(s.full_response_count, 1);
+    Ok(())
+}
+
+/// A 304 that carries a new `Last-Modified` replaces the stored one.
+#[tokio::test]
+async fn test_304_rotated_last_modified_is_stored_and_sent() -> Result<()> {
+    let lm1 = "Mon, 01 Jan 2024 00:00:00 GMT";
+    let lm2 = "Tue, 02 Jan 2024 00:00:00 GMT";
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        last_modified: Some(lm1.into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    state.lock().unwrap().not_modified_last_modified = Some(lm2.into());
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    assert_eq!(
+        stored_validators(&tc.database_conn()?, feed_id)
+            .1
+            .as_deref(),
+        Some(lm2)
+    );
+
+    {
+        let mut s = state.lock().unwrap();
+        s.last_modified = Some(lm2.into());
+        s.not_modified_last_modified = None;
+    }
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    let s = state.lock().unwrap();
+    assert_eq!(s.last_if_modified_since.as_deref(), Some(lm2));
+    assert_eq!(s.not_modified_count, 2);
+    Ok(())
+}
+
+/// A 304 that omits the validators keeps the stored ones.
+#[tokio::test]
+async fn test_304_without_validators_keeps_stored_ones() -> Result<()> {
+    let lm = "Mon, 01 Jan 2024 00:00:00 GMT";
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        last_modified: Some(lm.into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    assert_eq!(state.lock().unwrap().not_modified_count, 1);
+    assert_eq!(
+        stored_validators(&tc.database_conn()?, feed_id),
+        (Some("\"v1\"".into()), Some(lm.into()))
+    );
+    Ok(())
+}
+
+/// `Cache-Control: no-store` on a 304 clears the stored validators, as it
+/// does on a 200.
+#[tokio::test]
+async fn test_304_no_store_clears_validators() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    // Only after the first 200, so it stores the validators.
+    state.lock().unwrap().cache_control = Some("no-store".into());
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    assert_eq!(state.lock().unwrap().not_modified_count, 1);
+    assert_eq!(
+        stored_validators(&tc.database_conn()?, feed_id),
+        (None, None)
+    );
+    Ok(())
+}
+
+/// A 304 carrying `immutable` with a `max-age` opens a new immutable
+/// window, so the next refresh sends no conditional headers (RFC 8246).
+#[tokio::test]
+async fn test_304_immutable_opens_window() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    state.lock().unwrap().cache_control = Some("immutable, max-age=3600".into());
+    let now = Utc::now().timestamp();
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    assert_eq!(state.lock().unwrap().not_modified_count, 1);
+
+    let (immutable_until, expires): (Option<i64>, Option<i64>) = tc.database_conn()?.query_row(
+        "SELECT header_immutable_until, header_expires FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let until = immutable_until.expect("the 304 should open an immutable window");
+    assert!((now + 3590..=now + 3610).contains(&until), "got {until}");
+    assert!(expires.is_some_and(|e| (now + 3590..=now + 3610).contains(&e)));
+
+    // Inside the window the next refresh must not revalidate.
+    let before = state.lock().unwrap().if_none_match_count;
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    let s = state.lock().unwrap();
+    assert_eq!(s.if_none_match_count, before);
+    assert_eq!(s.full_response_count, 2);
+    Ok(())
+}
+
+/// A 304 with no freshness headers leaves the stored expiry alone.
+#[tokio::test]
+async fn test_304_without_freshness_keeps_stored_expires() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        cache_control: Some("max-age=600".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    let read_expires = || -> Option<i64> {
+        tc.database_conn()
+            .unwrap()
+            .query_row(
+                "SELECT header_expires FROM feeds WHERE id = ?1",
+                [feed_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let stored = read_expires();
+    assert!(stored.is_some());
+
+    state.lock().unwrap().cache_control = None;
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    assert_eq!(state.lock().unwrap().not_modified_count, 1);
+    assert_eq!(read_expires(), stored);
+    Ok(())
+}
