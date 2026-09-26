@@ -1727,3 +1727,214 @@ async fn test_304_without_freshness_keeps_stored_expires() -> Result<()> {
     assert_eq!(read_expires(), stored);
     Ok(())
 }
+
+/// Run one `refresh_feed` with the default test settings.
+async fn refresh_once(
+    client: &reqwest::Client,
+    feed_id: i64,
+    pool: &r2d2::Pool<SqliteConnectionManager>,
+) -> Result<()> {
+    refresh_feed(
+        client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await
+}
+
+/// Read one nullable integer column from a feed row.
+fn feed_column(tc: &crate::test::TestConfig, feed_id: i64, column: &str) -> Option<i64> {
+    tc.database_conn()
+        .unwrap()
+        .query_row(
+            &format!("SELECT {column} FROM feeds WHERE id = ?1"),
+            [feed_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// `immutable` without a `max-age` has no freshness to cover: no immutable
+/// window is stored and the next refresh still revalidates.
+#[tokio::test]
+async fn test_immutable_without_max_age_still_revalidates() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        cache_control: Some("immutable".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    refresh_once(&client, feed_id, &pool).await?;
+    assert_eq!(feed_column(&tc, feed_id, "header_immutable_until"), None);
+
+    reset_last_checked(&tc.database_conn()?, feed_id);
+    refresh_once(&client, feed_id, &pool).await?;
+    let s = state.lock().unwrap();
+    assert_eq!(
+        s.if_none_match_count, 1,
+        "should revalidate with If-None-Match"
+    );
+    assert_eq!(s.not_modified_count, 1);
+    Ok(())
+}
+
+/// Once an immutable window has passed, conditional requests resume.
+#[tokio::test]
+async fn test_expired_immutable_window_resumes_revalidation() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        cache_control: Some("immutable, max-age=3600".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    refresh_once(&client, feed_id, &pool).await?;
+    assert!(feed_column(&tc, feed_id, "header_immutable_until").is_some());
+
+    // Move the window into the past and make the feed eligible.
+    let conn = tc.database_conn()?;
+    conn.execute(
+        "UPDATE feeds SET header_immutable_until = ?1 WHERE id = ?2",
+        rusqlite::params![Utc::now().timestamp() - 1, feed_id],
+    )?;
+    reset_last_checked(&conn, feed_id);
+
+    refresh_once(&client, feed_id, &pool).await?;
+    let s = state.lock().unwrap();
+    assert_eq!(s.if_none_match_count, 1, "expired window should revalidate");
+    assert_eq!(s.not_modified_count, 1);
+    assert_eq!(s.full_response_count, 1);
+    Ok(())
+}
+
+/// A `Date` ahead of our clock must not extend freshness past `max-age`.
+#[tokio::test]
+async fn test_future_date_does_not_extend_max_age() -> Result<()> {
+    let future_date = (Utc::now() + chrono::Duration::minutes(30))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        cache_control: Some("max-age=600".into()),
+        date: Some(future_date),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    let before = Utc::now().timestamp();
+    refresh_once(&client, feed_id, &pool).await?;
+
+    let expires = feed_column(&tc, feed_id, "header_expires").expect("header_expires set");
+    let next = feed_column(&tc, feed_id, "next_fetch_at").expect("next_fetch_at set");
+    for (what, ts) in [("header_expires", expires), ("next_fetch_at", next)] {
+        assert!(
+            (before + 595..=before + 610).contains(&ts),
+            "{what} should be ~now+600 despite the future Date; got offset {}",
+            ts - before
+        );
+    }
+    Ok(())
+}
+
+/// `Expires` in asctime format is parsed (RFC 9110 §5.6.7).
+#[tokio::test]
+async fn test_expires_asctime_format_is_parsed() -> Result<()> {
+    let future = Utc::now() + chrono::Duration::minutes(30);
+    let asctime = future.format("%a %b %e %H:%M:%S %Y").to_string();
+
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        expires: Some(asctime),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    let before = Utc::now().timestamp();
+    refresh_once(&client, feed_id, &pool).await?;
+
+    let stored = feed_column(&tc, feed_id, "header_expires")
+        .expect("header_expires should parse from asctime format");
+    assert!(
+        (before + 25 * 60..=before + 35 * 60).contains(&stored),
+        "asctime Expires should parse into a ~30min-future timestamp"
+    );
+    Ok(())
+}
+
+/// `Expires: 0` is invalid and means "already expired" (RFC 9111 §5.3):
+/// nothing is stored and the feed falls back to its per-feed interval.
+#[tokio::test]
+async fn test_invalid_expires_gives_no_freshness() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        expires: Some("0".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    let before = Utc::now().timestamp();
+    refresh_once(&client, feed_id, &pool).await?;
+
+    assert_eq!(feed_column(&tc, feed_id, "header_expires"), None);
+    let next = feed_column(&tc, feed_id, "next_fetch_at").expect("next_fetch_at set");
+    assert!(
+        (before + 10_800..=before + 10_810).contains(&next),
+        "should use the default 3h per-feed interval; got offset {}",
+        next - before
+    );
+    Ok(())
+}
+
+/// Spin up a server that fails once with 503, `Retry-After: retry_after`
+/// and `Cache-Control: cache_control`, and return the scheduled
+/// `next_fetch_at` offset from just before the refresh.
+async fn retry_offset_with_stale_if_error(retry_after: &str, cache_control: &str) -> Result<i64> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        fail_next: 1,
+        fail_status: 503,
+        fail_retry_after: Some(retry_after.into()),
+        cache_control: Some(cache_control.into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    let before = Utc::now().timestamp();
+    refresh_once(&client, feed_id, &pool).await?;
+    Ok(feed_column(&tc, feed_id, "next_fetch_at").expect("next_fetch_at set") - before)
+}
+
+/// A `Retry-After` that outlasts `stale-if-error` is cut short so we retry
+/// before the grace window closes (RFC 5861 §4).
+#[tokio::test]
+async fn test_stale_if_error_caps_retry_after() -> Result<()> {
+    let offset = retry_offset_with_stale_if_error("7200", "stale-if-error=1800").await?;
+    assert!(
+        (1795..=1810).contains(&offset),
+        "stale-if-error=1800 should cap Retry-After: 7200; got offset {offset}"
+    );
+    Ok(())
+}
+
+/// A `Retry-After` inside the `stale-if-error` window is honored as is.
+#[tokio::test]
+async fn test_retry_after_within_stale_if_error_is_honored() -> Result<()> {
+    let offset = retry_offset_with_stale_if_error("600", "stale-if-error=3600").await?;
+    assert!(
+        (595..=610).contains(&offset),
+        "Retry-After: 600 should be honored; got offset {offset}"
+    );
+    Ok(())
+}

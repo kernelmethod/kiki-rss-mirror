@@ -67,6 +67,8 @@ pub struct FeedServerState {
     pub fail_next: usize,
     /// Status returned while `fail_next > 0`. Defaults to 503.
     pub fail_status: u16,
+    /// If set, forced failures carry this `Retry-After` header value.
+    pub fail_retry_after: Option<String>,
     /// If set, this value is returned as the response body instead of the
     /// default test RSS payload. Lets a test flip content mid-run while
     /// keeping validator headers (`etag`, `last_modified`) fixed.
@@ -324,10 +326,17 @@ impl TestConfig {
                 };
                 let cache_control = s.cache_control.clone();
                 let cache_control_extra = s.cache_control_extra.clone();
+                let retry_after = s.fail_retry_after.clone();
                 drop(s);
                 let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
                 let mut response = status.into_response();
                 append_cache_control_headers(&mut response, &cache_control, &cache_control_extra);
+                if let Some(ref retry_after) = retry_after {
+                    response.headers_mut().insert(
+                        axum::http::header::RETRY_AFTER,
+                        retry_after.parse().unwrap(),
+                    );
+                }
                 return response;
             }
 

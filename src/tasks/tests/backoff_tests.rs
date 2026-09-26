@@ -278,3 +278,59 @@ fn test_defer_past_skipped_all_skipped_is_ignored() {
         utc(2024, 1, 3, 11, 0)
     );
 }
+
+/// `stale-if-error` shorter than `Retry-After` caps the retry, so we try
+/// again before the grace window closes (RFC 5861 §4).
+#[test]
+fn test_compute_next_fetch_at_stale_if_error_caps_retry_after() {
+    let now = 1_000_000;
+    let next = compute_next_fetch_at(
+        FetchOutcome::TransientErr {
+            retry_after_ts: Some(now + 7200),
+            consecutive_failures: 1,
+            stale_if_error_secs: Some(1800),
+        },
+        now,
+        MIN_CADENCE,
+        MAX_BACKOFF,
+        MIN_FETCH_INTERVAL,
+    );
+    assert_eq!(next, now + 1800);
+}
+
+/// A `Retry-After` shorter than `stale-if-error` is honored as is.
+#[test]
+fn test_compute_next_fetch_at_retry_after_within_stale_if_error() {
+    let now = 1_000_000;
+    let next = compute_next_fetch_at(
+        FetchOutcome::TransientErr {
+            retry_after_ts: Some(now + 600),
+            consecutive_failures: 1,
+            stale_if_error_secs: Some(3600),
+        },
+        now,
+        MIN_CADENCE,
+        MAX_BACKOFF,
+        MIN_FETCH_INTERVAL,
+    );
+    assert_eq!(next, now + 600);
+}
+
+/// A tiny `stale-if-error` still can't push a retry below the global
+/// `min_polling_cadence` floor.
+#[test]
+fn test_compute_next_fetch_at_stale_if_error_respects_min_cadence() {
+    let now = 1_000_000;
+    let next = compute_next_fetch_at(
+        FetchOutcome::TransientErr {
+            retry_after_ts: Some(now + 7200),
+            consecutive_failures: 1,
+            stale_if_error_secs: Some(5),
+        },
+        now,
+        MIN_CADENCE,
+        MAX_BACKOFF,
+        MIN_FETCH_INTERVAL,
+    );
+    assert_eq!(next, now + MIN_CADENCE as i64);
+}
