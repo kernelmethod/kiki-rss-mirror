@@ -1,21 +1,25 @@
-//! Length-prefixed framing for inter-process messages.
+//! Length-prefixed framing for inter-process messages, and the script
+//! host's message types.
 //!
 //! Frames are a little-endian `u32` byte count followed by that many
-//! bytes of JSON. Both directions cap the frame size at
-//! [`MAX_FRAME_BYTES`]: the parent because a compromised child must not
-//! be able to drive it into an allocation it cannot afford, and the child
-//! for symmetry.
+//! bytes of JSON. Both directions cap the frame size: the parent because a
+//! compromised child must not be able to drive it into an allocation it
+//! cannot afford, and the child for symmetry. The script host channel uses
+//! [`MAX_FRAME_BYTES`]; the feed fetcher channel, which carries whole
+//! parsed feeds, passes its own larger limit to the `_limited` variants.
 //!
-//! The protocol is strictly request/response — every request written by
-//! the server is answered by exactly one response from the script host,
-//! including for observe-only events whose result is discarded. Keeping
-//! the two sides in lockstep means a dropped or malformed frame shows up
-//! immediately as an error rather than as a silently desynchronised
-//! stream.
+//! The script host protocol is strictly request/response — every request
+//! written by the server is answered by exactly one response from the
+//! script host, including for observe-only events whose result is
+//! discarded. Keeping the two sides in lockstep means a dropped or
+//! malformed frame shows up immediately as an error rather than as a
+//! silently desynchronised stream. The feed fetcher's protocol is
+//! multiplexed instead; see [`crate::process::feed_fetcher`].
 
 use crate::scripting::{Event, EventPayload, FeedEntry};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Largest frame either side will write or accept.
 ///
@@ -70,22 +74,53 @@ pub enum HostResponse {
 /// [`MAX_FRAME_BYTES`], and propagates any error from the underlying
 /// writer.
 pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
-    let len = u32::try_from(payload.len())
+    write_frame_limited(w, payload, MAX_FRAME_BYTES)
+}
+
+/// [`write_frame`] with a caller-chosen size limit in place of
+/// [`MAX_FRAME_BYTES`].
+///
+/// # Errors
+///
+/// As for [`write_frame`], with `max` as the limit.
+pub fn write_frame_limited<W: Write>(w: &mut W, payload: &[u8], max: usize) -> io::Result<()> {
+    let len = frame_len(payload, max)?;
+    w.write_all(&len.to_le_bytes())?;
+    w.write_all(payload)?;
+    w.flush()
+}
+
+/// Async counterpart of [`write_frame_limited`].
+///
+/// # Errors
+///
+/// As for [`write_frame_limited`].
+pub async fn write_frame_async<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    payload: &[u8],
+    max: usize,
+) -> io::Result<()> {
+    let len = frame_len(payload, max)?;
+    w.write_all(&len.to_le_bytes()).await?;
+    w.write_all(payload).await?;
+    w.flush().await
+}
+
+/// The length prefix for `payload`, or an error if it is over `max`.
+fn frame_len(payload: &[u8], max: usize) -> io::Result<u32> {
+    u32::try_from(payload.len())
         .ok()
-        .filter(|_| payload.len() <= MAX_FRAME_BYTES)
+        .filter(|_| payload.len() <= max)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "frame of {} bytes exceeds the {} byte limit",
                     payload.len(),
-                    MAX_FRAME_BYTES
+                    max
                 ),
             )
-        })?;
-    w.write_all(&len.to_le_bytes())?;
-    w.write_all(payload)?;
-    w.flush()
+        })
 }
 
 /// Read a single length-prefixed frame.
@@ -98,21 +133,52 @@ pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
 /// protocol violation, and the length is never used to size an
 /// allocation before it has been checked.
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+    read_frame_limited(r, MAX_FRAME_BYTES)
+}
+
+/// [`read_frame`] with a caller-chosen size limit in place of
+/// [`MAX_FRAME_BYTES`].
+///
+/// # Errors
+///
+/// As for [`read_frame`], with `max` as the limit.
+pub fn read_frame_limited<R: Read>(r: &mut R, max: usize) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
+    let len = checked_len(len_buf, max)?;
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload)?;
+    Ok(payload)
+}
+
+/// Async counterpart of [`read_frame_limited`].
+///
+/// # Errors
+///
+/// As for [`read_frame_limited`].
+pub async fn read_frame_async<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf).await?;
+    let len = checked_len(len_buf, max)?;
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
+/// Decode a length prefix, refusing anything over `max` before it is used
+/// to size an allocation.
+fn checked_len(len_buf: [u8; 4], max: usize) -> io::Result<usize> {
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_FRAME_BYTES {
+    if len > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "peer announced a {} byte frame, over the {} byte limit",
-                len, MAX_FRAME_BYTES
+                len, max
             ),
         ));
     }
-    let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload)?;
-    Ok(payload)
+    Ok(len)
 }
 
 #[cfg(test)]
@@ -179,6 +245,37 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         let err = read_frame(&mut cursor).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn a_custom_limit_is_enforced_both_ways() {
+        let mut buf = Vec::new();
+        let err = write_frame_limited(&mut buf, b"12345", 4).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        write_frame_limited(&mut buf, b"12345", 5).unwrap();
+        let err = read_frame_limited(&mut std::io::Cursor::new(&buf), 4).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_frame_limited(&mut std::io::Cursor::new(&buf), 5).unwrap(),
+            b"12345"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_frames_interoperate_with_blocking_ones() {
+        let mut buf = Vec::new();
+        write_frame_async(&mut buf, b"from async", 64)
+            .await
+            .unwrap();
+        write_frame(&mut buf, b"from sync").unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        assert_eq!(read_frame(&mut cursor).unwrap(), b"from async");
+        assert_eq!(
+            read_frame_async(&mut cursor, 64).await.unwrap(),
+            b"from sync"
+        );
     }
 
     #[test]

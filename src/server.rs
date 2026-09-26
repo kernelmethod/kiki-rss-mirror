@@ -71,6 +71,7 @@ pub struct ServerBuilder<'a> {
     single_threaded: bool,
     worker_count: Option<usize>,
     script_host: crate::process::ScriptHostHandle,
+    feed_fetcher: crate::process::FeedFetcherHandle,
 }
 
 impl<'a> ServerBuilder<'a> {
@@ -82,6 +83,7 @@ impl<'a> ServerBuilder<'a> {
             single_threaded: false,
             worker_count: None,
             script_host: None,
+            feed_fetcher: None,
         }
     }
 
@@ -123,6 +125,17 @@ impl<'a> ServerBuilder<'a> {
         self
     }
 
+    /// Retrieve and parse feeds in an already-spawned, sandboxed feed
+    /// fetcher process instead of in this one.
+    ///
+    /// As with [`Self::script_host`], the fetcher must be spawned by the
+    /// caller before it installs its own sandbox. Passing `None` fetches
+    /// in-process, which is what the library-level tests use.
+    pub fn feed_fetcher(mut self, fetcher: crate::process::FeedFetcherHandle) -> Self {
+        self.feed_fetcher = fetcher;
+        self
+    }
+
     pub fn build(self) -> Server {
         let listen_addr = self
             .listen_addr
@@ -145,6 +158,7 @@ impl<'a> ServerBuilder<'a> {
             single_threaded: self.single_threaded,
             worker_count: self.worker_count,
             script_host: self.script_host,
+            feed_fetcher: self.feed_fetcher,
             cancel_token: CancellationToken::new(),
         }
     }
@@ -197,6 +211,10 @@ pub struct Server {
     /// Sandboxed script host to dispatch script events to, if one was
     /// spawned. `None` runs Lua in this process.
     script_host: crate::process::ScriptHostHandle,
+
+    /// Sandboxed feed fetcher to retrieve and parse feeds in, if one was
+    /// spawned. `None` fetches in this process.
+    feed_fetcher: crate::process::FeedFetcherHandle,
 
     /// A [`CancellationToken`] used to indicate that the server should
     /// be killed.
@@ -330,6 +348,14 @@ impl Server {
             );
         }
 
+        let fetcher = match &self.feed_fetcher {
+            #[cfg(unix)]
+            Some(host) => crate::fetcher::Fetcher::Isolated(host.clone()),
+            #[cfg(not(unix))]
+            Some(()) => crate::fetcher::Fetcher::in_process()?,
+            None => crate::fetcher::Fetcher::in_process()?,
+        };
+
         let _worker_handles = tasks::spawn_workers(
             rx,
             tx.clone(),
@@ -339,6 +365,7 @@ impl Server {
             metrics.clone(),
             self.data_dir.clone(),
             script_runner.clone(),
+            fetcher,
         );
 
         tokio::spawn(metrics_sampler_loop(

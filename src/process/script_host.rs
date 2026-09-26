@@ -37,12 +37,11 @@
 
 use crate::process::ipc::{read_frame, write_frame, HostRequest, HostResponse, MAX_FRAME_BYTES};
 use crate::scripting::{Event, EventPayload, FeedEntry, ScriptRunner};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -51,9 +50,7 @@ use tracing::{debug, info, warn};
 pub const SUBCOMMAND: &str = "__script-host";
 
 /// File descriptor the child inherits its end of the socket pair on.
-///
-/// 0/1/2 are taken by the standard streams, so 3 is the first free slot.
-pub const HOST_FD: RawFd = 3;
+pub const HOST_FD: RawFd = crate::process::CHILD_FD;
 
 /// Environment variable set on the child, naming [`HOST_FD`].
 ///
@@ -73,10 +70,6 @@ pub const HOST_FD_ENV: &str = "KIKI_SCRIPT_HOST_FD";
 ///
 /// [`SCRIPT_TIMEOUT_MS`]: crate::scripting::lua::SCRIPT_TIMEOUT_MS
 pub const IPC_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long the server waits for the child to exit on shutdown before
-/// killing it.
-const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 /// Why a request to the script host could not be served.
 #[derive(Debug, thiserror::Error)]
@@ -156,57 +149,14 @@ impl ScriptHost {
     /// Fails if the current executable cannot be located, the socket pair
     /// cannot be created, or the child cannot be spawned.
     pub fn spawn(log_only: bool, no_sandbox: bool) -> Result<Self> {
-        let exe = std::env::current_exe().context("locating the kiki executable")?;
-        let (ours, theirs) = UnixStream::pair().context("creating the script host socket pair")?;
+        let (ours, child) =
+            crate::process::spawn_child(SUBCOMMAND, HOST_FD_ENV, log_only, no_sandbox)
+                .context("spawning the script host process")?;
 
         ours.set_read_timeout(Some(IPC_TIMEOUT))
             .context("setting the script host read timeout")?;
         ours.set_write_timeout(Some(IPC_TIMEOUT))
             .context("setting the script host write timeout")?;
-
-        let mut cmd = Command::new(&exe);
-        cmd.arg(SUBCOMMAND)
-            .env(HOST_FD_ENV, HOST_FD.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            // Keep stderr so the child's tracing output lands wherever
-            // the server's does.
-            .stderr(Stdio::inherit());
-        if log_only {
-            cmd.arg("--seccomp-log-only");
-        }
-        if no_sandbox {
-            cmd.arg("--no-sandbox");
-        }
-
-        let their_fd = theirs.as_raw_fd();
-        // SAFETY: the closure runs between fork and exec, where only
-        // async-signal-safe calls are permitted. `dup2` and `fcntl` are
-        // both on that list, and neither allocates nor takes a lock.
-        unsafe {
-            cmd.pre_exec(move || {
-                if their_fd == HOST_FD {
-                    // Already in the right slot; just clear CLOEXEC so it
-                    // survives the exec.
-                    let flags = libc::fcntl(HOST_FD, libc::F_GETFD);
-                    if flags < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::fcntl(HOST_FD, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                } else if libc::dup2(their_fd, HOST_FD) < 0 {
-                    // `dup2` clears CLOEXEC on the new descriptor for us.
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        let child = cmd.spawn().context("spawning the script host process")?;
-        // The child has its own copy now; holding ours open would keep
-        // the socket from ever reporting EOF.
-        drop(theirs);
 
         info!(pid = child.id(), "script host: spawned");
         Ok(ScriptHost {
@@ -277,24 +227,11 @@ impl ScriptHost {
 impl Drop for ScriptHost {
     fn drop(&mut self) {
         let live = self.state.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(mut live) = live {
+        if let Some(live) = live {
             // Closing our end is the child's shutdown signal: its next
             // read returns EOF and it exits.
             drop(live.stream);
-
-            let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
-            loop {
-                match live.child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-            let _ = live.child.kill();
-            let _ = live.child.wait();
+            crate::process::reap(live.child);
         }
     }
 }
@@ -402,23 +339,7 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
             .context("failed to install the script host sandbox")?;
     }
 
-    // Taking ownership of a descriptor that isn't open is an IO-safety
-    // violation, and Rust aborts the process on the eventual drop rather
-    // than returning an error. Check first so a bad invocation exits with
-    // a diagnostic instead.
-    // SAFETY: `fcntl(F_GETFD)` only inspects the descriptor table entry.
-    if unsafe { libc::fcntl(HOST_FD, libc::F_GETFD) } < 0 {
-        bail!(
-            "no socket on fd {}: {} is spawned by `kiki serve`, not run directly",
-            HOST_FD,
-            SUBCOMMAND
-        );
-    }
-
-    // SAFETY: the parent dup2'd its end of the socket pair onto HOST_FD
-    // before exec, the check above confirms it is open, and nothing else
-    // in this process has touched it.
-    let mut stream = unsafe { UnixStream::from_raw_fd(HOST_FD) };
+    let mut stream = crate::process::take_parent_socket(SUBCOMMAND)?;
 
     let mut runner: Option<crate::scripting::lua::LuaScriptRunner> = None;
 

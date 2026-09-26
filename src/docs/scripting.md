@@ -49,7 +49,7 @@ chunk is rejected at load time.
 | `entry.parsed`   | entry table (see below)                    | Observe a newly-parsed entry, before any transformations. Return value is ignored. |
 | `entry.ingest`   | entry table (see below)                    | **Transform or filter** a parsed entry. Return the (possibly modified) entry to keep it, or `nil` to drop it. |
 | `fetch.success`  | `{ feed_id, status, url, content_length }` | Fires after a successful (2xx) feed fetch, once the response body has been read. |
-| `fetch.error`    | `{ feed_id, kind, status, message, retry_after }` | Fires when a feed fetch fails. `kind` is one of `"http"`, `"timeout"`, `"network"`, `"too_many_redirects"`, or `"parse"`. `status` and `retry_after` are populated only when available. |
+| `fetch.error`    | `{ feed_id, kind, status, message, retry_after }` | Fires when a feed fetch fails. `kind` is one of `"http"`, `"timeout"`, `"network"`, `"too_many_redirects"`, `"body_too_large"`, `"parse"`, or `"fetcher"` (the isolated feed fetcher itself failed, e.g. its worker crashed while handling this feed). `status` and `retry_after` are populated only when available. |
 | `feed.added`     | `{ id, url, title }`                       | Fires after a feed is created via the HTTP API. |
 | `feed.removed`   | `{ id, url, title }`                       | Fires after a feed is deleted via the HTTP API. `id`, `url`, `title` reflect the feed's state immediately before deletion. |
 

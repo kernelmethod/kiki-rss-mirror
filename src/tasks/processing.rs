@@ -1,19 +1,27 @@
+use crate::fetcher::{AtomEntry, AtomFeedIngestData, RssEntry};
 use crate::metrics::Metrics;
 use crate::scripting::ScriptRunner;
 use crate::tasks::command::TaskManagerCommand;
-use crate::tasks::parsing::{
-    atom_entry_to_parts, extract_atom_feed_data, insert_atom_entry_data, insert_rss_entry_data,
-    rss_item_to_parts, upsert_atom_feed_data,
-};
+use crate::tasks::parsing::{insert_atom_entry_data, insert_rss_entry_data, upsert_atom_feed_data};
 use anyhow::Result;
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+/// Store a parsed Atom feed: its feed-level data, then each entry after
+/// it has been through the script chain.
+///
+/// Returns the ids of the entries that were written.
+///
+/// The entries may have come from the isolated fetcher, so nothing in them
+/// is trusted to say which feed they belong to: `feed_id` and the
+/// syndication format are re-stamped from the caller's own values before
+/// scripts or the database see them.
 pub(super) fn process_atom_feed(
     feed_id: i64,
-    feed: atom_syndication::Feed,
+    feed_data: AtomFeedIngestData,
+    entries: Vec<AtomEntry>,
     mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
@@ -21,10 +29,8 @@ pub(super) fn process_atom_feed(
     info!(
         "Successfully fetched Atom feed {} with {} items",
         feed_id,
-        feed.entries.len()
+        entries.len()
     );
-
-    let feed_data = extract_atom_feed_data(&feed);
 
     {
         let tx = conn.transaction()?;
@@ -37,8 +43,13 @@ pub(super) fn process_atom_feed(
     }
 
     let mut inserted_entry_ids: Vec<i64> = Vec::new();
-    for entry in feed.entries.into_iter() {
-        let (feed_entry, ingest) = atom_entry_to_parts(feed_id, entry);
+    for AtomEntry {
+        entry: mut feed_entry,
+        data: ingest,
+    } in entries
+    {
+        feed_entry.feed_id = feed_id;
+        feed_entry.syndication_format = "atom".to_string();
 
         let feed_entry = if let Some(runner) = script_runner {
             runner.dispatch_observe(
@@ -111,9 +122,15 @@ pub(super) fn process_atom_feed(
     Ok(inserted_entry_ids)
 }
 
+/// Store a parsed RSS feed, each item after it has been through the
+/// script chain.
+///
+/// Returns the ids of the entries that were written. As with
+/// [`process_atom_feed`], `feed_id` and the syndication format are
+/// re-stamped on every entry rather than trusted.
 pub(super) fn process_rss_feed(
     feed_id: i64,
-    channel: rss::Channel,
+    entries: Vec<RssEntry>,
     mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
@@ -121,7 +138,7 @@ pub(super) fn process_rss_feed(
     info!(
         "Successfully fetched RSS feed {} with {} items",
         feed_id,
-        channel.items.len()
+        entries.len()
     );
 
     conn.execute(
@@ -130,8 +147,13 @@ pub(super) fn process_rss_feed(
     )?;
 
     let mut inserted_entry_ids: Vec<i64> = Vec::new();
-    for item in channel.items.into_iter() {
-        let (feed_entry, ingest) = rss_item_to_parts(feed_id, item);
+    for RssEntry {
+        entry: mut feed_entry,
+        data: ingest,
+    } in entries
+    {
+        feed_entry.feed_id = feed_id;
+        feed_entry.syndication_format = "rss".to_string();
 
         let feed_entry = if let Some(runner) = script_runner {
             runner.dispatch_observe(

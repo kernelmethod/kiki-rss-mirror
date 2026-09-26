@@ -6,7 +6,7 @@ use reqwest::Url;
 /// Used to decide whether credentials intended for a feed's configured URL
 /// may be forwarded across a redirect. Parse failures are treated as "not
 /// same-origin" — we refuse to leak credentials to a URL we can't inspect.
-pub(super) fn same_origin(a: &str, b: &str) -> bool {
+pub(crate) fn same_origin(a: &str, b: &str) -> bool {
     let (Ok(ua), Ok(ub)) = (Url::parse(a), Url::parse(b)) else {
         return false;
     };

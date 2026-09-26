@@ -107,9 +107,10 @@ impl ServeArgs {
             Listener::Tcp(_) => None,
         };
 
-        // Spawn the script host *before* the sandbox goes up: every
-        // profile denies `execve`, so this is the last moment at which
-        // the server can start a child process at all.
+        // Spawn the children *before* the sandbox goes up: every profile
+        // denies `execve`, so this is the last moment at which the server
+        // can start a child process at all.
+        let feed_fetcher = self.spawn_feed_fetcher()?;
         #[cfg(all(unix, feature = "lua"))]
         let script_host = self.spawn_script_host()?;
 
@@ -123,7 +124,9 @@ impl ServeArgs {
             );
         }
 
-        let mut builder = server::ServerBuilder::new(&db_path).autofetch();
+        let mut builder = server::ServerBuilder::new(&db_path)
+            .autofetch()
+            .feed_fetcher(feed_fetcher);
         #[cfg(all(unix, feature = "lua"))]
         {
             builder = builder.script_host(script_host);
@@ -137,6 +140,27 @@ impl ServeArgs {
         std::thread::spawn(|| server.run())
             .join()
             .map_err(|_| anyhow::anyhow!("panic in server thread"))?
+    }
+
+    /// Start the isolated feed fetcher.
+    ///
+    /// There is no opt-out: the fetcher has the server resolve hostnames
+    /// for it, so it works wherever the server does, and a spawn failure
+    /// is fatal rather than a silent fall back to fetching untrusted feeds
+    /// next to the database. `--no-sandbox` still lifts the fetcher's
+    /// sandbox along with the server's.
+    fn spawn_feed_fetcher(&self) -> Result<crate::process::FeedFetcherHandle> {
+        #[cfg(unix)]
+        {
+            use crate::process::feed_fetcher::FeedFetcherHost;
+            let host = FeedFetcherHost::spawn(self.seccomp_log_only, self.no_sandbox)
+                .context("failed to start the isolated feed fetcher")?;
+            Ok(Some(std::sync::Arc::new(host)))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(None)
+        }
     }
 
     /// Start the isolated Lua script host, unless the operator opted out.

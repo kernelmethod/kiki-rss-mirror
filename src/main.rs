@@ -30,10 +30,15 @@ pub enum Commands {
     #[cfg(feature = "systemd")]
     Service(cli::service::ServiceArgs),
 
+    /// Internal: run the sandboxed feed fetcher. Spawned by `serve`.
+    #[cfg(unix)]
+    #[command(name = kiki_rss::process::feed_fetcher::SUBCOMMAND, hide = true)]
+    FeedFetcher(cli::child::ChildArgs),
+
     /// Internal: run the sandboxed Lua script host. Spawned by `serve`.
     #[cfg(all(unix, feature = "lua"))]
     #[command(name = kiki_rss::process::script_host::SUBCOMMAND, hide = true)]
-    ScriptHost(cli::script_host::ScriptHostArgs),
+    ScriptHost(cli::child::ChildArgs),
 
     /// Print the version of Kiki
     Version,
@@ -50,8 +55,16 @@ impl Commands {
             Commands::Docs(args) => args.run(),
             #[cfg(feature = "systemd")]
             Commands::Service(args) => args.run(),
+            #[cfg(unix)]
+            Commands::FeedFetcher(args) => {
+                use kiki_rss::process::feed_fetcher as f;
+                args.run(f::SUBCOMMAND, f::HOST_FD_ENV, f::run_child)
+            }
             #[cfg(all(unix, feature = "lua"))]
-            Commands::ScriptHost(args) => args.run(),
+            Commands::ScriptHost(args) => {
+                use kiki_rss::process::script_host as s;
+                args.run(s::SUBCOMMAND, s::HOST_FD_ENV, s::run_child)
+            }
             Commands::Version => {
                 println!("kiki {}", env!("CARGO_PKG_VERSION"));
                 Ok(())

@@ -12,6 +12,7 @@ mod processing;
 mod scripting;
 mod worker;
 
+pub(crate) use backoff::same_origin;
 pub use command::TaskManagerCommand;
 pub use error::FetchError;
 #[cfg(feature = "lua")]
@@ -24,8 +25,20 @@ pub use worker::{spawn_workers, worker_count};
 // this path (it imports them directly from the submodules instead).
 #[allow(unused_imports)]
 pub(crate) use entry_assets::cache_entry_assets;
-#[allow(unused_imports)]
-pub(crate) use fetch::refresh_feed;
+/// [`fetch::refresh_feed`] with an in-process fetcher around `client`,
+/// which is how the tests drive it.
+#[cfg(test)]
+pub(crate) async fn refresh_feed(
+    client: &reqwest::Client,
+    feed_id: i64,
+    pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    script_runner: Option<&dyn crate::scripting::ScriptRunner>,
+    metrics: &crate::metrics::Metrics,
+    task_tx: &async_channel::Sender<TaskManagerCommand>,
+) -> anyhow::Result<()> {
+    let fetcher = crate::fetcher::Fetcher::InProcess(client.clone());
+    fetch::refresh_feed(&fetcher, feed_id, pool, script_runner, metrics, task_tx).await
+}
 #[allow(unused_imports)]
 pub(crate) use maintenance::run_maintenance;
 

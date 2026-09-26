@@ -398,6 +398,222 @@ fn no_sandbox_flag_still_runs() {
 }
 
 // --------------------------------------------------------------------
+// Process-tree helpers
+// --------------------------------------------------------------------
+
+/// Scan /proc for children of `parent` whose command line contains
+/// `needle`.
+fn child_pids_matching(parent: u32, needle: &str) -> Vec<u32> {
+    let mut found = Vec::new();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return found,
+    };
+    for entry in entries.flatten() {
+        let pid: u32 = match entry.file_name().to_string_lossy().parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let ppid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        if ppid != Some(parent) {
+            continue;
+        }
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        if String::from_utf8_lossy(&cmdline).contains(needle) {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+/// Read the `Seccomp` mode out of a process's /proc status. `2` is
+/// `SECCOMP_MODE_FILTER`.
+fn seccomp_mode(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Seccomp:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// Poll until `pid` is gone, or the deadline passes.
+fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    !Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Refresh `feed_id` and poll until at least `n` entries exist, or the
+/// server dies.
+fn refresh_until_entries(kiki: &mut Kiki, feed_id: i64, n: i64) {
+    kiki.post_json(&format!("/v1/feeds/refresh/{feed_id}"), "")
+        .assert_success();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        kiki.assert_still_running();
+        let entries = kiki.get("/v1/entries?limit=5").assert_success();
+        if entries.json()["count"].as_i64().unwrap_or(0) >= n {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "entry never appeared after refresh; last response: {}",
+                entries.body_str()
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+// --------------------------------------------------------------------
+// Feed fetcher isolation
+// --------------------------------------------------------------------
+
+mod fetch_isolation {
+    use super::*;
+    use kiki_rss::process::feed_fetcher;
+
+    impl Kiki {
+        /// PID of this server's feed fetcher supervisor, if it has one.
+        fn fetcher_supervisor_pids(&self) -> Vec<u32> {
+            let server_pid = self.child.as_ref().expect("child").id();
+            child_pids_matching(server_pid, feed_fetcher::SUBCOMMAND)
+        }
+
+        /// Wait for the supervisor's worker to exist and return its PID.
+        fn wait_for_fetcher_worker(&mut self, not: Option<u32>) -> u32 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                self.assert_still_running();
+                let supervisor = *self
+                    .fetcher_supervisor_pids()
+                    .first()
+                    .expect("a feed fetcher supervisor");
+                let workers = child_pids_matching(supervisor, feed_fetcher::SUBCOMMAND);
+                if let Some(&w) = workers.iter().find(|&&w| Some(w) != not) {
+                    return w;
+                }
+                if Instant::now() >= deadline {
+                    panic!("no feed fetcher worker appeared (excluding {not:?})");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    fn create_feed(kiki: &mut Kiki, addr: SocketAddr) -> i64 {
+        let created = kiki
+            .post_json(
+                "/v1/feeds/create",
+                &format!(r#"{{"title":"isolated fetch","url":"http://{addr}/feed.xml"}}"#),
+            )
+            .assert_success();
+        created.json()["id"].as_i64().expect("id")
+    }
+
+    /// By default feeds are fetched by a sandboxed supervisor/worker pair,
+    /// not by the server.
+    #[test]
+    fn feeds_are_fetched_in_a_separate_sandboxed_process_by_default() {
+        let mut kiki = Kiki::spawn(&[]);
+        let supervisors = kiki.fetcher_supervisor_pids();
+        assert_eq!(
+            supervisors.len(),
+            1,
+            "expected exactly one `{}` child of the server, found {supervisors:?}",
+            feed_fetcher::SUBCOMMAND
+        );
+        let worker = kiki.wait_for_fetcher_worker(None);
+        for pid in [supervisors[0], worker] {
+            assert_eq!(
+                seccomp_mode(pid),
+                Some(2),
+                "fetcher pid {pid} is not running under a seccomp filter"
+            );
+        }
+        kiki.shutdown();
+    }
+
+    /// A worker that dies is replaced inside the sandbox, and fetching
+    /// carries on — the server itself can no longer spawn anything, so
+    /// this is the only way fetching survives a crash.
+    #[test]
+    fn a_killed_worker_is_replaced_and_fetching_continues() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&[]);
+        let supervisor = kiki.fetcher_supervisor_pids()[0];
+        let first = kiki.wait_for_fetcher_worker(None);
+
+        // SAFETY: SIGKILL to a process of our own; at worst ESRCH.
+        unsafe {
+            libc::kill(first as libc::pid_t, libc::SIGKILL);
+        }
+        assert!(wait_for_exit(first, Duration::from_secs(5)));
+        let second = kiki.wait_for_fetcher_worker(Some(first));
+        assert_ne!(first, second);
+        assert_eq!(
+            kiki.fetcher_supervisor_pids(),
+            vec![supervisor],
+            "the supervisor must survive its worker"
+        );
+
+        let feed_id = create_feed(&mut kiki, addr);
+        refresh_until_entries(&mut kiki, feed_id, 1);
+        kiki.shutdown();
+    }
+
+    /// A feed named by hostname rather than IP is fetched even though the
+    /// fetcher cannot read /etc/hosts or any resolver configuration: the
+    /// lookup is done by the server, on the fetcher's behalf.
+    #[test]
+    fn hostnames_are_resolved_by_the_server() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&[]);
+        let created = kiki
+            .post_json(
+                "/v1/feeds/create",
+                &format!(
+                    r#"{{"title":"by name","url":"http://localhost:{}/feed.xml"}}"#,
+                    addr.port()
+                ),
+            )
+            .assert_success();
+        let feed_id = created.json()["id"].as_i64().expect("id");
+        refresh_until_entries(&mut kiki, feed_id, 1);
+        kiki.shutdown();
+    }
+
+    /// Neither fetcher process may outlive the server.
+    #[test]
+    fn the_fetcher_exits_with_the_server() {
+        let mut kiki = Kiki::spawn(&[]);
+        let supervisor = kiki.fetcher_supervisor_pids()[0];
+        let worker = kiki.wait_for_fetcher_worker(None);
+        kiki.shutdown();
+
+        for pid in [supervisor, worker] {
+            assert!(
+                wait_for_exit(pid, Duration::from_secs(5)),
+                "fetcher pid {pid} outlived the server"
+            );
+        }
+    }
+}
+
+// --------------------------------------------------------------------
 // Script host isolation
 // --------------------------------------------------------------------
 
@@ -448,60 +664,6 @@ mod script_isolation {
         body.lines()
             .filter(|l| !l.starts_with('#'))
             .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
-    }
-
-    /// Scan /proc for children of `parent` whose command line contains
-    /// `needle`.
-    fn child_pids_matching(parent: u32, needle: &str) -> Vec<u32> {
-        let mut found = Vec::new();
-        let entries = match std::fs::read_dir("/proc") {
-            Ok(e) => e,
-            Err(_) => return found,
-        };
-        for entry in entries.flatten() {
-            let pid: u32 = match entry.file_name().to_string_lossy().parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let ppid = status
-                .lines()
-                .find_map(|l| l.strip_prefix("PPid:"))
-                .and_then(|v| v.trim().parse::<u32>().ok());
-            if ppid != Some(parent) {
-                continue;
-            }
-            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-            if String::from_utf8_lossy(&cmdline).contains(needle) {
-                found.push(pid);
-            }
-        }
-        found
-    }
-
-    /// Read the `Seccomp` mode out of a process's /proc status. `2` is
-    /// `SECCOMP_MODE_FILTER`.
-    fn seccomp_mode(pid: u32) -> Option<u32> {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix("Seccomp:"))
-            .and_then(|v| v.trim().parse().ok())
-    }
-
-    /// Poll until `pid` is gone, or the deadline passes.
-    fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if !Path::new(&format!("/proc/{pid}")).exists() {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        !Path::new(&format!("/proc/{pid}")).exists()
     }
 
     /// Add a script and wait for the reloaded runner to report it loaded.

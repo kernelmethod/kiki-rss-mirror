@@ -11,19 +11,27 @@
 //!   actually needs — for the server that is the data directory holding
 //!   the SQLite DB and cached assets, the Unix socket's parent directory,
 //!   and a small read-only set of system paths needed for DNS and TLS
-//!   trust stores. For the script host it is *nothing at all*.
+//!   trust stores. The feed fetcher gets only the TLS trust stores (it
+//!   has the server resolve hostnames for it), and the script host gets
+//!   *nothing at all*. Where the kernel
+//!   supports it, the feed fetcher is also barred from binding TCP ports
+//!   and from reaching abstract Unix sockets or signalling processes
+//!   outside its own sandbox.
 //! * **seccomp-bpf** blocks a denylist of syscalls the profile never uses
 //!   (`ptrace`, `mount`, `unshare`, `bpf`, `kexec_load`, module loading,
-//!   and friends; plus, for the script host, every socket call). The
-//!   default action for unmatched syscalls is `Allow` — this is a
+//!   and friends; plus, for the script host, every socket call, and for
+//!   the feed fetcher, binding, listening, accepting, and creating Unix
+//!   sockets).
+//!   The default action for unmatched syscalls is `Allow` — this is a
 //!   defence-in-depth layer that eliminates the most dangerous escape
 //!   primitives without risking that a benign syscall we forgot about
 //!   will kill the process.
 //!
 //! Both restrictions are installed before the process touches untrusted
 //! input — for the server, before it opens its listening socket(s); for
-//! the script host, before it reads its first byte of IPC. They are
-//! inherited by every thread and task spawned later.
+//! the children, before they read their first byte of IPC. They are
+//! inherited by every thread and task spawned later, and by the feed
+//! fetcher's forked workers.
 //!
 //! On non-Linux platforms [`apply`] is a no-op that logs a warning.
 
@@ -57,6 +65,17 @@ pub enum SandboxProfile {
     /// file descriptor already exists by the time the sandbox is applied,
     /// and is used through plain `read`/`write`.
     ScriptHost,
+
+    /// The feed fetcher: retrieves feeds over HTTP(S) and parses them,
+    /// and talks to the server over an inherited socket pair.
+    ///
+    /// This profile grants read-only access to the TLS trust stores and
+    /// nothing else — no data directory, no resolver configuration, no
+    /// `/proc`; the server resolves hostnames on its behalf. It may make
+    /// outbound TCP connections, but may not bind, listen for or accept
+    /// them, or create a Unix socket: the last keeps it away from the
+    /// server's API socket, whose only access control is reachability.
+    FeedFetcher,
 }
 
 /// Sandbox configuration derived from CLI flags and the process's role.
@@ -91,11 +110,20 @@ impl SandboxConfig {
         }
     }
 
+    /// Configuration for the feed fetcher process.
+    pub fn feed_fetcher(log_only: bool) -> Self {
+        SandboxConfig {
+            profile: SandboxProfile::FeedFetcher,
+            log_only,
+        }
+    }
+
     /// A short name for the profile, used in log messages.
     pub fn profile_name(&self) -> &'static str {
         match self.profile {
             SandboxProfile::Server { .. } => "server",
             SandboxProfile::ScriptHost => "script-host",
+            SandboxProfile::FeedFetcher => "feed-fetcher",
         }
     }
 }

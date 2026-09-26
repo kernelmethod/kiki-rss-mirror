@@ -130,7 +130,7 @@ impl fmt::Display for FeedAuthType {
 ///
 /// Instances are constructed from the `feeds` row that backs a given feed
 /// and applied to a request via [`FeedAuth::apply`].
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct FeedAuth {
     pub auth_type: FeedAuthType,
     pub username: Option<String>,

@@ -10,6 +10,7 @@
 
 pub mod db;
 pub mod docs;
+pub mod fetcher;
 pub mod http;
 pub mod metrics;
 pub mod process;

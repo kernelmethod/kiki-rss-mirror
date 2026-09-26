@@ -1,3 +1,4 @@
+use crate::fetcher::Fetcher;
 use crate::http::USER_AGENT;
 use crate::metrics::Metrics;
 use crate::scripting::{ScriptRunner, ScriptRunnerHandle};
@@ -74,6 +75,7 @@ struct Worker {
     metrics: Arc<Metrics>,
     data_dir: PathBuf,
     script_runner: ScriptRunnerHandle,
+    fetcher: Fetcher,
 }
 
 /// Determine the number of worker tasks to spawn.
@@ -87,6 +89,8 @@ pub fn worker_count() -> usize {
 ///
 /// All workers share a single [`ScriptRunnerHandle`]; reloads are handled centrally by
 /// a separate task that listens on `reload_rx` and swaps the runner inside the handle.
+/// They also share one [`Fetcher`], through which every feed refresh
+/// retrieves and parses its feed.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_workers(
     rx: async_channel::Receiver<TaskManagerCommand>,
@@ -97,6 +101,7 @@ pub fn spawn_workers(
     metrics: Arc<Metrics>,
     data_dir: PathBuf,
     script_runner: ScriptRunnerHandle,
+    fetcher: Fetcher,
 ) -> Vec<tokio::task::JoinHandle<Result<()>>> {
     let worker = Worker {
         rx,
@@ -108,6 +113,7 @@ pub fn spawn_workers(
         metrics,
         data_dir,
         script_runner,
+        fetcher,
     };
     let mut handles = Vec::with_capacity(num_workers);
 
@@ -122,6 +128,7 @@ pub fn spawn_workers(
 
 /// A single worker loop that pulls commands from the shared channel.
 async fn run_worker(worker_id: usize, w: Worker) -> Result<()> {
+    // Used for asset caching only; feed fetches go through `w.fetcher`.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(USER_AGENT)
@@ -168,7 +175,7 @@ async fn run_worker(worker_id: usize, w: Worker) -> Result<()> {
                 let script_runner: Option<&dyn ScriptRunner> = runner_snapshot.as_deref();
 
                 let outcome = match refresh_feed(
-                    &client,
+                    &w.fetcher,
                     feed_id,
                     w.pool.clone(),
                     script_runner,
