@@ -52,8 +52,11 @@ RestrictNamespaces=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 # Syscalls (outer belt; the in-process seccomp filter adds more).
+# @sandbox (landlock_* and seccomp) is not part of @system-service, but
+# every kiki process needs it to install its own Landlock and seccomp
+# filters; without it systemd kills `kiki serve` with SIGSYS on startup.
 SystemCallArchitectures=native
-SystemCallFilter=@system-service
+SystemCallFilter=@system-service @sandbox
 SystemCallFilter=~@privileged @resources @mount @swap @reboot @module @debug @cpu-emulation @obsolete @raw-io @keyring
 
 # Memory & execution
