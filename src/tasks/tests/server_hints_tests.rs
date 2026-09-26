@@ -124,11 +124,21 @@ fn test_hints_expires_asctime() {
     assert_eq!(extract_server_hints(&h, NOW).hint_secs, Some(3600));
 }
 
-/// An `Expires` in the past yields a zero-second hint.
+/// An `Expires` in the past, or exactly now, gives no freshness and so no
+/// hint, the same as an invalid one.
 #[test]
-fn test_hints_expires_in_past() {
-    let h = headers(&[("expires", "Sun, 06 Nov 1994 07:49:37 GMT")]);
-    assert_eq!(extract_server_hints(&h, NOW).hint_secs, Some(0));
+fn test_hints_expires_in_past_gives_no_hint() {
+    for value in [
+        "Sun, 06 Nov 1994 07:49:37 GMT",
+        "Sun, 06 Nov 1994 08:49:37 GMT",
+    ] {
+        let h = headers(&[("expires", value)]);
+        assert_eq!(
+            extract_server_hints(&h, NOW).hint_secs,
+            None,
+            "Expires: {value}"
+        );
+    }
 }
 
 /// An invalid `Expires` such as `0` gives no freshness (RFC 9111 §5.3

@@ -1871,13 +1871,12 @@ async fn test_expires_asctime_format_is_parsed() -> Result<()> {
     Ok(())
 }
 
-/// `Expires: 0` is invalid and means "already expired" (RFC 9111 §5.3):
-/// nothing is stored and the feed falls back to its per-feed interval.
-#[tokio::test]
-async fn test_invalid_expires_gives_no_freshness() -> Result<()> {
+/// Refresh once against a server sending `Expires: expires`, and return
+/// the scheduled `next_fetch_at` offset from just before the refresh.
+async fn next_fetch_offset_with_expires(expires: String) -> Result<(i64, Option<i64>)> {
     let mut tc = TestBuilder::default().init_database().build()?;
     let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
-        expires: Some("0".into()),
+        expires: Some(expires),
         ..Default::default()
     }));
     tc.init_feed_server_with_state(state.clone()).await?;
@@ -1885,13 +1884,37 @@ async fn test_invalid_expires_gives_no_freshness() -> Result<()> {
 
     let before = Utc::now().timestamp();
     refresh_once(&client, feed_id, &pool).await?;
-
-    assert_eq!(feed_column(&tc, feed_id, "header_expires"), None);
     let next = feed_column(&tc, feed_id, "next_fetch_at").expect("next_fetch_at set");
+    Ok((next - before, feed_column(&tc, feed_id, "header_expires")))
+}
+
+/// An `Expires` already in the past gives no freshness, so the feed stays
+/// on its per-feed interval instead of being polled at the min-cadence
+/// floor.
+#[tokio::test]
+async fn test_past_expires_uses_per_feed_interval() -> Result<()> {
+    let past = (Utc::now() - chrono::Duration::hours(1))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    let (offset, stored) = next_fetch_offset_with_expires(past).await?;
+    assert!(stored.is_some(), "the server's Expires is still recorded");
     assert!(
-        (before + 10_800..=before + 10_810).contains(&next),
-        "should use the default 3h per-feed interval; got offset {}",
-        next - before
+        (10_800..=10_810).contains(&offset),
+        "should use the default 3h per-feed interval; got offset {offset}"
+    );
+    Ok(())
+}
+
+/// `Expires: 0` is invalid and means "already expired" (RFC 9111 §5.3):
+/// nothing is stored and, like a past `Expires`, the feed stays on its
+/// per-feed interval.
+#[tokio::test]
+async fn test_invalid_expires_gives_no_freshness() -> Result<()> {
+    let (offset, stored) = next_fetch_offset_with_expires("0".into()).await?;
+    assert_eq!(stored, None);
+    assert!(
+        (10_800..=10_810).contains(&offset),
+        "should use the default 3h per-feed interval; got offset {offset}"
     );
     Ok(())
 }
