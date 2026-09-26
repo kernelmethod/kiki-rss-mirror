@@ -18,8 +18,11 @@
             src = let
               sqlFilter = path: _type: builtins.match ".*\\.sql$" path != null;
               xmlFilter = path: _type: builtins.match ".*\\.xml$" path != null;
+              # Markdown pulled into rustdoc via include_str! (e.g. src/docs/*.md)
+              docsFilter = path: _type: builtins.match ".*/src/.*\\.md$" path != null;
               customOrCargo = path: type:
-                (sqlFilter path type) || (xmlFilter path type) || (craneLib.filterCargoSources path type);
+                (sqlFilter path type) || (xmlFilter path type) || (docsFilter path type)
+                || (craneLib.filterCargoSources path type);
             in
               pkgs.lib.cleanSourceWith {
                 src = ./.;
