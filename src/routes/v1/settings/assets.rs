@@ -1,4 +1,6 @@
 //! Settings endpoint for the feed asset cache.
+use super::update_config;
+use crate::config::AssetCacheSettings;
 use crate::db::assets as db_assets;
 use crate::server::AppState;
 use axum::{
@@ -10,6 +12,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::task;
 use tracing::{event, Level};
+
+const SECTION: &str = "asset_cache";
 
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AssetCacheSettingsResponse {
@@ -24,12 +28,32 @@ pub struct AssetCacheSettingsRequest {
     pub max_bytes: Option<i64>,
 }
 
-fn read_settings(conn: &rusqlite::Connection) -> anyhow::Result<AssetCacheSettingsResponse> {
-    Ok(AssetCacheSettingsResponse {
-        enabled: db_assets::get_cache_enabled(conn)?,
-        max_bytes: db_assets::get_cache_max_bytes(conn)?,
-        current_bytes: db_assets::total_cache_size(conn)?,
+/// Builds the response from `settings` plus the cache's current size,
+/// which lives in the database.
+async fn respond(state: &AppState, settings: &AssetCacheSettings) -> Result<Response, Response> {
+    let pool = state.conn_pool.clone();
+    let res = task::spawn_blocking(move || -> anyhow::Result<i64> {
+        let conn = pool.get()?;
+        db_assets::total_cache_size(&conn)
     })
+    .await;
+
+    match res {
+        Ok(Ok(current_bytes)) => Ok(Json(AssetCacheSettingsResponse {
+            enabled: settings.enabled,
+            max_bytes: settings.max_bytes,
+            current_bytes,
+        })
+        .into_response()),
+        Ok(Err(e)) => {
+            event!(Level::ERROR, "read asset cache size: {:?}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
+        }
+        Err(e) => {
+            event!(Level::ERROR, "task error reading asset cache size: {:?}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
+        }
+    }
 }
 
 /// Get asset cache settings.
@@ -45,28 +69,8 @@ fn read_settings(conn: &rusqlite::Connection) -> anyhow::Result<AssetCacheSettin
 )]
 #[axum::debug_handler]
 pub async fn get_asset_cache_settings(State(state): State<AppState>) -> Result<Response, Response> {
-    let pool = state.conn_pool.clone();
-    let res = task::spawn_blocking(move || -> anyhow::Result<AssetCacheSettingsResponse> {
-        let conn = pool.get()?;
-        read_settings(&conn)
-    })
-    .await;
-
-    match res {
-        Ok(Ok(s)) => Ok(Json(s).into_response()),
-        Ok(Err(e)) => {
-            event!(Level::ERROR, "read asset cache settings: {:?}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
-        }
-        Err(e) => {
-            event!(
-                Level::ERROR,
-                "task error in get asset cache settings: {:?}",
-                e
-            );
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
-        }
-    }
+    let settings = state.config.current();
+    respond(&state, &settings.asset_cache).await
 }
 
 /// Update asset cache settings. Any field left `null` is unchanged.
@@ -78,6 +82,7 @@ pub async fn get_asset_cache_settings(State(state): State<AppState>) -> Result<R
         (status = 200, description = "Updated asset cache settings",
          body = AssetCacheSettingsResponse),
         (status = 400, description = "Invalid value"),
+        (status = 409, description = "The config file on disk is invalid"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "settings"
@@ -87,38 +92,16 @@ pub async fn put_asset_cache_settings(
     State(state): State<AppState>,
     Json(payload): Json<AssetCacheSettingsRequest>,
 ) -> Result<Response, Response> {
-    if let Some(b) = payload.max_bytes {
-        if b < 0 {
-            return Err((StatusCode::BAD_REQUEST, "max_bytes must be non-negative").into_response());
-        }
-    }
-
-    let pool = state.conn_pool.clone();
-    let res = task::spawn_blocking(move || -> anyhow::Result<AssetCacheSettingsResponse> {
-        let conn = pool.get()?;
+    let settings = update_config(&state, move |o| {
         if let Some(enabled) = payload.enabled {
-            db_assets::set_cache_enabled(&conn, enabled)?;
+            o.set(SECTION, "enabled", enabled)?;
         }
         if let Some(max_bytes) = payload.max_bytes {
-            db_assets::set_cache_max_bytes(&conn, max_bytes)?;
+            o.set(SECTION, "max_bytes", max_bytes)?;
         }
-        read_settings(&conn)
+        Ok(())
     })
-    .await;
+    .await?;
 
-    match res {
-        Ok(Ok(s)) => Ok(Json(s).into_response()),
-        Ok(Err(e)) => {
-            event!(Level::ERROR, "write asset cache settings: {:?}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
-        }
-        Err(e) => {
-            event!(
-                Level::ERROR,
-                "task error in put asset cache settings: {:?}",
-                e
-            );
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
-        }
-    }
+    respond(&state, &settings.asset_cache).await
 }

@@ -1,3 +1,4 @@
+use crate::config::Settings;
 use crate::fetcher::{
     FeedHints, FetchReply, FetchSpec, FetchedBody, Fetcher, ParseOutcome, ParsedFeed,
 };
@@ -112,25 +113,28 @@ pub(crate) async fn refresh_feed(
     fetcher: &Fetcher,
     feed_id: i64,
     pool: Pool<SqliteConnectionManager>,
+    settings: &Settings,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
     task_tx: &async_channel::Sender<TaskManagerCommand>,
 ) -> Result<()> {
     let fetch_start = Instant::now();
+    let fetch_settings = &settings.feed_fetch;
 
     let conn = pool.get()?;
     let row = load_feed_fetch_row(&conn, feed_id)?;
 
     let cfg = SchedulerConfig {
-        min_cadence: crate::db::settings::get_min_polling_cadence_seconds(&conn)?,
-        max_backoff: crate::db::settings::get_max_feed_backoff_seconds(&conn)?,
+        min_cadence: fetch_settings.min_polling_cadence_seconds,
+        max_backoff: fetch_settings.max_backoff_seconds,
         min_fetch_interval: row.min_fetch_interval.max(0) as u64,
-        force_refresh_after: crate::db::settings::get_force_refresh_after_secs(&conn)?,
+        force_refresh_after: fetch_settings.force_refresh_after_seconds,
     };
     let rec = Recorder {
         pool: &pool,
         feed_id,
         cfg,
+        max_feed_bytes: fetch_settings.max_feed_bytes,
         fetch_start,
         metrics,
         script_runner,
@@ -191,10 +195,11 @@ pub(crate) async fn refresh_feed(
             // server's validators have been honest.
             send_conditionals: !skip_conditionals && !force_conditionals_off,
             auth: row.auth.clone(),
-            // Both read per fetch, so an operator changing them does not
-            // have to restart the server for it to take effect.
-            timeout_secs: crate::db::settings::get_feed_update_timeout_seconds(&conn)?,
-            max_feed_bytes: crate::db::settings::get_max_feed_bytes(&conn)?,
+            // Both taken from the settings snapshot for this fetch, so an
+            // operator changing them does not have to restart the server
+            // for it to take effect.
+            timeout_secs: fetch_settings.timeout_seconds,
+            max_feed_bytes: fetch_settings.max_feed_bytes,
         };
         match fetcher.fetch(spec).await {
             Ok(reply) => match record_fetch_reply(&rec, &row, reply, force_conditionals_off) {
@@ -249,6 +254,8 @@ struct Recorder<'a> {
     pool: &'a Pool<SqliteConnectionManager>,
     feed_id: i64,
     cfg: SchedulerConfig,
+    /// The body-size cap this fetch was made with.
+    max_feed_bytes: u64,
     fetch_start: Instant,
     metrics: &'a Metrics,
     script_runner: Option<&'a dyn ScriptRunner>,
@@ -420,7 +427,7 @@ fn record_fetch_reply(
         } => {
             metrics.record_feed_redirects(redirects);
             debug!("Feed {}: gave up on the body after {} bytes", feed_id, seen);
-            let limit = crate::db::settings::get_max_feed_bytes(&conn)?;
+            let limit = rec.max_feed_bytes;
             let url = final_url;
             let kind = "body_too_large";
             rec.fail(FetchError::BodyTooLarge { url, limit }, kind, kind);

@@ -1,3 +1,4 @@
+use crate::config::ConfigHandle;
 use crate::fetcher::Fetcher;
 use crate::http::USER_AGENT;
 use crate::metrics::Metrics;
@@ -74,6 +75,7 @@ struct Worker {
     cleanup_in_progress: InProgressSet,
     metrics: Arc<Metrics>,
     data_dir: PathBuf,
+    config: ConfigHandle,
     script_runner: ScriptRunnerHandle,
     fetcher: Fetcher,
 }
@@ -90,7 +92,8 @@ pub fn worker_count() -> usize {
 /// All workers share a single [`ScriptRunnerHandle`]; reloads are handled centrally by
 /// a separate task that listens on `reload_rx` and swaps the runner inside the handle.
 /// They also share one [`Fetcher`], through which every feed refresh
-/// retrieves and parses its feed.
+/// retrieves and parses its feed, and read settings from `config` afresh
+/// for every command, so a settings change applies to the next one.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_workers(
     rx: async_channel::Receiver<TaskManagerCommand>,
@@ -100,6 +103,7 @@ pub fn spawn_workers(
     num_workers: usize,
     metrics: Arc<Metrics>,
     data_dir: PathBuf,
+    config: ConfigHandle,
     script_runner: ScriptRunnerHandle,
     fetcher: Fetcher,
 ) -> Vec<tokio::task::JoinHandle<Result<()>>> {
@@ -112,6 +116,7 @@ pub fn spawn_workers(
         cleanup_in_progress: Arc::new(Mutex::new(HashSet::new())),
         metrics,
         data_dir,
+        config,
         script_runner,
         fetcher,
     };
@@ -147,6 +152,7 @@ async fn run_worker(worker_id: usize, w: Worker) -> Result<()> {
 
         w.metrics.inc_workers_busy();
         let task_start = Instant::now();
+        let settings = w.config.current();
 
         match command {
             TaskManagerCommand::RefreshFeed(feed_id) => {
@@ -178,6 +184,7 @@ async fn run_worker(worker_id: usize, w: Worker) -> Result<()> {
                     &w.fetcher,
                     feed_id,
                     w.pool.clone(),
+                    &settings,
                     script_runner,
                     &w.metrics,
                     &w.tx,
@@ -197,6 +204,7 @@ async fn run_worker(worker_id: usize, w: Worker) -> Result<()> {
                                 &FetchError::Other {
                                     message: format!("{}", e),
                                 },
+                                &settings.feed_fetch,
                                 &w.metrics,
                             );
                         }
@@ -243,7 +251,11 @@ async fn run_worker(worker_id: usize, w: Worker) -> Result<()> {
                 let cleanup_start = Instant::now();
                 let mut outcome = "ok";
                 if let Ok(conn) = w.pool.get() {
-                    match crate::db::retention::cleanup_feed(&conn, feed_id) {
+                    match crate::db::retention::cleanup_feed(
+                        &conn,
+                        feed_id,
+                        settings.retention.max_age_days,
+                    ) {
                         Ok(0) => {}
                         Ok(n) => {
                             info!(
@@ -276,7 +288,8 @@ async fn run_worker(worker_id: usize, w: Worker) -> Result<()> {
                 let cleanup_start = Instant::now();
                 let mut outcome = "ok";
                 if let Ok(conn) = w.pool.get() {
-                    match crate::db::retention::cleanup_all(&conn) {
+                    match crate::db::retention::cleanup_all(&conn, settings.retention.max_age_days)
+                    {
                         Ok(0) => {}
                         Ok(n) => {
                             info!("Retention cleanup deleted {} entries", n);
@@ -303,14 +316,21 @@ async fn run_worker(worker_id: usize, w: Worker) -> Result<()> {
             }
 
             TaskManagerCommand::CacheEntryAssets { entry_id } => {
-                let outcome =
-                    match cache_entry_assets(&client, &w.pool, &w.data_dir, entry_id).await {
-                        Ok(()) => "ok",
-                        Err(e) => {
-                            warn!("failed caching assets for entry {}: {:?}", entry_id, e);
-                            "error"
-                        }
-                    };
+                let outcome = match cache_entry_assets(
+                    &client,
+                    &w.pool,
+                    &w.data_dir,
+                    &settings.asset_cache,
+                    entry_id,
+                )
+                .await
+                {
+                    Ok(()) => "ok",
+                    Err(e) => {
+                        warn!("failed caching assets for entry {}: {:?}", entry_id, e);
+                        "error"
+                    }
+                };
                 w.metrics.record_task_processed(
                     "cache_entry_assets",
                     outcome,

@@ -11,45 +11,6 @@ CREATE TABLE migrations (
     applied_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    type  TEXT
-);
-
--- Default global settings.
-INSERT INTO settings (key, value, type)
-VALUES ('feed_update_timeout_seconds', '15', 'integer');
-INSERT INTO settings (key, value, type)
-VALUES ('feed_asset_cache_enabled', 'true', 'boolean');
-INSERT INTO settings (key, value, type)
-VALUES ('feed_asset_cache_max_bytes', '1073741824', 'integer');
-
--- Absolute floor on how often any single feed can be polled, in seconds.
--- Caps the effect of a very low `max-age` or `Retry-After` value so a
--- misbehaving server cannot trigger hyperpolling.
-INSERT INTO settings (key, value, type)
-VALUES ('min_polling_cadence_seconds', '60', 'integer');
-
--- Cap on exponential backoff and the wait used for permanent errors,
--- in seconds. Defaults to 24 hours.
-INSERT INTO settings (key, value, type)
-VALUES ('max_feed_backoff_seconds', '86400', 'integer');
-
--- How often, in seconds, to bypass conditional-request headers and force a
--- full GET on a feed. Lets us detect servers that keep serving the same
--- `ETag`/`Last-Modified` while the body has actually changed. Defaults to
--- 7 days.
-INSERT INTO settings (key, value, type)
-VALUES ('force_refresh_after_secs', '604800', 'integer');
-
--- Largest feed response body, in bytes, that will be read into memory.
--- Feeds are text and sit far below this; the cap exists so a hostile or
--- broken server cannot stream an unbounded body into the process.
--- Defaults to 32 MiB.
-INSERT INTO settings (key, value, type)
-VALUES ('max_feed_bytes', '33554432', 'integer');
-
 -- Persistent record of when recurring background tasks last ran, so their
 -- schedules survive server restarts. Keyed by an opaque task name.
 CREATE TABLE task_queue (

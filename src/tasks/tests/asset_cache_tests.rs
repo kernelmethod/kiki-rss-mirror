@@ -123,7 +123,14 @@ async fn asset_cache_refresh_ingests_inline_and_enclosure() -> Result<()> {
     // Drain the queued CacheEntryAssets commands and run each.
     while let Ok(cmd) = rx.try_recv() {
         if let TaskManagerCommand::CacheEntryAssets { entry_id } = cmd {
-            super::super::cache_entry_assets(&client, &pool, &data_dir, entry_id).await?;
+            super::super::cache_entry_assets(
+                &client,
+                &pool,
+                &data_dir,
+                &crate::config::Settings::default().asset_cache,
+                entry_id,
+            )
+            .await?;
         }
     }
 
@@ -183,7 +190,8 @@ async fn asset_cache_disabled_skips_fetches() -> Result<()> {
         [&feed_url],
     )?;
     let feed_id = conn.last_insert_rowid();
-    crate::db::assets::set_cache_enabled(&conn, false)?;
+    let mut cache = crate::config::Settings::default().asset_cache;
+    cache.enabled = false;
     drop(conn);
 
     let client = reqwest::Client::builder()
@@ -204,7 +212,7 @@ async fn asset_cache_disabled_skips_fetches() -> Result<()> {
 
     while let Ok(cmd) = rx.try_recv() {
         if let TaskManagerCommand::CacheEntryAssets { entry_id } = cmd {
-            super::super::cache_entry_assets(&client, &pool, &data_dir, entry_id).await?;
+            super::super::cache_entry_assets(&client, &pool, &data_dir, &cache, entry_id).await?;
         }
     }
 
@@ -284,7 +292,14 @@ async fn asset_cache_rejects_disallowed_content_type() -> Result<()> {
     .await?;
     while let Ok(cmd) = rx.try_recv() {
         if let TaskManagerCommand::CacheEntryAssets { entry_id } = cmd {
-            super::super::cache_entry_assets(&client, &pool, &data_dir, entry_id).await?;
+            super::super::cache_entry_assets(
+                &client,
+                &pool,
+                &data_dir,
+                &crate::config::Settings::default().asset_cache,
+                entry_id,
+            )
+            .await?;
         }
     }
 
@@ -311,7 +326,8 @@ async fn asset_cache_evicts_when_over_cap() -> Result<()> {
     )?;
     let feed_id = conn.last_insert_rowid();
     // Cap the cache at 1 byte so every insert triggers eviction back to 0.
-    crate::db::assets::set_cache_max_bytes(&conn, 1)?;
+    let mut cache = crate::config::Settings::default().asset_cache;
+    cache.max_bytes = 1;
     drop(conn);
 
     let client = reqwest::Client::builder()
@@ -331,7 +347,7 @@ async fn asset_cache_evicts_when_over_cap() -> Result<()> {
     .await?;
     while let Ok(cmd) = rx.try_recv() {
         if let TaskManagerCommand::CacheEntryAssets { entry_id } = cmd {
-            super::super::cache_entry_assets(&client, &pool, &data_dir, entry_id).await?;
+            super::super::cache_entry_assets(&client, &pool, &data_dir, &cache, entry_id).await?;
         }
     }
 

@@ -1,59 +1,21 @@
 /// Retention policy helpers for cleaning up old entries.
+///
+/// The policy itself is [`crate::config::RetentionSettings`]; callers pass
+/// its `max_age_days` in.
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::Connection;
 
-const SETTING_KEY: &str = "retention_max_age_days";
-
-/// Returns the configured `retention_max_age_days` value, or `None` if unset.
-pub fn get_max_age_days(conn: &Connection) -> Result<Option<i64>> {
-    let mut stmt = conn
-        .prepare("SELECT value FROM settings WHERE key = ?1")
-        .with_context(|| "failed to prepare settings query")?;
-
-    let result: Option<String> = stmt.query_row([SETTING_KEY], |row| row.get(0)).ok();
-
-    match result {
-        Some(val) => {
-            let days = val
-                .parse::<i64>()
-                .with_context(|| format!("invalid retention_max_age_days value: {}", val))?;
-            Ok(Some(days))
-        }
-        None => Ok(None),
-    }
-}
-
-/// Sets the `retention_max_age_days` value. Pass `None` to disable retention.
-pub fn set_max_age_days(conn: &Connection, days: Option<i64>) -> Result<()> {
-    match days {
-        Some(d) => {
-            conn.execute(
-                "INSERT INTO settings (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                rusqlite::params![SETTING_KEY, d.to_string()],
-            )
-            .with_context(|| "failed to upsert retention setting")?;
-        }
-        None => {
-            conn.execute("DELETE FROM settings WHERE key = ?1", [SETTING_KEY])
-                .with_context(|| "failed to delete retention setting")?;
-        }
-    }
-    Ok(())
-}
-
-/// Delete entries older than the configured retention period across all feeds.
+/// Delete entries older than `max_age_days` across all feeds.
 ///
-/// Returns the number of deleted entries. Returns `Ok(0)` if no retention
-/// policy is configured.
-pub fn cleanup_all(conn: &Connection) -> Result<usize> {
-    let max_age_days = match get_max_age_days(conn)? {
-        Some(d) => d,
-        None => return Ok(0),
+/// Returns the number of deleted entries. Returns `Ok(0)` if `max_age_days`
+/// is `None`, i.e. no retention policy is configured.
+pub fn cleanup_all(conn: &Connection, max_age_days: Option<i64>) -> Result<usize> {
+    let Some(max_age_days) = max_age_days else {
+        return Ok(0);
     };
 
-    let cutoff = Utc::now().timestamp() - max_age_days * 86400;
+    let cutoff = cutoff_timestamp(max_age_days);
     let deleted = conn
         .execute("DELETE FROM entries WHERE published_at < ?1", [cutoff])
         .with_context(|| "failed to delete old entries")?;
@@ -61,17 +23,16 @@ pub fn cleanup_all(conn: &Connection) -> Result<usize> {
     Ok(deleted)
 }
 
-/// Delete entries older than the configured retention period for a single feed.
+/// Delete entries older than `max_age_days` for a single feed.
 ///
-/// Returns the number of deleted entries. Returns `Ok(0)` if no retention
-/// policy is configured.
-pub fn cleanup_feed(conn: &Connection, feed_id: i64) -> Result<usize> {
-    let max_age_days = match get_max_age_days(conn)? {
-        Some(d) => d,
-        None => return Ok(0),
+/// Returns the number of deleted entries. Returns `Ok(0)` if `max_age_days`
+/// is `None`, i.e. no retention policy is configured.
+pub fn cleanup_feed(conn: &Connection, feed_id: i64, max_age_days: Option<i64>) -> Result<usize> {
+    let Some(max_age_days) = max_age_days else {
+        return Ok(0);
     };
 
-    let cutoff = Utc::now().timestamp() - max_age_days * 86400;
+    let cutoff = cutoff_timestamp(max_age_days);
     let deleted = conn
         .execute(
             "DELETE FROM entries WHERE published_at < ?1 AND feed_id = ?2",
@@ -80,4 +41,28 @@ pub fn cleanup_feed(conn: &Connection, feed_id: i64) -> Result<usize> {
         .with_context(|| format!("failed to delete old entries for feed {}", feed_id))?;
 
     Ok(deleted)
+}
+
+/// Unix timestamp `max_age_days` before now. Saturates rather than
+/// overflowing, so an absurdly large value deletes nothing instead of
+/// wrapping to an arbitrary cutoff; config validation keeps values far
+/// below that anyway.
+fn cutoff_timestamp(max_age_days: i64) -> i64 {
+    Utc::now()
+        .timestamp()
+        .saturating_sub(max_age_days.saturating_mul(86400))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cutoff_does_not_overflow() {
+        // Far enough in the past to match no entry.
+        assert!(cutoff_timestamp(i64::MAX) < -(1 << 62));
+        let now = Utc::now().timestamp();
+        let c = cutoff_timestamp(1);
+        assert!((now - 86400 - 5..=now - 86400 + 5).contains(&c));
+    }
 }

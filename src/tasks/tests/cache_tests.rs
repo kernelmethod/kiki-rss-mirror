@@ -1338,14 +1338,12 @@ async fn test_expires_rfc850_format_is_parsed() -> Result<()> {
     Ok(())
 }
 
-/// Set `force_refresh_after_secs` on the test database so the next forced
-/// refresh fires immediately.
-fn set_force_refresh_after_secs(conn: &rusqlite::Connection, secs: u64) {
-    conn.execute(
-        "UPDATE settings SET value = ?1 WHERE key = 'force_refresh_after_secs'",
-        rusqlite::params![secs.to_string()],
-    )
-    .unwrap();
+/// Settings with `force_refresh_after_seconds` set to `secs`, so a forced
+/// refresh can be made to fire immediately.
+fn with_force_refresh_after_secs(secs: u64) -> crate::config::Settings {
+    let mut settings = crate::config::Settings::default();
+    settings.feed_fetch.force_refresh_after_seconds = secs;
+    settings
 }
 
 /// A server that keeps returning the same `ETag` while silently changing
@@ -1365,15 +1363,16 @@ async fn test_forced_refresh_detects_validator_lie() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     // Force refresh should fire on the very next eligible fetch.
-    set_force_refresh_after_secs(&tc.database_conn()?, 0);
+    let settings = with_force_refresh_after_secs(0);
 
     let metrics = super::test_metrics();
 
     // First fetch: normal 200, records baseline body hash + last_full_refresh_at.
-    refresh_feed(
+    refresh_feed_with_settings(
         &client,
         feed_id,
         pool.clone(),
+        &settings,
         None,
         &metrics,
         &super::test_tx(),
@@ -1400,7 +1399,16 @@ async fn test_forced_refresh_detects_validator_lie() -> Result<()> {
 
     // Second fetch: force_refresh_after_secs=0 skips conditionals, so the
     // server serves the new body under the old ETag.
-    refresh_feed(&client, feed_id, pool, None, &metrics, &super::test_tx()).await?;
+    refresh_feed_with_settings(
+        &client,
+        feed_id,
+        pool,
+        &settings,
+        None,
+        &metrics,
+        &super::test_tx(),
+    )
+    .await?;
 
     let expected_hash_b = blake3::hash(&body_b).to_hex().to_string();
     let stored_hash_after: Option<String> = conn.query_row(
@@ -1452,14 +1460,15 @@ async fn test_forced_refresh_match_does_not_fire_lie() -> Result<()> {
     tc.init_feed_server_with_state(state.clone()).await?;
 
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
-    set_force_refresh_after_secs(&tc.database_conn()?, 0);
+    let settings = with_force_refresh_after_secs(0);
 
     let metrics = super::test_metrics();
 
-    refresh_feed(
+    refresh_feed_with_settings(
         &client,
         feed_id,
         pool.clone(),
+        &settings,
         None,
         &metrics,
         &super::test_tx(),
@@ -1469,7 +1478,16 @@ async fn test_forced_refresh_match_does_not_fire_lie() -> Result<()> {
     let conn = tc.database_conn()?;
     reset_last_checked(&conn, feed_id);
 
-    refresh_feed(&client, feed_id, pool, None, &metrics, &super::test_tx()).await?;
+    refresh_feed_with_settings(
+        &client,
+        feed_id,
+        pool,
+        &settings,
+        None,
+        &metrics,
+        &super::test_tx(),
+    )
+    .await?;
 
     let rendered = metrics.render();
     assert!(

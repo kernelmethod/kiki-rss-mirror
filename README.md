@@ -64,7 +64,7 @@ locations they replace:
 
 | | Names |
 | --- | --- |
-| `$KIKI_HOME` | Kiki's home: the database and cached assets |
+| `$KIKI_HOME` | Kiki's home: the database, settings, and cached assets |
 | `$KIKI_RUNTIME_DIR` | Kiki's runtime directory: the socket |
 
 `$KIKI_HOME` alone moves the whole instance, socket included — a directory
@@ -93,6 +93,16 @@ at `./kiki.sock` unless `$KIKI_RUNTIME_DIR` says otherwise.
 
 To pin the socket to an exact path rather than a directory, pass
 `--uds PATH` or set `$KIKI_SOCKET`; both beat `$KIKI_RUNTIME_DIR`.
+
+### Settings
+
+Settings live in `kiki.toml` next to the database. Kiki has built-in
+defaults for everything, and the file holds only the settings that differ
+from them. It is managed through the `/v1/settings/*` API, which rewrites
+the file on every change. Changes made to the file directly are picked up
+by the running server; an invalid edit is logged and ignored. While the
+file is invalid, every settings update through the API fails with
+`409 Conflict` rather than overwriting it, so fix or remove it first.
 
 Kiki serves over a Unix socket and nothing else — it does not listen on
 TCP. A socket is reachable only by processes that can reach its path, which

@@ -113,27 +113,17 @@ pub(super) fn set_feed_error_with_schedule(
 }
 
 /// Back-compat wrapper around [`set_feed_error_with_schedule`] for callsites
-/// that don't have a `Retry-After` timestamp and need to read the tuning
-/// settings themselves. Looks them up from the database.
+/// that don't have a `Retry-After` timestamp. Takes the scheduler tuning
+/// from `settings`.
 pub(super) fn set_feed_error(
     conn: &PooledConnection<SqliteConnectionManager>,
     feed_id: i64,
     fetch_error: &FetchError,
+    settings: &crate::config::FeedFetchSettings,
     metrics: &Metrics,
 ) {
-    let (min_cadence, max_backoff) = match (
-        crate::db::settings::get_min_polling_cadence_seconds(conn),
-        crate::db::settings::get_max_feed_backoff_seconds(conn),
-    ) {
-        (Ok(c), Ok(b)) => (c, b),
-        _ => {
-            error!(
-                "Failed to read scheduler settings while recording error for feed {}",
-                feed_id
-            );
-            return;
-        }
-    };
+    let min_cadence = settings.min_polling_cadence_seconds;
+    let max_backoff = settings.max_backoff_seconds;
     let min_fetch_interval = conn
         .query_row(
             "SELECT min_fetch_interval_seconds FROM feeds WHERE id = ?1",
