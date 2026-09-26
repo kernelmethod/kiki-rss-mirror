@@ -118,7 +118,7 @@ post_install_script = """
 # Create and set ownership on data directory
 install -d -m 0750 -o kiki -g kiki /var/lib/kiki
 # Initialize the database (idempotent)
-su -s /bin/sh kiki -c '/usr/bin/kiki init --check /var/lib/kiki'
+su -s /bin/sh kiki -c 'KIKI_HOME=/var/lib/kiki /usr/bin/kiki init --check'
 # Reload systemd and enable service
 systemctl daemon-reload
 """
