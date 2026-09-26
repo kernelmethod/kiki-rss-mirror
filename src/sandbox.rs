@@ -51,10 +51,9 @@ pub enum SandboxProfile {
         /// access.
         data_dir: PathBuf,
 
-        /// Parent directory of the Unix domain socket, if the server is
-        /// listening on a UDS. Granted read-write access so the socket
-        /// file can be created and unlinked.
-        socket_dir: Option<PathBuf>,
+        /// Parent directory of the Unix domain socket. Granted read-write
+        /// access so the socket file can be created and unlinked.
+        socket_dir: PathBuf,
     },
 
     /// The Lua script host: evaluates user-supplied scripts and talks to
@@ -92,7 +91,7 @@ pub struct SandboxConfig {
 
 impl SandboxConfig {
     /// Configuration for the main server process.
-    pub fn server(data_dir: PathBuf, socket_dir: Option<PathBuf>, log_only: bool) -> Self {
+    pub fn server(data_dir: PathBuf, socket_dir: PathBuf, log_only: bool) -> Self {
         SandboxConfig {
             profile: SandboxProfile::Server {
                 data_dir,

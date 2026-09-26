@@ -9,8 +9,7 @@
 //! * **Persistent state** — the SQLite database and the cached asset tree —
 //!   lives in a *data directory*, defaulting to the platform's per-user data
 //!   location (`$XDG_DATA_HOME/kiki` on Linux, `~/Library/Application
-//!   Support/kiki` on macOS). This is the directory [`kiki init --auto`]
-//!   creates.
+//!   Support/kiki` on macOS). This is the directory [`kiki init`] creates.
 //! * **Runtime state** — the Unix domain socket the API is served on — lives
 //!   in the per-user *runtime directory* (`$XDG_RUNTIME_DIR/kiki`, i.e.
 //!   `/run/user/$UID/kiki`, on Linux). The XDG base directory specification
@@ -20,15 +19,26 @@
 //!   to one user, unreachable by others, and never leaves a stale file behind
 //!   across a reboot.
 //!
-//! `$KIKI_HOME` is the one knob that moves all of it. When set, it *is*
-//! Kiki's home directory: the database and the socket both live directly
-//! inside it, in preference to the platform data and runtime directories,
-//! for every subcommand. The runtime directory is the default only when
-//! nobody has named a directory at all — point Kiki somewhere and all of it
-//! goes there, so the socket always sits with the data it serves. The socket
-//! alone can still be pinned with `--uds` or `$KIKI_SOCKET`.
+//! Each has an environment variable that names it outright:
 //!
-//! [`kiki init --auto`]: crate::cli::init
+//! * `$KIKI_HOME` *is* Kiki's home directory. When set, the database lives
+//!   directly inside it, for every subcommand, in preference to the platform
+//!   data directory.
+//! * `$KIKI_RUNTIME_DIR` *is* Kiki's runtime directory. When set, the socket
+//!   lives directly inside it, in preference to `$XDG_RUNTIME_DIR/kiki`. No
+//!   `kiki/` subdirectory is appended — the variable names Kiki's own
+//!   directory, where `$XDG_RUNTIME_DIR` names one shared with every other
+//!   application on the system.
+//!
+//! Neither is required, and a directory Kiki was pointed at keeps the socket
+//! too: with `$KIKI_HOME` set — or when serving from a directory that
+//! already holds a database — the socket sits with the data it serves unless
+//! `$KIKI_RUNTIME_DIR` says otherwise. So `$KIKI_HOME` alone still moves the
+//! whole instance to one place, and `$KIKI_RUNTIME_DIR` alone still splits
+//! the socket back out. The socket can also be pinned to an exact path with
+//! `--uds` or `$KIKI_SOCKET`, which beat both.
+//!
+//! [`kiki init`]: crate::cli::init
 
 use anyhow::{bail, Context, Result};
 use std::os::unix::ffi::OsStrExt;
@@ -38,6 +48,10 @@ use std::path::{Path, PathBuf};
 /// Environment variable naming Kiki's home directory. When set, both the
 /// database and the Unix socket default to living directly inside it.
 pub const KIKI_HOME_ENV: &str = "KIKI_HOME";
+
+/// Environment variable naming Kiki's runtime directory. When set, the Unix
+/// socket defaults to living directly inside it.
+pub const KIKI_RUNTIME_DIR_ENV: &str = "KIKI_RUNTIME_DIR";
 
 /// Environment variable pinning the Unix socket path.
 pub const KIKI_SOCKET_ENV: &str = "KIKI_SOCKET";
@@ -49,6 +63,10 @@ pub const DB_FILE_NAME: &str = "kiki.db";
 pub const SOCKET_FILE_NAME: &str = "kiki.sock";
 
 /// Subdirectory created inside the platform runtime directory.
+///
+/// `$XDG_RUNTIME_DIR` is shared with every other application, so Kiki takes
+/// a subdirectory of its own. `$KIKI_RUNTIME_DIR` names Kiki's directory
+/// directly and gets no subdirectory appended.
 pub const RUNTIME_SUBDIR: &str = "kiki";
 
 /// Subdirectory created inside the platform data directory.
@@ -77,11 +95,17 @@ pub struct Env {
     /// Value of `$KIKI_HOME`, if set and non-empty.
     pub kiki_home: Option<PathBuf>,
 
+    /// Value of `$KIKI_RUNTIME_DIR`, if set and non-empty. This is the bare
+    /// variable; use [`default_runtime_dir`] to get it with the platform
+    /// runtime directory as a fallback.
+    pub kiki_runtime_dir: Option<PathBuf>,
+
     /// Value of `$KIKI_SOCKET`, if set and non-empty.
     pub kiki_socket: Option<PathBuf>,
 
     /// The platform runtime directory, if one exists and is usable. See
-    /// [`runtime_dir_is_usable`].
+    /// [`runtime_dir_is_usable`]. This is the bare platform location, with
+    /// no `kiki/` subdirectory applied.
     pub runtime_dir: Option<PathBuf>,
 
     /// The platform per-user data directory for Kiki, e.g.
@@ -96,10 +120,14 @@ pub struct Env {
 impl Env {
     /// Build an [`Env`] from the current process environment.
     ///
-    /// The runtime directory is validated here rather than at resolution
-    /// time, so a hostile or misconfigured `$XDG_RUNTIME_DIR` is simply
-    /// absent from the resulting `Env` and resolution falls through to the
-    /// data directory.
+    /// The *platform* runtime directory is validated here rather than at
+    /// resolution time, so a hostile or misconfigured `$XDG_RUNTIME_DIR` is
+    /// simply absent from the resulting `Env` and resolution falls through
+    /// to the data directory. `$KIKI_RUNTIME_DIR` is not validated: like
+    /// `$KIKI_HOME` and `$KIKI_SOCKET` it is an instruction, and silently
+    /// ignoring it would put the socket somewhere the operator did not ask
+    /// for. A directory Kiki has to create for it is made `0700`; see
+    /// [`crate::cli::serve`].
     pub fn from_process() -> Self {
         let runtime_dir = dirs::runtime_dir().filter(|d| {
             let usable = runtime_dir_is_usable(d);
@@ -115,6 +143,7 @@ impl Env {
 
         Self {
             kiki_home: non_empty_var(KIKI_HOME_ENV),
+            kiki_runtime_dir: non_empty_var(KIKI_RUNTIME_DIR_ENV),
             kiki_socket: non_empty_var(KIKI_SOCKET_ENV),
             runtime_dir,
             platform_data_dir: dirs::data_dir().map(|d| d.join(DATA_SUBDIR)),
@@ -152,10 +181,10 @@ pub fn runtime_dir_is_usable(dir: &Path) -> bool {
 /// otherwise: `$KIKI_HOME` if set, else the platform per-user data directory
 /// (`~/.local/share/kiki` and friends).
 ///
-/// This is the location `kiki init --auto` creates and `kiki systemd`
-/// installs a unit against. It deliberately does *not* consider the current
-/// directory — those commands name a well-known location, and picking one up
-/// from wherever the shell happens to be sitting would be a surprise.
+/// This is the location `kiki init` creates and `kiki systemd` installs a
+/// unit against. It deliberately does *not* consider the current directory —
+/// those commands name a well-known location, and picking one up from
+/// wherever the shell happens to be sitting would be a surprise.
 ///
 /// # Errors
 ///
@@ -185,6 +214,47 @@ pub fn default_data_dir(env: &Env) -> Result<PathBuf> {
         "unable to determine where Kiki should live: $KIKI_HOME is unset and the \
          platform data directory could not be determined",
     )
+}
+
+/// The directory Kiki puts its socket in when nothing more specific says
+/// otherwise: `$KIKI_RUNTIME_DIR` if set, else `$XDG_RUNTIME_DIR/kiki`.
+///
+/// Returns `None` when neither is available — no `$KIKI_RUNTIME_DIR`, and no
+/// usable platform runtime directory (a non-Linux platform, or a login
+/// session without one). [`resolve_socket_path`] then falls back to the data
+/// directory, which always exists.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::cli::paths::{default_runtime_dir, Env};
+/// use std::path::{Path, PathBuf};
+///
+/// // $KIKI_RUNTIME_DIR is Kiki's runtime directory as given, with no
+/// // `kiki/` subdirectory appended...
+/// let env = Env {
+///     kiki_runtime_dir: Some(PathBuf::from("/run/kiki")),
+///     runtime_dir: Some(PathBuf::from("/run/user/1000")),
+///     ..Env::default()
+/// };
+/// assert_eq!(default_runtime_dir(&env), Some(PathBuf::from("/run/kiki")));
+///
+/// // ...where $XDG_RUNTIME_DIR is shared, so Kiki takes a subdirectory.
+/// let env = Env {
+///     runtime_dir: Some(PathBuf::from("/run/user/1000")),
+///     ..Env::default()
+/// };
+/// assert_eq!(
+///     default_runtime_dir(&env),
+///     Some(PathBuf::from("/run/user/1000/kiki")),
+/// );
+/// ```
+pub fn default_runtime_dir(env: &Env) -> Option<PathBuf> {
+    if let Some(dir) = &env.kiki_runtime_dir {
+        return Some(dir.clone());
+    }
+
+    env.runtime_dir.as_ref().map(|d| d.join(RUNTIME_SUBDIR))
 }
 
 /// Where a resolved data directory came from.
@@ -227,8 +297,9 @@ impl DataDir {
 /// In precedence order:
 ///
 /// 1. `$KIKI_HOME`.
-/// 2. the current directory, if it already contains a `kiki.db`. This keeps
-///    the `kiki init . && kiki serve` workflow working.
+/// 2. the current directory, if it already contains a `kiki.db`. A database
+///    sitting right there is as clear a statement of intent as `$KIKI_HOME`,
+///    so `cd` into it and `kiki serve` finds it.
 /// 3. [`default_data_dir`], i.e. the platform per-user data directory.
 ///
 /// # Errors
@@ -288,14 +359,18 @@ pub fn resolve_data_dir(env: &Env) -> Result<DataDir> {
 ///
 /// 1. `explicit` — the `--uds` flag.
 /// 2. `$KIKI_SOCKET`.
-/// 3. `<data_dir>/kiki.sock`, when the data directory was *named* — by
+/// 3. `$KIKI_RUNTIME_DIR/kiki.sock`. Naming the runtime directory is a
+///    statement about the socket specifically, so it beats the data
+///    directory rule below — `$KIKI_HOME` being set as well does not take
+///    the socket back.
+/// 4. `<data_dir>/kiki.sock`, when the data directory was *named* — by
 ///    `$KIKI_HOME`, or by running from a directory that already holds a
 ///    database. Pointing Kiki at a directory points all of it there, so the
 ///    socket sits with the data it serves.
-/// 4. `$XDG_RUNTIME_DIR/kiki/kiki.sock`, when nobody named a directory. This
+/// 5. `$XDG_RUNTIME_DIR/kiki/kiki.sock`, when nobody named a directory. This
 ///    is the preferred default: see the module docs for why the runtime
 ///    directory is the right home for a socket.
-/// 5. `<data_dir>/kiki.sock`, for platforms and sessions with no runtime
+/// 6. `<data_dir>/kiki.sock`, for platforms and sessions with no runtime
 ///    directory.
 ///
 /// # Examples
@@ -310,23 +385,33 @@ pub fn resolve_data_dir(env: &Env) -> Result<DataDir> {
 /// };
 ///
 /// // Nobody named a directory, so the socket goes to the runtime directory.
-/// let data_dir = DataDir {
+/// let platform = DataDir {
 ///     path: PathBuf::from("/home/rey/.local/share/kiki"),
 ///     source: DataDirSource::Platform,
 /// };
 /// assert_eq!(
-///     resolve_socket_path(None, &data_dir, &env),
+///     resolve_socket_path(None, &platform, &env),
 ///     Path::new("/run/user/1000/kiki/kiki.sock"),
 /// );
 ///
 /// // $KIKI_HOME named one, so the socket follows it.
-/// let data_dir = DataDir {
+/// let home = DataDir {
 ///     path: PathBuf::from("/srv/kiki"),
 ///     source: DataDirSource::KikiHome,
 /// };
 /// assert_eq!(
-///     resolve_socket_path(None, &data_dir, &env),
+///     resolve_socket_path(None, &home, &env),
 ///     Path::new("/srv/kiki/kiki.sock"),
+/// );
+///
+/// // ...unless $KIKI_RUNTIME_DIR splits the socket back out.
+/// let env = Env {
+///     kiki_runtime_dir: Some(PathBuf::from("/run/kiki")),
+///     ..env
+/// };
+/// assert_eq!(
+///     resolve_socket_path(None, &home, &env),
+///     Path::new("/run/kiki/kiki.sock"),
 /// );
 /// ```
 pub fn resolve_socket_path(explicit: Option<&Path>, data_dir: &DataDir, env: &Env) -> PathBuf {
@@ -338,12 +423,14 @@ pub fn resolve_socket_path(explicit: Option<&Path>, data_dir: &DataDir, env: &En
         return path.clone();
     }
 
-    if data_dir.is_named() {
-        return data_dir.path.join(SOCKET_FILE_NAME);
-    }
-
-    if let Some(runtime) = &env.runtime_dir {
-        return runtime.join(RUNTIME_SUBDIR).join(SOCKET_FILE_NAME);
+    // The runtime directory takes the socket when it was named outright, and
+    // when nobody named a data directory for it to sit in instead. A named
+    // data directory otherwise keeps it, and is the last resort for a
+    // platform or session with no runtime directory at all.
+    if env.kiki_runtime_dir.is_some() || !data_dir.is_named() {
+        if let Some(runtime) = default_runtime_dir(env) {
+            return runtime.join(SOCKET_FILE_NAME);
+        }
     }
 
     data_dir.path.join(SOCKET_FILE_NAME)
@@ -402,7 +489,7 @@ mod test {
     }
 
     /// A directory that already holds a `kiki.db` keeps being used, so that
-    /// `kiki init . && kiki serve` behaves as it always has.
+    /// `cd`-ing into one and running `kiki serve` finds it.
     #[test]
     fn data_dir_falls_back_to_cwd_holding_a_database() -> Result<()> {
         let td = TempDir::new("kiki_")?;
@@ -451,8 +538,8 @@ mod test {
     }
 
     /// Unlike [`resolve_data_dir`], the default location ignores the current
-    /// directory: `init --auto` and `systemd install` name a well-known
-    /// place, not wherever the shell happens to be.
+    /// directory: `init` and `systemd install` name a well-known place, not
+    /// wherever the shell happens to be.
     #[test]
     fn default_data_dir_ignores_the_current_directory() -> Result<()> {
         let td = TempDir::new("kiki_")?;
@@ -536,7 +623,7 @@ mod test {
     }
 
     /// The same holds for a directory named by having a database in it, so
-    /// `kiki init . && kiki serve` puts the socket back in `./kiki.sock`.
+    /// serving from one puts the socket back in `./kiki.sock`.
     #[test]
     fn socket_follows_the_current_dir_when_it_holds_the_database() {
         let env = Env {
@@ -551,6 +638,100 @@ mod test {
             resolve_socket_path(None, &data_dir, &env),
             Path::new("/home/rey/project/kiki.sock")
         );
+    }
+
+    /// `$KIKI_RUNTIME_DIR` names Kiki's runtime directory outright, so the
+    /// socket goes directly inside it with no `kiki/` subdirectory.
+    #[test]
+    fn socket_uses_kiki_runtime_dir_verbatim() {
+        let env = Env {
+            kiki_runtime_dir: Some(PathBuf::from("/run/kiki")),
+            runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..empty_env()
+        };
+        assert_eq!(
+            resolve_socket_path(None, &platform_dir("/data"), &env),
+            Path::new("/run/kiki/kiki.sock")
+        );
+    }
+
+    /// Naming the runtime directory is a statement about the socket, so it
+    /// beats the rule that a named data directory keeps the socket.
+    #[test]
+    fn kiki_runtime_dir_beats_a_named_data_dir() {
+        let env = Env {
+            kiki_runtime_dir: Some(PathBuf::from("/run/kiki")),
+            ..empty_env()
+        };
+        assert_eq!(
+            resolve_socket_path(None, &named_dir("/srv/kiki"), &env),
+            Path::new("/run/kiki/kiki.sock")
+        );
+    }
+
+    /// ...but `--uds` and `$KIKI_SOCKET` name the socket file itself, so
+    /// they beat `$KIKI_RUNTIME_DIR` in turn.
+    #[test]
+    fn an_explicit_socket_beats_kiki_runtime_dir() {
+        let env = Env {
+            kiki_runtime_dir: Some(PathBuf::from("/run/kiki")),
+            kiki_socket: Some(PathBuf::from("/run/env.sock")),
+            ..empty_env()
+        };
+        assert_eq!(
+            resolve_socket_path(None, &platform_dir("/data"), &env),
+            Path::new("/run/env.sock")
+        );
+
+        let explicit = PathBuf::from("/tmp/explicit.sock");
+        assert_eq!(
+            resolve_socket_path(Some(&explicit), &platform_dir("/data"), &env),
+            explicit
+        );
+    }
+
+    /// An empty `$KIKI_RUNTIME_DIR` is treated as unset, not as a relative
+    /// path resolving to `./kiki.sock`.
+    #[test]
+    fn empty_kiki_runtime_dir_is_ignored() {
+        // `non_empty_var` filters it out on the way in, so an `Env` built
+        // from the process never carries one. Confirm resolution agrees.
+        let env = Env {
+            kiki_runtime_dir: None,
+            runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..empty_env()
+        };
+        assert_eq!(
+            resolve_socket_path(None, &platform_dir("/data"), &env),
+            Path::new("/run/user/1000/kiki/kiki.sock")
+        );
+    }
+
+    #[test]
+    fn default_runtime_dir_prefers_kiki_runtime_dir() {
+        let env = Env {
+            kiki_runtime_dir: Some(PathBuf::from("/run/kiki")),
+            runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..empty_env()
+        };
+        assert_eq!(default_runtime_dir(&env), Some(PathBuf::from("/run/kiki")));
+    }
+
+    #[test]
+    fn default_runtime_dir_subdivides_the_platform_dir() {
+        let env = Env {
+            runtime_dir: Some(PathBuf::from("/run/user/1000")),
+            ..empty_env()
+        };
+        assert_eq!(
+            default_runtime_dir(&env),
+            Some(PathBuf::from("/run/user/1000/kiki"))
+        );
+    }
+
+    #[test]
+    fn default_runtime_dir_is_none_when_nothing_is_available() {
+        assert_eq!(default_runtime_dir(&empty_env()), None);
     }
 
     /// With nobody naming anything, the runtime directory wins.

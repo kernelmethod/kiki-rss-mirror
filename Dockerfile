@@ -52,11 +52,7 @@ COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 WORKDIR /data
 VOLUME ["/data"]
 
-ENV KIKI_HOME=/data \
-    KIKI_BIND=0.0.0.0 \
-    KIKI_PORT=8000
-
-EXPOSE 8000
+ENV KIKI_HOME=/data
 
 USER kiki
 

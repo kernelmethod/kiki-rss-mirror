@@ -9,7 +9,6 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use std::{
     fs, io,
-    net::SocketAddr,
     os::unix::{
         fs::{FileTypeExt, PermissionsExt},
         net::UnixStream,
@@ -18,10 +17,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{
-    net::{TcpListener, UnixListener},
-    signal,
-};
+use tokio::{net::UnixListener, signal};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, span, Level};
 
@@ -56,17 +52,9 @@ pub struct SharedAppState {
 
 pub type AppState = Arc<SharedAppState>;
 
-/// Specifies how the server should listen for connections.
-pub enum ListenAddr {
-    /// Listen on a Unix domain socket at the given path.
-    Uds(PathBuf),
-    /// Listen on a TCP socket address.
-    Tcp(SocketAddr),
-}
-
 pub struct ServerBuilder<'a> {
     db_path: &'a Path,
-    listen_addr: Option<ListenAddr>,
+    socket_path: Option<PathBuf>,
     autofetch: bool,
     single_threaded: bool,
     worker_count: Option<usize>,
@@ -78,7 +66,7 @@ impl<'a> ServerBuilder<'a> {
     pub fn new(db_path: &'a Path) -> Self {
         ServerBuilder {
             db_path,
-            listen_addr: None,
+            socket_path: None,
             autofetch: false,
             single_threaded: false,
             worker_count: None,
@@ -88,12 +76,7 @@ impl<'a> ServerBuilder<'a> {
     }
 
     pub fn socket_path(mut self, p: &'a Path) -> Self {
-        self.listen_addr = Some(ListenAddr::Uds(p.to_path_buf()));
-        self
-    }
-
-    pub fn bind_addr(mut self, addr: SocketAddr) -> Self {
-        self.listen_addr = Some(ListenAddr::Tcp(addr));
+        self.socket_path = Some(p.to_path_buf());
         self
     }
 
@@ -137,9 +120,9 @@ impl<'a> ServerBuilder<'a> {
     }
 
     pub fn build(self) -> Server {
-        let listen_addr = self
-            .listen_addr
-            .unwrap_or_else(|| ListenAddr::Uds(PathBuf::from("kiki.sock")));
+        let socket_path = self
+            .socket_path
+            .unwrap_or_else(|| PathBuf::from("kiki.sock"));
 
         // Default the data directory to the directory containing the
         // database file. Callers that want an explicit location can extend
@@ -153,7 +136,7 @@ impl<'a> ServerBuilder<'a> {
         Server {
             db_path: PathBuf::from(self.db_path),
             data_dir,
-            listen_addr,
+            socket_path,
             autofetch: self.autofetch,
             single_threaded: self.single_threaded,
             worker_count: self.worker_count,
@@ -196,8 +179,8 @@ pub struct Server {
     /// Root directory for on-disk state (cached assets live beneath this).
     data_dir: PathBuf,
 
-    /// How the server listens for connections.
-    listen_addr: ListenAddr,
+    /// Path of the Unix domain socket the server listens on.
+    socket_path: PathBuf,
 
     /// Whether or not to automatically fetch feed contents.
     autofetch: bool,
@@ -416,33 +399,17 @@ impl Server {
             ));
         }
 
-        match self.listen_addr {
-            ListenAddr::Uds(socket_path) => {
-                claim_socket_path(&socket_path)?;
-                tokio::spawn(uds_server(
-                    socket_path,
-                    tx.clone(),
-                    reload_tx.clone(),
-                    pool.clone(),
-                    self.cancel_token.clone(),
-                    metrics.clone(),
-                    self.data_dir.clone(),
-                    script_runner.clone(),
-                ));
-            }
-            ListenAddr::Tcp(addr) => {
-                tokio::spawn(tcp_server(
-                    addr,
-                    tx.clone(),
-                    reload_tx.clone(),
-                    pool.clone(),
-                    self.cancel_token.clone(),
-                    metrics.clone(),
-                    self.data_dir.clone(),
-                    script_runner.clone(),
-                ));
-            }
-        }
+        claim_socket_path(&self.socket_path)?;
+        tokio::spawn(uds_server(
+            self.socket_path,
+            tx.clone(),
+            reload_tx.clone(),
+            pool.clone(),
+            self.cancel_token.clone(),
+            metrics.clone(),
+            self.data_dir.clone(),
+            script_runner.clone(),
+        ));
 
         self.cancel_token.cancelled().await;
 
@@ -817,41 +784,6 @@ async fn uds_server(
         .with_graceful_shutdown(web_shutdown_signal(socket_path, cancel_token.clone()))
         .await
         .with_context(|| "Error encountered while running server")
-}
-
-/// Parent function for the TCP web worker threads.
-#[allow(clippy::too_many_arguments)]
-async fn tcp_server(
-    addr: SocketAddr,
-    tx: async_channel::Sender<TaskManagerCommand>,
-    reload_tx: tokio::sync::watch::Sender<()>,
-    pool: r2d2::Pool<SqliteConnectionManager>,
-    cancel_token: CancellationToken,
-    metrics: Arc<crate::metrics::Metrics>,
-    data_dir: PathBuf,
-    script_runner: ScriptRunnerHandle,
-) -> Result<()> {
-    let shared_state = Arc::new(SharedAppState {
-        task_manager_tx: tx,
-        reload_tx,
-        conn_pool: pool,
-        cancel_token: cancel_token.clone(),
-        metrics: metrics.clone(),
-        data_dir,
-        script_runner,
-    });
-    let app = routes::create_router(metrics).with_state(shared_state);
-
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Unable to bind to TCP address {}", addr))?;
-
-    tracing::info!("Listening on http://{}", addr);
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(cancel_token.cancelled_owned())
-        .await
-        .with_context(|| "Error encountered while running TCP server")
 }
 
 async fn web_shutdown_signal(socket_path: PathBuf, cancel_token: CancellationToken) {
