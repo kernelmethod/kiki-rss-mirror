@@ -11,6 +11,7 @@ mod fetch_error_tests;
 mod format_data_tests;
 mod maintenance_tests;
 mod retry_after_tests;
+mod server_hints_tests;
 #[cfg(feature = "extra-tests")]
 mod stress_tests;
 
