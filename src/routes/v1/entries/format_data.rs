@@ -90,15 +90,21 @@ pub(crate) fn query_atom_categories(
 /// when no `rss_entry_data` row exists for the entry (e.g. the entry
 /// belongs to an Atom feed, or it was ingested before format-specific data
 /// was being captured).
+///
+/// `rss_entry_data.description` is only stored when it differs from
+/// `entries.content`, so a NULL description is filled in from the entry's
+/// content.
 pub fn load_rss_entry_data(
     conn: &Connection,
     entry_id: i64,
 ) -> rusqlite::Result<Option<RssEntryData>> {
     let Some(mut data) = query_optional(
         conn,
-        "SELECT description, comments, author,
-                enclosure_url, enclosure_length, enclosure_mime_type
-         FROM rss_entry_data WHERE entry_id = ?1 LIMIT 1",
+        "SELECT COALESCE(red.description, e.content), red.comments, red.author,
+                red.enclosure_url, red.enclosure_length, red.enclosure_mime_type
+         FROM rss_entry_data red
+         JOIN entries e ON e.id = red.entry_id
+         WHERE red.entry_id = ?1 LIMIT 1",
         [entry_id],
         |row| {
             Ok(RssEntryData {

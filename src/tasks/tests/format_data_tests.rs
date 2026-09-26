@@ -94,7 +94,17 @@ async fn ingest_rss_populates_rss_entry_data() -> Result<()> {
             ))
         },
     )?;
-    assert_eq!(desc.as_deref(), Some("A full-featured item."));
+    // The description matches the entry content, so it is not stored twice;
+    // the API fills it in from `entries.content`.
+    assert_eq!(desc, None);
+    let entry_id: i64 = conn.query_row(
+        "SELECT id FROM entries WHERE feed_id = ?1 AND guid = 'http://example.com/items/1'",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    let loaded = crate::routes::v1::entries::format_data::load_rss_entry_data(&conn, entry_id)?
+        .expect("rss entry data present");
+    assert_eq!(loaded.description.as_deref(), Some("A full-featured item."));
     assert_eq!(
         comments.as_deref(),
         Some("http://example.com/items/1/comments")

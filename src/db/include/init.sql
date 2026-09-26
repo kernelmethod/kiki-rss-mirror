@@ -232,7 +232,12 @@ CREATE INDEX idx_entry_tags_tag_id ON entry_tags(tag_id);
 -- relationship with `entries`.
 CREATE TABLE rss_entry_data (
     entry_id        INTEGER PRIMARY KEY,
+
+    -- The item's <description>, which is also stored as `entries.content`.
+    -- Only set when a script changed the content; NULL means "same as
+    -- entries.content" so the text is not stored twice.
     description     VARCHAR,
+
     comments        VARCHAR,
     author          VARCHAR,
 

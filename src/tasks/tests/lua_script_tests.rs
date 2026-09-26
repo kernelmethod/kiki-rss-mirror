@@ -128,6 +128,59 @@ async fn integration_modify_script_changes_titles() -> Result<()> {
     Ok(())
 }
 
+/// When a script rewrites an RSS entry's content, the original
+/// `<description>` is kept in `rss_entry_data` rather than deduplicated away.
+#[tokio::test]
+async fn integration_content_script_preserves_rss_description() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let (feed_id, client, pool) = setup_feed_with_script(
+        &tc,
+        r#"kiki.on("entry.ingest", function(entry)
+            if entry.content then
+                entry.content = "[MODIFIED] " .. entry.content
+            end
+            return entry
+        end)"#,
+    )
+    .await?;
+    tc.database_conn()?.execute(
+        "UPDATE feeds SET url = ?1 WHERE id = ?2",
+        rusqlite::params![tc.rich_rss_feed_url(), feed_id],
+    )?;
+
+    let runner = {
+        let conn = pool.get()?;
+        let sources = load_all_script_sources(&conn)?;
+        crate::scripting::lua::LuaScriptRunner::new(&sources)?
+    };
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        Some(&runner as &dyn ScriptRunner),
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let (entry_id, content, stored): (i64, Option<String>, Option<String>) = conn.query_row(
+        "SELECT e.id, e.content, red.description
+         FROM entries e JOIN rss_entry_data red ON red.entry_id = e.id
+         WHERE e.feed_id = ?1 AND e.guid = 'http://example.com/items/1'",
+        [feed_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(content.as_deref(), Some("[MODIFIED] A full-featured item."));
+    assert_eq!(stored.as_deref(), Some("A full-featured item."));
+
+    let loaded = crate::routes::v1::entries::format_data::load_rss_entry_data(&conn, entry_id)?
+        .expect("rss entry data present");
+    assert_eq!(loaded.description.as_deref(), Some("A full-featured item."));
+
+    Ok(())
+}
+
 /// A tagging script should add the specified tag to every entry.
 #[tokio::test]
 async fn integration_tagging_script_adds_tags() -> Result<()> {
