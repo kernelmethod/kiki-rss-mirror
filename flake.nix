@@ -30,6 +30,10 @@
               };
             strictDeps = true;
 
+            # The test suite already runs in the CI "Tests" job; running it
+            # here too roughly doubles the Nix build time (release + LTO).
+            doCheck = false;
+
             buildInputs = [ pkgs.openssl ];
             nativeBuildInputs = [ pkgs.pkg-config pkgs.cacert ];
             SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
