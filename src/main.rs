@@ -28,7 +28,7 @@ pub enum Commands {
 
     /// Manage the kiki systemd user service
     #[cfg(feature = "systemd")]
-    Service(cli::service::ServiceArgs),
+    Systemd(cli::systemd::SystemdArgs),
 
     /// Internal: run the sandboxed feed fetcher. Spawned by `serve`.
     #[cfg(unix)]
@@ -54,7 +54,7 @@ impl Commands {
             #[cfg(feature = "api-docs")]
             Commands::Docs(args) => args.run(),
             #[cfg(feature = "systemd")]
-            Commands::Service(args) => args.run(),
+            Commands::Systemd(args) => args.run(),
             #[cfg(unix)]
             Commands::FeedFetcher(args) => {
                 use kiki_rss::process::feed_fetcher as f;

@@ -1,6 +1,6 @@
 [package]
 name = "kiki-rss"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "An RSS feed aggregator"
 license = "MIT"
@@ -73,6 +73,12 @@ tempdir = "0.3"
 incremental = true
 opt-level = 2
 debug = true
+
+# Keep dependencies optimized, but build kiki-rss itself unoptimized: most of
+# the generic code from tokio/serde/axum is monomorphized in this crate, and
+# optimizing it roughly triples compile time without speeding up the tests.
+[profile.dev.package.kiki-rss]
+opt-level = 0
 
 [profile.release]
 lto = "thin"
