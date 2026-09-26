@@ -64,6 +64,10 @@ libc = "0.2"
 landlock = "0.4"
 seccompiler = "0.5"
 
+# musl's malloc is slow under contention, so musl builds use mimalloc instead.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"
+
 [dev-dependencies]
 flate2 = "1"
 http = "1"
