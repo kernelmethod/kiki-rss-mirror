@@ -57,8 +57,27 @@ const RO_TLS_PATHS: &[&str] = &[
 /// — and everything the fetcher's runtime reads there has a fallback.
 const RO_INTROSPECTION_PATHS: &[&str] = &["/proc", "/sys"];
 
-fn existing(paths: &'static [&'static str]) -> impl Iterator<Item = &'static Path> {
-    paths.iter().map(Path::new).filter(|p| p.exists())
+fn existing(paths: &'static [&'static str]) -> impl Iterator<Item = PathBuf> {
+    paths.iter().map(PathBuf::from).filter(|p| p.exists())
+}
+
+/// Trust-store locations named by `SSL_CERT_FILE` and `SSL_CERT_DIR`
+/// (the latter a `:`-separated list), which the TLS stack consults
+/// before the defaults in [`RO_TLS_PATHS`]. Missing paths are skipped.
+///
+/// Without these, a system whose only CA bundle lives elsewhere — Nix
+/// builds and some NixOS setups point `SSL_CERT_FILE` into the store —
+/// leaves the feed fetcher with no trust store, and it cannot build its
+/// HTTP client at all.
+fn tls_env_paths() -> Vec<PathBuf> {
+    let file = std::env::var_os("SSL_CERT_FILE").map(PathBuf::from);
+    let dirs = std::env::var_os("SSL_CERT_DIR")
+        .map(|v| std::env::split_paths(&v).collect::<Vec<_>>())
+        .unwrap_or_default();
+    file.into_iter()
+        .chain(dirs)
+        .filter(|p| !p.as_os_str().is_empty() && p.exists())
+        .collect()
 }
 
 pub fn apply(config: &SandboxConfig) -> Result<()> {
@@ -72,7 +91,7 @@ pub fn apply(config: &SandboxConfig) -> Result<()> {
 /// The script host gets neither: an empty ruleset that handles every
 /// access right denies the entire filesystem, which is exactly what a
 /// process that only ever talks to an inherited socket needs.
-fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<&'static Path>) {
+fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
     match profile {
         SandboxProfile::Server {
             data_dir,
@@ -84,14 +103,18 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<&'static Path>
                     rw_paths.push(d.clone());
                 }
             }
-            let ro_paths: Vec<&Path> = existing(RO_RESOLVER_PATHS)
+            let ro_paths: Vec<PathBuf> = existing(RO_RESOLVER_PATHS)
                 .chain(existing(RO_TLS_PATHS))
+                .chain(tls_env_paths())
                 .chain(existing(RO_INTROSPECTION_PATHS))
                 .collect();
             (rw_paths, ro_paths)
         }
         SandboxProfile::ScriptHost => (Vec::new(), Vec::new()),
-        SandboxProfile::FeedFetcher => (Vec::new(), existing(RO_TLS_PATHS).collect()),
+        SandboxProfile::FeedFetcher => (
+            Vec::new(),
+            existing(RO_TLS_PATHS).chain(tls_env_paths()).collect(),
+        ),
     }
 }
 
@@ -431,9 +454,10 @@ mod tests {
                 .any(|p| p.starts_with("/proc") || p.starts_with("/sys")),
             "the feed fetcher must not be able to read /proc or /sys: {ro:?}"
         );
+        let env_paths = tls_env_paths();
         for p in &ro {
             assert!(
-                RO_TLS_PATHS.iter().any(|allowed| Path::new(allowed) == *p),
+                RO_TLS_PATHS.iter().any(|allowed| Path::new(allowed) == p) || env_paths.contains(p),
                 "unexpected read-only path for the feed fetcher: {p:?}"
             );
         }
