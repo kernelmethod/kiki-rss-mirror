@@ -110,6 +110,20 @@ CREATE TABLE feeds (
     -- If-Modified-Since) are omitted and the feed is not refetched.
     header_immutable_until  INTEGER,
 
+    -- Refresh hints the feed declares in its own markup, captured from the
+    -- most recent successfully parsed 200 response:
+    --   * feed_ttl_seconds: RSS <ttl>, converted from minutes.
+    --   * feed_update_interval_seconds: sy:updatePeriod / sy:updateFrequency.
+    --   * feed_skip_hours: RSS <skipHours> as a bitmask (bit h = hour h UTC).
+    --   * feed_skip_days: RSS <skipDays> as a bitmask (bit 0 = Monday).
+    -- The longer of the two intervals is a fallback freshness hint when the
+    -- HTTP response carries none; the skip masks defer every scheduled
+    -- fetch out of the hours and days the publisher asked us to avoid.
+    feed_ttl_seconds                INTEGER,
+    feed_update_interval_seconds    INTEGER,
+    feed_skip_hours                 INTEGER NOT NULL DEFAULT 0,
+    feed_skip_days                  INTEGER NOT NULL DEFAULT 0,
+
     -- Most recent fetch error message, if any. Cleared on successful fetch.
     last_fetch_error        VARCHAR,
     -- Timestamp of the most recent fetch error.

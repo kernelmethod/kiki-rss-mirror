@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use reqwest::Url;
 
 /// Return true if two URL strings share the same (scheme, host, port) origin.
@@ -131,4 +131,38 @@ pub(super) fn compute_next_fetch_at(
     let floor = now_ts.saturating_add(min_cadence as i64);
     let ceiling = now_ts.saturating_add(max_backoff as i64);
     raw_next_ts.max(floor).min(ceiling)
+}
+
+/// Move `ts` forward to the first hour the feed has not asked to be left
+/// alone, per RSS `<skipHours>` / `<skipDays>` (both in UTC).
+///
+/// `skip_hours` and `skip_days` are the bitmasks from
+/// [`crate::fetcher::FeedHints`]. A deferred time lands on the top of the
+/// first allowed hour. Masks that rule out every hour or every day are
+/// treated as a publisher mistake and ignored, rather than never fetching
+/// the feed again.
+pub(super) fn defer_past_skipped(ts: i64, skip_hours: u32, skip_days: u8) -> i64 {
+    const ALL_HOURS: u32 = (1 << 24) - 1;
+    const ALL_DAYS: u8 = (1 << 7) - 1;
+    let skip_hours = skip_hours & ALL_HOURS;
+    let skip_days = skip_days & ALL_DAYS;
+    if (skip_hours == 0 && skip_days == 0) || skip_hours == ALL_HOURS || skip_days == ALL_DAYS {
+        return ts;
+    }
+
+    let mut candidate = ts;
+    // Six skipped days plus a day of skipped hours is the longest possible
+    // run, so eight days of hours always reaches an allowed one.
+    for _ in 0..(8 * 24) {
+        let Some(dt) = DateTime::<Utc>::from_timestamp(candidate, 0) else {
+            return ts;
+        };
+        let hour_skipped = skip_hours & (1 << dt.hour()) != 0;
+        let day_skipped = skip_days & (1 << dt.weekday().num_days_from_monday()) != 0;
+        if !hour_skipped && !day_skipped {
+            return candidate;
+        }
+        candidate = candidate - candidate.rem_euclid(3600) + 3600;
+    }
+    ts
 }

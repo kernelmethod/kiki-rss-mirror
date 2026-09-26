@@ -1,9 +1,11 @@
-use crate::fetcher::{FetchReply, FetchSpec, FetchedBody, Fetcher, ParseOutcome, ParsedFeed};
+use crate::fetcher::{
+    FeedHints, FetchReply, FetchSpec, FetchedBody, Fetcher, ParseOutcome, ParsedFeed,
+};
 use crate::http::{FeedAuth, FeedAuthType};
 use crate::metrics::Metrics;
 use crate::scripting::ScriptRunner;
 use crate::tasks::backoff::{
-    compute_next_fetch_at, parse_retry_after, FetchOutcome, SchedulerConfig,
+    compute_next_fetch_at, defer_past_skipped, parse_retry_after, FetchOutcome, SchedulerConfig,
 };
 use crate::tasks::cache::{corrected_max_age, extract_server_hints, parse_http_date, CacheControl};
 use crate::tasks::command::TaskManagerCommand;
@@ -32,6 +34,9 @@ struct FeedFetchRow {
     next_fetch_at: Option<i64>,
     min_fetch_interval: i64,
     auth: FeedAuth,
+    /// Refresh hints from the last feed document that parsed, used when a
+    /// response carries no body to read them from (a 304).
+    feed_hints: FeedHints,
 }
 
 fn load_feed_fetch_row(
@@ -52,7 +57,11 @@ fn load_feed_fetch_row(
             auth_type,
             auth_username,
             auth_password,
-            auth_bearer_token
+            auth_bearer_token,
+            feed_ttl_seconds,
+            feed_update_interval_seconds,
+            feed_skip_hours,
+            feed_skip_days
          FROM feeds
          WHERE id = ?1",
         [feed_id],
@@ -80,6 +89,12 @@ fn load_feed_fetch_row(
                     username: row.get(10)?,
                     password: row.get(11)?,
                     bearer_token: row.get(12)?,
+                },
+                feed_hints: FeedHints {
+                    ttl_secs: row.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u64),
+                    update_interval_secs: row.get::<_, Option<i64>>(14)?.map(|v| v.max(0) as u64),
+                    skip_hours: row.get::<_, i64>(15)? as u32,
+                    skip_days: row.get::<_, i64>(16)? as u8,
                 },
             })
         },
@@ -216,10 +231,10 @@ pub(crate) async fn refresh_feed(
     };
     metrics.record_feed_parse(feed.format(), parsed.seconds, feed.entry_count() as u64);
     let inserted = match feed {
-        ParsedFeed::Atom { feed, entries } => {
+        ParsedFeed::Atom { feed, entries, .. } => {
             process_atom_feed(feed_id, *feed, entries, pool.get()?, script_runner, metrics)?
         }
-        ParsedFeed::Rss { entries } => {
+        ParsedFeed::Rss { entries, .. } => {
             process_rss_feed(feed_id, entries, pool.get()?, script_runner, metrics)?
         }
     };
@@ -340,14 +355,13 @@ fn record_fetch_reply(
             info!("Feed {} was not modified since last check", feed_id);
             let now_ts = Utc::now().timestamp();
             let hints = extract_server_hints(&headers.to_header_map(), now_ts);
-            let next_fetch_at = compute_next_fetch_at(
+            let next_fetch_at = schedule_success(
                 FetchOutcome::NotModified {
-                    server_hint_secs: hints.hint_secs,
+                    server_hint_secs: hints.hint_secs.or(row.feed_hints.refresh_hint_secs()),
                 },
+                &row.feed_hints,
                 now_ts,
-                cfg.min_cadence,
-                cfg.max_backoff,
-                cfg.min_fetch_interval,
+                cfg,
             );
             conn.execute(
                 "UPDATE feeds SET
@@ -500,14 +514,22 @@ fn record_fetch_reply(
         None
     };
 
-    let next_fetch_at = compute_next_fetch_at(
+    // Refresh hints from the feed document. A body that did not parse
+    // leaves the previously stored ones in force.
+    let feed_hints = parsed
+        .feed
+        .as_ref()
+        .map_or(row.feed_hints, |feed| *feed.hints());
+
+    // HTTP freshness takes precedence (RFC 9111 is specific to this
+    // representation); the feed's own <ttl> / sy:update* is the fallback.
+    let next_fetch_at = schedule_success(
         FetchOutcome::Success {
-            server_hint_secs: hints.hint_secs,
+            server_hint_secs: hints.hint_secs.or(feed_hints.refresh_hint_secs()),
         },
+        &feed_hints,
         now_ts,
-        cfg.min_cadence,
-        cfg.max_backoff,
-        cfg.min_fetch_interval,
+        cfg,
     );
 
     metrics.record_feed_response_bytes(body_len);
@@ -562,9 +584,13 @@ fn record_fetch_reply(
             last_checked = ?,
             next_fetch_at = ?,
             consecutive_failures = 0,
-            retry_after_at = NULL
+            retry_after_at = NULL,
+            feed_ttl_seconds = ?,
+            feed_update_interval_seconds = ?,
+            feed_skip_hours = ?,
+            feed_skip_days = ?
          WHERE id = ?",
-        (
+        rusqlite::params![
             etag.as_deref(),
             last_modified.as_deref(),
             expires,
@@ -573,8 +599,12 @@ fn record_fetch_reply(
             now_ts,
             now_ts,
             next_fetch_at,
+            feed_hints.ttl_secs.map(saturating_i64),
+            feed_hints.update_interval_secs.map(saturating_i64),
+            feed_hints.skip_hours,
+            feed_hints.skip_days,
             feed_id,
-        ),
+        ],
     )?;
 
     metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
@@ -582,6 +612,30 @@ fn record_fetch_reply(
     fire_fetch_success(rec.script_runner, feed_id, 200, final_url, Some(body_len));
 
     Ok(Some(parsed))
+}
+
+/// Convert seconds to SQLite's integer type; an absurd `<ttl>` saturates
+/// rather than wrapping negative.
+fn saturating_i64(secs: u64) -> i64 {
+    i64::try_from(secs).unwrap_or(i64::MAX)
+}
+
+/// Schedule the next fetch after a 200 or 304, then move it out of any
+/// hours or days the feed asked not to be read in.
+fn schedule_success(
+    outcome: FetchOutcome,
+    feed_hints: &FeedHints,
+    now_ts: i64,
+    cfg: SchedulerConfig,
+) -> i64 {
+    let next_fetch_at = compute_next_fetch_at(
+        outcome,
+        now_ts,
+        cfg.min_cadence,
+        cfg.max_backoff,
+        cfg.min_fetch_interval,
+    );
+    defer_past_skipped(next_fetch_at, feed_hints.skip_hours, feed_hints.skip_days)
 }
 
 fn retrieve_file_feed(
