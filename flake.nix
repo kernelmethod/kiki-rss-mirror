@@ -44,13 +44,44 @@
           kiki = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
           });
+
+          # rustdoc for the kiki_rss crate, including the guides pulled in
+          # from src/docs/*.md. The HTML lands in $out/share/doc.
+          docs = craneLib.cargoDoc (commonArgs // {
+            inherit cargoArtifacts;
+          });
+
+          # Test coverage report: $out/lcov.info for coverage services,
+          # $out/html for browsing, and $out/summary.txt for build logs.
+          coverage = craneLib.cargoLlvmCov (commonArgs // {
+            # Instrumented builds can't reuse the release-profile dependency
+            # artifacts, so build everything from scratch.
+            cargoArtifacts = null;
+            # Build with the dev profile, like `cargo test` in CI.
+            CARGO_PROFILE = "";
+            # cargo-llvm-cov needs the LLVM tools matching rustc's LLVM.
+            LLVM_COV = "${pkgs.rustc.unwrapped.llvmPackages.llvm}/bin/llvm-cov";
+            LLVM_PROFDATA = "${pkgs.rustc.unwrapped.llvmPackages.llvm}/bin/llvm-profdata";
+            # Record source paths relative to the repo root rather than the
+            # Nix build directory, so the reports line up with the checkout.
+            cargoLlvmCovExtraArgs = "--no-report --remap-path-prefix";
+            postBuild = ''
+              mkdir -p $out
+              cargo llvm-cov report --remap-path-prefix --lcov --output-path $out/lcov.info
+              cargo llvm-cov report --remap-path-prefix --html --output-dir $out
+              cargo llvm-cov report --remap-path-prefix --summary-only | tee $out/summary.txt
+            '';
+          });
         in
         {
           checks = {
             inherit kiki;
           };
 
-          packages.default = kiki;
+          packages = {
+            default = kiki;
+            inherit docs coverage;
+          };
 
           devShells.default = craneLib.devShell {
             checks = self.checks.${system};
