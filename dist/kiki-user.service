@@ -24,7 +24,7 @@ WorkingDirectory=%h/.local/share/kiki
 RuntimeDirectory=kiki
 RuntimeDirectoryMode=0700
 
-ExecStartPre=/usr/bin/kiki init --check %h/.local/share/kiki
+ExecStartPre=/usr/bin/kiki init --check
 ExecStart=/usr/bin/kiki serve
 Restart=on-failure
 RestartSec=5
