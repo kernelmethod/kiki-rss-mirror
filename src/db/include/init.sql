@@ -43,6 +43,13 @@ VALUES ('max_feed_backoff_seconds', '86400', 'integer');
 INSERT INTO settings (key, value, type)
 VALUES ('force_refresh_after_secs', '604800', 'integer');
 
+-- Largest feed response body, in bytes, that will be read into memory.
+-- Feeds are text and sit far below this; the cap exists so a hostile or
+-- broken server cannot stream an unbounded body into the process.
+-- Defaults to 32 MiB.
+INSERT INTO settings (key, value, type)
+VALUES ('max_feed_bytes', '33554432', 'integer');
+
 -- Persistent record of when recurring background tasks last ran, so their
 -- schedules survive server restarts. Keyed by an opaque task name.
 CREATE TABLE task_queue (

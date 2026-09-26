@@ -52,6 +52,14 @@ pub async fn delete_feed(
                 event!(Level::ERROR, "unable to begin transaction: {:?}", e);
             })?;
 
+        // Capture the pre-delete feed identity so we can report it in the
+        // `feed.removed` event after the transaction commits.
+        let feed_identity = tx
+            .query_row("SELECT url, title FROM feeds WHERE id = ?1", [id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .ok();
+
         if delete_entries {
             tx.execute("DELETE FROM entries WHERE feed_id = ?1", [id])?;
         }
@@ -65,7 +73,7 @@ pub async fn delete_feed(
 
         tx.commit()?;
 
-        Ok::<usize, rusqlite::Error>(affected_rows)
+        Ok::<(usize, Option<(String, String)>), rusqlite::Error>((affected_rows, feed_identity))
     })
     .await
     .inspect_err(|e| {
@@ -73,8 +81,16 @@ pub async fn delete_feed(
     });
 
     match result {
-        Ok(Ok(0)) => Ok((StatusCode::NOT_FOUND, "Feed not found").into_response()),
-        Ok(Ok(_)) => Ok((StatusCode::NO_CONTENT, "").into_response()),
+        Ok(Ok((0, _))) => Ok((StatusCode::NOT_FOUND, "Feed not found").into_response()),
+        Ok(Ok((_, identity))) => {
+            if let (Some(runner), Some((url, title))) = (state.script_runner.current(), identity) {
+                runner.dispatch_observe(
+                    crate::scripting::Event::FeedRemoved,
+                    crate::scripting::EventPayload::Feed { id, url, title },
+                );
+            }
+            Ok((StatusCode::NO_CONTENT, "").into_response())
+        }
         Ok(Err(_)) | Err(_) => {
             event!(Level::ERROR, "an error occurred while running delete_feed");
             Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())

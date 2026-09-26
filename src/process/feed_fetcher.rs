@@ -1,0 +1,1183 @@
+//! The feed fetcher process, and the server-side client that drives it.
+//!
+//! Fetching a feed means talking to an arbitrary server on the internet
+//! and then parsing whatever it sent: TLS, HTTP framing, three
+//! decompressors, and two XML-based parsers all run over bytes an
+//! attacker may control. Before this process existed all of that ran in
+//! the server, next to the SQLite handle, the asset cache and — in UDS
+//! mode — the listening socket that is Kiki's only access control.
+//!
+//! This module moves that work into a child that holds none of those: no
+//! database, no writable filesystem (Landlock grants only read access to
+//! the TLS trust stores), no way to create a Unix socket, bind, or listen
+//! for connections (seccomp), and it gets from the server only a
+//! [`FetchSpec`] per request. What it sends back is plain data — a
+//! [`FetchReply`] — that the server validates and writes itself.
+//!
+//! # Name resolution
+//!
+//! The worker does no DNS of its own. Its HTTP client's resolver sends
+//! each hostname to the server ([`FromFetcher::Resolve`]), which looks it
+//! up with the system resolver and answers with addresses
+//! ([`ToFetcher::Resolved`]). Hostname lookup therefore behaves exactly as
+//! it does for every other program on the host — including setups that
+//! resolve through a local daemon over a Unix socket (nscd, sssd,
+//! systemd-resolved), which the fetcher's sandbox could not reach — and
+//! the fetcher needs neither the resolver's configuration files nor the
+//! syscalls `getaddrinfo` makes.
+//!
+//! This is for compatibility and a smaller sandbox, not an access control:
+//! the worker can still connect to any address it is given, or that a feed
+//! names by IP.
+//!
+//! # Processes
+//!
+//! `kiki __feed-fetcher` is a small **supervisor**. It installs the
+//! sandbox, then `fork`s a **worker** that does the actual fetching; the
+//! worker inherits the sandbox and has no descriptor to the server, only
+//! a socket pair to the supervisor, which relays frames between the two.
+//!
+//! The split exists so the fetcher can be *replaced*. The server cannot
+//! spawn anything once its own sandbox is up (every profile denies
+//! `execve`), which is acceptable for the optional script host but not
+//! for fetching, which is Kiki's core job. `fork` is not denied, so the
+//! supervisor — single-threaded, and never touching untrusted input —
+//! forks a fresh worker whenever the last one dies. The supervisor tracks
+//! which requests were in flight, answers each of them with a failure, and
+//! the server records those feeds as transiently failed so they back off
+//! rather than crashing the next worker straight away.
+//!
+//! # Protocol
+//!
+//! Unlike the script host's lockstep request/response stream, fetches are
+//! slow and concurrent, so the channel is multiplexed, and requests flow
+//! both ways. The server sends [`ToFetcher`] frames — a [`Request`] for
+//! work, or the answer to a lookup — and receives [`FromFetcher`] frames —
+//! a [`Response`] to its request, or a lookup of the worker's own. Each
+//! side picks the ids for the requests it starts, and answers carry them
+//! back, in any order. Frames use [`crate::process::ipc`]'s
+//! length-prefixed framing, capped at [`MAX_FRAME_BYTES`].
+
+use crate::fetcher::{
+    client_builder, parse_off_thread, retrieve, FetchReply, FetchSpec, FetcherError, ParseOutcome,
+    MAX_REDIRECTS,
+};
+use crate::process::ipc::{
+    read_frame_async, read_frame_limited, write_frame_async, write_frame_limited,
+};
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::net::{Shutdown, SocketAddr, ToSocketAddrs};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::process::Child;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
+use tracing::{debug, info, warn};
+
+/// The hidden subcommand the server re-execs itself with.
+pub const SUBCOMMAND: &str = "__feed-fetcher";
+
+/// Environment variable set on the child, naming [`CHILD_FD`](crate::process::CHILD_FD).
+///
+/// As for the script host, purely informational: it lets a hand-run
+/// `kiki __feed-fetcher` refuse with a clear message.
+pub const HOST_FD_ENV: &str = "KIKI_FEED_FETCHER_FD";
+
+/// Largest frame either side will write or accept.
+///
+/// A response carries a whole parsed feed, whose body is capped upstream
+/// by the `max_feed_bytes` setting (32 MiB by default). JSON escaping can
+/// grow that several-fold in the worst case, so the cap here is a
+/// multiple of the default; a reply that still does not fit is turned
+/// into an error by the worker rather than sent.
+pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
+
+/// Extra time the server allows past the fetch's own timeouts before it
+/// stops waiting: time to parse, and to cross two process boundaries.
+const DEADLINE_SLACK: Duration = Duration::from_secs(30);
+
+/// How long the server waits for a `file://` body to be parsed.
+const PARSE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long the supervisor waits for a worker to finish a frame it has
+/// started writing, or to accept one, before declaring it wedged.
+const WORKER_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A worker that lived at least this long before dying is not counted as
+/// part of a crash loop.
+const HEALTHY_WORKER_LIFETIME: Duration = Duration::from_secs(60);
+
+/// Ceiling on the delay between respawns of a crash-looping worker.
+const MAX_RESPAWN_DELAY: Duration = Duration::from_secs(30);
+
+/// How long a worker waits for the server to answer a lookup.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Threads the server dedicates to answering the worker's lookups. Each
+/// lookup blocks in `getaddrinfo`, so this bounds how many run at once.
+const RESOLVER_THREADS: usize = 4;
+
+/// Lookups the server will queue behind [`RESOLVER_THREADS`] before it
+/// starts refusing them, so a misbehaving worker cannot make the server
+/// buffer without limit.
+const RESOLVER_QUEUE: usize = 256;
+
+/// Longest hostname the server will look up (RFC 1035's limit on a full
+/// domain name, in its dotted text form).
+const MAX_HOSTNAME_LEN: usize = 253;
+
+/// A frame from the server to the fetcher.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ToFetcher {
+    /// Work for the fetcher.
+    Request(Request),
+
+    /// The answer to a [`FromFetcher::Resolve`] with the same id: the
+    /// host's addresses (port 0), or why they could not be found.
+    Resolved {
+        id: u64,
+        result: Result<Vec<SocketAddr>, String>,
+    },
+}
+
+/// A frame from the fetcher to the server.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum FromFetcher {
+    /// The answer to a [`Request`].
+    Response(Response),
+
+    /// Ask the server to look up `host`. `id` is chosen by the worker.
+    Resolve { id: u64, host: String },
+}
+
+/// A message from the server to the fetcher.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Request {
+    /// Chosen by the server, unique among its outstanding requests.
+    pub id: u64,
+    pub job: Job,
+}
+
+/// The work a [`Request`] asks for.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Job {
+    /// Fetch a feed over HTTP(S) and parse it.
+    Fetch(FetchSpec),
+
+    /// Parse a body the server read itself (a `file://` feed).
+    Parse { feed_id: i64, body: Vec<u8> },
+}
+
+/// A message from the fetcher back to the server.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Response {
+    /// The id of the [`Request`] this answers.
+    pub id: u64,
+    pub result: JobResult,
+}
+
+/// The outcome of a [`Job`].
+#[derive(Debug, Serialize, Deserialize)]
+pub enum JobResult {
+    Fetched(FetchReply),
+    Parsed(ParseOutcome),
+
+    /// The job could not be completed: the worker crashed while serving
+    /// it, the task serving it panicked, or the reply was too large to
+    /// send.
+    Failed {
+        message: String,
+    },
+}
+
+/// Just the id of a message, for the supervisor, which needs to know what
+/// is outstanding but has no reason to decode the rest.
+#[derive(Deserialize)]
+struct IdOnly {
+    id: u64,
+}
+
+/// The kind and id of a [`ToFetcher`] frame.
+#[derive(Deserialize)]
+enum PeekTo {
+    Request(IdOnly),
+    Resolved(IdOnly),
+}
+
+/// The kind and id of a [`FromFetcher`] frame.
+#[derive(Deserialize)]
+enum PeekFrom {
+    Response(IdOnly),
+    Resolve(IdOnly),
+}
+
+fn peek_to(frame: &[u8]) -> Option<PeekTo> {
+    serde_json::from_slice(frame).ok()
+}
+
+fn peek_from(frame: &[u8]) -> Option<PeekFrom> {
+    serde_json::from_slice(frame).ok()
+}
+
+/// Encode a frame the server sends, or fail the way a bad request does.
+fn encode_to(msg: &ToFetcher) -> Result<Vec<u8>, FetcherError> {
+    serde_json::to_vec(msg)
+        .map_err(|e| FetcherError::Unavailable(format!("could not encode request: {e}")))
+}
+
+// ------------------------------------------------------------------
+// Server side
+// ------------------------------------------------------------------
+
+/// Requests awaiting an answer, keyed by the id they were sent with.
+///
+/// Used on both sides of the channel: by the server for its requests, and
+/// by the worker for its lookups. Closing it wakes every waiter with an
+/// error and refuses later registrations, under one lock, so nothing is
+/// ever left waiting on a channel that has already failed.
+struct Pending<T> {
+    waiters: Mutex<Option<HashMap<u64, oneshot::Sender<T>>>>,
+    next_id: AtomicU64,
+}
+
+impl<T> Pending<T> {
+    fn new() -> Self {
+        Pending {
+            waiters: Mutex::new(Some(HashMap::new())),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<HashMap<u64, oneshot::Sender<T>>>> {
+        self.waiters.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Allocate an id and a receiver for its answer, or `None` if closed.
+    fn register(&self) -> Option<(u64, oneshot::Receiver<T>)> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.lock().as_mut()?.insert(id, tx);
+        Some((id, rx))
+    }
+
+    /// Deliver the answer to `id`. Late answers, whose waiter has given
+    /// up, are dropped.
+    fn complete(&self, id: u64, value: T) {
+        let waiter = self.lock().as_mut().and_then(|w| w.remove(&id));
+        if let Some(w) = waiter {
+            let _ = w.send(value);
+        }
+    }
+
+    fn forget(&self, id: u64) {
+        if let Some(w) = self.lock().as_mut() {
+            w.remove(&id);
+        }
+    }
+
+    /// Fail every waiter and refuse new ones. Returns whether this call
+    /// was the one that closed it.
+    fn close(&self) -> bool {
+        self.lock().take().is_some()
+    }
+
+    fn is_open(&self) -> bool {
+        self.lock().is_some()
+    }
+}
+
+/// Close the server's side of the channel: every outstanding request
+/// fails immediately, and every later one is refused.
+fn retire(pending: &Pending<JobResult>, why: &str) {
+    if pending.close() {
+        warn!(
+            reason = why,
+            "feed fetcher: channel failed, feed fetching is disabled until restart"
+        );
+    }
+}
+
+/// A handle to the feed fetcher process.
+///
+/// Many requests can be outstanding at once. Each [`Self::fetch`] writes
+/// its request through a dedicated writer thread and awaits its own
+/// response, which a reader thread routes back by id, so a slow feed never
+/// holds up any other — and no async task ever blocks on the socket.
+pub struct FeedFetcherHost {
+    pending: Arc<Pending<JobResult>>,
+    writer: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    /// A clone of the socket kept only to shut it down on drop, which
+    /// wakes the reader thread and tells the supervisor to exit.
+    control: UnixStream,
+    child: Mutex<Option<Child>>,
+}
+
+impl FeedFetcherHost {
+    /// Spawn the feed fetcher.
+    ///
+    /// **Must be called before the caller installs its own sandbox** —
+    /// every sandbox profile denies `execve`. `log_only` and `no_sandbox`
+    /// are forwarded so the child's sandbox matches the operator's intent
+    /// for the server's.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the child cannot be spawned, or the threads that service
+    /// its socket cannot be started.
+    pub fn spawn(log_only: bool, no_sandbox: bool) -> Result<Self> {
+        let (stream, child) =
+            crate::process::spawn_child(SUBCOMMAND, HOST_FD_ENV, log_only, no_sandbox)
+                .context("spawning the feed fetcher")?;
+        info!(pid = child.id(), "feed fetcher: spawned");
+        Self::from_stream(stream, Some(child))
+    }
+
+    /// Wrap an already-connected socket. The far end must speak the
+    /// supervisor's side of the protocol.
+    fn from_stream(stream: UnixStream, child: Option<Child>) -> Result<Self> {
+        let pending = Arc::new(Pending::new());
+
+        let control = stream.try_clone().context("cloning the fetcher socket")?;
+        let mut write_half = stream.try_clone().context("cloning the fetcher socket")?;
+        let mut read_half = stream;
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let lookups = spawn_resolver_pool(tx.clone())?;
+
+        let writer_pending = Arc::clone(&pending);
+        std::thread::Builder::new()
+            .name("fetcher-writer".into())
+            .spawn(move || {
+                for frame in rx {
+                    if let Err(e) = write_frame_limited(&mut write_half, &frame, MAX_FRAME_BYTES) {
+                        retire(&writer_pending, &format!("write failed: {e}"));
+                        return;
+                    }
+                }
+            })
+            .context("starting the fetcher writer thread")?;
+
+        let reader_pending = Arc::clone(&pending);
+        std::thread::Builder::new()
+            .name("fetcher-reader".into())
+            .spawn(move || loop {
+                let frame = match read_frame_limited(&mut read_half, MAX_FRAME_BYTES) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        retire(&reader_pending, &format!("read failed: {e}"));
+                        return;
+                    }
+                };
+                match serde_json::from_slice(&frame) {
+                    Ok(FromFetcher::Response(r)) => reader_pending.complete(r.id, r.result),
+                    Ok(FromFetcher::Resolve { id, host }) => lookups.submit(id, host),
+                    Err(e) => {
+                        retire(&reader_pending, &format!("malformed response: {e}"));
+                        return;
+                    }
+                }
+            })
+            .context("starting the fetcher reader thread")?;
+
+        Ok(FeedFetcherHost {
+            pending,
+            writer: Mutex::new(Some(tx)),
+            control,
+            child: Mutex::new(child),
+        })
+    }
+
+    /// Fetch, and on success parse, the feed described by `spec`.
+    ///
+    /// # Errors
+    ///
+    /// Fails only if the fetcher could not serve the request; failures of
+    /// the fetch itself are [`FetchReply`] variants.
+    pub async fn fetch(&self, spec: FetchSpec) -> Result<FetchReply, FetcherError> {
+        // A fetch can take up to one timeout per hop, then a parse.
+        let hops = u32::try_from(MAX_REDIRECTS + 1).unwrap_or(u32::MAX);
+        let deadline = Duration::from_secs(spec.timeout_secs)
+            .saturating_mul(hops)
+            .saturating_add(DEADLINE_SLACK);
+        match self.request(Job::Fetch(spec), deadline).await? {
+            JobResult::Fetched(reply) => Ok(reply),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Parse a body the server has already read.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::fetch`].
+    pub async fn parse(&self, feed_id: i64, body: Vec<u8>) -> Result<ParseOutcome, FetcherError> {
+        match self
+            .request(Job::Parse { feed_id, body }, PARSE_DEADLINE)
+            .await?
+        {
+            JobResult::Parsed(outcome) => Ok(outcome),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Whether the channel to the fetcher is still usable.
+    pub fn is_alive(&self) -> bool {
+        self.pending.is_open()
+    }
+
+    async fn request(&self, job: Job, deadline: Duration) -> Result<JobResult, FetcherError> {
+        let gone = || FetcherError::Unavailable("the fetcher process is no longer running".into());
+        let (id, rx) = self.pending.register().ok_or_else(gone)?;
+
+        // Refused before it reaches the wire, so the channel is fine.
+        let encoded = encode_to(&ToFetcher::Request(Request { id, job })).and_then(|v| {
+            if v.len() > MAX_FRAME_BYTES {
+                Err(FetcherError::Unavailable(format!(
+                    "request of {} bytes exceeds the {} byte frame limit",
+                    v.len(),
+                    MAX_FRAME_BYTES
+                )))
+            } else {
+                Ok(v)
+            }
+        });
+        let encoded = match encoded {
+            Ok(v) => v,
+            Err(e) => {
+                self.pending.forget(id);
+                return Err(e);
+            }
+        };
+
+        let sent = self
+            .writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|w| w.send(encoded).is_ok());
+        if !sent {
+            self.pending.forget(id);
+            return Err(gone());
+        }
+
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(JobResult::Failed { message })) => Err(FetcherError::Unavailable(message)),
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err(gone()),
+            Err(_) => {
+                // Not fatal: the worker may just be slow on this one feed,
+                // and every other request is independent of it.
+                self.pending.forget(id);
+                Err(FetcherError::Timeout(deadline))
+            }
+        }
+    }
+}
+
+fn unexpected(result: JobResult) -> FetcherError {
+    FetcherError::Unavailable(format!("unexpected response from the fetcher: {result:?}"))
+}
+
+/// The server's side of name resolution: a small, fixed pool of threads
+/// that answer the worker's [`FromFetcher::Resolve`] frames.
+struct ResolverPool {
+    jobs: mpsc::SyncSender<(u64, String)>,
+    replies: mpsc::Sender<Vec<u8>>,
+}
+
+impl ResolverPool {
+    /// Queue a lookup, or refuse it at once if the queue is full.
+    fn submit(&self, id: u64, host: String) {
+        if let Err(mpsc::TrySendError::Full((id, _))) = self.jobs.try_send((id, host)) {
+            send_resolved(&self.replies, id, Err("too many lookups in flight".into()));
+        }
+    }
+}
+
+/// Start [`RESOLVER_THREADS`] threads that look hostnames up and write the
+/// answers through `replies`. They exit when the returned pool is dropped,
+/// which happens when the reader thread that owns it does.
+fn spawn_resolver_pool(replies: mpsc::Sender<Vec<u8>>) -> Result<ResolverPool> {
+    let (jobs, queue) = mpsc::sync_channel::<(u64, String)>(RESOLVER_QUEUE);
+    let queue = Arc::new(Mutex::new(queue));
+    for n in 0..RESOLVER_THREADS {
+        let queue = Arc::clone(&queue);
+        let replies = replies.clone();
+        std::thread::Builder::new()
+            .name(format!("fetcher-dns-{n}"))
+            .spawn(move || loop {
+                let next = queue.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                let Ok((id, host)) = next else { return };
+                send_resolved(&replies, id, lookup_host(&host));
+            })
+            .context("starting a fetcher resolver thread")?;
+    }
+    Ok(ResolverPool { jobs, replies })
+}
+
+/// Resolve `host` with the system resolver, as any other program on this
+/// host would.
+fn lookup_host(host: &str) -> Result<Vec<SocketAddr>, String> {
+    if host.is_empty() || host.len() > MAX_HOSTNAME_LEN || host.contains('\0') {
+        return Err("not a valid hostname".into());
+    }
+    let addrs: Vec<SocketAddr> = (host, 0)
+        .to_socket_addrs()
+        .map_err(|e| format!("{e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("no addresses found for {host}"));
+    }
+    Ok(addrs)
+}
+
+fn send_resolved(
+    replies: &mpsc::Sender<Vec<u8>>,
+    id: u64,
+    result: Result<Vec<SocketAddr>, String>,
+) {
+    if let Ok(frame) = encode_to(&ToFetcher::Resolved { id, result }) {
+        let _ = replies.send(frame);
+    }
+}
+
+impl Drop for FeedFetcherHost {
+    fn drop(&mut self) {
+        // Stop the writer, then shut the socket down: the reader thread
+        // wakes with EOF, and the supervisor sees EOF and exits, taking
+        // its worker with it.
+        self.writer.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let _ = self.control.shutdown(Shutdown::Both);
+
+        if let Some(child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            crate::process::reap(child);
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Child side: supervisor
+// ------------------------------------------------------------------
+
+/// Run the feed fetcher: sandbox this process, then supervise workers
+/// until the server closes the channel.
+///
+/// This is the whole of the child's life. It never returns to any other
+/// code path.
+///
+/// # Errors
+///
+/// Fails if the sandbox cannot be installed, or if a worker cannot be
+/// forked at all. Once running, the server closing the channel is a
+/// normal shutdown, not an error.
+pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
+    if no_sandbox {
+        warn!(
+            "feed fetcher: sandbox disabled via --no-sandbox; feeds are fetched and parsed \
+             with full filesystem and syscall access"
+        );
+    } else {
+        crate::sandbox::apply(&crate::sandbox::SandboxConfig::feed_fetcher(log_only))
+            .context("failed to install the feed fetcher sandbox")?;
+    }
+
+    let mut server = crate::process::take_parent_socket(SUBCOMMAND)?;
+
+    let mut quick_deaths: u32 = 0;
+    loop {
+        let (mut ours, theirs) =
+            UnixStream::pair().context("creating the fetcher worker socket pair")?;
+        ours.set_read_timeout(Some(WORKER_IO_TIMEOUT))?;
+        ours.set_write_timeout(Some(WORKER_IO_TIMEOUT))?;
+
+        let supervisor_pid = std::process::id();
+        // SAFETY: this process is single-threaded — the supervisor never
+        // starts a thread or a runtime — so the child is a complete copy
+        // and may run arbitrary code, not just async-signal-safe calls.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(io::Error::last_os_error()).context("forking a fetcher worker");
+        }
+        if pid == 0 {
+            // The worker must never be able to talk to the server
+            // directly: everything it says goes through the relay below.
+            drop(server);
+            drop(ours);
+            std::process::exit(worker_main(theirs, supervisor_pid));
+        }
+        drop(theirs);
+
+        info!(pid, "feed fetcher: worker started");
+        let started = Instant::now();
+        let end = relay(&mut server, &mut ours);
+
+        // Whatever happened, this worker is finished; make sure of it.
+        // SAFETY: `pid` is our own child, which has not been reaped yet.
+        let status = unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            status
+        };
+
+        let in_flight = match end {
+            RelayEnd::ServerClosed => {
+                debug!("feed fetcher: server closed the channel, exiting");
+                return Ok(());
+            }
+            RelayEnd::WorkerGone { in_flight, why } => {
+                warn!(
+                    pid,
+                    reason = %why,
+                    status = %describe_wait_status(status),
+                    in_flight = in_flight.len(),
+                    "feed fetcher: worker exited; starting a new one"
+                );
+                in_flight
+            }
+        };
+
+        // Answer everything the dead worker had accepted, so the server
+        // records those feeds as failed (and backs them off) now, instead
+        // of waiting out their deadlines.
+        for id in in_flight {
+            let response = FromFetcher::Response(Response {
+                id,
+                result: JobResult::Failed {
+                    message: "the fetcher worker exited while handling this feed".into(),
+                },
+            });
+            let encoded = serde_json::to_vec(&response).context("encoding a failure response")?;
+            if write_frame_limited(&mut server, &encoded, MAX_FRAME_BYTES).is_err() {
+                return Ok(());
+            }
+        }
+
+        if started.elapsed() >= HEALTHY_WORKER_LIFETIME {
+            quick_deaths = 0;
+        } else {
+            quick_deaths = quick_deaths.saturating_add(1);
+        }
+        let delay = respawn_delay(quick_deaths);
+        if !delay.is_zero() {
+            warn!(
+                ?delay,
+                "feed fetcher: worker is crash-looping; delaying respawn"
+            );
+            std::thread::sleep(delay);
+        }
+    }
+}
+
+/// How long to wait before starting the next worker, given how many have
+/// died young in a row. The first death is free; after that the delay
+/// doubles from one second up to [`MAX_RESPAWN_DELAY`].
+fn respawn_delay(quick_deaths: u32) -> Duration {
+    if quick_deaths <= 1 {
+        return Duration::ZERO;
+    }
+    let exp = quick_deaths.saturating_sub(2).min(16);
+    Duration::from_secs(1u64 << exp).min(MAX_RESPAWN_DELAY)
+}
+
+fn describe_wait_status(status: libc::c_int) -> String {
+    if libc::WIFSIGNALED(status) {
+        let sig = libc::WTERMSIG(status);
+        if sig == libc::SIGSYS {
+            "killed by SIGSYS (a syscall denied by the seccomp filter)".into()
+        } else {
+            format!("killed by signal {sig}")
+        }
+    } else if libc::WIFEXITED(status) {
+        format!("exited with status {}", libc::WEXITSTATUS(status))
+    } else {
+        format!("wait status {status}")
+    }
+}
+
+/// Why [`relay`] stopped.
+enum RelayEnd {
+    /// The server closed its end: time to exit.
+    ServerClosed,
+
+    /// The worker died, wedged, or broke the protocol. `in_flight` holds
+    /// the ids it had been given but not answered.
+    WorkerGone {
+        in_flight: HashSet<u64>,
+        why: String,
+    },
+}
+
+/// Copy frames between the server and the current worker until one side
+/// goes away, keeping track of which requests are outstanding in each
+/// direction.
+///
+/// Lookups are tracked so that an answer meant for a worker that has since
+/// died is dropped rather than delivered to its replacement, whose ids
+/// start again from the beginning.
+///
+/// Both peers read and write independently, so blocking on a write to
+/// either can never deadlock against a write of theirs.
+fn relay(server: &mut UnixStream, worker: &mut UnixStream) -> RelayEnd {
+    let mut in_flight: HashSet<u64> = HashSet::new();
+    let mut lookups: HashSet<u64> = HashSet::new();
+    let gone = |in_flight: HashSet<u64>, why: String| RelayEnd::WorkerGone { in_flight, why };
+
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: server.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: worker.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `fds` is a valid array of two initialised pollfds, and
+        // its length is passed alongside it.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return gone(in_flight, format!("poll failed: {err}"));
+        }
+
+        let [server_fd, worker_fd] = fds;
+
+        // Drain responses first so a busy server cannot starve them.
+        if worker_fd.revents != 0 {
+            let frame = match read_frame_limited(worker, MAX_FRAME_BYTES) {
+                Ok(f) => f,
+                Err(e) => return gone(in_flight, format!("read failed: {e}")),
+            };
+            match peek_from(&frame) {
+                Some(PeekFrom::Response(IdOnly { id })) => {
+                    in_flight.remove(&id);
+                }
+                Some(PeekFrom::Resolve(IdOnly { id })) => {
+                    lookups.insert(id);
+                }
+                None => return gone(in_flight, "sent a malformed frame".into()),
+            }
+            if write_frame_limited(server, &frame, MAX_FRAME_BYTES).is_err() {
+                return RelayEnd::ServerClosed;
+            }
+        }
+
+        if server_fd.revents != 0 {
+            let frame = match read_frame_limited(server, MAX_FRAME_BYTES) {
+                Ok(f) => f,
+                Err(_) => return RelayEnd::ServerClosed,
+            };
+            match peek_to(&frame) {
+                Some(PeekTo::Request(IdOnly { id })) => {
+                    in_flight.insert(id);
+                }
+                Some(PeekTo::Resolved(IdOnly { id })) => {
+                    if !lookups.remove(&id) {
+                        // For a previous worker, or never asked for.
+                        continue;
+                    }
+                }
+                None => continue,
+            }
+            if let Err(e) = write_frame_limited(worker, &frame, MAX_FRAME_BYTES) {
+                return gone(in_flight, format!("write failed: {e}"));
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Child side: worker
+// ------------------------------------------------------------------
+
+/// Entry point of a forked worker. Returns the process exit code.
+fn worker_main(stream: UnixStream, supervisor_pid: u32) -> i32 {
+    // Die with the supervisor. Checked again after the `prctl` in case the
+    // supervisor exited before it took effect.
+    // SAFETY: plain `prctl`/`getppid` calls with no pointer arguments.
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        if libc::getppid() as u32 != supervisor_pid {
+            return 0;
+        }
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("fetcher-worker")
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            warn!(error = %e, "feed fetcher: could not start the worker runtime");
+            return 1;
+        }
+    };
+
+    match runtime.block_on(serve(stream)) {
+        Ok(()) => 0,
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "feed fetcher: worker failed");
+            1
+        }
+    }
+}
+
+/// Serve requests from the supervisor, each on its own task, until the
+/// supervisor closes the channel.
+async fn serve(stream: UnixStream) -> Result<()> {
+    stream.set_nonblocking(true)?;
+    let stream = tokio::net::UnixStream::from_std(stream)?;
+    let (mut rd, mut wr) = stream.into_split();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            if let Err(e) = write_frame_async(&mut wr, &frame, MAX_FRAME_BYTES).await {
+                warn!(error = %e, "feed fetcher: write failed");
+                return;
+            }
+        }
+    });
+
+    let resolver = ServerResolver {
+        frames: tx.clone(),
+        pending: Arc::new(Pending::new()),
+    };
+    let client = client_builder()
+        .dns_resolver(Arc::new(resolver.clone()))
+        .build()
+        .context("building the HTTP client")?;
+
+    loop {
+        let frame = match read_frame_async(&mut rd, MAX_FRAME_BYTES).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e).context("reading a request"),
+        };
+        let request = match serde_json::from_slice(&frame) {
+            Ok(ToFetcher::Request(r)) => r,
+            Ok(ToFetcher::Resolved { id, result }) => {
+                resolver.pending.complete(id, result);
+                continue;
+            }
+            // Both ends are the same binary, so this is corruption: exit,
+            // and let the supervisor fail what was in flight and respawn.
+            Err(e) => return Err(e).context("decoding a request"),
+        };
+
+        let client = client.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let id = request.id;
+            // Run the job on a task of its own so a panic in it becomes an
+            // answer instead of a request the server waits out.
+            let result = match tokio::spawn(run_job(client, request.job)).await {
+                Ok(r) => r,
+                Err(e) => JobResult::Failed {
+                    message: format!("fetch task failed: {e}"),
+                },
+            };
+            let _ = tx.send(encode_response(id, result));
+        });
+    }
+
+    drop(tx);
+    writer.abort();
+    Ok(())
+}
+
+/// A host's addresses, or why they could not be found.
+type LookupResult = Result<Vec<SocketAddr>, String>;
+
+/// The worker's DNS resolver: asks the server, over the same channel as
+/// everything else, instead of resolving anything itself.
+#[derive(Clone)]
+struct ServerResolver {
+    frames: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    pending: Arc<Pending<LookupResult>>,
+}
+
+impl reqwest::dns::Resolve for ServerResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let this = self.clone();
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let (id, rx) = this
+                .pending
+                .register()
+                .ok_or("the worker is shutting down")?;
+            let frame = serde_json::to_vec(&FromFetcher::Resolve {
+                id,
+                host: host.clone(),
+            })?;
+            if this.frames.send(frame).is_err() {
+                this.pending.forget(id);
+                return Err("the channel to the server is closed".into());
+            }
+            let answer = tokio::time::timeout(RESOLVE_TIMEOUT, rx).await;
+            this.pending.forget(id);
+            match answer {
+                Ok(Ok(Ok(addrs))) => Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs),
+                Ok(Ok(Err(message))) => Err(format!("resolving {host}: {message}").into()),
+                Ok(Err(_)) => Err("the channel to the server is closed".into()),
+                Err(_) => Err(format!("resolving {host}: no answer from the server").into()),
+            }
+        })
+    }
+}
+
+async fn run_job(client: reqwest::Client, job: Job) -> JobResult {
+    match job {
+        Job::Fetch(spec) => JobResult::Fetched(retrieve(&client, &spec).await),
+        Job::Parse { feed_id, body } => JobResult::Parsed(parse_off_thread(feed_id, body).await),
+    }
+}
+
+/// Encode a response, replacing it with a failure if it cannot be sent.
+fn encode_response(id: u64, result: JobResult) -> Vec<u8> {
+    let encoded = serde_json::to_vec(&FromFetcher::Response(Response { id, result }))
+        .map_err(|e| format!("could not encode the response: {e}"))
+        .and_then(|v| {
+            if v.len() > MAX_FRAME_BYTES {
+                Err(format!(
+                    "the parsed feed is {} bytes as JSON, over the {} byte frame limit",
+                    v.len(),
+                    MAX_FRAME_BYTES
+                ))
+            } else {
+                Ok(v)
+            }
+        });
+    match encoded {
+        Ok(v) => v,
+        Err(message) => {
+            let fallback = FromFetcher::Response(Response {
+                id,
+                result: JobResult::Failed { message },
+            });
+            // A bare id and a short string always encode.
+            serde_json::to_vec(&fallback).unwrap_or_default()
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::http::FeedAuth;
+
+    fn spec(url: &str) -> FetchSpec {
+        FetchSpec {
+            feed_id: 1,
+            url: url.to_string(),
+            etag: None,
+            last_modified: None,
+            send_conditionals: true,
+            auth: FeedAuth::default(),
+            timeout_secs: 5,
+            max_feed_bytes: 1024 * 1024,
+        }
+    }
+
+    const RSS: &[u8] = br#"<rss version="2.0"><channel><title>t</title><link>http://x/</link>
+        <description>d</description><item><title>hi</title><guid>g1</guid></item>
+        </channel></rss>"#;
+
+    /// Run a worker on one end of a socket pair in a background thread,
+    /// standing in for the supervisor's relay, and return a host wired to
+    /// the other end.
+    fn host_with_in_thread_worker() -> FeedFetcherHost {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = rt.block_on(serve(theirs));
+        });
+        FeedFetcherHost::from_stream(ours, None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn parse_requests_round_trip_through_a_worker() {
+        let host = host_with_in_thread_worker();
+        let outcome = host.parse(7, RSS.to_vec()).await.unwrap();
+        let feed = outcome.feed.expect("parsed");
+        assert_eq!(feed.format(), "rss");
+        assert_eq!(feed.entry_count(), 1);
+
+        let outcome = host.parse(7, b"not xml".to_vec()).await.unwrap();
+        assert!(outcome.feed.is_none());
+        assert!(host.is_alive());
+    }
+
+    #[tokio::test]
+    async fn fetch_requests_are_served_concurrently() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    RSS
+                }),
+            )
+            .route("/fast", get(|| async { RSS }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+        let host = Arc::new(host_with_in_thread_worker());
+        let slow = {
+            let host = Arc::clone(&host);
+            let url = format!("http://{addr}/slow");
+            tokio::spawn(async move { host.fetch(spec(&url)).await })
+        };
+
+        let start = Instant::now();
+        let fast = host.fetch(spec(&format!("http://{addr}/fast"))).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a fast feed waited behind a slow one"
+        );
+        assert!(matches!(fast, Ok(FetchReply::Body(_))), "got {fast:?}");
+        assert!(matches!(slow.await.unwrap(), Ok(FetchReply::Body(_))));
+    }
+
+    /// When the far end goes away, outstanding and later requests fail
+    /// promptly instead of waiting out their deadlines.
+    #[tokio::test]
+    async fn a_dead_channel_fails_requests_immediately() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let host = FeedFetcherHost::from_stream(ours, None).unwrap();
+        drop(theirs);
+
+        let start = Instant::now();
+        let err = host.parse(1, RSS.to_vec()).await.unwrap_err();
+        assert!(matches!(err, FetcherError::Unavailable(_)), "got {err:?}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(!host.is_alive());
+    }
+
+    #[test]
+    fn respawns_back_off_only_when_crash_looping() {
+        assert_eq!(respawn_delay(0), Duration::ZERO);
+        assert_eq!(respawn_delay(1), Duration::ZERO);
+        assert_eq!(respawn_delay(2), Duration::from_secs(1));
+        assert_eq!(respawn_delay(3), Duration::from_secs(2));
+        assert_eq!(respawn_delay(40), MAX_RESPAWN_DELAY);
+    }
+
+    #[test]
+    fn oversized_replies_become_failures() {
+        let huge = "x".repeat(MAX_FRAME_BYTES + 1);
+        let encoded = encode_response(
+            9,
+            JobResult::Failed {
+                message: huge.clone(),
+            },
+        );
+        assert!(encoded.len() < MAX_FRAME_BYTES);
+        let decoded: FromFetcher = serde_json::from_slice(&encoded).unwrap();
+        match decoded {
+            FromFetcher::Response(r) => {
+                assert_eq!(r.id, 9);
+                assert!(matches!(r.result, JobResult::Failed { .. }));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kinds_and_ids_can_be_read_without_decoding_the_body() {
+        let frame = serde_json::to_vec(&ToFetcher::Request(Request {
+            id: 42,
+            job: Job::Parse {
+                feed_id: 1,
+                body: vec![1, 2, 3],
+            },
+        }))
+        .unwrap();
+        assert!(matches!(
+            peek_to(&frame),
+            Some(PeekTo::Request(IdOnly { id: 42 }))
+        ));
+
+        let frame = serde_json::to_vec(&ToFetcher::Resolved {
+            id: 7,
+            result: Ok(vec!["127.0.0.1:0".parse().unwrap()]),
+        })
+        .unwrap();
+        assert!(matches!(
+            peek_to(&frame),
+            Some(PeekTo::Resolved(IdOnly { id: 7 }))
+        ));
+
+        let frame = serde_json::to_vec(&FromFetcher::Resolve {
+            id: 3,
+            host: "example.com".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            peek_from(&frame),
+            Some(PeekFrom::Resolve(IdOnly { id: 3 }))
+        ));
+
+        assert!(peek_to(b"{}").is_none());
+        assert!(peek_from(b"{\"id\":1}").is_none());
+    }
+
+    #[test]
+    fn the_server_refuses_to_look_up_nonsense() {
+        assert!(lookup_host("").is_err());
+        assert!(lookup_host(&"a".repeat(MAX_HOSTNAME_LEN + 1)).is_err());
+        assert!(lookup_host("bad\0host").is_err());
+        assert!(lookup_host("localhost").is_ok());
+    }
+
+    /// A feed named by hostname is resolved by the server side of the
+    /// channel, and a name that does not resolve surfaces as an ordinary
+    /// network failure of that one fetch.
+    #[tokio::test]
+    async fn hostnames_are_resolved_through_the_server() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new().route("/feed", get(|| async { RSS }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+        let host = host_with_in_thread_worker();
+        let reply = host
+            .fetch(spec(&format!("http://localhost:{port}/feed")))
+            .await;
+        assert!(matches!(reply, Ok(FetchReply::Body(_))), "got {reply:?}");
+
+        let reply = host
+            .fetch(spec("http://no-such-host.invalid/feed"))
+            .await
+            .unwrap();
+        match reply {
+            FetchReply::Network { message, .. } => {
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected a network failure, got {other:?}"),
+        }
+        assert!(host.is_alive());
+    }
+}

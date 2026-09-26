@@ -63,6 +63,8 @@ in
       after = [ "network.target" ];
       wantedBy = [ "multi-user.target" ];
 
+      environment.KIKI_HOME = cfg.dataDir;
+
       serviceConfig = {
         Type = "simple";
         User = cfg.user;

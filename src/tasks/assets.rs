@@ -10,6 +10,7 @@
 //! Eviction is enforced inline: after each successful insertion, if the total
 //! cache size exceeds the configured cap, the least-recently-accessed rows
 //! are dropped via [`crate::db::assets::evict_to`] and their files unlinked.
+use crate::http::{read_body_capped, CappedBody};
 use anyhow::{Context, Result};
 use lol_html::html_content::Element;
 use lol_html::{element, HtmlRewriter, Settings};
@@ -164,7 +165,7 @@ pub fn asset_path(data_dir: &Path, blake3: &str) -> PathBuf {
 }
 
 /// Write `bytes` atomically to the asset path for `blake3`.
-fn write_asset_file(data_dir: &Path, blake3: &str, bytes: &[u8]) -> Result<PathBuf> {
+pub fn write_asset_file(data_dir: &Path, blake3: &str, bytes: &[u8]) -> Result<PathBuf> {
     let final_path = asset_path(data_dir, blake3);
     let parent = final_path
         .parent()
@@ -262,34 +263,23 @@ pub async fn cache_asset(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Reject upfront when Content-Length announces a body over the cap.
-    if let Some(declared) = resp.content_length() {
-        if declared > MAX_ASSET_BYTES {
+    // Streamed under the cap: checking `Content-Length` up front and then
+    // calling `bytes()` would still buffer the whole body for a server
+    // that lies about (or omits) the header.
+    let bytes = match read_body_capped(resp, MAX_ASSET_BYTES).await {
+        Ok(CappedBody::Complete(b)) => b,
+        Ok(CappedBody::TooLarge { seen }) => {
             warn!(
-                "asset {} content-length {} exceeds cap {}, skipping",
-                asset_url, declared, MAX_ASSET_BYTES
+                "asset {} body of {} bytes exceeds cap {}, skipping",
+                asset_url, seen, MAX_ASSET_BYTES
             );
             return Ok(());
         }
-    }
-
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
         Err(e) => {
             warn!("asset body read failed for {}: {}", asset_url, e);
             return Ok(());
         }
     };
-    if bytes.len() as u64 > MAX_ASSET_BYTES {
-        warn!(
-            "asset {} returned {} bytes, exceeds cap {}, skipping",
-            asset_url,
-            bytes.len(),
-            MAX_ASSET_BYTES
-        );
-        return Ok(());
-    }
-    let bytes = bytes.to_vec();
 
     let hash = blake3::hash(&bytes).to_hex().to_string();
     let size = bytes.len() as i64;

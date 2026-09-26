@@ -7,16 +7,21 @@ arch=('x86_64')
 url="https://github.com/kernelmethod/kiki-rss"
 license=('MIT')
 depends=('gcc-libs' 'systemd')
-makedepends=('cargo' 'openssl')
+makedepends=('cargo')
+# Keep makepkg from adding -flto=auto to CFLAGS/CXXFLAGS/LDFLAGS. Build
+# scripts such as aws-lc-sys compile and link probe programs with these
+# flags, and the resulting GCC LTO objects fail to link.
+options=('!lto')
 install=kiki.install
 source=()
 
 build() {
     cd "$startdir/.."
-    # Disable GCC LTO for C code compiled by vendored build scripts
-    # (zstd-sys, libsqlite3-sys, mlua-sys). Arch's makepkg.conf adds
-    # -flto=auto to CFLAGS, which produces GCC GIMPLE LTO objects that
-    # Rust's lld linker cannot process, causing undefined symbol errors.
+    # Belt-and-braces with options=('!lto'): disable GCC LTO for C code
+    # compiled by vendored build scripts (zstd-sys, libsqlite3-sys,
+    # mlua-sys, aws-lc-sys) in case makepkg.conf puts -flto in CFLAGS
+    # directly. GCC GIMPLE LTO objects can't be processed by Rust's lld
+    # linker, causing undefined symbol errors.
     export CFLAGS+=" -fno-lto"
     export CXXFLAGS+=" -fno-lto"
     cargo build --release --locked

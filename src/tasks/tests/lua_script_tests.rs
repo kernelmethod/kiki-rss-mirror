@@ -1,8 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use super::super::scripting::load_all_script_sources;
 use super::super::*;
+use crate::scripting::ScriptRunner;
 use crate::test::TestBuilder;
 use anyhow::Result;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 
 fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
@@ -48,8 +51,11 @@ async fn setup_feed_with_script(
 #[tokio::test]
 async fn integration_filter_script_drops_all_entries() -> Result<()> {
     let tc = TestBuilder::default().init_database().build()?;
-    let (feed_id, client, pool) =
-        setup_feed_with_script(&tc, "return function(entry) return nil end").await?;
+    let (feed_id, client, pool) = setup_feed_with_script(
+        &tc,
+        r#"kiki.on("entry.ingest", function(entry) return nil end)"#,
+    )
+    .await?;
 
     let runner = {
         let conn = pool.get()?;
@@ -83,7 +89,10 @@ async fn integration_modify_script_changes_titles() -> Result<()> {
     let tc = TestBuilder::default().init_database().build()?;
     let (feed_id, client, pool) = setup_feed_with_script(
         &tc,
-        r#"return function(entry) entry.title = "[MODIFIED] " .. entry.title; return entry end"#,
+        r#"kiki.on("entry.ingest", function(entry)
+            entry.title = "[MODIFIED] " .. entry.title
+            return entry
+        end)"#,
     )
     .await?;
 
@@ -125,7 +134,10 @@ async fn integration_tagging_script_adds_tags() -> Result<()> {
     let tc = TestBuilder::default().init_database().build()?;
     let (feed_id, client, pool) = setup_feed_with_script(
         &tc,
-        r#"return function(entry) table.insert(entry.tags, "test-tag"); return entry end"#,
+        r#"kiki.on("entry.ingest", function(entry)
+            table.insert(entry.tags, "test-tag")
+            return entry
+        end)"#,
     )
     .await?;
 
@@ -184,14 +196,14 @@ async fn integration_filter_script_prevents_tagging_script() -> Result<()> {
 
     // Insert the filter script first so it runs first in the chain.
     conn.execute(
-        "INSERT INTO scripts (engine, text, kind) VALUES ('lua', 'return function(entry) return nil end', 'user')",
+        "INSERT INTO scripts (engine, text, kind) VALUES ('lua', 'kiki.on(\"entry.ingest\", function(entry) return nil end)', 'user')",
         [],
     )?;
     let filter_script_id = conn.last_insert_rowid();
 
     // Insert the tagging script second.
     conn.execute(
-        "INSERT INTO scripts (engine, text, kind) VALUES ('lua', 'return function(entry) table.insert(entry.tags, \"should-not-appear\"); return entry end', 'user')",
+        "INSERT INTO scripts (engine, text, kind) VALUES ('lua', 'kiki.on(\"entry.ingest\", function(entry) table.insert(entry.tags, \"should-not-appear\"); return entry end)', 'user')",
         [],
     )?;
     let tag_script_id = conn.last_insert_rowid();

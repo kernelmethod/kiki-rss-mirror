@@ -1,0 +1,155 @@
+//! OS-level sandboxing for Kiki's processes.
+//!
+//! Kiki runs as more than one process (see [`crate::process`]). Each has a
+//! different job, so each gets its own policy rather than one policy wide
+//! enough for the union of everything Kiki does. A profile is chosen with
+//! [`SandboxProfile`] and applied by [`apply`].
+//!
+//! On Linux two layers are installed, per profile:
+//!
+//! * **Landlock** restricts filesystem access to the paths the profile
+//!   actually needs — for the server that is the data directory holding
+//!   the SQLite DB and cached assets, the Unix socket's parent directory,
+//!   and a small read-only set of system paths needed for DNS and TLS
+//!   trust stores. The feed fetcher gets only the TLS trust stores (it
+//!   has the server resolve hostnames for it), and the script host gets
+//!   *nothing at all*. Where the kernel
+//!   supports it, the feed fetcher is also barred from binding TCP ports
+//!   and from reaching abstract Unix sockets or signalling processes
+//!   outside its own sandbox.
+//! * **seccomp-bpf** blocks a denylist of syscalls the profile never uses
+//!   (`ptrace`, `mount`, `unshare`, `bpf`, `kexec_load`, module loading,
+//!   and friends; plus, for the script host, every socket call, and for
+//!   the feed fetcher, binding, listening, accepting, and creating Unix
+//!   sockets).
+//!   The default action for unmatched syscalls is `Allow` — this is a
+//!   defence-in-depth layer that eliminates the most dangerous escape
+//!   primitives without risking that a benign syscall we forgot about
+//!   will kill the process.
+//!
+//! Both restrictions are installed before the process touches untrusted
+//! input — for the server, before it opens its listening socket(s); for
+//! the children, before they read their first byte of IPC. They are
+//! inherited by every thread and task spawned later, and by the feed
+//! fetcher's forked workers.
+//!
+//! On non-Linux platforms [`apply`] is a no-op that logs a warning.
+
+use std::path::PathBuf;
+
+/// Which of Kiki's processes a [`SandboxConfig`] describes.
+///
+/// Each variant carries only the paths its process legitimately needs, so
+/// adding a profile is the way to add a process — there is no "default"
+/// set of privileges to inherit by accident.
+pub enum SandboxProfile {
+    /// The main `kiki serve` process: owns the SQLite database, the asset
+    /// cache, the listening socket, and all outbound feed fetches.
+    Server {
+        /// Directory containing the SQLite database, its WAL/SHM
+        /// companions, and the cached assets tree. Granted read-write
+        /// access.
+        data_dir: PathBuf,
+
+        /// Parent directory of the Unix domain socket, if the server is
+        /// listening on a UDS. Granted read-write access so the socket
+        /// file can be created and unlinked.
+        socket_dir: Option<PathBuf>,
+    },
+
+    /// The Lua script host: evaluates user-supplied scripts and talks to
+    /// the server over an inherited socket pair, nothing else.
+    ///
+    /// This profile grants **no filesystem access whatsoever** and denies
+    /// every syscall that could open a socket. The host's inherited IPC
+    /// file descriptor already exists by the time the sandbox is applied,
+    /// and is used through plain `read`/`write`.
+    ScriptHost,
+
+    /// The feed fetcher: retrieves feeds over HTTP(S) and parses them,
+    /// and talks to the server over an inherited socket pair.
+    ///
+    /// This profile grants read-only access to the TLS trust stores and
+    /// nothing else — no data directory, no resolver configuration, no
+    /// `/proc`; the server resolves hostnames on its behalf. It may make
+    /// outbound TCP connections, but may not bind, listen for or accept
+    /// them, or create a Unix socket: the last keeps it away from the
+    /// server's API socket, whose only access control is reachability.
+    FeedFetcher,
+}
+
+/// Sandbox configuration derived from CLI flags and the process's role.
+pub struct SandboxConfig {
+    /// The process this configuration applies to.
+    pub profile: SandboxProfile,
+
+    /// If `true`, seccomp violations are logged instead of killing the
+    /// process. Useful when tightening the filter or diagnosing an
+    /// unexpected denial in production. Has no effect on Landlock, which
+    /// has no equivalent mode.
+    pub log_only: bool,
+}
+
+impl SandboxConfig {
+    /// Configuration for the main server process.
+    pub fn server(data_dir: PathBuf, socket_dir: Option<PathBuf>, log_only: bool) -> Self {
+        SandboxConfig {
+            profile: SandboxProfile::Server {
+                data_dir,
+                socket_dir,
+            },
+            log_only,
+        }
+    }
+
+    /// Configuration for the Lua script host process.
+    pub fn script_host(log_only: bool) -> Self {
+        SandboxConfig {
+            profile: SandboxProfile::ScriptHost,
+            log_only,
+        }
+    }
+
+    /// Configuration for the feed fetcher process.
+    pub fn feed_fetcher(log_only: bool) -> Self {
+        SandboxConfig {
+            profile: SandboxProfile::FeedFetcher,
+            log_only,
+        }
+    }
+
+    /// A short name for the profile, used in log messages.
+    pub fn profile_name(&self) -> &'static str {
+        match self.profile {
+            SandboxProfile::Server { .. } => "server",
+            SandboxProfile::ScriptHost => "script-host",
+            SandboxProfile::FeedFetcher => "feed-fetcher",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux;
+
+/// Apply the configured sandbox to the current process.
+///
+/// Must be called before any untrusted input is accepted. On Linux this
+/// installs Landlock filesystem rules and a seccomp-bpf syscall filter
+/// that are inherited by every thread spawned after the call returns.
+///
+/// Note that every profile denies `execve`, so a process must spawn any
+/// children it needs *before* calling this.
+pub fn apply(config: &SandboxConfig) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::apply(config)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tracing::warn!(
+            profile = config.profile_name(),
+            "sandbox: not supported on this platform, continuing unsandboxed"
+        );
+        Ok(())
+    }
+}

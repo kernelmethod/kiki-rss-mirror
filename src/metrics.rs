@@ -1,15 +1,13 @@
 //! Prometheus metrics surface.
 //!
-//! Each server instance owns a [`Metrics`] value that wraps a private
-//! [`PrometheusRecorder`]: instrumentation calls from route handlers, task
-//! workers, and the sampler loop all go through methods on this struct
-//! rather than the global `metrics` facade. That gives us per-server
-//! isolation (useful for tests, which each get a fresh recorder) and lets
-//! `/metrics` render just the state for its own server.
+//! Each server instance owns a [`Metrics`] value that wraps a private PrometheusRecorder:
+//! instrumentation calls from route handlers, task workers, and the sampler loop all go through
+//! methods on this struct rather than the global `metrics` facade. That gives us per-server
+//! isolation (useful for tests, which each get a fresh recorder) and lets `/metrics` render just
+//! the state for its own server.
 //!
-//! When the `metrics` feature is disabled, [`Metrics`] becomes a zero-sized
-//! type whose methods are no-ops, so call sites stay free of `cfg`
-//! attributes.
+//! When the `metrics` feature is disabled, [`Metrics`] becomes a zero-sized type whose methods are
+//! no-ops, so call sites stay free of `cfg` attributes.
 
 #[cfg(feature = "metrics")]
 pub use imp::{handle_metrics, track_http, Metrics};

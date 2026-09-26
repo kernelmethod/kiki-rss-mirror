@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::cli::init::{default_directory, InitArgs};
+use crate::cli::paths::Env;
 
 const SERVICE_NAME: &str = "kiki.service";
 
@@ -72,7 +73,43 @@ fn service_file_path() -> Result<PathBuf> {
 }
 
 /// Generate the systemd unit file contents.
-fn generate_unit_file(binary: &str, data_dir: &str, listen_args: &str) -> String {
+///
+/// The emitted unit layers systemd's process-hardening directives
+/// (see systemd.exec(5)) on top of the in-process Landlock + seccomp
+/// filters that `kiki serve` installs at startup. Directives that would
+/// conflict with user-level execution (e.g. `PrivateUsers=yes`,
+/// `ProtectHome=yes`) are deliberately omitted.
+///
+/// `named_home` says whether `data_dir` came from `$KIKI_HOME` in the
+/// installing shell. If it did, the unit sets `$KIKI_HOME` too, so the
+/// service resolves the same paths the CLI just did — a systemd user service
+/// does not inherit the installing shell's environment. If it did not, the
+/// unit says nothing and lets `kiki serve` fall back to the platform
+/// defaults, which is what puts the socket in the runtime directory.
+fn generate_unit_file(binary: &str, data_dir: &str, named_home: bool, port: Option<u16>) -> String {
+    let listen_args = match port {
+        Some(port) => format!(" -p {port}"),
+        None => String::new(),
+    };
+
+    let environment = if named_home {
+        format!("Environment=KIKI_HOME={data_dir}\n")
+    } else {
+        String::new()
+    };
+
+    // With no $KIKI_HOME the socket defaults to
+    // `$XDG_RUNTIME_DIR/kiki/kiki.sock`. `ProtectSystem=strict` below would
+    // leave that read-only, so the unit has to declare it; `RuntimeDirectory=`
+    // also gets systemd to create it with the right mode and remove it again
+    // when the service stops. With $KIKI_HOME set the socket lives in the
+    // data directory instead, and no runtime directory is needed.
+    let runtime_dir = if port.is_some() || named_home {
+        String::new()
+    } else {
+        "RuntimeDirectory=kiki\nRuntimeDirectoryMode=0700\n".to_string()
+    };
+
     format!(
         "\
 [Unit]
@@ -82,10 +119,31 @@ After=default.target
 [Service]
 Type=simple
 WorkingDirectory={data_dir}
-ExecStartPre={binary} init --auto --check
-ExecStart={binary} serve{listen_args}
+{environment}{runtime_dir}ExecStartPre=\"{binary}\" init --check \"{data_dir}\"
+ExecStart=\"{binary}\" serve{listen_args}
 Restart=on-failure
 RestartSec=5
+
+# Hardening — see systemd.exec(5)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths={data_dir}
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @module @debug @cpu-emulation @obsolete @raw-io @keyring
+UMask=0077
 
 [Install]
 WantedBy=default.target
@@ -130,11 +188,7 @@ fn install(args: &InstallArgs) -> Result<()> {
 
     let data_dir = default_directory()?;
     let data_dir_str = data_dir.display().to_string();
-
-    let listen_args = match args.port {
-        Some(port) => format!(" -p {port}"),
-        None => String::new(),
-    };
+    let named_home = Env::from_process().kiki_home.is_some();
 
     // Initialize the data directory (idempotent — skips if already set up)
     let init_args = InitArgs::auto_with_check();
@@ -142,7 +196,7 @@ fn install(args: &InstallArgs) -> Result<()> {
         .run()
         .context("failed to initialize kiki data directory")?;
 
-    let unit_contents = generate_unit_file(&binary_str, &data_dir_str, &listen_args);
+    let unit_contents = generate_unit_file(&binary_str, &data_dir_str, named_home, args.port);
 
     let service_path = service_file_path()?;
     let parent = service_path
@@ -177,6 +231,10 @@ fn install(args: &InstallArgs) -> Result<()> {
     }
     println!("  systemctl --user start {SERVICE_NAME}    # start now");
     println!("  systemctl --user status {SERVICE_NAME}   # check status");
+    println!();
+    println!("A user service stops when your last session ends, which also removes");
+    println!("the runtime directory holding kiki's socket. To keep it running:");
+    println!("  loginctl enable-linger $USER");
 
     Ok(())
 }
@@ -256,4 +314,56 @@ fn status() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod test {
+    use super::*;
+
+    const DATA_DIR: &str = "/home/rey/.local/share/kiki";
+
+    /// Without `$KIKI_HOME` the socket defaults into the runtime directory,
+    /// which the unit must declare or `ProtectSystem=strict` leaves it
+    /// read-only.
+    #[test]
+    fn uds_unit_declares_a_runtime_directory() {
+        let unit = generate_unit_file("/usr/bin/kiki", DATA_DIR, false, None);
+
+        assert!(unit.contains("RuntimeDirectory=kiki\n"));
+        assert!(unit.contains("RuntimeDirectoryMode=0700\n"));
+        assert!(!unit.contains("Environment=KIKI_HOME"));
+        assert!(unit.contains("ExecStart=\"/usr/bin/kiki\" serve\n"));
+    }
+
+    /// Installed from a shell with `$KIKI_HOME` set, the unit carries it
+    /// forward — a user service inherits nothing from that shell. The socket
+    /// then lives in the data directory, so no runtime directory is needed.
+    #[test]
+    fn unit_carries_kiki_home_forward_when_it_named_the_directory() {
+        let unit = generate_unit_file("/usr/bin/kiki", "/srv/kiki", true, None);
+
+        assert!(unit.contains("Environment=KIKI_HOME=/srv/kiki\n"));
+        assert!(!unit.contains("RuntimeDirectory"));
+        assert!(unit.contains("ExecStart=\"/usr/bin/kiki\" serve\n"));
+    }
+
+    /// A TCP server binds no socket, so it needs no runtime directory.
+    #[test]
+    fn tcp_unit_omits_the_runtime_directory() {
+        let unit = generate_unit_file("/usr/bin/kiki", DATA_DIR, false, Some(8000));
+
+        assert!(!unit.contains("RuntimeDirectory"));
+        assert!(unit.contains("ExecStart=\"/usr/bin/kiki\" serve -p 8000\n"));
+    }
+
+    /// The data directory is quoted, so a home directory containing a space
+    /// does not split into two arguments.
+    #[test]
+    fn unit_quotes_paths_passed_to_the_binary() {
+        let unit = generate_unit_file("/usr/bin/kiki", "/home/ada lovelace/kiki", false, None);
+
+        assert!(unit
+            .contains("ExecStartPre=\"/usr/bin/kiki\" init --check \"/home/ada lovelace/kiki\"\n"));
+    }
 }

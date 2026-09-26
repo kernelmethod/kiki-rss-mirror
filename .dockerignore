@@ -1,0 +1,15 @@
+target/
+.git/
+.github/
+.gitignore
+Dockerfile
+.dockerignore
+dist/
+nix/
+flake.lock
+flake.nix
+.vscode/
+.idea/
+**/*.swp
+*.md
+!README.md

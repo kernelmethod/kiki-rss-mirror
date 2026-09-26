@@ -39,6 +39,8 @@ use utoipa::OpenApi;
         crate::routes::v1::scripts::reload_scripts::reload_scripts,
         crate::routes::v1::settings::retention::get_retention,
         crate::routes::v1::settings::retention::put_retention,
+        crate::routes::v1::settings::feed_fetch::get_feed_fetch_settings,
+        crate::routes::v1::settings::feed_fetch::put_feed_fetch_settings,
         crate::routes::v1::entries::cleanup::cleanup,
         crate::routes::v1::shutdown::shutdown,
     ),
@@ -91,6 +93,8 @@ use utoipa::OpenApi;
             crate::routes::v1::scripts::update_script::UpdateScriptRequest,
             crate::routes::v1::settings::retention::RetentionResponse,
             crate::routes::v1::settings::retention::RetentionRequest,
+            crate::routes::v1::settings::feed_fetch::FeedFetchSettingsResponse,
+            crate::routes::v1::settings::feed_fetch::FeedFetchSettingsRequest,
             crate::routes::v1::entries::cleanup::CleanupResponse,
         )
     ),

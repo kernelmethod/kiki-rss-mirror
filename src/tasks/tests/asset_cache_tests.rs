@@ -7,6 +7,7 @@ use super::super::*;
 use crate::test::TestBuilder;
 use anyhow::Result;
 use axum::{routing::get, Router};
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use std::net::SocketAddr;
 use std::sync::Arc;

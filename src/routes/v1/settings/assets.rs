@@ -18,7 +18,7 @@ pub struct AssetCacheSettingsResponse {
     pub current_bytes: i64,
 }
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AssetCacheSettingsRequest {
     pub enabled: Option<bool>,
     pub max_bytes: Option<i64>,
