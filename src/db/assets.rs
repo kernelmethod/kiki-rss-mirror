@@ -158,7 +158,10 @@ pub fn list_entry_assets(conn: &Connection, entry_id: i64) -> Result<Vec<EntryAs
 /// caller is responsible for unlinking the corresponding files from disk.
 pub fn evict_to(conn: &mut Connection, target_bytes: i64) -> Result<Vec<String>> {
     let mut deleted: Vec<String> = Vec::new();
-    let tx = conn.transaction()?;
+    // Immediate: this reads before it writes, and a deferred transaction
+    // that has to upgrade its read lock fails with "database is locked"
+    // straight away rather than waiting out the busy timeout.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut total: i64 = tx
         .query_row(
             "SELECT COALESCE(SUM(size_bytes), 0) FROM feed_assets",

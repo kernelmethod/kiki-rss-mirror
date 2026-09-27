@@ -6,6 +6,7 @@ use crate::tasks::parsing::{insert_atom_entry_data, insert_rss_entry_data, upser
 use anyhow::Result;
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::{Connection, TransactionBehavior};
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -18,6 +19,12 @@ use tracing::{debug, info, warn};
 /// is trusted to say which feed they belong to: `feed_id` and the
 /// syndication format are re-stamped from the caller's own values before
 /// scripts or the database see them.
+///
+/// Scripts run first, outside any transaction; everything is then written
+/// in a single `BEGIN IMMEDIATE` transaction, so a refresh takes the write
+/// lock once rather than once per entry, and waits for it (up to the busy
+/// timeout) instead of failing with "database is locked" when it would
+/// have to upgrade a read.
 pub(super) fn process_atom_feed(
     feed_id: i64,
     feed_data: AtomFeedIngestData,
@@ -32,72 +39,45 @@ pub(super) fn process_atom_feed(
         entries.len()
     );
 
-    {
-        let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE feeds SET syndication_format = 'atom' WHERE id = ?1",
-            [feed_id],
-        )?;
-        upsert_atom_feed_data(&tx, feed_id, &feed_data)?;
-        tx.commit()?;
-    }
-
     let parsed_count = entries.len();
-    let mut inserted_entry_ids: Vec<i64> = Vec::new();
-    let mut seen_guids: Vec<String> = Vec::new();
-    for AtomEntry {
-        entry: mut feed_entry,
-        data: ingest,
-    } in entries
-    {
-        feed_entry.feed_id = feed_id;
-        feed_entry.syndication_format = "atom".to_string();
+    let entries: Vec<_> = entries
+        .into_iter()
+        .filter_map(
+            |AtomEntry {
+                 entry: mut feed_entry,
+                 data,
+             }| {
+                feed_entry.feed_id = feed_id;
+                feed_entry.syndication_format = "atom".to_string();
+                run_scripts(feed_id, feed_entry, script_runner, metrics).map(|e| (e, data))
+            },
+        )
+        .collect();
 
-        let feed_entry = if let Some(runner) = script_runner {
-            runner.dispatch_observe(
-                crate::scripting::Event::EntryParsed,
-                crate::scripting::EventPayload::Entry(feed_entry.clone()),
-            );
-            let original = feed_entry.clone();
-            let script_start = Instant::now();
-            match runner.dispatch_transform_entry(feed_entry) {
-                Ok(Some(e)) => {
-                    metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "ok");
-                    e
-                }
-                Ok(None) => {
-                    metrics
-                        .record_script_execution(script_start.elapsed().as_secs_f64(), "filtered");
-                    debug!("atom entry filtered by script for feed {}", feed_id);
-                    continue;
-                }
-                Err(e) => {
-                    metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "error");
-                    warn!(
-                        "script error processing atom entry for feed {}: {}; inserting unmodified",
-                        feed_id, e
-                    );
-                    original
-                }
-            }
-        } else {
-            feed_entry
-        };
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute(
+        "UPDATE feeds SET syndication_format = 'atom' WHERE id = ?1",
+        [feed_id],
+    )?;
+    upsert_atom_feed_data(&tx, feed_id, &feed_data)?;
 
-        let tx = conn.transaction()?;
+    let mut inserted_entry_ids: Vec<i64> = Vec::with_capacity(entries.len());
+    let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
+    for (feed_entry, ingest) in entries {
         let entry_id = upsert_entry(&tx, feed_id, "atom", &feed_entry)?;
         insert_atom_entry_data(&tx, entry_id, &ingest)?;
-        tx.commit()?;
-        metrics.record_feed_entry_upserted("atom");
-        inserted_entry_ids.push(entry_id);
-
         if !feed_entry.tags.is_empty() {
-            sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
+            sync_entry_tags(&tx, entry_id, &feed_entry.tags)?;
         }
+        inserted_entry_ids.push(entry_id);
         seen_guids.push(feed_entry.guid);
     }
 
-    mark_dropped_entries(&conn, feed_id, parsed_count, &seen_guids)?;
+    mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
+    tx.commit()?;
+    for _ in &inserted_entry_ids {
+        metrics.record_feed_entry_upserted("atom");
+    }
     Ok(inserted_entry_ids)
 }
 
@@ -106,7 +86,8 @@ pub(super) fn process_atom_feed(
 ///
 /// Returns the ids of the entries that were written. As with
 /// [`process_atom_feed`], `feed_id` and the syndication format are
-/// re-stamped on every entry rather than trusted.
+/// re-stamped on every entry rather than trusted, and everything is
+/// written in one immediate transaction once the scripts have run.
 pub(super) fn process_rss_feed(
     feed_id: i64,
     entries: Vec<RssEntry>,
@@ -120,68 +101,86 @@ pub(super) fn process_rss_feed(
         entries.len()
     );
 
-    conn.execute(
+    let parsed_count = entries.len();
+    let entries: Vec<_> = entries
+        .into_iter()
+        .filter_map(
+            |RssEntry {
+                 entry: mut feed_entry,
+                 data,
+             }| {
+                feed_entry.feed_id = feed_id;
+                feed_entry.syndication_format = "rss".to_string();
+                run_scripts(feed_id, feed_entry, script_runner, metrics).map(|e| (e, data))
+            },
+        )
+        .collect();
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute(
         "UPDATE feeds SET syndication_format = 'rss' WHERE id = ?1",
         [feed_id],
     )?;
 
-    let parsed_count = entries.len();
-    let mut inserted_entry_ids: Vec<i64> = Vec::new();
-    let mut seen_guids: Vec<String> = Vec::new();
-    for RssEntry {
-        entry: mut feed_entry,
-        data: ingest,
-    } in entries
-    {
-        feed_entry.feed_id = feed_id;
-        feed_entry.syndication_format = "rss".to_string();
-
-        let feed_entry = if let Some(runner) = script_runner {
-            runner.dispatch_observe(
-                crate::scripting::Event::EntryParsed,
-                crate::scripting::EventPayload::Entry(feed_entry.clone()),
-            );
-            let original = feed_entry.clone();
-            let script_start = Instant::now();
-            match runner.dispatch_transform_entry(feed_entry) {
-                Ok(Some(e)) => {
-                    metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "ok");
-                    e
-                }
-                Ok(None) => {
-                    metrics
-                        .record_script_execution(script_start.elapsed().as_secs_f64(), "filtered");
-                    debug!("rss entry filtered by script for feed {}", feed_id);
-                    continue;
-                }
-                Err(e) => {
-                    metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "error");
-                    warn!(
-                        "script error processing rss entry for feed {}: {}; inserting unmodified",
-                        feed_id, e
-                    );
-                    original
-                }
-            }
-        } else {
-            feed_entry
-        };
-
-        let tx = conn.transaction()?;
+    let mut inserted_entry_ids: Vec<i64> = Vec::with_capacity(entries.len());
+    let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
+    for (feed_entry, ingest) in entries {
         let entry_id = upsert_entry(&tx, feed_id, "rss", &feed_entry)?;
         insert_rss_entry_data(&tx, entry_id, &ingest, feed_entry.content.as_deref())?;
-        tx.commit()?;
-        metrics.record_feed_entry_upserted("rss");
-        inserted_entry_ids.push(entry_id);
-
         if !feed_entry.tags.is_empty() {
-            sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
+            sync_entry_tags(&tx, entry_id, &feed_entry.tags)?;
         }
+        inserted_entry_ids.push(entry_id);
         seen_guids.push(feed_entry.guid);
     }
 
-    mark_dropped_entries(&conn, feed_id, parsed_count, &seen_guids)?;
+    mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
+    tx.commit()?;
+    for _ in &inserted_entry_ids {
+        metrics.record_feed_entry_upserted("rss");
+    }
     Ok(inserted_entry_ids)
+}
+
+/// Run one entry through the script chain.
+///
+/// Returns the entry to store, or `None` if a script filtered it out. An
+/// entry whose scripts fail is stored unmodified.
+fn run_scripts(
+    feed_id: i64,
+    feed_entry: FeedEntry,
+    script_runner: Option<&dyn ScriptRunner>,
+    metrics: &Metrics,
+) -> Option<FeedEntry> {
+    let Some(runner) = script_runner else {
+        return Some(feed_entry);
+    };
+    let format = feed_entry.syndication_format.clone();
+    runner.dispatch_observe(
+        crate::scripting::Event::EntryParsed,
+        crate::scripting::EventPayload::Entry(feed_entry.clone()),
+    );
+    let original = feed_entry.clone();
+    let script_start = Instant::now();
+    match runner.dispatch_transform_entry(feed_entry) {
+        Ok(Some(e)) => {
+            metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "ok");
+            Some(e)
+        }
+        Ok(None) => {
+            metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "filtered");
+            debug!("{} entry filtered by script for feed {}", format, feed_id);
+            None
+        }
+        Err(e) => {
+            metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "error");
+            warn!(
+                "script error processing {} entry for feed {}: {}; inserting unmodified",
+                format, feed_id, e
+            );
+            Some(original)
+        }
+    }
 }
 
 /// Insert an entry, or update the existing row for the same
@@ -236,7 +235,7 @@ fn upsert_entry(
 /// than a feed that really emptied, so it marks nothing; entries that
 /// scripts filtered out are marked like any other.
 fn mark_dropped_entries(
-    conn: &PooledConnection<SqliteConnectionManager>,
+    conn: &Connection,
     feed_id: i64,
     parsed_count: usize,
     seen_guids: &[String],
@@ -273,7 +272,7 @@ pub(super) fn enqueue_asset_caching(
     }
 }
 
-/// Resolve and sync the script-provided tags for a newly inserted database entry.
+/// Sync the script-provided tags for the entry `entry_id`.
 ///
 /// For each tag name in `tags`:
 /// - ensures the tag row exists in `tags` (`INSERT OR IGNORE`)
@@ -281,18 +280,7 @@ pub(super) fn enqueue_asset_caching(
 ///
 /// Then removes any `entry_tags` rows for this entry whose `tag_id` is not in the
 /// script-provided set, and inserts new associations (`INSERT OR IGNORE`).
-fn sync_entry_tags(
-    conn: &PooledConnection<SqliteConnectionManager>,
-    feed_id: i64,
-    guid: &str,
-    tags: &[String],
-) -> Result<()> {
-    let entry_id: i64 = conn.query_row(
-        "SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2",
-        rusqlite::params![feed_id, guid],
-        |row| row.get(0),
-    )?;
-
+fn sync_entry_tags(conn: &Connection, entry_id: i64, tags: &[String]) -> Result<()> {
     // Upsert each tag and collect its id.
     let mut tag_ids: Vec<i64> = Vec::with_capacity(tags.len());
     for name in tags {
