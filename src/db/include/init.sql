@@ -195,6 +195,9 @@ CREATE TABLE entry_tags (
     FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_entry_published_at ON entries(published_at);
+-- Serves per-feed entry listings in newest-first order. SQLite appends the
+-- rowid (entries.id) to every index, so this also covers the id tie-breaker.
+CREATE INDEX idx_entry_feed_published_at ON entries(feed_id, published_at);
 CREATE INDEX idx_entry_tags_entry_id ON entry_tags(entry_id);
 CREATE INDEX idx_entry_tags_tag_id ON entry_tags(tag_id);
 
