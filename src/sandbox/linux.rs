@@ -80,6 +80,75 @@ fn tls_env_paths() -> Vec<PathBuf> {
         .collect()
 }
 
+/// How deep [`symlink_targets`] looks below each directory it is given.
+/// Trust stores and zoneinfo nest a level or two; this leaves headroom
+/// without walking anything unbounded.
+const SYMLINK_SEARCH_DEPTH: usize = 4;
+
+/// Where the symlinks below the directories in `paths` lead, for those
+/// that lead outside all of `paths`.
+///
+/// Landlock checks the file a path finally resolves to, not the path
+/// itself, so a rule on a directory does not cover a symlink inside it
+/// that points elsewhere. That is how NixOS lays out `/etc`: the CA
+/// bundles in `/etc/ssl/certs` (and `/etc/hosts`, `/etc/nsswitch.conf`,
+/// ...) are symlinks into `/nix/store`, and without their targets the
+/// sandboxed processes find no trust store at all. Rules on the paths
+/// themselves are unaffected — Landlock opens them following symlinks —
+/// so only symlinks *inside* a granted directory need this.
+///
+/// Symlinked directories are granted whole and not descended into.
+/// Dangling symlinks, and anything that cannot be read, are skipped.
+fn symlink_targets(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let roots: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
+    let mut targets = Vec::new();
+    for root in &roots {
+        collect_symlink_targets(root, SYMLINK_SEARCH_DEPTH, &roots, &mut targets);
+    }
+    targets
+}
+
+fn collect_symlink_targets(dir: &Path, depth: usize, roots: &[PathBuf], out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // not a directory, or unreadable
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_symlink() {
+            let Ok(target) = std::fs::canonicalize(&path) else {
+                continue; // dangling
+            };
+            if !roots.iter().any(|r| target.starts_with(r)) && !out.contains(&target) {
+                out.push(target);
+            }
+        } else if file_type.is_dir() && depth > 0 {
+            collect_symlink_targets(&path, depth - 1, roots, out);
+        }
+    }
+}
+
+/// Read-only paths for the TLS trust stores, including those named by
+/// `SSL_CERT_FILE`/`SSL_CERT_DIR` and wherever their symlinks lead.
+fn tls_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = existing(RO_TLS_PATHS).chain(tls_env_paths()).collect();
+    paths.extend(symlink_targets(&paths));
+    paths
+}
+
+/// Read-only paths for name resolution and time zones, including wherever
+/// their symlinks lead.
+fn resolver_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = existing(RO_RESOLVER_PATHS).collect();
+    paths.extend(symlink_targets(&paths));
+    paths
+}
+
 pub fn apply(config: &SandboxConfig) -> Result<()> {
     apply_landlock(config).context("installing landlock filesystem sandbox")?;
     apply_seccomp(config).context("installing seccomp-bpf syscall filter")?;
@@ -103,18 +172,15 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
             if !paths_equal(data_dir, socket_dir) {
                 rw_paths.push(socket_dir.clone());
             }
-            let ro_paths: Vec<PathBuf> = existing(RO_RESOLVER_PATHS)
-                .chain(existing(RO_TLS_PATHS))
-                .chain(tls_env_paths())
+            let ro_paths: Vec<PathBuf> = resolver_paths()
+                .into_iter()
+                .chain(tls_paths())
                 .chain(existing(RO_INTROSPECTION_PATHS))
                 .collect();
             (rw_paths, ro_paths)
         }
         SandboxProfile::ScriptHost => (Vec::new(), Vec::new()),
-        SandboxProfile::FeedFetcher => (
-            Vec::new(),
-            existing(RO_TLS_PATHS).chain(tls_env_paths()).collect(),
-        ),
+        SandboxProfile::FeedFetcher => (Vec::new(), tls_paths()),
     }
 }
 
@@ -409,6 +475,37 @@ fn detect_arch() -> Option<seccompiler::TargetArch> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A symlink below a granted directory that leads outside it — the
+    /// NixOS `/etc/ssl/certs` layout — has its target granted too; one
+    /// that stays inside, or dangles, adds nothing.
+    #[test]
+    fn symlinks_leading_outside_granted_dirs_are_followed() {
+        let td = tempfile::TempDir::with_prefix("kiki_sandbox").unwrap();
+        let store = td.path().join("store");
+        let etc_ssl = td.path().join("etc/ssl");
+        std::fs::create_dir_all(store.join("certs-dir")).unwrap();
+        std::fs::create_dir_all(etc_ssl.join("certs")).unwrap();
+        std::fs::write(store.join("ca-bundle.crt"), "").unwrap();
+        std::fs::write(etc_ssl.join("local.pem"), "").unwrap();
+
+        let certs = etc_ssl.join("certs");
+        let link = |target: &Path, name: &str| {
+            std::os::unix::fs::symlink(target, certs.join(name)).unwrap();
+        };
+        link(&store.join("ca-bundle.crt"), "ca-certificates.crt");
+        link(&store.join("certs-dir"), "extra");
+        link(&etc_ssl.join("local.pem"), "local.pem");
+        link(&td.path().join("missing"), "dangling");
+
+        let mut targets = symlink_targets(&[etc_ssl]);
+        targets.sort();
+        let store = std::fs::canonicalize(&store).unwrap();
+        assert_eq!(
+            targets,
+            vec![store.join("ca-bundle.crt"), store.join("certs-dir")]
+        );
+    }
 
     #[test]
     fn script_host_gets_no_filesystem_access() {

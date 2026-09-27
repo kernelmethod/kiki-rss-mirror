@@ -9,7 +9,7 @@ use crate::tasks::error::FetchError;
 use crate::tasks::error_recording::set_feed_error;
 use crate::tasks::fetch::refresh_feed;
 use crate::tasks::maintenance::run_maintenance;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use std::collections::HashSet;
@@ -78,6 +78,8 @@ struct Worker {
     config: ConfigHandle,
     script_runner: ScriptRunnerHandle,
     fetcher: Fetcher,
+    /// Client for asset caching; feed fetches go through `fetcher`.
+    asset_client: reqwest::Client,
 }
 
 /// Determine the number of worker tasks to spawn.
@@ -94,6 +96,13 @@ pub fn worker_count() -> usize {
 /// They also share one [`Fetcher`], through which every feed refresh
 /// retrieves and parses its feed, and read settings from `config` afresh
 /// for every command, so a settings change applies to the next one.
+///
+/// # Errors
+///
+/// Returns an error, before spawning any worker, if the HTTP client used
+/// for asset caching cannot be built — for instance when no TLS trust
+/// store is readable. Building it once here makes that a startup failure
+/// rather than every worker exiting as soon as it starts.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_workers(
     rx: async_channel::Receiver<TaskManagerCommand>,
@@ -106,7 +115,13 @@ pub fn spawn_workers(
     config: ConfigHandle,
     script_runner: ScriptRunnerHandle,
     fetcher: Fetcher,
-) -> Vec<tokio::task::JoinHandle<Result<()>>> {
+) -> Result<Vec<tokio::task::JoinHandle<()>>> {
+    let asset_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(USER_AGENT)
+        .build()
+        .context("failed to build the HTTP client for asset caching")?;
+
     let worker = Worker {
         rx,
         tx,
@@ -119,6 +134,7 @@ pub fn spawn_workers(
         config,
         script_runner,
         fetcher,
+        asset_client,
     };
     let mut handles = Vec::with_capacity(num_workers);
 
@@ -128,26 +144,22 @@ pub fn spawn_workers(
         handles.push(tokio::spawn(run_worker(worker_id, worker)));
     }
 
-    handles
+    Ok(handles)
 }
 
 /// A single worker loop that pulls commands from the shared channel.
-async fn run_worker(worker_id: usize, w: Worker) -> Result<()> {
-    // Used for asset caching only; feed fetches go through `w.fetcher`.
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(USER_AGENT)
-        .build()?;
-
+///
+/// Returns when the channel closes or `w.token` is cancelled.
+async fn run_worker(worker_id: usize, w: Worker) {
     loop {
         let command = tokio::select! {
             cmd = w.rx.recv() => {
                 match cmd {
                     Ok(c) => c,
-                    Err(_) => return Ok(()), // channel closed
+                    Err(_) => return, // channel closed
                 }
             }
-            _ = w.token.cancelled() => return Ok(()),
+            _ = w.token.cancelled() => return,
         };
 
         w.metrics.inc_workers_busy();
@@ -317,7 +329,7 @@ async fn run_worker(worker_id: usize, w: Worker) -> Result<()> {
 
             TaskManagerCommand::CacheEntryAssets { entry_id } => {
                 let outcome = match cache_entry_assets(
-                    &client,
+                    &w.asset_client,
                     &w.pool,
                     &w.data_dir,
                     &settings.asset_cache,

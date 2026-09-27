@@ -376,7 +376,7 @@ impl Server {
             None => crate::fetcher::Fetcher::in_process()?,
         };
 
-        let _worker_handles = tasks::spawn_workers(
+        let worker_handles = tasks::spawn_workers(
             rx,
             tx.clone(),
             pool.clone(),
@@ -387,7 +387,8 @@ impl Server {
             config.clone(),
             script_runner.clone(),
             fetcher,
-        );
+        )?;
+        let workers_exited = wait_for_workers(worker_handles);
 
         tokio::spawn(metrics_sampler_loop(
             tx.clone(),
@@ -450,9 +451,17 @@ impl Server {
             config,
         ));
 
-        self.cancel_token.cancelled().await;
-
-        Ok(())
+        // Without workers nothing queued is ever run — feeds included — so
+        // if they all exit while the server is still meant to be up, stop
+        // with an error rather than carry on without them.
+        tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => Ok(()),
+            _ = workers_exited => {
+                self.cancel_token.cancel();
+                bail!("all task workers exited; stopping the server")
+            }
+        }
     }
 
     pub fn cancel_token(&self) -> CancellationToken {
@@ -569,6 +578,17 @@ async fn cleanup_loop(
     }
 
     Ok(())
+}
+
+/// Wait for every task worker in `handles` to finish, logging any that
+/// panicked.
+async fn wait_for_workers(handles: Vec<tokio::task::JoinHandle<()>>) {
+    for (worker_id, handle) in handles.into_iter().enumerate() {
+        match handle.await {
+            Ok(()) => debug!("task worker {worker_id} exited"),
+            Err(e) => tracing::error!("task worker {worker_id} failed: {e}"),
+        }
+    }
 }
 
 /// Compute the delay before the first tick of a persisted periodic task.
