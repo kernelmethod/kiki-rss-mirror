@@ -51,20 +51,35 @@
             inherit cargoArtifacts;
           });
 
-          # Test coverage report: $out/lcov.info for coverage services,
-          # $out/html for browsing, and $out/summary.txt for build logs.
-          coverage = craneLib.cargoLlvmCov (commonArgs // {
-            # Instrumented builds can't reuse the release-profile dependency
-            # artifacts, so build everything from scratch.
-            cargoArtifacts = null;
+          coverageArgs = commonArgs // {
             # Build with the dev profile, like `cargo test` in CI.
             CARGO_PROFILE = "";
             # cargo-llvm-cov needs the LLVM tools matching rustc's LLVM.
             LLVM_COV = "${pkgs.rustc.unwrapped.llvmPackages.llvm}/bin/llvm-cov";
             LLVM_PROFDATA = "${pkgs.rustc.unwrapped.llvmPackages.llvm}/bin/llvm-profdata";
-            # Record source paths relative to the repo root rather than the
-            # Nix build directory, so the reports line up with the checkout.
-            cargoLlvmCovExtraArgs = "--no-report --remap-path-prefix";
+          };
+
+          # Record source paths relative to the repo root rather than the Nix
+          # build directory, so the reports line up with the checkout.
+          coverageLlvmCovArgs = "--no-report --remap-path-prefix";
+
+          # Instrumented builds can't reuse the release-profile dependency
+          # artifacts, so cache a separate set of dependencies compiled through
+          # cargo-llvm-cov. Its RUSTFLAGS and target dir must match the
+          # coverage build exactly, or cargo will rebuild everything anyway.
+          coverageDeps = craneLib.buildDepsOnly (coverageArgs // {
+            pname = "kiki-rss-llvm-cov";
+            nativeBuildInputs = coverageArgs.nativeBuildInputs ++ [ pkgs.cargo-llvm-cov ];
+            buildPhaseCargoCommand = ''
+              cargoWithProfile llvm-cov test --locked ${coverageLlvmCovArgs}
+            '';
+          });
+
+          # Test coverage report: $out/lcov.info for coverage services,
+          # $out/html for browsing, and $out/summary.txt for build logs.
+          coverage = craneLib.cargoLlvmCov (coverageArgs // {
+            cargoArtifacts = coverageDeps;
+            cargoLlvmCovExtraArgs = coverageLlvmCovArgs;
             postBuild = ''
               mkdir -p $out
               cargo llvm-cov report --remap-path-prefix --lcov --output-path $out/lcov.info
