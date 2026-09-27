@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tempdir::TempDir;
+use tempfile::TempDir;
 
 const KIKI_BIN: &str = env!("CARGO_BIN_EXE_kiki");
 
@@ -29,7 +29,7 @@ impl Drop for Server {
 
 /// Initialize a data directory and return it along with its temp dir guard.
 fn init_home() -> (TempDir, PathBuf) {
-    let td = TempDir::new("kiki-paths-test").expect("create tempdir");
+    let td = TempDir::with_prefix("kiki-paths-test").expect("create tempdir");
     let home = td.path().to_path_buf();
 
     let status = Command::new(KIKI_BIN)
@@ -96,7 +96,7 @@ fn wait_for_failure(mut child: Child) -> String {
 /// unrelated working directory.
 #[test]
 fn kiki_home_governs_init_and_migrate() {
-    let td = TempDir::new("kiki-paths-test").expect("create tempdir");
+    let td = TempDir::with_prefix("kiki-paths-test").expect("create tempdir");
     let home = td.path().join("home");
     let elsewhere = td.path().join("elsewhere");
     std::fs::create_dir(&elsewhere).expect("create dir");
@@ -265,7 +265,7 @@ fn kiki_runtime_dir_holds_the_socket() {
 /// with every other application.
 #[test]
 fn xdg_runtime_dir_is_the_default_and_gets_a_subdirectory() {
-    let td = TempDir::new("kiki-paths-test").expect("create tempdir");
+    let td = TempDir::with_prefix("kiki-paths-test").expect("create tempdir");
     let xdg_data = td.path().join("data");
     let runtime = td.path().join("run");
     let elsewhere = td.path().join("elsewhere");

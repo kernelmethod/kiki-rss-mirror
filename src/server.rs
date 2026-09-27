@@ -376,7 +376,7 @@ impl Server {
             None => crate::fetcher::Fetcher::in_process()?,
         };
 
-        let _worker_handles = tasks::spawn_workers(
+        let worker_handles = tasks::spawn_workers(
             rx,
             tx.clone(),
             pool.clone(),
@@ -387,7 +387,8 @@ impl Server {
             config.clone(),
             script_runner.clone(),
             fetcher,
-        );
+        )?;
+        let workers_exited = wait_for_workers(worker_handles);
 
         tokio::spawn(metrics_sampler_loop(
             tx.clone(),
@@ -450,9 +451,17 @@ impl Server {
             config,
         ));
 
-        self.cancel_token.cancelled().await;
-
-        Ok(())
+        // Without workers nothing queued is ever run — feeds included — so
+        // if they all exit while the server is still meant to be up, stop
+        // with an error rather than carry on without them.
+        tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => Ok(()),
+            _ = workers_exited => {
+                self.cancel_token.cancel();
+                bail!("all task workers exited; stopping the server")
+            }
+        }
     }
 
     pub fn cancel_token(&self) -> CancellationToken {
@@ -569,6 +578,17 @@ async fn cleanup_loop(
     }
 
     Ok(())
+}
+
+/// Wait for every task worker in `handles` to finish, logging any that
+/// panicked.
+async fn wait_for_workers(handles: Vec<tokio::task::JoinHandle<()>>) {
+    for (worker_id, handle) in handles.into_iter().enumerate() {
+        match handle.await {
+            Ok(()) => debug!("task worker {worker_id} exited"),
+            Err(e) => tracing::error!("task worker {worker_id} failed: {e}"),
+        }
+    }
 }
 
 /// Compute the delay before the first tick of a persisted periodic task.
@@ -857,7 +877,7 @@ mod test {
     /// Nothing at the path means nothing to clean up.
     #[test]
     fn claim_socket_path_accepts_an_unused_path() -> Result<()> {
-        let td = tempdir::TempDir::new("kiki_")?;
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
         claim_socket_path(&td.path().join("kiki.sock"))?;
         Ok(())
     }
@@ -865,7 +885,7 @@ mod test {
     /// A socket file whose server is gone is stale, and gets cleared.
     #[test]
     fn claim_socket_path_removes_a_stale_socket() -> Result<()> {
-        let td = tempdir::TempDir::new("kiki_")?;
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
         let path = td.path().join("kiki.sock");
 
         // Dropping the listener closes the socket but leaves its file behind,
@@ -884,7 +904,7 @@ mod test {
     /// must not be stolen from it.
     #[test]
     fn claim_socket_path_refuses_a_live_socket() -> Result<()> {
-        let td = tempdir::TempDir::new("kiki_")?;
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
         let path = td.path().join("kiki.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&path)?;
 
@@ -900,7 +920,7 @@ mod test {
     /// Whatever a non-socket file at the path is, it is not ours to delete.
     #[test]
     fn claim_socket_path_refuses_to_remove_a_regular_file() -> Result<()> {
-        let td = tempdir::TempDir::new("kiki_")?;
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
         let path = td.path().join("kiki.sock");
         fs::write(&path, b"not a socket")?;
 

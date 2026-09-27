@@ -136,11 +136,11 @@ fn read_input(path: &Path) -> Result<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     #[test]
     fn test_import_then_export() -> Result<()> {
-        let dir = TempDir::new("kiki-opml")?;
+        let dir = TempDir::with_prefix("kiki-opml")?;
         let database = dir.path().join("kiki.db");
         ConnectionBuilder::default()
             .at_path(&database)
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_import_missing_database() {
-        let dir = TempDir::new("kiki-opml").unwrap();
+        let dir = TempDir::with_prefix("kiki-opml").unwrap();
         let input = dir.path().join("in.opml");
         std::fs::write(&input, "<opml><body/></opml>").unwrap();
 

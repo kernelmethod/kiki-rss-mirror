@@ -234,7 +234,7 @@ async fn maintenance_commands_end_to_end_via_worker() -> Result<()> {
         )?),
         crate::scripting::ScriptRunnerHandle::empty(),
         crate::fetcher::Fetcher::in_process()?,
-    );
+    )?;
 
     tx.send(TaskManagerCommand::OptimizeFts).await?;
     tx.send(TaskManagerCommand::WalCheckpointAnalyze).await?;

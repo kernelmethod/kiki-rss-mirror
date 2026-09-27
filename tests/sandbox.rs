@@ -25,7 +25,7 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use tempdir::TempDir;
+use tempfile::TempDir;
 
 const KIKI_BIN: &str = env!("CARGO_BIN_EXE_kiki");
 
@@ -45,7 +45,7 @@ impl Kiki {
     /// Spawn `kiki serve` with the given extra flags in a fresh temp
     /// data directory and wait for it to start listening.
     fn spawn(extra_args: &[&str]) -> Self {
-        let dir = TempDir::new("kiki-sandbox-test").expect("create tempdir");
+        let dir = TempDir::with_prefix("kiki-sandbox-test").expect("create tempdir");
 
         let init_status = Command::new(KIKI_BIN)
             .arg("init")

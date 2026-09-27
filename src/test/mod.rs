@@ -14,7 +14,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tempdir::TempDir;
+use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -171,7 +171,7 @@ impl Drop for TestConfig {
 impl TestConfig {
     pub fn new() -> Result<Self> {
         let config = TestConfig {
-            td: TempDir::new("kiki_")?,
+            td: TempDir::with_prefix("kiki_")?,
             server_handle: None,
             server_token: None,
             feed_server_handle: None,

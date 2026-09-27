@@ -219,10 +219,10 @@ fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     fn store() -> (TempDir, ConfigStore) {
-        let td = TempDir::new("kiki_config").unwrap();
+        let td = TempDir::with_prefix("kiki_config").unwrap();
         let store = ConfigStore::open(td.path().join("kiki.toml")).unwrap();
         (td, store)
     }
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn open_rejects_an_invalid_file() {
-        let td = TempDir::new("kiki_config").unwrap();
+        let td = TempDir::with_prefix("kiki_config").unwrap();
         let path = td.path().join("kiki.toml");
         fs::write(&path, "[feed_fetch]\nbogus = 1\n").unwrap();
         assert!(matches!(
