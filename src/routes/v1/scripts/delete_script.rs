@@ -70,14 +70,11 @@ pub async fn delete_script(
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod test {
-    use crate::routes::v1::entries::ListEntriesResponse;
-    use crate::routes::v1::feeds::add_feed::{AddFeedRequest, AddFeedResponse};
     use crate::routes::v1::scripts::add_script::{AddScriptRequest, AddScriptResponse};
     use crate::routes::v1::scripts::list_scripts::ListScriptsResponse;
     use crate::test::TestBuilder;
     use anyhow::Result;
     use axum::http::StatusCode;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn test_delete_script() -> Result<()> {
@@ -135,8 +132,12 @@ mod test {
     /// entries appear on a subsequent fetch. Start with a filter-all script,
     /// fetch (no entries), delete the script (reload fires), re-fetch, and
     /// confirm entries now appear.
+    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_delete_script_triggers_reload() -> Result<()> {
+        use crate::routes::v1::entries::ListEntriesResponse;
+        use crate::routes::v1::feeds::add_feed::{AddFeedRequest, AddFeedResponse};
+
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;
 
@@ -159,7 +160,8 @@ mod test {
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
-        std::thread::sleep(Duration::from_millis(250));
+        tc.wait_for_metric("kiki_scripts_loaded", |n| n == 1.0)
+            .await?;
 
         // Add a feed.
         let resp = client
@@ -174,8 +176,7 @@ mod test {
         assert_eq!(resp.status(), StatusCode::CREATED);
         let feed_id = resp.json::<AddFeedResponse>().await?.id;
 
-        // Wait for the initial fetch.
-        std::thread::sleep(Duration::from_millis(500));
+        tc.wait_for_fetches(1).await?;
 
         // No entries should exist because the filter script drops everything.
         let resp = client.get("http://localhost/v1/entries").send().await?;
@@ -198,8 +199,8 @@ mod test {
             )?;
         }
 
-        // Allow time for the reload command to be processed before fetching.
-        std::thread::sleep(Duration::from_millis(250));
+        tc.wait_for_metric("kiki_scripts_loaded", |n| n == 0.0)
+            .await?;
 
         // Re-fetch the feed.
         let resp = client
@@ -208,8 +209,7 @@ mod test {
             .await?;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-        // Wait for the fetch to complete.
-        std::thread::sleep(Duration::from_millis(500));
+        tc.wait_for_fetches(2).await?;
 
         // Entries should now appear since the filter script was removed.
         let resp = client.get("http://localhost/v1/entries").send().await?;

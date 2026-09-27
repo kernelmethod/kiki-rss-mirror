@@ -128,6 +128,14 @@
             tests = craneLib.cargoTest (devArgs // {
               cargoArtifacts = devDeps;
               doCheck = true;
+              # Many tests spend part of their time waiting on a test server
+              # or the filesystem, so running twice as many as there are
+              # cores keeps the CPU busy. More than that is slower again.
+              preBuild = ''
+                cores=''${NIX_BUILD_CORES:-0}
+                if [ "$cores" -le 0 ]; then cores=$(nproc); fi
+                export RUST_TEST_THREADS=$((cores * 2))
+              '';
             });
           };
 

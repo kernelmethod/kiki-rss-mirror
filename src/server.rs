@@ -1056,18 +1056,25 @@ mod test {
             Arc::new(crate::metrics::Metrics::new()?),
         ));
 
-        // Give the loop a moment to call ensure_task.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let after = chrono::Utc::now().timestamp();
-
-        let ts: i64 = {
-            let conn = pool.get()?;
-            conn.query_row(
+        // Wait for the loop to call ensure_task.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let ts: i64 = loop {
+            let row = pool.get()?.query_row(
                 "SELECT last_run_at FROM task_queue WHERE task_type = 'test_fresh'",
                 [],
                 |r| r.get(0),
-            )?
+            );
+            match row {
+                Ok(ts) => break ts,
+                Err(rusqlite::Error::QueryReturnedNoRows)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
         };
+        let after = chrono::Utc::now().timestamp();
         assert!(ts >= before && ts <= after, "unexpected last_run_at {ts}");
 
         token.cancel();
