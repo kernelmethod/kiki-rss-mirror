@@ -76,7 +76,8 @@ pub struct ImportSummary {
 ///
 /// Every `<outline>` with an `xmlUrl` attribute is treated as a feed; any
 /// other `<outline>` is a folder whose name is added as a tag to the feeds
-/// nested inside it. A feed listed more than once (for instance, in several
+/// nested inside it. Outlines with an empty `xmlUrl` are skipped. A feed
+/// listed more than once (for instance, in several
 /// folders, which is how [`build_opml`] writes a feed with several tags) is
 /// returned once with the union of its tags.
 ///
@@ -108,6 +109,11 @@ pub fn parse_opml(xml: &str) -> Result<Vec<OpmlFeed>, OpmlError> {
     let mut open: Vec<bool> = Vec::new();
 
     let mut add_feed = |attrs: OutlineAttrs, url: String, folders: &[String]| {
+        // A feed with no URL can't be fetched, and importing one would add a
+        // new URL-less feed on every run since there is nothing to match on.
+        if url.is_empty() {
+            return;
+        }
         let title = attrs.text.unwrap_or_else(|| url.clone());
         if let Some(existing) = by_url.get(&url).and_then(|&i| feeds.get_mut(i)) {
             for tag in folders {
@@ -424,6 +430,21 @@ mod tests {
         assert_eq!(
             parse_opml(xml).unwrap(),
             vec![feed("F", "http://example.com/f", &["news", "tech"])]
+        );
+    }
+
+    #[test]
+    fn test_parse_skips_empty_xml_url() {
+        let xml = r#"<opml><body>
+  <outline text="Empty" xmlUrl=""/>
+  <outline text="Also empty" xmlUrl="">
+    <outline text="F" xmlUrl="http://example.com/f"/>
+  </outline>
+</body></opml>"#;
+        // An outline with an empty xmlUrl is neither a feed nor a folder
+        assert_eq!(
+            parse_opml(xml).unwrap(),
+            vec![feed("F", "http://example.com/f", &[])]
         );
     }
 
