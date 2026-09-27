@@ -181,3 +181,13 @@ fn test_hints_stale_if_error_without_max_age() {
     assert_eq!(hints.stale_if_error, Some(1800));
     assert_eq!(hints.hint_secs, None);
 }
+
+/// `no-cache` and `no-store` each suppress the freshness hint on their own,
+/// even when the same header also carries a `max-age`.
+#[test]
+fn test_hints_no_cache_or_no_store_overrides_max_age() {
+    for cc in ["no-cache, max-age=600", "no-store, max-age=600"] {
+        let h = headers(&[("cache-control", cc)]);
+        assert_eq!(extract_server_hints(&h, NOW).hint_secs, None, "{cc}");
+    }
+}

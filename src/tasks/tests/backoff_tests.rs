@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use super::super::backoff::{compute_next_fetch_at, defer_past_skipped, FetchOutcome};
+use super::super::backoff::{compute_next_fetch_at, defer_past_skipped, same_origin, FetchOutcome};
 use super::super::FetchError;
 
 const MIN_CADENCE: u64 = 60;
@@ -333,4 +333,20 @@ fn test_compute_next_fetch_at_stale_if_error_respects_min_cadence() {
         MIN_FETCH_INTERVAL,
     );
     assert_eq!(next, now + MIN_CADENCE as i64);
+}
+
+/// Credentials may only follow a redirect when scheme, host and port all
+/// match the feed's URL; any one differing makes the origin foreign.
+#[test]
+fn test_same_origin() {
+    let feed = "https://example.com/feed";
+    assert!(same_origin(feed, "https://example.com/other?x=1"));
+    // An explicit default port is the same origin as an implied one.
+    assert!(same_origin(feed, "https://example.com:443/feed"));
+
+    assert!(!same_origin(feed, "http://example.com/feed"));
+    assert!(!same_origin(feed, "https://evil.example.net/feed"));
+    assert!(!same_origin(feed, "https://example.com:8443/feed"));
+    // Unparseable URLs are never trusted.
+    assert!(!same_origin(feed, "not a url"));
 }

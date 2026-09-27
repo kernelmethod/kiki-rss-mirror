@@ -5,3 +5,6 @@
 *.deb
 *.rpm
 *.pkg.tar.zst
+
+# cargo-mutants output
+/mutants.out*
