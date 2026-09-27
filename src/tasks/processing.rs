@@ -1,6 +1,6 @@
 use crate::fetcher::{AtomEntry, AtomFeedIngestData, RssEntry};
 use crate::metrics::Metrics;
-use crate::scripting::ScriptRunner;
+use crate::scripting::{FeedEntry, ScriptRunner};
 use crate::tasks::command::TaskManagerCommand;
 use crate::tasks::parsing::{insert_atom_entry_data, insert_rss_entry_data, upsert_atom_feed_data};
 use anyhow::Result;
@@ -42,7 +42,9 @@ pub(super) fn process_atom_feed(
         tx.commit()?;
     }
 
+    let parsed_count = entries.len();
     let mut inserted_entry_ids: Vec<i64> = Vec::new();
+    let mut seen_guids: Vec<String> = Vec::new();
     for AtomEntry {
         entry: mut feed_entry,
         data: ingest,
@@ -83,32 +85,7 @@ pub(super) fn process_atom_feed(
         };
 
         let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT OR REPLACE INTO entries (
-                feed_id,
-                syndication_format,
-                guid,
-                published_at,
-                title,
-                url,
-                content
-            ) VALUES (?1, 'atom', ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                feed_id,
-                feed_entry.guid,
-                feed_entry.published_at,
-                feed_entry.title,
-                feed_entry.url,
-                feed_entry.content
-            ],
-        )?;
-
-        let entry_id: i64 = tx.query_row(
-            "SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2",
-            rusqlite::params![feed_id, feed_entry.guid],
-            |row| row.get(0),
-        )?;
-
+        let entry_id = upsert_entry(&tx, feed_id, "atom", &feed_entry)?;
         insert_atom_entry_data(&tx, entry_id, &ingest)?;
         tx.commit()?;
         metrics.record_feed_entry_upserted("atom");
@@ -117,8 +94,10 @@ pub(super) fn process_atom_feed(
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
         }
+        seen_guids.push(feed_entry.guid);
     }
 
+    mark_dropped_entries(&conn, feed_id, parsed_count, &seen_guids)?;
     Ok(inserted_entry_ids)
 }
 
@@ -146,7 +125,9 @@ pub(super) fn process_rss_feed(
         [feed_id],
     )?;
 
+    let parsed_count = entries.len();
     let mut inserted_entry_ids: Vec<i64> = Vec::new();
+    let mut seen_guids: Vec<String> = Vec::new();
     for RssEntry {
         entry: mut feed_entry,
         data: ingest,
@@ -187,32 +168,7 @@ pub(super) fn process_rss_feed(
         };
 
         let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT OR REPLACE INTO entries (
-                feed_id,
-                syndication_format,
-                guid,
-                published_at,
-                title,
-                url,
-                content
-            ) VALUES (?1, 'rss', ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                feed_id,
-                feed_entry.guid,
-                feed_entry.published_at,
-                feed_entry.title,
-                feed_entry.url,
-                feed_entry.content
-            ],
-        )?;
-
-        let entry_id: i64 = tx.query_row(
-            "SELECT id FROM entries WHERE feed_id = ?1 AND guid = ?2",
-            rusqlite::params![feed_id, feed_entry.guid],
-            |row| row.get(0),
-        )?;
-
+        let entry_id = upsert_entry(&tx, feed_id, "rss", &feed_entry)?;
         insert_rss_entry_data(&tx, entry_id, &ingest, feed_entry.content.as_deref())?;
         tx.commit()?;
         metrics.record_feed_entry_upserted("rss");
@@ -221,9 +177,82 @@ pub(super) fn process_rss_feed(
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&conn, feed_id, &feed_entry.guid, &feed_entry.tags)?;
         }
+        seen_guids.push(feed_entry.guid);
     }
 
+    mark_dropped_entries(&conn, feed_id, parsed_count, &seen_guids)?;
     Ok(inserted_entry_ids)
+}
+
+/// Insert an entry, or update the existing row for the same
+/// `(feed_id, guid)` in place, and return its id.
+///
+/// Updating in place keeps the entry's id stable across refreshes, and
+/// with it everything keyed on that id (tags, cached assets, the search
+/// index). The entry is in the feed again, so `dropped_at` is cleared.
+fn upsert_entry(
+    tx: &rusqlite::Transaction,
+    feed_id: i64,
+    syndication_format: &str,
+    entry: &FeedEntry,
+) -> Result<i64> {
+    let entry_id = tx.query_row(
+        "INSERT INTO entries (
+            feed_id,
+            syndication_format,
+            guid,
+            published_at,
+            title,
+            url,
+            content
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(feed_id, guid) DO UPDATE SET
+            syndication_format = excluded.syndication_format,
+            published_at = excluded.published_at,
+            title = excluded.title,
+            url = excluded.url,
+            content = excluded.content,
+            dropped_at = NULL
+        RETURNING id",
+        rusqlite::params![
+            feed_id,
+            syndication_format,
+            entry.guid,
+            entry.published_at,
+            entry.title,
+            entry.url,
+            entry.content
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(entry_id)
+}
+
+/// Mark the feed's stored entries that this refresh did not store as
+/// dropped, starting their retention clock.
+///
+/// `parsed_count` is how many entries the feed document held before
+/// scripts ran. A document with none is more likely a publisher glitch
+/// than a feed that really emptied, so it marks nothing; entries that
+/// scripts filtered out are marked like any other.
+fn mark_dropped_entries(
+    conn: &PooledConnection<SqliteConnectionManager>,
+    feed_id: i64,
+    parsed_count: usize,
+    seen_guids: &[String],
+) -> Result<()> {
+    if parsed_count == 0 {
+        debug!(
+            "feed {} listed no entries; not marking any dropped",
+            feed_id
+        );
+        return Ok(());
+    }
+    let marked = crate::db::retention::mark_dropped(conn, feed_id, seen_guids)?;
+    if marked > 0 {
+        debug!("marked {} entries of feed {} as dropped", marked, feed_id);
+    }
+    Ok(())
 }
 
 /// Enqueue a [`TaskManagerCommand::CacheEntryAssets`] for each of the given
