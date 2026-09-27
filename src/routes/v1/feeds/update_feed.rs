@@ -21,11 +21,14 @@ pub struct UpdateFeedRequest {
     /// Authentication scheme to apply when fetching this feed. Setting
     /// `"none"` clears any existing credentials.
     pub auth_type: Option<FeedAuthType>,
-    /// Username for HTTP Basic auth. Omitted fields are left unchanged.
+    /// Username for HTTP Basic auth. Omitted fields are left unchanged. When `auth_type`
+    /// is omitted, this may only be set if the feed already uses `"basic"`.
     pub auth_username: Option<String>,
-    /// Password for HTTP Basic auth. Omitted fields are left unchanged.
+    /// Password for HTTP Basic auth. Omitted fields are left unchanged. When `auth_type`
+    /// is omitted, this may only be set if the feed already uses `"basic"`.
     pub auth_password: Option<String>,
-    /// Token for HTTP Bearer auth. Omitted fields are left unchanged.
+    /// Token for HTTP Bearer auth. Omitted fields are left unchanged. When `auth_type`
+    /// is omitted, this may only be set if the feed already uses `"bearer"`.
     pub auth_bearer_token: Option<String>,
 }
 
@@ -54,6 +57,14 @@ enum UpdateFeedTaskError {
     #[error("{0}")]
     InvalidAuth(#[from] FeedAuthError),
 
+    #[error(
+        "'{field}' cannot be set while auth_type is '{auth_type}'; set auth_type to change schemes"
+    )]
+    CredentialSchemeMismatch {
+        field: &'static str,
+        auth_type: FeedAuthType,
+    },
+
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
 }
@@ -70,7 +81,7 @@ enum UpdateFeedTaskError {
     request_body = UpdateFeedRequest,
     responses(
         (status = 200, description = "Feed updated successfully", body = UpdateFeedResponse),
-        (status = 400, description = "No update fields provided"),
+        (status = 400, description = "No update fields provided, or invalid field values"),
         (status = 404, description = "Feed not found"),
         (status = 500, description = "Internal server error"),
     ),
@@ -166,7 +177,62 @@ pub async fn update_feed(
                     params.push(Box::new(auth.bearer_token));
                 }
             }
-        } else {
+        } else if payload.auth_username.is_some()
+            || payload.auth_password.is_some()
+            || payload.auth_bearer_token.is_some()
+        {
+            // Patching individual credentials is only allowed for fields used
+            // by the feed's current scheme; otherwise we'd store secrets that
+            // are never sent and never cleared.
+            let current = conn
+                .prepare(
+                    "SELECT auth_type, auth_username, auth_password, auth_bearer_token
+                    FROM feeds WHERE id = ?1",
+                )
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([id], |row| {
+                    let auth_type_raw: Option<String> = row.get(0)?;
+                    Ok(FeedAuth {
+                        auth_type: FeedAuthType::from_db(auth_type_raw.as_deref())
+                            .unwrap_or_default(),
+                        username: row.get(1)?,
+                        password: row.get(2)?,
+                        bearer_token: row.get(3)?,
+                    })
+                })?;
+
+            let allowed: &[&'static str] = match current.auth_type {
+                FeedAuthType::None => &[],
+                FeedAuthType::Basic => &["auth_username", "auth_password"],
+                FeedAuthType::Bearer => &["auth_bearer_token"],
+            };
+            let provided = [
+                ("auth_username", payload.auth_username.is_some()),
+                ("auth_password", payload.auth_password.is_some()),
+                ("auth_bearer_token", payload.auth_bearer_token.is_some()),
+            ];
+            if let Some((field, _)) = provided
+                .iter()
+                .find(|(field, set)| *set && !allowed.contains(field))
+            {
+                return Err(UpdateFeedTaskError::CredentialSchemeMismatch {
+                    field,
+                    auth_type: current.auth_type,
+                });
+            }
+
+            // Make sure the patched credentials still form a valid
+            // configuration (e.g. a basic username isn't blanked out).
+            let patched = FeedAuth {
+                auth_type: current.auth_type,
+                username: payload.auth_username.clone().or(current.username),
+                password: payload.auth_password.clone().or(current.password),
+                bearer_token: payload.auth_bearer_token.clone().or(current.bearer_token),
+            };
+            patched.validate()?;
+
             if let Some(username) = payload.auth_username {
                 updates.push("auth_username = ?".to_string());
                 params.push(Box::new(username));
@@ -238,6 +304,9 @@ pub async fn update_feed(
             "min_fetch_interval_seconds must be positive",
         )
             .into_response()),
+        Ok(Err(e @ UpdateFeedTaskError::CredentialSchemeMismatch { .. })) => {
+            Err((StatusCode::BAD_REQUEST, format!("{e}")).into_response())
+        }
         Ok(Err(UpdateFeedTaskError::InvalidAuth(e))) => {
             Err((StatusCode::BAD_REQUEST, format!("{e}")).into_response())
         }
@@ -819,8 +888,9 @@ mod test {
         assert_eq!(row.auth_username.as_deref(), Some("carol"));
         assert_eq!(row.auth_password.as_deref(), Some("correct horse"));
 
-        // Without auth_type the scheme isn't touched, so a bearer token can be
-        // stored ahead of time while the feed keeps using basic auth.
+        // A bearer token belongs to a different scheme, so it can't be patched
+        // in without also switching auth_type.
+        let before = read_feed_row(&tc, id)?;
         let resp = put_feed(
             &client,
             id,
@@ -830,11 +900,172 @@ mod test {
             },
         )
         .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.text().await?,
+            "'auth_bearer_token' cannot be set while auth_type is 'basic'; \
+             set auth_type to change schemes"
+        );
+        assert_eq!(read_feed_row(&tc, id)?, before);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_feed_rejects_credentials_for_other_scheme() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        // A feed without auth accepts no credential fields at all.
+        let plain = create_plain_feed(&client).await?;
+        let before = read_feed_row(&tc, plain)?;
+        for (req, field) in [
+            (
+                UpdateFeedRequest {
+                    auth_username: Some("alice".into()),
+                    ..Default::default()
+                },
+                "auth_username",
+            ),
+            (
+                UpdateFeedRequest {
+                    auth_password: Some("pw".into()),
+                    ..Default::default()
+                },
+                "auth_password",
+            ),
+            (
+                UpdateFeedRequest {
+                    // Also includes a valid field that must not be applied.
+                    title: Some("should not be applied".into()),
+                    auth_bearer_token: Some("tok".into()),
+                    ..Default::default()
+                },
+                "auth_bearer_token",
+            ),
+        ] {
+            let resp = put_feed(&client, plain, &req).await?;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                resp.text().await?,
+                format!(
+                    "'{field}' cannot be set while auth_type is 'none'; \
+                     set auth_type to change schemes"
+                )
+            );
+        }
+        assert_eq!(read_feed_row(&tc, plain)?, before);
+
+        // A bearer feed rejects basic credentials but accepts a new token.
+        let bearer = create_feed(
+            &client,
+            AddFeedRequest {
+                title: "bearer".into(),
+                url: "https://example.com/bearer.xml".into(),
+                auth_type: Some(FeedAuthType::Bearer),
+                auth_bearer_token: Some("old".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let resp = put_feed(
+            &client,
+            bearer,
+            &UpdateFeedRequest {
+                auth_bearer_token: Some("new".into()),
+                auth_username: Some("alice".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            read_feed_row(&tc, bearer)?.auth_bearer_token.as_deref(),
+            Some("old")
+        );
+
+        let resp = put_feed(
+            &client,
+            bearer,
+            &UpdateFeedRequest {
+                auth_bearer_token: Some("new".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
         assert_eq!(resp.status(), StatusCode::OK);
-        let row = read_feed_row(&tc, id)?;
-        assert_eq!(row.auth_type.as_deref(), Some("basic"));
-        assert_eq!(row.auth_username.as_deref(), Some("carol"));
-        assert_eq!(row.auth_bearer_token.as_deref(), Some("tok"));
+        let row = read_feed_row(&tc, bearer)?;
+        assert_eq!(row.auth_type.as_deref(), Some("bearer"));
+        assert_eq!(row.auth_bearer_token.as_deref(), Some("new"));
+        assert_eq!(row.auth_username, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_feed_rejects_blanking_required_credential() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let basic = create_feed(
+            &client,
+            AddFeedRequest {
+                title: "basic".into(),
+                url: "https://example.com/basic.xml".into(),
+                auth_type: Some(FeedAuthType::Basic),
+                auth_username: Some("alice".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let bearer = create_feed(
+            &client,
+            AddFeedRequest {
+                title: "bearer".into(),
+                url: "https://example.com/bearer.xml".into(),
+                auth_type: Some(FeedAuthType::Bearer),
+                auth_bearer_token: Some("tok".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let resp = put_feed(
+            &client,
+            basic,
+            &UpdateFeedRequest {
+                auth_username: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.text().await?,
+            "auth_type 'basic' requires 'auth_username'"
+        );
+        assert_eq!(
+            read_feed_row(&tc, basic)?.auth_username.as_deref(),
+            Some("alice")
+        );
+
+        let resp = put_feed(
+            &client,
+            bearer,
+            &UpdateFeedRequest {
+                auth_bearer_token: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.text().await?,
+            "auth_type 'bearer' requires 'auth_bearer_token'"
+        );
+        assert_eq!(
+            read_feed_row(&tc, bearer)?.auth_bearer_token.as_deref(),
+            Some("tok")
+        );
 
         Ok(())
     }
