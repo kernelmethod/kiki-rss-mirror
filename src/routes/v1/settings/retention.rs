@@ -16,8 +16,9 @@ pub struct RetentionResponse {
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RetentionRequest {
-    /// Delete entries published more than this many days ago. Must be at
-    /// least 1. `null` disables retention, keeping entries forever.
+    /// Delete entries once their feed has stopped listing them for more
+    /// than this many days. Entries still in their feed are kept. Must be
+    /// at least 1. `null` disables retention, keeping entries forever.
     pub max_age_days: Option<i64>,
 }
 

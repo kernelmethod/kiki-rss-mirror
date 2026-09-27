@@ -26,6 +26,9 @@ pub enum Commands {
     /// Migrate the Kiki database schema to the latest version
     Migrate(cli::migrate::MigrateArgs),
 
+    /// Import or export feeds as OPML
+    Opml(cli::opml::OpmlArgs),
+
     /// Generate a static HTML page for the API documentation
     #[cfg(feature = "api-docs")]
     Docs(cli::docs::DocsArgs),
@@ -59,6 +62,7 @@ impl Commands {
             Commands::Init(args) => args.run(),
             Commands::Migrate(args) => args.run(),
             Commands::Serve(args) => args.run(),
+            Commands::Opml(args) => args.run(),
             #[cfg(feature = "api-docs")]
             Commands::Docs(args) => args.run(),
             #[cfg(feature = "systemd")]

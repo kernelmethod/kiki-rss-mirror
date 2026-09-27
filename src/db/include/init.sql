@@ -181,10 +181,17 @@ CREATE TABLE entries (
     title           VARCHAR NOT NULL,
     url             VARCHAR NOT NULL,
     content         VARCHAR,
+
+    -- Unix timestamp of the first successful refresh of the entry's feed
+    -- that no longer listed it. NULL while the feed still carries the
+    -- entry; cleared if it reappears. Retention only deletes entries that
+    -- have been dropped for longer than `retention.max_age_days`.
+    dropped_at      INTEGER,
     FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE SET NULL,
     FOREIGN KEY(source_id) REFERENCES entry_sources(id) ON DELETE SET NULL
 );
 CREATE UNIQUE INDEX idx_entry_guids ON entries(feed_id, guid);
+CREATE INDEX idx_entry_dropped_at ON entries(dropped_at) WHERE dropped_at IS NOT NULL;
 
 -- Table mapping entries to the tags that they belong to
 CREATE TABLE entry_tags (
@@ -468,7 +475,9 @@ CREATE TRIGGER entries_fts_bd BEFORE DELETE ON entries BEGIN
     VALUES ('delete', old.id, old.title, old.content, old.url);
 END;
 
-CREATE TRIGGER entries_fts_au AFTER UPDATE ON entries BEGIN
+-- Only the indexed columns: marking entries dropped touches many rows at
+-- once and should not reindex them.
+CREATE TRIGGER entries_fts_au AFTER UPDATE OF title, content, url ON entries BEGIN
     INSERT INTO entries_fts(entries_fts, rowid, title, content, url)
     VALUES ('delete', old.id, old.title, old.content, old.url);
     INSERT INTO entries_fts(rowid, title, content, url)

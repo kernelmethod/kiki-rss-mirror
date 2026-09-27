@@ -1,5 +1,6 @@
 pub mod init;
 pub mod migrate;
+pub mod opml;
 pub mod paths;
 pub mod serve;
 
