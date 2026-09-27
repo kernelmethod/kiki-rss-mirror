@@ -34,6 +34,10 @@ pub enum Commands {
     #[cfg(feature = "systemd")]
     Systemd(cli::systemd::SystemdArgs),
 
+    /// Starts the Kiki web UI
+    #[cfg(feature = "web-ui")]
+    Web(cli::web::WebArgs),
+
     /// Internal: run the sandboxed feed fetcher. Spawned by `serve`.
     #[cfg(unix)]
     #[command(name = kiki_rss::process::feed_fetcher::SUBCOMMAND, hide = true)]
@@ -59,6 +63,8 @@ impl Commands {
             Commands::Docs(args) => args.run(),
             #[cfg(feature = "systemd")]
             Commands::Systemd(args) => args.run(),
+            #[cfg(feature = "web-ui")]
+            Commands::Web(args) => args.run(),
             #[cfg(unix)]
             Commands::FeedFetcher(args) => {
                 use kiki_rss::process::feed_fetcher as f;

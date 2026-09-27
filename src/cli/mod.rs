@@ -9,5 +9,8 @@ pub mod docs;
 #[cfg(feature = "systemd")]
 pub mod systemd;
 
+#[cfg(feature = "web-ui")]
+pub mod web;
+
 #[cfg(unix)]
 pub mod child;

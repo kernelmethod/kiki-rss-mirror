@@ -20,9 +20,11 @@
               xmlFilter = path: _type: builtins.match ".*\\.xml$" path != null;
               # Markdown pulled into rustdoc via include_str! (e.g. src/docs/*.md)
               docsFilter = path: _type: builtins.match ".*/src/.*\\.md$" path != null;
+              # Web UI pages pulled in via include_str! (e.g. src/cli/web/*.html)
+              htmlFilter = path: _type: builtins.match ".*/src/.*\\.html$" path != null;
               customOrCargo = path: type:
                 (sqlFilter path type) || (xmlFilter path type) || (docsFilter path type)
-                || (craneLib.filterCargoSources path type);
+                || (htmlFilter path type) || (craneLib.filterCargoSources path type);
             in
               pkgs.lib.cleanSourceWith {
                 src = ./.;
