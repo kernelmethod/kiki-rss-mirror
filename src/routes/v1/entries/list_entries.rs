@@ -56,7 +56,8 @@ impl Default for ListEntriesError {
 
 /// List all entries
 ///
-/// Retrieve a paginated list of all RSS and Atom entries that the server has retrieved.
+/// Retrieve a paginated list of all RSS and Atom entries that the server has retrieved,
+/// newest first. Entries with the same publication time are ordered by descending ID.
 #[utoipa::path(
     get,
     path = "/v1/entries",
@@ -94,7 +95,9 @@ pub async fn list_entries(
             .prepare(
                 "SELECT id, feed_id, source_id, syndication_format,
                     guid, published_at, title, url, content
-                FROM entries LIMIT ?1 OFFSET ?2",
+                FROM entries
+                ORDER BY published_at DESC, id DESC
+                LIMIT ?1 OFFSET ?2",
             )
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);

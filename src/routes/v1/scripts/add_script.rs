@@ -20,7 +20,7 @@ pub struct AddScriptResponse {
     pub id: i64,
 }
 
-/// Route handler for adding a new script.
+/// Add a script
 #[utoipa::path(
     post,
     path = "/v1/scripts/create",

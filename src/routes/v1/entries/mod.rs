@@ -168,15 +168,72 @@ mod test {
         assert!(entry_formats.contains(&"rss".to_string()));
         assert!(entry_formats.contains(&"atom".to_string()));
 
-        // Validate the publication dates that are returned
+        // Validate the publication dates that are returned (newest first)
         assert_eq!(
             response.entries[0].published_at.as_deref(),
-            Some("2026-05-15T00:00:00+00:00")
+            Some("2026-05-16T00:00:00+00:00")
         );
         assert_eq!(
             response.entries[1].published_at.as_deref(),
-            Some("2026-05-16T00:00:00+00:00")
+            Some("2026-05-15T00:00:00+00:00")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_entries_ordering() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (title, url, syndication_format) VALUES ('A', 'http://a', 'rss')",
+            [],
+        )?;
+        let feed_a = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO feeds (title, url, syndication_format) VALUES ('B', 'http://b', 'rss')",
+            [],
+        )?;
+        let feed_b = conn.last_insert_rowid();
+
+        // Insert out of chronological order, across feeds, with two entries
+        // sharing a timestamp, and one orphaned entry.
+        let insert = |feed_id: Option<i64>, guid: &str, published_at: i64| -> Result<i64> {
+            conn.execute(
+                "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+                 VALUES (?1, 'rss', ?2, ?3, ?2, 'http://example.com')",
+                rusqlite::params![feed_id, guid, published_at],
+            )?;
+            Ok(conn.last_insert_rowid())
+        };
+        let middle = insert(Some(feed_a), "middle", 2_000)?;
+        let oldest = insert(Some(feed_b), "oldest", 1_000)?;
+        let tie_first = insert(Some(feed_b), "tie-first", 3_000)?;
+        let orphan = insert(None, "orphan", 1_500)?;
+        let tie_second = insert(Some(feed_a), "tie-second", 3_000)?;
+        let expected = vec![tie_second, tie_first, middle, orphan, oldest];
+
+        let response = client.get("http://localhost/v1/entries").send().await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response.json::<list_entries::ListEntriesResponse>().await?;
+        let ids: Vec<i64> = response.entries.iter().map(|e| e.id).collect();
+        assert_eq!(ids, expected);
+
+        // Paging through the list yields the same order.
+        let mut paged = Vec::new();
+        for offset in (0..expected.len()).step_by(2) {
+            let response = client
+                .get(format!(
+                    "http://localhost/v1/entries?offset={offset}&limit=2"
+                ))
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = response.json::<list_entries::ListEntriesResponse>().await?;
+            paged.extend(response.entries.iter().map(|e| e.id));
+        }
+        assert_eq!(paged, expected);
 
         Ok(())
     }
