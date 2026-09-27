@@ -260,7 +260,7 @@ mod tests {
     use super::*;
     use crate::sandbox::SandboxProfile;
     use clap::Parser;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     /// Wrapper so the `Args`-derived [`ServeArgs`] can be exercised
     /// through real argv parsing, covering the flag names too.
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn socket_dir_is_created_owner_only() -> Result<()> {
-        let td = TempDir::new("kiki_")?;
+        let td = TempDir::with_prefix("kiki_")?;
         let dir = td.path().join("runtime").join("kiki");
         let created = ensure_socket_dir(&dir.join("kiki.sock"))?;
 
@@ -470,7 +470,7 @@ mod tests {
     /// systemd that is `RuntimeDirectory=`/`RuntimeDirectoryMode=`.
     #[test]
     fn socket_dir_that_already_exists_is_left_alone() -> Result<()> {
-        let td = TempDir::new("kiki_")?;
+        let td = TempDir::with_prefix("kiki_")?;
         let dir = td.path().join("runtime");
         fs::create_dir(&dir)?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o750))?;

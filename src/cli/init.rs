@@ -117,7 +117,7 @@ impl InitArgs {
 mod test {
     use super::*;
     use anyhow::Result;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     /// An `InitArgs` with every flag at its default.
     fn args() -> InitArgs {
@@ -130,7 +130,7 @@ mod test {
     /// Test the `--check` flag for `kiki init`.
     #[test]
     fn test_check() -> Result<()> {
-        let td = TempDir::new("kiki_")?;
+        let td = TempDir::with_prefix("kiki_")?;
         let path = td.path();
         assert!(args().run_in(path).is_ok());
         assert!(args().run_in(path).is_err());
@@ -147,7 +147,7 @@ mod test {
     /// Test the `--force` flag for `kiki init`
     #[test]
     fn test_force() -> Result<()> {
-        let td = TempDir::new("kiki_")?;
+        let td = TempDir::with_prefix("kiki_")?;
         let path = td.path();
         assert!(args().run_in(path).is_ok());
         assert!(args().run_in(path).is_err());
@@ -165,7 +165,7 @@ mod test {
     /// database alone rather than failing on it.
     #[test]
     fn test_with_check_is_idempotent() -> Result<()> {
-        let td = TempDir::new("kiki_")?;
+        let td = TempDir::with_prefix("kiki_")?;
         let path = td.path();
         assert!(InitArgs::with_check().run_in(path).is_ok());
         assert!(InitArgs::with_check().run_in(path).is_ok());
@@ -177,7 +177,7 @@ mod test {
     /// requiring it to exist already.
     #[test]
     fn test_creates_a_missing_directory() -> Result<()> {
-        let td = TempDir::new("kiki_")?;
+        let td = TempDir::with_prefix("kiki_")?;
         let path = td.path().join("nested").join("home");
         assert!(args().run_in(&path).is_ok());
         assert!(path.join(paths::DB_FILE_NAME).exists());

@@ -120,7 +120,7 @@ mod tests {
     use crate::config::ConfigStore;
     use std::sync::Arc;
     use std::time::Instant;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     async fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -159,7 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn edits_on_disk_are_picked_up() {
-        let td = TempDir::new("kiki_watch").unwrap();
+        let td = TempDir::with_prefix("kiki_watch").unwrap();
         let store = Arc::new(ConfigStore::open(td.path().join("kiki.toml")).unwrap());
         let cancel = CancellationToken::new();
         spawn_watcher(store.clone(), cancel.clone()).unwrap();

@@ -468,7 +468,7 @@ pub fn validate_socket_path(path: &Path) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod test {
     use super::*;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     /// An `Env` with every location unset.
     fn empty_env() -> Env {
@@ -493,7 +493,7 @@ mod test {
     /// `cd`-ing into one and running `kiki serve` finds it.
     #[test]
     fn data_dir_falls_back_to_cwd_holding_a_database() -> Result<()> {
-        let td = TempDir::new("kiki_")?;
+        let td = TempDir::with_prefix("kiki_")?;
         std::fs::write(td.path().join(DB_FILE_NAME), b"")?;
 
         let env = Env {
@@ -512,7 +512,7 @@ mod test {
     /// platform default.
     #[test]
     fn data_dir_ignores_cwd_without_a_database() -> Result<()> {
-        let td = TempDir::new("kiki_")?;
+        let td = TempDir::with_prefix("kiki_")?;
         let platform = PathBuf::from("/home/rey/.local/share/kiki");
 
         let env = Env {
@@ -543,7 +543,7 @@ mod test {
     /// wherever the shell happens to be.
     #[test]
     fn default_data_dir_ignores_the_current_directory() -> Result<()> {
-        let td = TempDir::new("kiki_")?;
+        let td = TempDir::with_prefix("kiki_")?;
         std::fs::write(td.path().join(DB_FILE_NAME), b"")?;
         let platform = PathBuf::from("/home/rey/.local/share/kiki");
 
@@ -760,7 +760,7 @@ mod test {
     fn runtime_dir_must_be_private_to_this_user() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let td = TempDir::new("kiki_")?;
+        let td = TempDir::with_prefix("kiki_")?;
         let dir = td.path().join("runtime");
         std::fs::create_dir(&dir)?;
 
@@ -777,7 +777,7 @@ mod test {
 
     #[test]
     fn runtime_dir_must_exist_and_be_a_directory() -> Result<()> {
-        let td = TempDir::new("kiki_")?;
+        let td = TempDir::with_prefix("kiki_")?;
         assert!(!runtime_dir_is_usable(&td.path().join("missing")));
 
         let file = td.path().join("file");

@@ -77,7 +77,7 @@ flate2 = "1"
 http = "1"
 itertools = "0.14"
 serial_test = "3.4"
-tempdir = "0.3"
+tempfile = "3"
 
 [profile.dev]
 incremental = true

@@ -502,7 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_server_is_reported_on_the_page() -> Result<()> {
-        let td = tempdir::TempDir::new("kiki_")?;
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
         let api = api_client(&td.path().join("missing.sock"))?;
         let (status, body) = get_index(api).await?;
 

@@ -857,7 +857,7 @@ mod test {
     /// Nothing at the path means nothing to clean up.
     #[test]
     fn claim_socket_path_accepts_an_unused_path() -> Result<()> {
-        let td = tempdir::TempDir::new("kiki_")?;
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
         claim_socket_path(&td.path().join("kiki.sock"))?;
         Ok(())
     }
@@ -865,7 +865,7 @@ mod test {
     /// A socket file whose server is gone is stale, and gets cleared.
     #[test]
     fn claim_socket_path_removes_a_stale_socket() -> Result<()> {
-        let td = tempdir::TempDir::new("kiki_")?;
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
         let path = td.path().join("kiki.sock");
 
         // Dropping the listener closes the socket but leaves its file behind,
@@ -884,7 +884,7 @@ mod test {
     /// must not be stolen from it.
     #[test]
     fn claim_socket_path_refuses_a_live_socket() -> Result<()> {
-        let td = tempdir::TempDir::new("kiki_")?;
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
         let path = td.path().join("kiki.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&path)?;
 
@@ -900,7 +900,7 @@ mod test {
     /// Whatever a non-socket file at the path is, it is not ours to delete.
     #[test]
     fn claim_socket_path_refuses_to_remove_a_regular_file() -> Result<()> {
-        let td = tempdir::TempDir::new("kiki_")?;
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
         let path = td.path().join("kiki.sock");
         fs::write(&path, b"not a socket")?;
 
