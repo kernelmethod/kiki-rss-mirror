@@ -10,6 +10,7 @@ mod feed_hints_tests;
 mod fetch_error_tests;
 mod format_data_tests;
 mod maintenance_tests;
+mod retention_tests;
 mod retry_after_tests;
 mod server_hints_tests;
 #[cfg(feature = "extra-tests")]

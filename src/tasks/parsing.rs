@@ -107,9 +107,9 @@ pub(super) fn upsert_atom_feed_data(
 }
 
 /// Insert the atom-specific child rows for a single entry. Children key
-/// directly on `entries.id` and are cleared by the `INSERT OR REPLACE INTO
-/// entries` CASCADE; we also delete defensively in case we're called on an
-/// entry that wasn't replaced (e.g. a script-filtered re-ingest).
+/// directly on `entries.id`, which is stable across refreshes because
+/// entries are updated in place, so the previous refresh's rows are
+/// deleted first.
 pub(super) fn insert_atom_entry_data(
     tx: &rusqlite::Transaction,
     entry_id: i64,
