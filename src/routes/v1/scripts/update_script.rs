@@ -154,12 +154,9 @@ pub async fn update_script(
 #[allow(clippy::indexing_slicing)]
 mod test {
     use super::*;
-    use crate::routes::v1::entries::ListEntriesResponse;
-    use crate::routes::v1::feeds::add_feed::{AddFeedRequest, AddFeedResponse};
     use crate::routes::v1::scripts::add_script::{AddScriptRequest, AddScriptResponse};
     use crate::test::TestBuilder;
     use anyhow::Result;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn test_update_script() -> Result<()> {
@@ -253,8 +250,13 @@ mod test {
     /// behavioral change: start with a passthrough script, fetch a feed
     /// (entries appear), then update the script to filter everything out,
     /// delete existing entries, re-fetch, and confirm no new entries appear.
+    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_update_script_triggers_reload() -> Result<()> {
+        use crate::routes::v1::entries::ListEntriesResponse;
+        use crate::routes::v1::feeds::add_feed::{AddFeedRequest, AddFeedResponse};
+        use std::time::Duration;
+
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;
 
@@ -284,8 +286,7 @@ mod test {
         assert_eq!(resp.status(), StatusCode::CREATED);
         let feed_id = resp.json::<AddFeedResponse>().await?.id;
 
-        // Wait for the initial fetch to complete.
-        std::thread::sleep(Duration::from_millis(250));
+        tc.wait_for_fetches(1).await?;
 
         // Entries should have been inserted (passthrough script).
         let resp = client.get("http://localhost/v1/entries").send().await?;
@@ -304,37 +305,39 @@ mod test {
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Delete existing entries and reset last_checked so the next fetch
-        // isn't skipped by the 3-hour freshness check.
-        {
-            let conn = tc.database_conn()?;
+        // The reload is asynchronous, and swapping one script for another
+        // leaves the loaded-script count unchanged, so there is nothing to
+        // wait on. Instead, re-fetch until a fetch runs the filter script
+        // and stores nothing; without a reload, that never happens.
+        const FILTERED: &str = "kiki_script_executions_total{outcome=\"filtered\"}";
+        let conn = tc.database_conn()?;
+        let start = std::time::Instant::now();
+        for fetches in 2.. {
+            // Delete existing entries and reset the schedule so the fetch
+            // isn't skipped by the freshness check.
             conn.execute("DELETE FROM entries WHERE feed_id = ?1", [feed_id])?;
             conn.execute(
-                "UPDATE feeds SET last_checked = NULL WHERE id = ?1",
+                "UPDATE feeds SET last_checked = NULL, next_fetch_at = NULL WHERE id = ?1",
                 [feed_id],
             )?;
+
+            let resp = client
+                .post(format!("http://localhost/v1/feeds/refresh/{feed_id}"))
+                .send()
+                .await?;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            tc.wait_for_fetches(fetches).await?;
+
+            let resp = client.get("http://localhost/v1/entries").send().await?;
+            let body = resp.json::<ListEntriesResponse>().await?;
+            if body.count == 0 && tc.metric(FILTERED).await? > 0.0 {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "filter script should have prevented entries after reload"
+            );
         }
-
-        // Allow time for the reload command to be processed.
-        std::thread::sleep(Duration::from_millis(250));
-
-        // Trigger a fetch so the updated (filter-all) script runs.
-        let resp = client
-            .post(format!("http://localhost/v1/feeds/refresh/{feed_id}"))
-            .send()
-            .await?;
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
-
-        // Wait for the fetch to complete.
-        std::thread::sleep(Duration::from_millis(500));
-
-        // No entries should appear because the filter script drops everything.
-        let resp = client.get("http://localhost/v1/entries").send().await?;
-        let body = resp.json::<ListEntriesResponse>().await?;
-        assert_eq!(
-            body.count, 0,
-            "filter script should have prevented entries after reload"
-        );
 
         Ok(())
     }

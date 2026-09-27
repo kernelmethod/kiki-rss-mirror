@@ -39,6 +39,22 @@ pub fn record_run(conn: &Connection, task_type: &str) -> Result<()> {
     Ok(())
 }
 
+/// Move `task_type`'s `last_run_at` `secs` seconds into the past and return
+/// the new value.
+///
+/// `last_run_at` has one-second resolution, so tests use this to make a
+/// later run observable without sleeping for a second.
+#[cfg(test)]
+pub(crate) fn backdate_task(conn: &Connection, task_type: &str, secs: i64) -> Result<i64> {
+    conn.query_row(
+        "UPDATE task_queue SET last_run_at = last_run_at - ?2 WHERE task_type = ?1
+         RETURNING last_run_at",
+        rusqlite::params![task_type, secs],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("failed to backdate {}", task_type))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -58,10 +74,10 @@ mod tests {
     #[test]
     fn ensure_task_is_idempotent() -> Result<()> {
         let conn = ConnectionBuilder::default().in_memory().create().build()?;
-        let first = ensure_task(&conn, "some_task")?;
-        // Sleep long enough that `unixepoch()` would advance if a new row
-        // were inserted on the second call.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        ensure_task(&conn, "some_task")?;
+        // Backdate the row so that a fresh insert on the second call would
+        // be distinguishable from the existing row.
+        let first = backdate_task(&conn, "some_task", 10)?;
         let second = ensure_task(&conn, "some_task")?;
         assert_eq!(first, second);
         Ok(())
@@ -70,8 +86,8 @@ mod tests {
     #[test]
     fn record_run_updates_timestamp() -> Result<()> {
         let conn = ConnectionBuilder::default().in_memory().create().build()?;
-        let initial = ensure_task(&conn, "some_task")?;
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        ensure_task(&conn, "some_task")?;
+        let initial = backdate_task(&conn, "some_task", 10)?;
         record_run(&conn, "some_task")?;
         let after = ensure_task(&conn, "some_task")?;
         assert!(after > initial);

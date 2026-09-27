@@ -1073,12 +1073,18 @@ mod tests {
     async fn fetch_requests_are_served_concurrently() {
         use axum::{routing::get, Router};
 
+        // The slow feed answers only once the test has seen the fast one
+        // come back, so the fast request can't have waited behind it.
+        let release = Arc::new(tokio::sync::Notify::new());
         let app = Router::new()
             .route(
                 "/slow",
-                get(|| async {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    RSS
+                get({
+                    let release = Arc::clone(&release);
+                    || async move {
+                        release.notified().await;
+                        RSS
+                    }
                 }),
             )
             .route("/fast", get(|| async { RSS }));
@@ -1093,13 +1099,14 @@ mod tests {
             tokio::spawn(async move { host.fetch(spec(&url)).await })
         };
 
-        let start = Instant::now();
-        let fast = host.fetch(spec(&format!("http://{addr}/fast"))).await;
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "a fast feed waited behind a slow one"
-        );
+        let fast = tokio::time::timeout(
+            Duration::from_secs(5),
+            host.fetch(spec(&format!("http://{addr}/fast"))),
+        )
+        .await
+        .expect("a fast feed waited behind a slow one");
         assert!(matches!(fast, Ok(FetchReply::Body(_))), "got {fast:?}");
+        release.notify_one();
         assert!(matches!(slow.await.unwrap(), Ok(FetchReply::Body(_))));
     }
 
