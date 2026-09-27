@@ -97,19 +97,50 @@ impl ServeArgs {
             );
         }
 
-        let mut builder = server::ServerBuilder::new(&db_path)
+        let builder = server::ServerBuilder::new(&db_path)
             .autofetch()
             .feed_fetcher(feed_fetcher)
             .socket_path(&socket_path);
         #[cfg(all(unix, feature = "lua"))]
-        {
-            builder = builder.script_host(script_host);
-        }
+        let builder = builder.script_host(script_host);
         let server = builder.build();
 
         std::thread::spawn(|| server.run())
             .join()
             .map_err(|_| anyhow::anyhow!("panic in server thread"))?
+    }
+
+    /// Resolve the socket the server will listen on, from the flags and
+    /// the process environment, exactly as `kiki serve` itself would.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no data directory can be resolved, or if the
+    /// resolved socket path is too long to fit in a Unix socket address.
+    #[cfg(feature = "web-ui")]
+    pub fn socket_path(&self) -> Result<PathBuf> {
+        let env = Env::from_process();
+        let data_dir = paths::resolve_data_dir(&env)?;
+        self.resolve_socket_path(&data_dir, &env)
+    }
+
+    /// Render these arguments back into a `kiki serve` command line that
+    /// listens on `socket_path`, so another command can start a server
+    /// child whose socket it already knows.
+    #[cfg(feature = "web-ui")]
+    pub fn to_argv(&self, socket_path: &Path) -> Vec<std::ffi::OsString> {
+        let mut argv = vec!["--uds".into(), socket_path.as_os_str().to_owned()];
+        if self.no_sandbox {
+            argv.push("--no-sandbox".into());
+        }
+        if self.seccomp_log_only {
+            argv.push("--seccomp-log-only".into());
+        }
+        #[cfg(all(unix, feature = "lua"))]
+        if self.no_script_isolation {
+            argv.push("--no-script-isolation".into());
+        }
+        argv
     }
 
     /// Start the isolated feed fetcher.
@@ -453,6 +484,24 @@ mod tests {
     #[test]
     fn relative_socket_path_resolves_against_the_current_directory() {
         assert_eq!(parent_or_cwd(Path::new("kiki.sock")), Path::new("."));
+    }
+
+    /// Whatever flags were given survive a round trip through `to_argv`,
+    /// so a `kiki serve` child sees exactly what the parent was asked for,
+    /// listening on the socket the parent resolved.
+    #[cfg(feature = "web-ui")]
+    #[test]
+    fn to_argv_round_trips() {
+        let mut argvs = vec![vec![], vec!["--no-sandbox", "--seccomp-log-only"]];
+        #[cfg(all(unix, feature = "lua"))]
+        argvs.push(vec!["--no-script-isolation"]);
+
+        for argv in argvs {
+            let rendered = parse(&argv).to_argv(Path::new("/tmp/k.sock"));
+            let rendered: Vec<&str> = rendered.iter().map(|s| s.to_str().unwrap()).collect();
+            let expected: Vec<&str> = ["--uds", "/tmp/k.sock"].into_iter().chain(argv).collect();
+            assert_eq!(rendered, expected);
+        }
     }
 
     /// Script isolation is the default; opting out has to be explicit.

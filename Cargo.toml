@@ -1,6 +1,6 @@
 [package]
 name = "kiki-rss"
-version = "0.9.4"
+version = "0.10.0"
 edition = "2021"
 description = "An RSS feed aggregator"
 license = "MIT"
@@ -17,12 +17,13 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli", "lua", "systemd", "api-docs", "metrics"]
+default = ["cli", "lua", "systemd", "api-docs", "metrics", "web-ui"]
 cli = ["clap"]
 lua = ["mlua"]
 systemd = []
 api-docs = ["utoipa-scalar"]
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
+web-ui = ["cli"]
 extra-tests = []
 
 [dependencies]

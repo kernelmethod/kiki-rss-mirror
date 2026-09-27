@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::db::task_queue::{
-    ensure_task, TASK_FTS_OPTIMIZE, TASK_INCREMENTAL_VACUUM, TASK_WAL_CHECKPOINT_ANALYZE,
+    backdate_task, ensure_task, TASK_FTS_OPTIMIZE, TASK_INCREMENTAL_VACUUM,
+    TASK_WAL_CHECKPOINT_ANALYZE,
 };
 use crate::tasks::{run_maintenance, spawn_workers, TaskManagerCommand};
 use crate::test::TestBuilder;
@@ -67,9 +68,8 @@ fn optimize_fts_success_records_run_and_merges_segments() -> Result<()> {
     );
 
     ensure_task(&conn, TASK_FTS_OPTIMIZE)?;
-    let before = last_run_at(&conn, TASK_FTS_OPTIMIZE)?;
-    // unixepoch() is second-resolution; sleep to ensure an observable advance.
-    std::thread::sleep(Duration::from_millis(1100));
+    // unixepoch() is second-resolution; backdate to ensure an observable advance.
+    let before = backdate_task(&conn, TASK_FTS_OPTIMIZE, 10)?;
 
     run_maintenance(&pool, TASK_FTS_OPTIMIZE, "FTS5 optimize", |c| {
         c.execute(
@@ -105,8 +105,7 @@ fn wal_checkpoint_analyze_success_records_run_and_populates_stats() -> Result<()
 
     let conn = pool.get()?;
     ensure_task(&conn, TASK_WAL_CHECKPOINT_ANALYZE)?;
-    let before = last_run_at(&conn, TASK_WAL_CHECKPOINT_ANALYZE)?;
-    std::thread::sleep(Duration::from_millis(1100));
+    let before = backdate_task(&conn, TASK_WAL_CHECKPOINT_ANALYZE, 10)?;
 
     run_maintenance(
         &pool,
@@ -153,8 +152,7 @@ fn incremental_vacuum_success_records_run_and_reclaims_pages() -> Result<()> {
     );
 
     ensure_task(&conn, TASK_INCREMENTAL_VACUUM)?;
-    let before = last_run_at(&conn, TASK_INCREMENTAL_VACUUM)?;
-    std::thread::sleep(Duration::from_millis(1100));
+    let before = backdate_task(&conn, TASK_INCREMENTAL_VACUUM, 10)?;
 
     run_maintenance(&pool, TASK_INCREMENTAL_VACUUM, "incremental vacuum", |c| {
         c.execute_batch("PRAGMA incremental_vacuum;")?;
@@ -179,8 +177,8 @@ fn run_maintenance_failure_does_not_record_run() -> Result<()> {
 
     let conn = pool.get()?;
     ensure_task(&conn, "synthetic_task")?;
-    let before = last_run_at(&conn, "synthetic_task")?;
-    std::thread::sleep(Duration::from_millis(1100));
+    // Backdate so that a (wrongly) recorded run would be observable.
+    let before = backdate_task(&conn, "synthetic_task", 10)?;
 
     run_maintenance(&pool, "synthetic_task", "synthetic", |_c| {
         Err(anyhow::anyhow!("synthetic failure"))
@@ -202,26 +200,23 @@ async fn maintenance_commands_end_to_end_via_worker() -> Result<()> {
         for i in 0..10 {
             insert_entry(&conn, i, 100)?;
         }
-        ensure_task(&conn, TASK_FTS_OPTIMIZE)?;
-        ensure_task(&conn, TASK_WAL_CHECKPOINT_ANALYZE)?;
-        ensure_task(&conn, TASK_INCREMENTAL_VACUUM)?;
     }
 
+    // Backdate each task so that its next run is observable.
     let baselines: Vec<(&'static str, i64)> = {
         let conn = pool.get()?;
-        vec![
-            (TASK_FTS_OPTIMIZE, last_run_at(&conn, TASK_FTS_OPTIMIZE)?),
-            (
-                TASK_WAL_CHECKPOINT_ANALYZE,
-                last_run_at(&conn, TASK_WAL_CHECKPOINT_ANALYZE)?,
-            ),
-            (
-                TASK_INCREMENTAL_VACUUM,
-                last_run_at(&conn, TASK_INCREMENTAL_VACUUM)?,
-            ),
+        [
+            TASK_FTS_OPTIMIZE,
+            TASK_WAL_CHECKPOINT_ANALYZE,
+            TASK_INCREMENTAL_VACUUM,
         ]
+        .into_iter()
+        .map(|t| {
+            ensure_task(&conn, t)?;
+            Ok((t, backdate_task(&conn, t, 10)?))
+        })
+        .collect::<Result<_>>()?
     };
-    tokio::time::sleep(Duration::from_millis(1100)).await;
 
     let (tx, rx) = async_channel::bounded(16);
     let token = CancellationToken::new();

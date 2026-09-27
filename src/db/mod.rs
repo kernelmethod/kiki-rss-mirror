@@ -49,7 +49,7 @@ impl<'a> ConnectionBuilder<'a> {
 
     /// Build connection instance.
     pub fn build(&self) -> Result<Connection> {
-        let conn = match self.conntype {
+        let mut conn = match self.conntype {
             ConnectionType::Memory => Connection::open_in_memory_with_flags(self.flags)
                 .with_context(|| "unable to open in-memory database connection")?,
             ConnectionType::DefaultConnection | ConnectionType::File(_) => {
@@ -73,14 +73,25 @@ impl<'a> ConnectionBuilder<'a> {
             .with_context(|| "unable to enable foreign keys on database connection")?;
 
         if self.create {
-            // Initialize database
-            conn.execute_batch(include_str!("include/init.sql"))
+            // Initialize the database in a single transaction. Otherwise each
+            // statement commits (and syncs to disk) on its own, which makes
+            // initialization an order of magnitude slower, and a failure
+            // partway through leaves a half-built schema behind.
+            //
+            // init.sql's `PRAGMA auto_vacuum` still takes effect in the
+            // transaction, since no tables exist yet; its `PRAGMA
+            // foreign_keys` is a no-op there, but foreign keys were already
+            // enabled on this connection above.
+            let tx = conn
+                .transaction()
+                .with_context(|| "unable to start database initialization")?;
+            tx.execute_batch(include_str!("include/init.sql"))
                 .with_context(|| "Failed to initialize database")?;
 
             // Mark all known migrations as applied since init.sql
             // contains the complete current schema
             for migration in migrations::MIGRATIONS {
-                conn.execute(
+                tx.execute(
                     "INSERT INTO migrations (name) VALUES (?1)",
                     (migration.name,),
                 )
@@ -88,6 +99,8 @@ impl<'a> ConnectionBuilder<'a> {
                     format!("unable to record migration {} during init", migration.name)
                 })?;
             }
+            tx.commit()
+                .with_context(|| "unable to commit database initialization")?;
         }
 
         Ok(conn)
@@ -192,6 +205,27 @@ mod tests {
             .collect();
         let applied_names: Vec<String> = applied.into_iter().map(|r| r.text).collect();
         assert_eq!(applied_names, expected_migrations);
+
+        Ok(())
+    }
+
+    /// The pragmas at the top of init.sql still apply to a database file
+    /// even though initialization runs inside a transaction.
+    #[test]
+    fn test_init_database_file_settings() -> Result<()> {
+        let td = tempdir::TempDir::new("kiki_")?;
+        let path = td.path().join("kiki.db");
+        ConnectionBuilder::default()
+            .at_path(&path)
+            .create()
+            .build()?;
+
+        let conn = ConnectionBuilder::default().at_path(&path).build()?;
+        // 2 = INCREMENTAL
+        let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+        assert_eq!(auto_vacuum, 2);
+        let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+        assert_eq!(foreign_keys, 1);
 
         Ok(())
     }

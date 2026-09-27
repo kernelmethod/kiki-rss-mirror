@@ -500,18 +500,28 @@ impl TestConfig {
     /// Create an HTTP client to connect to the test server being run
     /// in the background.
     pub fn client(&self) -> Result<reqwest::Client> {
+        Ok(self.client_builder()?.build()?)
+    }
+
+    /// Wait for the test server to accept connections, then return a client
+    /// builder pointed at its socket, for tests that need to customize the
+    /// client.
+    pub fn client_builder(&self) -> Result<reqwest::ClientBuilder> {
         let p = self.socket_path();
 
-        // The server may take a little bit of time to start up.
-        // We spin and wait until it's available.
+        // The server may take a little bit of time to start up, so spin until
+        // it accepts a connection. The socket file alone isn't enough: it
+        // appears at bind(2), and connecting before the listen(2) that
+        // follows fails with ECONNREFUSED.
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
-            if !p.exists() {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
+            if self.server_handle.as_ref().is_some_and(|h| h.is_finished()) {
+                bail!("HTTP server exited before listening on {:?}", &p);
             }
-
-            return Ok(reqwest::Client::builder().unix_socket(p).build()?);
+            if std::os::unix::net::UnixStream::connect(&p).is_ok() {
+                return Ok(reqwest::Client::builder().unix_socket(p));
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
 
         bail!("HTTP server has not been started on {:?}", &p);
@@ -543,6 +553,9 @@ impl TestConfig {
     /// POST /v1/feeds/create with the given title+url, assert 201, wait for
     /// the background worker to ingest, then return the new feed's id.
     ///
+    /// `url` must be a `file://` URL: the feed is parsed here too, to learn
+    /// how many entries ingestion will store.
+    ///
     /// Shared by the entry- and feed-route test modules.
     pub async fn add_feed_from_url(&self, title: &str, url: String) -> Result<i64> {
         #[derive(serde::Serialize)]
@@ -555,10 +568,22 @@ impl TestConfig {
             id: i64,
         }
 
+        let path = url
+            .strip_prefix("file://")
+            .with_context(|| format!("not a file:// URL: {url}"))?;
+        let expected = crate::fetcher::parse_off_thread(0, std::fs::read(path)?)
+            .await
+            .feed
+            .with_context(|| format!("failed to parse test feed {path}"))?
+            .entry_count();
+
         let client = self.client()?;
         let resp = client
             .post("http://localhost/v1/feeds/create")
-            .json(&Req { title, url })
+            .json(&Req {
+                title,
+                url: url.clone(),
+            })
             .send()
             .await?;
         if resp.status() != reqwest::StatusCode::CREATED {
@@ -568,8 +593,83 @@ impl TestConfig {
             );
         }
         let id = resp.json::<Resp>().await?.id;
-        std::thread::sleep(Duration::from_millis(250));
-        Ok(id)
+
+        // Entries are committed one at a time, so wait until all of them
+        // are in rather than until the first one appears.
+        let conn = self.database_conn()?;
+        let start = Instant::now();
+        loop {
+            let stored: usize = conn.query_row(
+                "SELECT count(*) FROM entries WHERE feed_id = ?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            if stored >= expected {
+                return Ok(id);
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                bail!("feed {id} stored {stored} of {expected} entries from {url}");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Read `name` from the test server's `/metrics` endpoint, summed over
+    /// all of its label sets. `name` can also be a single series, labels
+    /// included, as the exporter prints it. A metric that has not been
+    /// recorded yet reads as 0.
+    #[cfg(feature = "metrics")]
+    pub async fn metric(&self, name: &str) -> Result<f64> {
+        let body = self
+            .client()?
+            .get("http://localhost/metrics")
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        let labelled = format!("{name}{{");
+        let mut total = 0.0;
+        for line in body.lines().filter(|l| !l.starts_with('#')) {
+            let Some((series, value)) = line.rsplit_once(' ') else {
+                continue;
+            };
+            if series == name || series.starts_with(&labelled) {
+                total += value
+                    .parse::<f64>()
+                    .with_context(|| format!("bad metric line: {line}"))?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Poll [`Self::metric`] until `done` accepts its value, and return it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `done` hasn't accepted a value within 5 seconds.
+    #[cfg(feature = "metrics")]
+    pub async fn wait_for_metric(&self, name: &str, done: impl Fn(f64) -> bool) -> Result<f64> {
+        let start = Instant::now();
+        loop {
+            let value = self.metric(name).await?;
+            if done(value) {
+                return Ok(value);
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                bail!("timed out waiting on {name} (last value: {value})");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Wait until the server has finished `n` feed fetches in total,
+    /// whatever their outcome.
+    #[cfg(feature = "metrics")]
+    pub async fn wait_for_fetches(&self, n: u32) -> Result<()> {
+        self.wait_for_metric("kiki_feed_fetch_total", |v| v >= f64::from(n))
+            .await?;
+        Ok(())
     }
 
     pub fn config_dir(&self) -> &Path {

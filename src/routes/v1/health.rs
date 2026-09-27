@@ -5,11 +5,11 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::task;
 use tracing::{event, Level};
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct HealthResponse {
     pub status: String,
     pub feed_count: usize,

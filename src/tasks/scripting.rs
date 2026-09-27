@@ -123,13 +123,15 @@ pub fn reload_script_runner(
 
         match host.reload(sources) {
             Ok(loaded) => {
-                metrics.set_scripts_loaded(loaded as f64);
                 handle.set(if empty {
                     None
                 } else {
                     Some(Arc::new(SubprocessScriptRunner::new(host.clone()))
                         as Arc<dyn ScriptRunner>)
                 });
+                // Only after the swap, so that the gauge reaching a value
+                // means the reload has taken effect.
+                metrics.set_scripts_loaded(loaded as f64);
             }
             Err(e) if host.is_alive() => {
                 // The host answered, it just could not compile what we
@@ -159,12 +161,13 @@ pub fn reload_script_runner(
     let count = sources.len() as f64;
     match crate::scripting::lua::LuaScriptRunner::new(&sources) {
         Ok(runner) => {
-            metrics.set_scripts_loaded(count);
             handle.set(if empty {
                 None
             } else {
                 Some(Arc::new(runner) as Arc<dyn ScriptRunner>)
             });
+            // As above, only after the swap.
+            metrics.set_scripts_loaded(count);
         }
         Err(e) => {
             warn!("failed to compile Lua scripts: {}", e);
