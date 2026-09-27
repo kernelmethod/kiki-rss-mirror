@@ -49,6 +49,17 @@ curl \
     http://localhost/v1/feeds/fetch/$id
 ```
 
+To move feeds in or out of Kiki from another aggregator, use OPML. Folders in
+the OPML file become tags, and feeds that are already present are skipped:
+
+```bash
+kiki opml import subscriptions.opml   # or `-` to read from stdin
+kiki opml export -o subscriptions.opml
+```
+
+Both commands work on the same database `kiki serve` uses, and a running
+server starts fetching imported feeds within a few seconds.
+
 ## Where Kiki keeps its files
 
 | | Default |

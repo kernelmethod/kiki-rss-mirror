@@ -14,6 +14,7 @@ pub mod docs;
 pub mod fetcher;
 pub mod http;
 pub mod metrics;
+pub mod opml;
 pub mod process;
 pub mod routes;
 pub mod sandbox;
