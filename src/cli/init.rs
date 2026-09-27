@@ -89,7 +89,7 @@ impl InitArgs {
             }
 
             if !self.force {
-                bail!("A database has already been set up at {:#?}", &db_path);
+                bail!("A database has already been set up at {:#?}", db_path);
             }
 
             fs::remove_file(&db_path)
