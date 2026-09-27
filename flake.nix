@@ -30,8 +30,8 @@
               };
             strictDeps = true;
 
-            # The test suite already runs in the CI "Tests" job; running it
-            # here too roughly doubles the Nix build time (release + LTO).
+            # The test suite already runs in checks.tests; running it here too
+            # roughly doubles the Nix build time (release + LTO).
             doCheck = false;
 
             buildInputs = [ pkgs.openssl ];
@@ -44,6 +44,30 @@
           kiki = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
           });
+
+          # Dev-profile builds for the clippy and test checks, so they don't
+          # pay for release optimizations and LTO.
+          devArgs = commonArgs // {
+            CARGO_PROFILE = "";
+            # Line tables are enough for backtraces, and full debug info
+            # noticeably slows down codegen.
+            CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
+          };
+
+          devDeps = craneLib.buildDepsOnly devArgs;
+
+          # Fully static musl binary for GitHub releases. crane cross-compiles
+          # with pkgsStatic's build-platform rustc, which the binary cache
+          # carries, and a musl C toolchain for the -sys crates.
+          craneLibStatic = crane.mkLib pkgs.pkgsStatic;
+
+          static = craneLibStatic.buildPackage {
+            inherit (commonArgs) src strictDeps doCheck;
+            # pkgsStatic adds -static to every link, including the glibc
+            # build scripts, which then fail to link. rustc already links
+            # musl binaries statically, so drop it.
+            preBuild = "unset NIX_CFLAGS_LINK";
+          };
 
           # rustdoc for the kiki_rss crate, including the guides pulled in
           # from src/docs/*.md. The HTML lands in $out/share/doc.
@@ -91,11 +115,27 @@
         {
           checks = {
             inherit kiki;
+
+            fmt = craneLib.cargoFmt {
+              inherit (commonArgs) src;
+            };
+
+            clippy = craneLib.cargoClippy (devArgs // {
+              cargoArtifacts = devDeps;
+              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+            });
+
+            tests = craneLib.cargoTest (devArgs // {
+              cargoArtifacts = devDeps;
+              doCheck = true;
+            });
           };
 
           packages = {
             default = kiki;
             inherit docs coverage;
+          } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+            inherit static;
           };
 
           devShells.default = craneLib.devShell {
