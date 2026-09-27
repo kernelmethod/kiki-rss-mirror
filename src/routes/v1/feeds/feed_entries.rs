@@ -12,12 +12,15 @@ use tokio::task;
 use tracing::{event, Level};
 
 const DEFAULT_LIMIT: usize = 50;
+/// Largest page size a client may request; larger values are clamped to this.
+const MAX_LIMIT: usize = 200;
 
 #[derive(Deserialize, utoipa::IntoParams)]
 pub struct FeedEntriesQueryParams {
     /// Number of records to skip (default: 0).
     pub offset: Option<usize>,
-    /// Maximum number of records to return (default: 50).
+    /// Maximum number of records to return (default: 50, max: 200). Larger
+    /// values are clamped to 200; the response reports the limit that was applied.
     pub limit: Option<usize>,
 }
 
@@ -66,7 +69,7 @@ pub async fn feed_entries(
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
     let offset = params.offset.unwrap_or(0);
-    let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
+    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
 
     let result = task::spawn_blocking(move || {
         // Check if feed exists
@@ -417,17 +420,56 @@ mod test {
         }
 
         // A limit larger than the feed returns everything.
-        let resp = get_entries(&client, feed_id, "?limit=1000").await?;
+        let resp = get_entries(&client, feed_id, "?limit=100").await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<FeedEntriesResponse>().await?;
         assert_eq!(ids(&body), all_ids);
-        assert_eq!(body.limit, 1000);
+        assert_eq!(body.limit, 100);
 
         // A page that straddles the end is truncated.
         let resp = get_entries(&client, feed_id, "?offset=3&limit=10").await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<FeedEntriesResponse>().await?;
         assert_eq!(body.entries.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_limit_is_capped() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let feed_id = insert_feed(&tc, "capped")?;
+        insert_entries(&tc, feed_id, MAX_LIMIT + 10)?;
+
+        // The cap itself is honoured exactly.
+        let resp = get_entries(&client, feed_id, &format!("?limit={MAX_LIMIT}")).await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert_eq!(body.entries.len(), MAX_LIMIT);
+        assert_eq!(body.limit, MAX_LIMIT);
+
+        // Anything larger is clamped, including values that don't fit in an
+        // SQLite integer.
+        for limit in [MAX_LIMIT + 1, 1_000_000, usize::MAX] {
+            let resp = get_entries(&client, feed_id, &format!("?limit={limit}")).await?;
+            assert_eq!(resp.status(), StatusCode::OK, "limit {limit}");
+            let body = resp.json::<FeedEntriesResponse>().await?;
+            assert_eq!(body.entries.len(), MAX_LIMIT, "limit {limit}");
+            assert_eq!(body.limit, MAX_LIMIT, "limit {limit}");
+            assert_eq!(body.count, MAX_LIMIT + 10);
+        }
+
+        // The remainder is reachable by paging past the cap.
+        let resp = get_entries(
+            &client,
+            feed_id,
+            &format!("?offset={MAX_LIMIT}&limit={}", usize::MAX),
+        )
+        .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert_eq!(body.entries.len(), 10);
 
         Ok(())
     }
