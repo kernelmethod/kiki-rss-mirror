@@ -43,7 +43,8 @@ enum FeedEntriesTaskError {
 
 /// List entries
 ///
-/// List all of the entries belonging to a specific feed.
+/// List all of the entries belonging to a specific feed, newest first. Entries
+/// with the same publication time are ordered by descending ID.
 #[utoipa::path(
     get,
     path = "/v1/feeds/id/{id}/entries",
@@ -96,6 +97,7 @@ pub async fn feed_entries(
                 "SELECT id, feed_id, source_id, syndication_format,
                         guid, published_at, title, url, content
                  FROM entries WHERE feed_id = ?1
+                 ORDER BY published_at DESC, id DESC
                  LIMIT ?2 OFFSET ?3",
             )
             .inspect_err(|e| {
@@ -327,6 +329,45 @@ mod test {
         let body = resp.json::<FeedEntriesResponse>().await?;
         assert_eq!(body.count, 0);
         assert!(body.entries.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_ordering() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let feed_id = insert_feed(&tc, "ordered")?;
+        let other = insert_feed(&tc, "other")?;
+
+        // Insert out of chronological order, with two entries sharing a
+        // timestamp and an entry from another feed in between.
+        let middle = insert_entry(&tc, Some(feed_id), "middle", 2_000, None)?;
+        let oldest = insert_entry(&tc, Some(feed_id), "oldest", 1_000, None)?;
+        let tie_first = insert_entry(&tc, Some(feed_id), "tie-first", 3_000, None)?;
+        insert_entry(&tc, Some(other), "other", 2_500, None)?;
+        let tie_second = insert_entry(&tc, Some(feed_id), "tie-second", 3_000, None)?;
+        let newest = insert_entry(&tc, Some(feed_id), "newest", 4_000, None)?;
+
+        // Newest first, with ties broken by descending ID.
+        let expected = vec![newest, tie_second, tie_first, middle, oldest];
+
+        let resp = get_entries(&client, feed_id, "").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        let ids: Vec<i64> = body.entries.iter().map(|e| e.id).collect();
+        assert_eq!(ids, expected);
+
+        // Paging through the feed yields the same order, including across the
+        // tie at a page boundary.
+        let mut paged = Vec::new();
+        for offset in (0..expected.len()).step_by(2) {
+            let resp = get_entries(&client, feed_id, &format!("?offset={offset}&limit=2")).await?;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.json::<FeedEntriesResponse>().await?;
+            paged.extend(body.entries.iter().map(|e| e.id));
+        }
+        assert_eq!(paged, expected);
 
         Ok(())
     }
