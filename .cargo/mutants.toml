@@ -1,0 +1,12 @@
+# Configuration for cargo-mutants (https://mutants.rs).
+#
+# Run on a few files at a time, e.g.
+#   cargo mutants -f src/tasks/backoff.rs -f src/tasks/cache.rs
+
+exclude_re = [
+    # The early return for empty or all-covering skip masks only saves work:
+    # without it the loop finds no skipped hour and returns `ts` unchanged,
+    # or never finds an allowed one and returns `ts` after 192 steps.
+    # Either way the result is the same, so no test can tell them apart.
+    "replace \\|\\| with && in defer_past_skipped",
+]
