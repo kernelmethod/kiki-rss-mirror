@@ -500,18 +500,28 @@ impl TestConfig {
     /// Create an HTTP client to connect to the test server being run
     /// in the background.
     pub fn client(&self) -> Result<reqwest::Client> {
+        Ok(self.client_builder()?.build()?)
+    }
+
+    /// Wait for the test server to accept connections, then return a client
+    /// builder pointed at its socket, for tests that need to customize the
+    /// client.
+    pub fn client_builder(&self) -> Result<reqwest::ClientBuilder> {
         let p = self.socket_path();
 
-        // The server may take a little bit of time to start up.
-        // We spin and wait until it's available.
+        // The server may take a little bit of time to start up, so spin until
+        // it accepts a connection. The socket file alone isn't enough: it
+        // appears at bind(2), and connecting before the listen(2) that
+        // follows fails with ECONNREFUSED.
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
-            if !p.exists() {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
+            if self.server_handle.as_ref().is_some_and(|h| h.is_finished()) {
+                bail!("HTTP server exited before listening on {:?}", &p);
             }
-
-            return Ok(reqwest::Client::builder().unix_socket(p).build()?);
+            if std::os::unix::net::UnixStream::connect(&p).is_ok() {
+                return Ok(reqwest::Client::builder().unix_socket(p));
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
 
         bail!("HTTP server has not been started on {:?}", &p);

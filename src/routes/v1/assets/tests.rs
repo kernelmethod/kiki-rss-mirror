@@ -118,17 +118,10 @@ async fn get_asset_unknown_hash_is_404() -> Result<()> {
 #[tokio::test]
 async fn get_asset_by_url_redirects_when_cached() -> Result<()> {
     let tc = TestBuilder::all().build()?;
-    // Wait for the unix socket before building the client, mirroring
-    // `TestConfig::client()` but with redirects disabled so the 302 is
-    // observable.
-    let socket_path = tc.socket_path();
-    let start = std::time::Instant::now();
-    while !socket_path.exists() && start.elapsed() < std::time::Duration::from_secs(5) {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    let raw_client = reqwest::Client::builder()
+    // Disable redirects so the 302 is observable.
+    let raw_client = tc
+        .client_builder()?
         .redirect(reqwest::redirect::Policy::none())
-        .unix_socket(socket_path)
         .build()?;
 
     let hash = seed_asset(&tc, b"xyz", "http://src.example/q.png")?;
