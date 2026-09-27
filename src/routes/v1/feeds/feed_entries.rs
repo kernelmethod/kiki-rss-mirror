@@ -137,3 +137,379 @@ pub async fn feed_entries(
         Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod test {
+    use super::*;
+    use crate::test::{TestBuilder, TestConfig};
+    use anyhow::Result;
+    use std::collections::HashSet;
+
+    fn insert_feed(tc: &TestConfig, title: &str) -> Result<i64> {
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (title, url, syndication_format) VALUES (?1, ?2, 'rss')",
+            [title, &format!("https://example.com/{title}.xml")],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn insert_entry(
+        tc: &TestConfig,
+        feed_id: Option<i64>,
+        guid: &str,
+        published_at: i64,
+        content: Option<&str>,
+    ) -> Result<i64> {
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO entries
+                (feed_id, syndication_format, guid, published_at, title, url, content)
+             VALUES (?1, 'rss', ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                feed_id,
+                guid,
+                published_at,
+                format!("title {guid}"),
+                format!("https://example.com/{guid}"),
+                content,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Insert `n` entries into a feed and return their IDs.
+    fn insert_entries(tc: &TestConfig, feed_id: i64, n: usize) -> Result<Vec<i64>> {
+        (0..n)
+            .map(|i| {
+                insert_entry(
+                    tc,
+                    Some(feed_id),
+                    &format!("feed{feed_id}-guid-{i:03}"),
+                    1_700_000_000 + i as i64,
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    async fn get_entries(
+        client: &reqwest::Client,
+        feed_id: impl std::fmt::Display,
+        query: &str,
+    ) -> Result<reqwest::Response> {
+        Ok(client
+            .get(format!(
+                "http://localhost/v1/feeds/id/{feed_id}/entries{query}"
+            ))
+            .send()
+            .await?)
+    }
+
+    fn ids(resp: &FeedEntriesResponse) -> HashSet<i64> {
+        resp.entries.iter().map(|e| e.id).collect()
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_empty_feed() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let feed_id = insert_feed(&tc, "empty")?;
+
+        let resp = get_entries(&client, feed_id, "").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert!(body.entries.is_empty());
+        assert_eq!(body.count, 0);
+        assert_eq!(body.offset, 0);
+        assert_eq!(body.limit, DEFAULT_LIMIT);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_not_found() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        for query in ["", "?offset=0&limit=10"] {
+            let resp = get_entries(&client, 12345, query).await?;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert_eq!(resp.text().await?, "Feed not found");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_response_fields() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let feed_id = insert_feed(&tc, "fields")?;
+        let with_content = insert_entry(
+            &tc,
+            Some(feed_id),
+            "with-content",
+            1_700_000_000,
+            Some("<p>hi</p>"),
+        )?;
+        let without_content = insert_entry(&tc, Some(feed_id), "no-content", 0, None)?;
+
+        let resp = get_entries(&client, feed_id, "").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert_eq!(body.count, 2);
+        assert_eq!(body.entries.len(), 2);
+
+        let entry = body
+            .entries
+            .iter()
+            .find(|e| e.id == with_content)
+            .expect("entry with content should be listed");
+        assert_eq!(entry.feed_id, Some(feed_id));
+        assert_eq!(entry.source_id, None);
+        assert_eq!(entry.syndication_format, "rss");
+        assert_eq!(entry.guid, "with-content");
+        assert_eq!(
+            entry.published_at.as_deref(),
+            Some("2023-11-14T22:13:20+00:00")
+        );
+        assert_eq!(entry.title, "title with-content");
+        assert_eq!(entry.url, "https://example.com/with-content");
+        assert_eq!(entry.content.as_deref(), Some("<p>hi</p>"));
+
+        let entry = body
+            .entries
+            .iter()
+            .find(|e| e.id == without_content)
+            .expect("entry without content should be listed");
+        assert_eq!(
+            entry.published_at.as_deref(),
+            Some("1970-01-01T00:00:00+00:00")
+        );
+        assert_eq!(entry.content, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_only_returns_entries_for_feed() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let feed_a = insert_feed(&tc, "a")?;
+        let feed_b = insert_feed(&tc, "b")?;
+        let empty = insert_feed(&tc, "empty")?;
+        let a_ids: HashSet<i64> = insert_entries(&tc, feed_a, 3)?.into_iter().collect();
+        let b_ids: HashSet<i64> = insert_entries(&tc, feed_b, 5)?.into_iter().collect();
+        // Orphaned entries (e.g. from a feed deleted with delete_entries=false)
+        // must not leak into any feed's listing.
+        insert_entry(&tc, None, "orphan", 1_700_000_000, None)?;
+
+        let resp = get_entries(&client, feed_a, "").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert_eq!(body.count, 3);
+        assert_eq!(ids(&body), a_ids);
+        assert!(body.entries.iter().all(|e| e.feed_id == Some(feed_a)));
+
+        let resp = get_entries(&client, feed_b, "").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert_eq!(body.count, 5);
+        assert_eq!(ids(&body), b_ids);
+
+        let resp = get_entries(&client, empty, "").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert_eq!(body.count, 0);
+        assert!(body.entries.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_default_limit() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let feed_id = insert_feed(&tc, "big")?;
+        insert_entries(&tc, feed_id, DEFAULT_LIMIT + 5)?;
+
+        let resp = get_entries(&client, feed_id, "").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert_eq!(body.entries.len(), DEFAULT_LIMIT);
+        // `count` is the total for the feed, not the size of this page.
+        assert_eq!(body.count, DEFAULT_LIMIT + 5);
+        assert_eq!(body.offset, 0);
+        assert_eq!(body.limit, DEFAULT_LIMIT);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_pagination() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let feed_id = insert_feed(&tc, "paged")?;
+        let other = insert_feed(&tc, "other")?;
+        let all_ids: HashSet<i64> = insert_entries(&tc, feed_id, 10)?.into_iter().collect();
+        insert_entries(&tc, other, 4)?;
+
+        // Walking the feed in pages of 3 visits every entry exactly once.
+        let mut seen = HashSet::new();
+        for (offset, expected_len) in [(0, 3), (3, 3), (6, 3), (9, 1)] {
+            let resp = get_entries(&client, feed_id, &format!("?offset={offset}&limit=3")).await?;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.json::<FeedEntriesResponse>().await?;
+            assert_eq!(body.entries.len(), expected_len, "offset {offset}");
+            assert_eq!(body.count, 10);
+            assert_eq!(body.offset, offset);
+            assert_eq!(body.limit, 3);
+            for id in ids(&body) {
+                assert!(seen.insert(id), "entry {id} returned on more than one page");
+            }
+        }
+        assert_eq!(seen, all_ids);
+
+        // Offset alone uses the default limit.
+        let resp = get_entries(&client, feed_id, "?offset=8").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert_eq!(body.entries.len(), 2);
+        assert_eq!(body.offset, 8);
+        assert_eq!(body.limit, DEFAULT_LIMIT);
+
+        // Limit alone starts from the beginning.
+        let resp = get_entries(&client, feed_id, "?limit=4").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert_eq!(body.entries.len(), 4);
+        assert_eq!(body.offset, 0);
+        assert_eq!(body.limit, 4);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_pagination_edge_cases() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let feed_id = insert_feed(&tc, "edges")?;
+        let all_ids: HashSet<i64> = insert_entries(&tc, feed_id, 5)?.into_iter().collect();
+
+        // limit=0 returns no entries but still reports the total.
+        let resp = get_entries(&client, feed_id, "?limit=0").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert!(body.entries.is_empty());
+        assert_eq!(body.count, 5);
+        assert_eq!(body.limit, 0);
+
+        // An offset at or past the end yields an empty page, not an error.
+        for offset in [5, 6, 1000] {
+            let resp = get_entries(&client, feed_id, &format!("?offset={offset}")).await?;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.json::<FeedEntriesResponse>().await?;
+            assert!(body.entries.is_empty(), "offset {offset}");
+            assert_eq!(body.count, 5);
+            assert_eq!(body.offset, offset);
+        }
+
+        // A limit larger than the feed returns everything.
+        let resp = get_entries(&client, feed_id, "?limit=1000").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert_eq!(ids(&body), all_ids);
+        assert_eq!(body.limit, 1000);
+
+        // A page that straddles the end is truncated.
+        let resp = get_entries(&client, feed_id, "?offset=3&limit=10").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert_eq!(body.entries.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_malformed_requests() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let feed_id = insert_feed(&tc, "malformed")?;
+        insert_entries(&tc, feed_id, 2)?;
+
+        let resp = get_entries(&client, "not-a-number", "").await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        for query in [
+            "?offset=-1",
+            "?limit=-1",
+            "?offset=abc",
+            "?limit=abc",
+            "?limit=1.5",
+            "?offset=",
+        ] {
+            let resp = get_entries(&client, feed_id, query).await?;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {query}");
+        }
+
+        // Unknown query parameters are ignored.
+        let resp = get_entries(&client, feed_id, "?foo=bar").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert_eq!(body.count, 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_after_feed_deleted() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let feed_id = insert_feed(&tc, "doomed")?;
+        insert_entries(&tc, feed_id, 3)?;
+
+        let resp = client
+            .delete(format!(
+                "http://localhost/v1/feeds/id/{feed_id}?delete_entries=false"
+            ))
+            .send()
+            .await?;
+        assert!(resp.status().is_success());
+
+        // The entries survive, but the feed no longer exists.
+        let resp = get_entries(&client, feed_id, "").await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_from_fetched_feed() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let feed_id = tc
+            .add_feed_from_url("example", tc.example_feed_url())
+            .await?;
+
+        let resp = get_entries(&client, feed_id, "").await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<FeedEntriesResponse>().await?;
+        assert!(body.count > 0, "fetched feed should have entries");
+        assert_eq!(body.entries.len(), body.count.min(DEFAULT_LIMIT));
+        assert!(body.entries.iter().all(|e| e.feed_id == Some(feed_id)));
+        assert!(body.entries.iter().all(|e| e.published_at.is_some()));
+
+        // The per-feed count agrees with the database.
+        let conn = tc.database_conn()?;
+        let db_count: usize = conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
+            [feed_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(body.count, db_count);
+
+        Ok(())
+    }
+}
