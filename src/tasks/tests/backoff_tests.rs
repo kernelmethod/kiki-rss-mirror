@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use super::super::backoff::{compute_next_fetch_at, FetchOutcome};
+use super::super::backoff::{compute_next_fetch_at, defer_past_skipped, FetchOutcome};
 use super::super::FetchError;
 
 const MIN_CADENCE: u64 = 60;
@@ -189,4 +189,148 @@ fn test_compute_next_fetch_at_permanent_uses_max_backoff() {
         MIN_FETCH_INTERVAL,
     );
     assert_eq!(next, now + MAX_BACKOFF as i64);
+}
+
+/// Unix timestamp for a UTC date and time, for the skip-window tests.
+fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
+    chrono::NaiveDate::from_ymd_opt(y, mo, d)
+        .unwrap()
+        .and_hms_opt(h, mi, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp()
+}
+
+const MONDAY: u8 = 1 << 0;
+const SATURDAY: u8 = 1 << 5;
+const SUNDAY: u8 = 1 << 6;
+
+/// Without `<skipHours>` / `<skipDays>` the schedule is untouched.
+#[test]
+fn test_defer_past_skipped_no_masks() {
+    let ts = utc(2024, 1, 3, 10, 17);
+    assert_eq!(defer_past_skipped(ts, 0, 0), ts);
+}
+
+/// A time outside every skip window is untouched.
+#[test]
+fn test_defer_past_skipped_allowed_time_unchanged() {
+    // Wednesday 10:17, skipping 02:00-03:59 and weekends.
+    let ts = utc(2024, 1, 3, 10, 17);
+    assert_eq!(
+        defer_past_skipped(ts, (1 << 2) | (1 << 3), SATURDAY | SUNDAY),
+        ts
+    );
+}
+
+/// A time in a skipped hour moves to the top of the next allowed hour.
+#[test]
+fn test_defer_past_skipped_hours() {
+    let ts = utc(2024, 1, 3, 2, 40);
+    assert_eq!(
+        defer_past_skipped(ts, (1 << 2) | (1 << 3), 0),
+        utc(2024, 1, 3, 4, 0)
+    );
+}
+
+/// Skipped hours wrap past midnight into the next day.
+#[test]
+fn test_defer_past_skipped_hours_wrap_midnight() {
+    let ts = utc(2024, 1, 3, 23, 5);
+    assert_eq!(
+        defer_past_skipped(ts, (1 << 23) | (1 << 0), 0),
+        utc(2024, 1, 4, 1, 0)
+    );
+}
+
+/// A skipped day moves the fetch to midnight of the next allowed day.
+#[test]
+fn test_defer_past_skipped_days() {
+    // Saturday 2024-01-06 15:00, skipping the weekend.
+    let ts = utc(2024, 1, 6, 15, 0);
+    assert_eq!(
+        defer_past_skipped(ts, 0, SATURDAY | SUNDAY),
+        utc(2024, 1, 8, 0, 0)
+    );
+}
+
+/// Skipped days and hours combine: out of the weekend, then past Monday's
+/// skipped early hours.
+#[test]
+fn test_defer_past_skipped_days_and_hours() {
+    let ts = utc(2024, 1, 6, 23, 30);
+    assert_eq!(
+        defer_past_skipped(ts, (1 << 0) | (1 << 1), SATURDAY | SUNDAY),
+        utc(2024, 1, 8, 2, 0)
+    );
+}
+
+/// A feed that skips every hour or every day would never be fetched again;
+/// that is treated as a mistake and the skip masks are ignored.
+#[test]
+fn test_defer_past_skipped_all_skipped_is_ignored() {
+    let ts = utc(2024, 1, 3, 10, 17);
+    assert_eq!(defer_past_skipped(ts, (1 << 24) - 1, 0), ts);
+    assert_eq!(defer_past_skipped(ts, 0, 0x7f), ts);
+    // Bits outside the valid range don't count toward "everything".
+    assert_eq!(
+        defer_past_skipped(ts, !(1 << 11), MONDAY),
+        utc(2024, 1, 3, 11, 0)
+    );
+}
+
+/// `stale-if-error` shorter than `Retry-After` caps the retry, so we try
+/// again before the grace window closes (RFC 5861 §4).
+#[test]
+fn test_compute_next_fetch_at_stale_if_error_caps_retry_after() {
+    let now = 1_000_000;
+    let next = compute_next_fetch_at(
+        FetchOutcome::TransientErr {
+            retry_after_ts: Some(now + 7200),
+            consecutive_failures: 1,
+            stale_if_error_secs: Some(1800),
+        },
+        now,
+        MIN_CADENCE,
+        MAX_BACKOFF,
+        MIN_FETCH_INTERVAL,
+    );
+    assert_eq!(next, now + 1800);
+}
+
+/// A `Retry-After` shorter than `stale-if-error` is honored as is.
+#[test]
+fn test_compute_next_fetch_at_retry_after_within_stale_if_error() {
+    let now = 1_000_000;
+    let next = compute_next_fetch_at(
+        FetchOutcome::TransientErr {
+            retry_after_ts: Some(now + 600),
+            consecutive_failures: 1,
+            stale_if_error_secs: Some(3600),
+        },
+        now,
+        MIN_CADENCE,
+        MAX_BACKOFF,
+        MIN_FETCH_INTERVAL,
+    );
+    assert_eq!(next, now + 600);
+}
+
+/// A tiny `stale-if-error` still can't push a retry below the global
+/// `min_polling_cadence` floor.
+#[test]
+fn test_compute_next_fetch_at_stale_if_error_respects_min_cadence() {
+    let now = 1_000_000;
+    let next = compute_next_fetch_at(
+        FetchOutcome::TransientErr {
+            retry_after_ts: Some(now + 7200),
+            consecutive_failures: 1,
+            stale_if_error_secs: Some(5),
+        },
+        now,
+        MIN_CADENCE,
+        MAX_BACKOFF,
+        MIN_FETCH_INTERVAL,
+    );
+    assert_eq!(next, now + MIN_CADENCE as i64);
 }

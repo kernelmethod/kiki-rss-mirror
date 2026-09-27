@@ -170,11 +170,19 @@ pub(super) fn insert_atom_entry_data(
 }
 
 /// Insert the RSS-specific child rows for a single entry.
+///
+/// `content` is the value just written to `entries.content`. An RSS item's
+/// `<description>` is also its content, so the description is only stored
+/// when a script changed the content; otherwise the column is left NULL and
+/// readers fall back to `entries.content`.
 pub(super) fn insert_rss_entry_data(
     tx: &rusqlite::Transaction,
     entry_id: i64,
     data: &RssEntryIngestData,
+    content: Option<&str>,
 ) -> Result<()> {
+    let description = data.description.as_deref().filter(|d| Some(*d) != content);
+
     tx.execute("DELETE FROM rss_entry_data WHERE entry_id = ?1", [entry_id])?;
     tx.execute(
         "INSERT INTO rss_entry_data (
@@ -183,7 +191,7 @@ pub(super) fn insert_rss_entry_data(
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             entry_id,
-            data.description,
+            description,
             data.comments,
             data.author,
             data.enclosure_url,

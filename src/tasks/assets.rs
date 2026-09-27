@@ -200,12 +200,16 @@ pub fn unlink_asset_file(data_dir: &Path, blake3: &str) {
 /// Short-circuits to just linking the entry if an asset with the same
 /// `original_url` already exists in the index.
 ///
+/// After storing, evicts the oldest assets until the cache is back under
+/// `max_cache_bytes`.
+///
 /// Returns `Ok(())` even when the fetch fails — individual asset failures
 /// shouldn't block the rest of the entry. Errors are logged at WARN.
 pub async fn cache_asset(
     client: &reqwest::Client,
     pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     data_dir: &Path,
+    max_cache_bytes: i64,
     asset_url: &Url,
     entry_id: i64,
     kind: AssetKind,
@@ -310,9 +314,8 @@ pub async fn cache_asset(
 
         // Enforce cache cap inline. Cheap: one SUM and, in the common case
         // where we're under the cap, no deletes.
-        let max_bytes = crate::db::assets::get_cache_max_bytes(&conn).unwrap_or(i64::MAX);
-        if crate::db::assets::total_cache_size(&conn).unwrap_or(0) > max_bytes {
-            match crate::db::assets::evict_to(&mut conn, max_bytes) {
+        if crate::db::assets::total_cache_size(&conn).unwrap_or(0) > max_cache_bytes {
+            match crate::db::assets::evict_to(&mut conn, max_cache_bytes) {
                 Ok(deleted) => {
                     for h in deleted {
                         unlink_asset_file(&data_dir, &h);

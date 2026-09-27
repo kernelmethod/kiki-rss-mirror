@@ -15,8 +15,13 @@ pub(crate) async fn cache_entry_assets(
     client: &reqwest::Client,
     pool: &Pool<SqliteConnectionManager>,
     data_dir: &std::path::Path,
+    cache: &crate::config::AssetCacheSettings,
     entry_id: i64,
 ) -> Result<()> {
+    if !cache.enabled {
+        return Ok(());
+    }
+
     #[derive(Debug)]
     struct EntryCtx {
         content: Option<String>,
@@ -26,9 +31,6 @@ pub(crate) async fn cache_entry_assets(
 
     let ctx = {
         let conn = pool.get()?;
-        if !crate::db::assets::get_cache_enabled(&conn)? {
-            return Ok(());
-        }
         let row = conn
             .query_row(
                 "SELECT e.content, f.url, e.url, red.enclosure_url
@@ -82,6 +84,7 @@ pub(crate) async fn cache_entry_assets(
                 client,
                 pool,
                 data_dir,
+                cache.max_bytes,
                 &url,
                 entry_id,
                 assets::AssetKind::InlineImg,
@@ -103,6 +106,7 @@ pub(crate) async fn cache_entry_assets(
                 client,
                 pool,
                 data_dir,
+                cache.max_bytes,
                 &url,
                 entry_id,
                 assets::AssetKind::Enclosure,

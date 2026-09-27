@@ -25,8 +25,8 @@ pub use worker::{spawn_workers, worker_count};
 // this path (it imports them directly from the submodules instead).
 #[allow(unused_imports)]
 pub(crate) use entry_assets::cache_entry_assets;
-/// [`fetch::refresh_feed`] with an in-process fetcher around `client`,
-/// which is how the tests drive it.
+/// [`fetch::refresh_feed`] with an in-process fetcher around `client` and
+/// the default settings, which is how the tests drive it.
 #[cfg(test)]
 pub(crate) async fn refresh_feed(
     client: &reqwest::Client,
@@ -36,8 +36,41 @@ pub(crate) async fn refresh_feed(
     metrics: &crate::metrics::Metrics,
     task_tx: &async_channel::Sender<TaskManagerCommand>,
 ) -> anyhow::Result<()> {
+    let settings = crate::config::Settings::default();
+    refresh_feed_with_settings(
+        client,
+        feed_id,
+        pool,
+        &settings,
+        script_runner,
+        metrics,
+        task_tx,
+    )
+    .await
+}
+
+/// [`refresh_feed`] with explicit settings, for tests that tune them.
+#[cfg(test)]
+pub(crate) async fn refresh_feed_with_settings(
+    client: &reqwest::Client,
+    feed_id: i64,
+    pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    settings: &crate::config::Settings,
+    script_runner: Option<&dyn crate::scripting::ScriptRunner>,
+    metrics: &crate::metrics::Metrics,
+    task_tx: &async_channel::Sender<TaskManagerCommand>,
+) -> anyhow::Result<()> {
     let fetcher = crate::fetcher::Fetcher::InProcess(client.clone());
-    fetch::refresh_feed(&fetcher, feed_id, pool, script_runner, metrics, task_tx).await
+    fetch::refresh_feed(
+        &fetcher,
+        feed_id,
+        pool,
+        settings,
+        script_runner,
+        metrics,
+        task_tx,
+    )
+    .await
 }
 #[allow(unused_imports)]
 pub(crate) use maintenance::run_maintenance;

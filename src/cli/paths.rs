@@ -6,7 +6,8 @@
 //!
 //! Kiki keeps two kinds of state, and they belong in two different places:
 //!
-//! * **Persistent state** — the SQLite database and the cached asset tree —
+//! * **Persistent state** — the SQLite database, the settings file
+//!   ([`crate::config::CONFIG_FILE_NAME`]), and the cached asset tree —
 //!   lives in a *data directory*, defaulting to the platform's per-user data
 //!   location (`$XDG_DATA_HOME/kiki` on Linux, `~/Library/Application
 //!   Support/kiki` on macOS). This is the directory [`kiki init`] creates.

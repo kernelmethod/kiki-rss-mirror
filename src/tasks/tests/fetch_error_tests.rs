@@ -468,15 +468,14 @@ async fn test_body_too_large_error_honours_the_configured_cap() -> Result<()> {
     let feed_url = format!("http://{}/feed", addr);
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
-    {
-        let conn = tc.database_conn()?;
-        crate::db::settings::set_max_feed_bytes(&conn, CAP)?;
-    }
+    let mut settings = crate::config::Settings::default();
+    settings.feed_fetch.max_feed_bytes = CAP;
 
-    refresh_feed(
+    refresh_feed_with_settings(
         &client,
         feed_id,
         pool,
+        &settings,
         None,
         &super::test_metrics(),
         &super::test_tx(),
@@ -525,15 +524,14 @@ async fn test_body_within_configured_cap_is_ingested() -> Result<()> {
     let feed_url = format!("http://{}/feed", addr);
     let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
 
-    {
-        let conn = tc.database_conn()?;
-        crate::db::settings::set_max_feed_bytes(&conn, 8 * 1024 * 1024)?;
-    }
+    let mut settings = crate::config::Settings::default();
+    settings.feed_fetch.max_feed_bytes = 8 * 1024 * 1024;
 
-    refresh_feed(
+    refresh_feed_with_settings(
         &client,
         feed_id,
         pool,
+        &settings,
         None,
         &super::test_metrics(),
         &super::test_tx(),

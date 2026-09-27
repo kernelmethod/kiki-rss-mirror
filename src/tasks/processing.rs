@@ -213,7 +213,7 @@ pub(super) fn process_rss_feed(
             |row| row.get(0),
         )?;
 
-        insert_rss_entry_data(&tx, entry_id, &ingest)?;
+        insert_rss_entry_data(&tx, entry_id, &ingest, feed_entry.content.as_deref())?;
         tx.commit()?;
         metrics.record_feed_entry_upserted("rss");
         inserted_entry_ids.push(entry_id);

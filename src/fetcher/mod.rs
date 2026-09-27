@@ -204,10 +204,69 @@ pub enum ParsedFeed {
     Atom {
         feed: Box<AtomFeedIngestData>,
         entries: Vec<AtomEntry>,
+        hints: FeedHints,
     },
     Rss {
         entries: Vec<RssEntry>,
+        hints: FeedHints,
     },
+}
+
+/// Refresh hints a publisher declares in the feed document itself, as
+/// opposed to in HTTP response headers.
+///
+/// Covers RSS 2.0 `<ttl>`, `<skipHours>` and `<skipDays>`, and the RSS 1.0
+/// Syndication module (`sy:updatePeriod` / `sy:updateFrequency`), which
+/// also turns up in RSS 2.0 and Atom feeds.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::fetcher::{parse_feed, FeedHints};
+///
+/// let rss = br#"<rss version="2.0"><channel><title>t</title><link>http://x/</link>
+///     <description>d</description><ttl>90</ttl>
+///     <skipDays><day>Sunday</day></skipDays></channel></rss>"#;
+/// let parsed = parse_feed(1, rss).expect("valid RSS");
+/// let hints = parsed.hints();
+/// assert_eq!(hints.ttl_secs, Some(90 * 60));
+/// assert_eq!(hints.refresh_hint_secs(), Some(90 * 60));
+/// assert_eq!(hints.skip_days, 1 << 6);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedHints {
+    /// RSS `<ttl>`, converted from minutes to seconds. `None` when absent,
+    /// unparseable, or zero.
+    pub ttl_secs: Option<u64>,
+
+    /// Seconds between updates according to `sy:updatePeriod` divided by
+    /// `sy:updateFrequency`. `None` when the feed carries no Syndication
+    /// module elements.
+    pub update_interval_secs: Option<u64>,
+
+    /// RSS `<skipHours>` as a bitmask: bit `h` set means the feed asks not
+    /// to be read during hour `h` (0–23, UTC).
+    pub skip_hours: u32,
+
+    /// RSS `<skipDays>` as a bitmask: bit 0 is Monday through bit 6,
+    /// Sunday (days are interpreted in UTC).
+    pub skip_days: u8,
+}
+
+impl FeedHints {
+    /// The feed's own statement of how long it can go between refreshes,
+    /// in seconds.
+    ///
+    /// When both `<ttl>` and the Syndication module are present the longer
+    /// of the two is used: each is a publisher saying nothing new is
+    /// expected sooner, so the politer reading wins. Returns `None` when
+    /// the feed declares neither.
+    pub fn refresh_hint_secs(&self) -> Option<u64> {
+        match (self.ttl_secs, self.update_interval_secs) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 impl ParsedFeed {
@@ -223,7 +282,14 @@ impl ParsedFeed {
     pub fn entry_count(&self) -> usize {
         match self {
             ParsedFeed::Atom { entries, .. } => entries.len(),
-            ParsedFeed::Rss { entries } => entries.len(),
+            ParsedFeed::Rss { entries, .. } => entries.len(),
+        }
+    }
+
+    /// Refresh hints declared in the feed document.
+    pub fn hints(&self) -> &FeedHints {
+        match self {
+            ParsedFeed::Atom { hints, .. } | ParsedFeed::Rss { hints, .. } => hints,
         }
     }
 }

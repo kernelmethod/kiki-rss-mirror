@@ -233,6 +233,10 @@ async fn maintenance_commands_end_to_end_via_worker() -> Result<()> {
         1,
         std::sync::Arc::new(super::test_metrics()),
         std::path::PathBuf::from("."),
+        std::sync::Arc::new(crate::config::ConfigStore::open(
+            tc.database_path()
+                .with_file_name(crate::config::CONFIG_FILE_NAME),
+        )?),
         crate::scripting::ScriptRunnerHandle::empty(),
         crate::fetcher::Fetcher::in_process()?,
     );

@@ -281,6 +281,7 @@ mod test {
         assert_eq!(rss["enclosure_mime_type"], "audio/mpeg");
         assert_eq!(rss["author"], "alice@example.com (Alice)");
         assert_eq!(rss["comments"], "http://example.com/items/1/comments");
+        assert_eq!(rss["description"], "A full-featured item.");
 
         let cats = rss["categories"].as_array().unwrap();
         assert_eq!(cats.len(), 2);

@@ -1338,14 +1338,12 @@ async fn test_expires_rfc850_format_is_parsed() -> Result<()> {
     Ok(())
 }
 
-/// Set `force_refresh_after_secs` on the test database so the next forced
-/// refresh fires immediately.
-fn set_force_refresh_after_secs(conn: &rusqlite::Connection, secs: u64) {
-    conn.execute(
-        "UPDATE settings SET value = ?1 WHERE key = 'force_refresh_after_secs'",
-        rusqlite::params![secs.to_string()],
-    )
-    .unwrap();
+/// Settings with `force_refresh_after_seconds` set to `secs`, so a forced
+/// refresh can be made to fire immediately.
+fn with_force_refresh_after_secs(secs: u64) -> crate::config::Settings {
+    let mut settings = crate::config::Settings::default();
+    settings.feed_fetch.force_refresh_after_seconds = secs;
+    settings
 }
 
 /// A server that keeps returning the same `ETag` while silently changing
@@ -1365,15 +1363,16 @@ async fn test_forced_refresh_detects_validator_lie() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     // Force refresh should fire on the very next eligible fetch.
-    set_force_refresh_after_secs(&tc.database_conn()?, 0);
+    let settings = with_force_refresh_after_secs(0);
 
     let metrics = super::test_metrics();
 
     // First fetch: normal 200, records baseline body hash + last_full_refresh_at.
-    refresh_feed(
+    refresh_feed_with_settings(
         &client,
         feed_id,
         pool.clone(),
+        &settings,
         None,
         &metrics,
         &super::test_tx(),
@@ -1400,7 +1399,16 @@ async fn test_forced_refresh_detects_validator_lie() -> Result<()> {
 
     // Second fetch: force_refresh_after_secs=0 skips conditionals, so the
     // server serves the new body under the old ETag.
-    refresh_feed(&client, feed_id, pool, None, &metrics, &super::test_tx()).await?;
+    refresh_feed_with_settings(
+        &client,
+        feed_id,
+        pool,
+        &settings,
+        None,
+        &metrics,
+        &super::test_tx(),
+    )
+    .await?;
 
     let expected_hash_b = blake3::hash(&body_b).to_hex().to_string();
     let stored_hash_after: Option<String> = conn.query_row(
@@ -1452,14 +1460,15 @@ async fn test_forced_refresh_match_does_not_fire_lie() -> Result<()> {
     tc.init_feed_server_with_state(state.clone()).await?;
 
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
-    set_force_refresh_after_secs(&tc.database_conn()?, 0);
+    let settings = with_force_refresh_after_secs(0);
 
     let metrics = super::test_metrics();
 
-    refresh_feed(
+    refresh_feed_with_settings(
         &client,
         feed_id,
         pool.clone(),
+        &settings,
         None,
         &metrics,
         &super::test_tx(),
@@ -1469,7 +1478,16 @@ async fn test_forced_refresh_match_does_not_fire_lie() -> Result<()> {
     let conn = tc.database_conn()?;
     reset_last_checked(&conn, feed_id);
 
-    refresh_feed(&client, feed_id, pool, None, &metrics, &super::test_tx()).await?;
+    refresh_feed_with_settings(
+        &client,
+        feed_id,
+        pool,
+        &settings,
+        None,
+        &metrics,
+        &super::test_tx(),
+    )
+    .await?;
 
     let rendered = metrics.render();
     assert!(
@@ -1481,5 +1499,465 @@ async fn test_forced_refresh_match_does_not_fire_lie() -> Result<()> {
         "forced-refresh counter should record the match; got:\n{rendered}"
     );
 
+    Ok(())
+}
+
+/// Read the stored `(header_etag, header_last_modified)` for a feed.
+fn stored_validators(
+    conn: &rusqlite::Connection,
+    feed_id: i64,
+) -> (Option<String>, Option<String>) {
+    conn.query_row(
+        "SELECT header_etag, header_last_modified FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap()
+}
+
+/// Fetch once to store validators, then make the feed eligible again.
+async fn fetch_and_reset(
+    tc: &crate::test::TestConfig,
+    client: &reqwest::Client,
+    feed_id: i64,
+    pool: &r2d2::Pool<SqliteConnectionManager>,
+) -> Result<()> {
+    refresh_feed(
+        client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+    reset_last_checked(&tc.database_conn()?, feed_id);
+    Ok(())
+}
+
+/// A 304 that carries a new `ETag` replaces the stored one (RFC 9111
+/// §4.3.4), and the new value is what the next request revalidates with.
+#[tokio::test]
+async fn test_304_rotated_etag_is_stored_and_sent() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+
+    // The server revalidates "v1" but announces "v2" on the 304.
+    state.lock().unwrap().not_modified_etag = Some("\"v2\"".into());
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    assert_eq!(state.lock().unwrap().not_modified_count, 1);
+    assert_eq!(
+        stored_validators(&tc.database_conn()?, feed_id)
+            .0
+            .as_deref(),
+        Some("\"v2\"")
+    );
+
+    // From now on the server only recognizes "v2".
+    {
+        let mut s = state.lock().unwrap();
+        s.etag = Some("\"v2\"".into());
+        s.not_modified_etag = None;
+    }
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    let s = state.lock().unwrap();
+    assert_eq!(s.last_if_none_match.as_deref(), Some("\"v2\""));
+    assert_eq!(
+        s.not_modified_count, 2,
+        "the rotated ETag should revalidate"
+    );
+    assert_eq!(s.full_response_count, 1);
+    Ok(())
+}
+
+/// A 304 that carries a new `Last-Modified` replaces the stored one.
+#[tokio::test]
+async fn test_304_rotated_last_modified_is_stored_and_sent() -> Result<()> {
+    let lm1 = "Mon, 01 Jan 2024 00:00:00 GMT";
+    let lm2 = "Tue, 02 Jan 2024 00:00:00 GMT";
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        last_modified: Some(lm1.into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    state.lock().unwrap().not_modified_last_modified = Some(lm2.into());
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    assert_eq!(
+        stored_validators(&tc.database_conn()?, feed_id)
+            .1
+            .as_deref(),
+        Some(lm2)
+    );
+
+    {
+        let mut s = state.lock().unwrap();
+        s.last_modified = Some(lm2.into());
+        s.not_modified_last_modified = None;
+    }
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    let s = state.lock().unwrap();
+    assert_eq!(s.last_if_modified_since.as_deref(), Some(lm2));
+    assert_eq!(s.not_modified_count, 2);
+    Ok(())
+}
+
+/// A 304 that omits the validators keeps the stored ones.
+#[tokio::test]
+async fn test_304_without_validators_keeps_stored_ones() -> Result<()> {
+    let lm = "Mon, 01 Jan 2024 00:00:00 GMT";
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        last_modified: Some(lm.into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    assert_eq!(state.lock().unwrap().not_modified_count, 1);
+    assert_eq!(
+        stored_validators(&tc.database_conn()?, feed_id),
+        (Some("\"v1\"".into()), Some(lm.into()))
+    );
+    Ok(())
+}
+
+/// `Cache-Control: no-store` on a 304 clears the stored validators, as it
+/// does on a 200.
+#[tokio::test]
+async fn test_304_no_store_clears_validators() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    // Only after the first 200, so it stores the validators.
+    state.lock().unwrap().cache_control = Some("no-store".into());
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    assert_eq!(state.lock().unwrap().not_modified_count, 1);
+    assert_eq!(
+        stored_validators(&tc.database_conn()?, feed_id),
+        (None, None)
+    );
+    Ok(())
+}
+
+/// A 304 carrying `immutable` with a `max-age` opens a new immutable
+/// window, so the next refresh sends no conditional headers (RFC 8246).
+#[tokio::test]
+async fn test_304_immutable_opens_window() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    state.lock().unwrap().cache_control = Some("immutable, max-age=3600".into());
+    let now = Utc::now().timestamp();
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    assert_eq!(state.lock().unwrap().not_modified_count, 1);
+
+    let (immutable_until, expires): (Option<i64>, Option<i64>) = tc.database_conn()?.query_row(
+        "SELECT header_immutable_until, header_expires FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let until = immutable_until.expect("the 304 should open an immutable window");
+    assert!((now + 3590..=now + 3610).contains(&until), "got {until}");
+    assert!(expires.is_some_and(|e| (now + 3590..=now + 3610).contains(&e)));
+
+    // Inside the window the next refresh must not revalidate.
+    let before = state.lock().unwrap().if_none_match_count;
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    let s = state.lock().unwrap();
+    assert_eq!(s.if_none_match_count, before);
+    assert_eq!(s.full_response_count, 2);
+    Ok(())
+}
+
+/// A 304 with no freshness headers leaves the stored expiry alone.
+#[tokio::test]
+async fn test_304_without_freshness_keeps_stored_expires() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        cache_control: Some("max-age=600".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    let read_expires = || -> Option<i64> {
+        tc.database_conn()
+            .unwrap()
+            .query_row(
+                "SELECT header_expires FROM feeds WHERE id = ?1",
+                [feed_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let stored = read_expires();
+    assert!(stored.is_some());
+
+    state.lock().unwrap().cache_control = None;
+    fetch_and_reset(&tc, &client, feed_id, &pool).await?;
+    assert_eq!(state.lock().unwrap().not_modified_count, 1);
+    assert_eq!(read_expires(), stored);
+    Ok(())
+}
+
+/// Run one `refresh_feed` with the default test settings.
+async fn refresh_once(
+    client: &reqwest::Client,
+    feed_id: i64,
+    pool: &r2d2::Pool<SqliteConnectionManager>,
+) -> Result<()> {
+    refresh_feed(
+        client,
+        feed_id,
+        pool.clone(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await
+}
+
+/// Read one nullable integer column from a feed row.
+fn feed_column(tc: &crate::test::TestConfig, feed_id: i64, column: &str) -> Option<i64> {
+    tc.database_conn()
+        .unwrap()
+        .query_row(
+            &format!("SELECT {column} FROM feeds WHERE id = ?1"),
+            [feed_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// `immutable` without a `max-age` has no freshness to cover: no immutable
+/// window is stored and the next refresh still revalidates.
+#[tokio::test]
+async fn test_immutable_without_max_age_still_revalidates() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        cache_control: Some("immutable".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    refresh_once(&client, feed_id, &pool).await?;
+    assert_eq!(feed_column(&tc, feed_id, "header_immutable_until"), None);
+
+    reset_last_checked(&tc.database_conn()?, feed_id);
+    refresh_once(&client, feed_id, &pool).await?;
+    let s = state.lock().unwrap();
+    assert_eq!(
+        s.if_none_match_count, 1,
+        "should revalidate with If-None-Match"
+    );
+    assert_eq!(s.not_modified_count, 1);
+    Ok(())
+}
+
+/// Once an immutable window has passed, conditional requests resume.
+#[tokio::test]
+async fn test_expired_immutable_window_resumes_revalidation() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        cache_control: Some("immutable, max-age=3600".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    refresh_once(&client, feed_id, &pool).await?;
+    assert!(feed_column(&tc, feed_id, "header_immutable_until").is_some());
+
+    // Move the window into the past and make the feed eligible.
+    let conn = tc.database_conn()?;
+    conn.execute(
+        "UPDATE feeds SET header_immutable_until = ?1 WHERE id = ?2",
+        rusqlite::params![Utc::now().timestamp() - 1, feed_id],
+    )?;
+    reset_last_checked(&conn, feed_id);
+
+    refresh_once(&client, feed_id, &pool).await?;
+    let s = state.lock().unwrap();
+    assert_eq!(s.if_none_match_count, 1, "expired window should revalidate");
+    assert_eq!(s.not_modified_count, 1);
+    assert_eq!(s.full_response_count, 1);
+    Ok(())
+}
+
+/// A `Date` ahead of our clock must not extend freshness past `max-age`.
+#[tokio::test]
+async fn test_future_date_does_not_extend_max_age() -> Result<()> {
+    let future_date = (Utc::now() + chrono::Duration::minutes(30))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        cache_control: Some("max-age=600".into()),
+        date: Some(future_date),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    let before = Utc::now().timestamp();
+    refresh_once(&client, feed_id, &pool).await?;
+
+    let expires = feed_column(&tc, feed_id, "header_expires").expect("header_expires set");
+    let next = feed_column(&tc, feed_id, "next_fetch_at").expect("next_fetch_at set");
+    for (what, ts) in [("header_expires", expires), ("next_fetch_at", next)] {
+        assert!(
+            (before + 595..=before + 610).contains(&ts),
+            "{what} should be ~now+600 despite the future Date; got offset {}",
+            ts - before
+        );
+    }
+    Ok(())
+}
+
+/// `Expires` in asctime format is parsed (RFC 9110 §5.6.7).
+#[tokio::test]
+async fn test_expires_asctime_format_is_parsed() -> Result<()> {
+    let future = Utc::now() + chrono::Duration::minutes(30);
+    let asctime = future.format("%a %b %e %H:%M:%S %Y").to_string();
+
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        expires: Some(asctime),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    let before = Utc::now().timestamp();
+    refresh_once(&client, feed_id, &pool).await?;
+
+    let stored = feed_column(&tc, feed_id, "header_expires")
+        .expect("header_expires should parse from asctime format");
+    assert!(
+        (before + 25 * 60..=before + 35 * 60).contains(&stored),
+        "asctime Expires should parse into a ~30min-future timestamp"
+    );
+    Ok(())
+}
+
+/// Refresh once against a server sending `Expires: expires`, and return
+/// the scheduled `next_fetch_at` offset from just before the refresh.
+async fn next_fetch_offset_with_expires(expires: String) -> Result<(i64, Option<i64>)> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        expires: Some(expires),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    let before = Utc::now().timestamp();
+    refresh_once(&client, feed_id, &pool).await?;
+    let next = feed_column(&tc, feed_id, "next_fetch_at").expect("next_fetch_at set");
+    Ok((next - before, feed_column(&tc, feed_id, "header_expires")))
+}
+
+/// An `Expires` already in the past gives no freshness, so the feed stays
+/// on its per-feed interval instead of being polled at the min-cadence
+/// floor.
+#[tokio::test]
+async fn test_past_expires_uses_per_feed_interval() -> Result<()> {
+    let past = (Utc::now() - chrono::Duration::hours(1))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    let (offset, stored) = next_fetch_offset_with_expires(past).await?;
+    assert!(stored.is_some(), "the server's Expires is still recorded");
+    assert!(
+        (10_800..=10_810).contains(&offset),
+        "should use the default 3h per-feed interval; got offset {offset}"
+    );
+    Ok(())
+}
+
+/// `Expires: 0` is invalid and means "already expired" (RFC 9111 §5.3):
+/// nothing is stored and, like a past `Expires`, the feed stays on its
+/// per-feed interval.
+#[tokio::test]
+async fn test_invalid_expires_gives_no_freshness() -> Result<()> {
+    let (offset, stored) = next_fetch_offset_with_expires("0".into()).await?;
+    assert_eq!(stored, None);
+    assert!(
+        (10_800..=10_810).contains(&offset),
+        "should use the default 3h per-feed interval; got offset {offset}"
+    );
+    Ok(())
+}
+
+/// Spin up a server that fails once with 503, `Retry-After: retry_after`
+/// and `Cache-Control: cache_control`, and return the scheduled
+/// `next_fetch_at` offset from just before the refresh.
+async fn retry_offset_with_stale_if_error(retry_after: &str, cache_control: &str) -> Result<i64> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        fail_next: 1,
+        fail_status: 503,
+        fail_retry_after: Some(retry_after.into()),
+        cache_control: Some(cache_control.into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+
+    let before = Utc::now().timestamp();
+    refresh_once(&client, feed_id, &pool).await?;
+    Ok(feed_column(&tc, feed_id, "next_fetch_at").expect("next_fetch_at set") - before)
+}
+
+/// A `Retry-After` that outlasts `stale-if-error` is cut short so we retry
+/// before the grace window closes (RFC 5861 §4).
+#[tokio::test]
+async fn test_stale_if_error_caps_retry_after() -> Result<()> {
+    let offset = retry_offset_with_stale_if_error("7200", "stale-if-error=1800").await?;
+    assert!(
+        (1795..=1810).contains(&offset),
+        "stale-if-error=1800 should cap Retry-After: 7200; got offset {offset}"
+    );
+    Ok(())
+}
+
+/// A `Retry-After` inside the `stale-if-error` window is honored as is.
+#[tokio::test]
+async fn test_retry_after_within_stale_if_error_is_honored() -> Result<()> {
+    let offset = retry_offset_with_stale_if_error("600", "stale-if-error=3600").await?;
+    assert!(
+        (595..=610).contains(&offset),
+        "Retry-After: 600 should be honored; got offset {offset}"
+    );
     Ok(())
 }

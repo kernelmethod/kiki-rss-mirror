@@ -8,6 +8,7 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::indexing_slicing)]
 
+pub mod config;
 pub mod db;
 pub mod docs;
 pub mod fetcher;

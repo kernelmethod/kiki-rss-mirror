@@ -11,45 +11,6 @@ CREATE TABLE migrations (
     applied_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    type  TEXT
-);
-
--- Default global settings.
-INSERT INTO settings (key, value, type)
-VALUES ('feed_update_timeout_seconds', '15', 'integer');
-INSERT INTO settings (key, value, type)
-VALUES ('feed_asset_cache_enabled', 'true', 'boolean');
-INSERT INTO settings (key, value, type)
-VALUES ('feed_asset_cache_max_bytes', '1073741824', 'integer');
-
--- Absolute floor on how often any single feed can be polled, in seconds.
--- Caps the effect of a very low `max-age` or `Retry-After` value so a
--- misbehaving server cannot trigger hyperpolling.
-INSERT INTO settings (key, value, type)
-VALUES ('min_polling_cadence_seconds', '60', 'integer');
-
--- Cap on exponential backoff and the wait used for permanent errors,
--- in seconds. Defaults to 24 hours.
-INSERT INTO settings (key, value, type)
-VALUES ('max_feed_backoff_seconds', '86400', 'integer');
-
--- How often, in seconds, to bypass conditional-request headers and force a
--- full GET on a feed. Lets us detect servers that keep serving the same
--- `ETag`/`Last-Modified` while the body has actually changed. Defaults to
--- 7 days.
-INSERT INTO settings (key, value, type)
-VALUES ('force_refresh_after_secs', '604800', 'integer');
-
--- Largest feed response body, in bytes, that will be read into memory.
--- Feeds are text and sit far below this; the cap exists so a hostile or
--- broken server cannot stream an unbounded body into the process.
--- Defaults to 32 MiB.
-INSERT INTO settings (key, value, type)
-VALUES ('max_feed_bytes', '33554432', 'integer');
-
 -- Persistent record of when recurring background tasks last ran, so their
 -- schedules survive server restarts. Keyed by an opaque task name.
 CREATE TABLE task_queue (
@@ -109,6 +70,20 @@ CREATE TABLE feeds (
     -- the future, conditional request headers (If-None-Match,
     -- If-Modified-Since) are omitted and the feed is not refetched.
     header_immutable_until  INTEGER,
+
+    -- Refresh hints the feed declares in its own markup, captured from the
+    -- most recent successfully parsed 200 response:
+    --   * feed_ttl_seconds: RSS <ttl>, converted from minutes.
+    --   * feed_update_interval_seconds: sy:updatePeriod / sy:updateFrequency.
+    --   * feed_skip_hours: RSS <skipHours> as a bitmask (bit h = hour h UTC).
+    --   * feed_skip_days: RSS <skipDays> as a bitmask (bit 0 = Monday).
+    -- The longer of the two intervals is a fallback freshness hint when the
+    -- HTTP response carries none; the skip masks defer every scheduled
+    -- fetch out of the hours and days the publisher asked us to avoid.
+    feed_ttl_seconds                INTEGER,
+    feed_update_interval_seconds    INTEGER,
+    feed_skip_hours                 INTEGER NOT NULL DEFAULT 0,
+    feed_skip_days                  INTEGER NOT NULL DEFAULT 0,
 
     -- Most recent fetch error message, if any. Cleared on successful fetch.
     last_fetch_error        VARCHAR,
@@ -232,7 +207,12 @@ CREATE INDEX idx_entry_tags_tag_id ON entry_tags(tag_id);
 -- relationship with `entries`.
 CREATE TABLE rss_entry_data (
     entry_id        INTEGER PRIMARY KEY,
+
+    -- The item's <description>, which is also stored as `entries.content`.
+    -- Only set when a script changed the content; NULL means "same as
+    -- entries.content" so the text is not stored twice.
     description     VARCHAR,
+
     comments        VARCHAR,
     author          VARCHAR,
 

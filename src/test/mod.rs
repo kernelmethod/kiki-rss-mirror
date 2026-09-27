@@ -67,6 +67,8 @@ pub struct FeedServerState {
     pub fail_next: usize,
     /// Status returned while `fail_next > 0`. Defaults to 503.
     pub fail_status: u16,
+    /// If set, forced failures carry this `Retry-After` header value.
+    pub fail_retry_after: Option<String>,
     /// If set, this value is returned as the response body instead of the
     /// default test RSS payload. Lets a test flip content mid-run while
     /// keeping validator headers (`etag`, `last_modified`) fixed.
@@ -81,6 +83,15 @@ pub struct FeedServerState {
     /// Number of `401 Unauthorized` responses served due to missing or
     /// mismatched `Authorization` headers.
     pub unauthorized_count: usize,
+    /// If set, a `304 Not Modified` carries this `ETag`. Lets a test
+    /// simulate a server that rotates its validator on revalidation.
+    pub not_modified_etag: Option<String>,
+    /// If set, a `304 Not Modified` carries this `Last-Modified`.
+    pub not_modified_last_modified: Option<String>,
+    /// The most recent `If-None-Match` header observed, if any.
+    pub last_if_none_match: Option<String>,
+    /// The most recent `If-Modified-Since` header observed, if any.
+    pub last_if_modified_since: Option<String>,
 }
 
 /// Convenience alias for the shared, mutable feed-server state.
@@ -301,6 +312,8 @@ impl TestConfig {
             if if_modified_since.is_some() {
                 s.if_modified_since_count += 1;
             }
+            s.last_if_none_match = if_none_match.map(str::to_string);
+            s.last_if_modified_since = if_modified_since.map(str::to_string);
 
             // Forced-failure branch: return the configured error status
             // without invoking the usual 200/304 logic.
@@ -313,10 +326,17 @@ impl TestConfig {
                 };
                 let cache_control = s.cache_control.clone();
                 let cache_control_extra = s.cache_control_extra.clone();
+                let retry_after = s.fail_retry_after.clone();
                 drop(s);
                 let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
                 let mut response = status.into_response();
                 append_cache_control_headers(&mut response, &cache_control, &cache_control_extra);
+                if let Some(ref retry_after) = retry_after {
+                    response.headers_mut().insert(
+                        axum::http::header::RETRY_AFTER,
+                        retry_after.parse().unwrap(),
+                    );
+                }
                 return response;
             }
 
@@ -335,9 +355,21 @@ impl TestConfig {
                 s.not_modified_count += 1;
                 let cache_control = s.cache_control.clone();
                 let cache_control_extra = s.cache_control_extra.clone();
+                let etag = s.not_modified_etag.clone();
+                let last_modified = s.not_modified_last_modified.clone();
                 drop(s);
                 let mut response = StatusCode::NOT_MODIFIED.into_response();
                 append_cache_control_headers(&mut response, &cache_control, &cache_control_extra);
+                if let Some(ref etag) = etag {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::ETAG, etag.parse().unwrap());
+                }
+                if let Some(ref lm) = last_modified {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::LAST_MODIFIED, lm.parse().unwrap());
+                }
                 return response;
             }
 

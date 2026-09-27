@@ -1,33 +1,64 @@
 //! Settings endpoint for how feed responses are fetched.
-use crate::db::settings as db_settings;
+use super::update_config;
+use crate::config::FeedFetchSettings;
 use crate::server::AppState;
 use axum::{
     extract::State,
-    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task;
-use tracing::{event, Level};
+
+const SECTION: &str = "feed_fetch";
 
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct FeedFetchSettingsResponse {
+    /// HTTP request timeout for a feed fetch, in seconds.
+    pub timeout_seconds: u64,
+    /// Minimum interval, in seconds, between polls of any one feed.
+    pub min_polling_cadence_seconds: u64,
+    /// Cap, in seconds, on backoff after failed fetches.
+    pub max_backoff_seconds: u64,
+    /// How often, in seconds, to skip conditional headers and force a full
+    /// fetch.
+    pub force_refresh_after_seconds: u64,
     /// Largest feed response body, in bytes, that will be read into memory.
     pub max_feed_bytes: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct FeedFetchSettingsRequest {
-    /// Largest feed response body, in bytes, to read into memory. Must be
-    /// greater than zero. Leave `null` to keep the current value.
-    pub max_feed_bytes: Option<u64>,
+impl From<&FeedFetchSettings> for FeedFetchSettingsResponse {
+    fn from(s: &FeedFetchSettings) -> Self {
+        FeedFetchSettingsResponse {
+            timeout_seconds: s.timeout_seconds,
+            min_polling_cadence_seconds: s.min_polling_cadence_seconds,
+            max_backoff_seconds: s.max_backoff_seconds,
+            force_refresh_after_seconds: s.force_refresh_after_seconds,
+            max_feed_bytes: s.max_feed_bytes,
+        }
+    }
 }
 
-fn read_settings(conn: &rusqlite::Connection) -> anyhow::Result<FeedFetchSettingsResponse> {
-    Ok(FeedFetchSettingsResponse {
-        max_feed_bytes: db_settings::get_max_feed_bytes(conn)?,
-    })
+/// Fields left `null` (or omitted) keep their current value.
+#[derive(Debug, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct FeedFetchSettingsRequest {
+    /// HTTP request timeout for a feed fetch, in seconds. Must be greater
+    /// than zero.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    /// Minimum interval, in seconds, between polls of any one feed.
+    #[serde(default)]
+    pub min_polling_cadence_seconds: Option<u64>,
+    /// Cap, in seconds, on backoff after failed fetches.
+    #[serde(default)]
+    pub max_backoff_seconds: Option<u64>,
+    /// How often, in seconds, to skip conditional headers and force a full
+    /// fetch.
+    #[serde(default)]
+    pub force_refresh_after_seconds: Option<u64>,
+    /// Largest feed response body, in bytes, to read into memory. Must be
+    /// greater than zero.
+    #[serde(default)]
+    pub max_feed_bytes: Option<u64>,
 }
 
 /// Get feed fetch settings.
@@ -37,40 +68,19 @@ fn read_settings(conn: &rusqlite::Connection) -> anyhow::Result<FeedFetchSetting
     responses(
         (status = 200, description = "Current feed fetch settings",
          body = FeedFetchSettingsResponse),
-        (status = 500, description = "Internal server error"),
     ),
     tag = "settings"
 )]
 #[axum::debug_handler]
-pub async fn get_feed_fetch_settings(State(state): State<AppState>) -> Result<Response, Response> {
-    let pool = state.conn_pool.clone();
-    let res = task::spawn_blocking(move || -> anyhow::Result<FeedFetchSettingsResponse> {
-        let conn = pool.get()?;
-        read_settings(&conn)
-    })
-    .await;
-
-    match res {
-        Ok(Ok(s)) => Ok(Json(s).into_response()),
-        Ok(Err(e)) => {
-            event!(Level::ERROR, "read feed fetch settings: {:?}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
-        }
-        Err(e) => {
-            event!(
-                Level::ERROR,
-                "task error in get feed fetch settings: {:?}",
-                e
-            );
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
-        }
-    }
+pub async fn get_feed_fetch_settings(State(state): State<AppState>) -> Response {
+    let settings = state.config.current();
+    Json(FeedFetchSettingsResponse::from(&settings.feed_fetch)).into_response()
 }
 
 /// Update feed fetch settings. Any field left `null` is unchanged.
 ///
-/// The new cap applies to the next fetch of every feed; no restart is
-/// needed. Lowering it does not retroactively affect already-stored
+/// Changes apply to the next fetch of every feed; no restart is needed.
+/// Lowering `max_feed_bytes` does not retroactively affect already-stored
 /// entries.
 #[utoipa::path(
     put,
@@ -80,6 +90,7 @@ pub async fn get_feed_fetch_settings(State(state): State<AppState>) -> Result<Re
         (status = 200, description = "Updated feed fetch settings",
          body = FeedFetchSettingsResponse),
         (status = 400, description = "Invalid value"),
+        (status = 409, description = "The config file on disk is invalid"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "settings"
@@ -89,39 +100,28 @@ pub async fn put_feed_fetch_settings(
     State(state): State<AppState>,
     Json(payload): Json<FeedFetchSettingsRequest>,
 ) -> Result<Response, Response> {
-    // A cap of zero would reject every feed, so refuse it at the boundary
-    // rather than letting the operator lock themselves out of all fetches.
-    if payload.max_feed_bytes == Some(0) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "max_feed_bytes must be greater than zero",
-        )
-            .into_response());
-    }
-
-    let pool = state.conn_pool.clone();
-    let res = task::spawn_blocking(move || -> anyhow::Result<FeedFetchSettingsResponse> {
-        let conn = pool.get()?;
-        if let Some(max_feed_bytes) = payload.max_feed_bytes {
-            db_settings::set_max_feed_bytes(&conn, max_feed_bytes)?;
+    let settings = update_config(&state, move |o| {
+        let fields = [
+            ("timeout_seconds", payload.timeout_seconds),
+            (
+                "min_polling_cadence_seconds",
+                payload.min_polling_cadence_seconds,
+            ),
+            ("max_backoff_seconds", payload.max_backoff_seconds),
+            (
+                "force_refresh_after_seconds",
+                payload.force_refresh_after_seconds,
+            ),
+            ("max_feed_bytes", payload.max_feed_bytes),
+        ];
+        for (key, value) in fields {
+            if let Some(value) = value {
+                o.set(SECTION, key, value)?;
+            }
         }
-        read_settings(&conn)
+        Ok(())
     })
-    .await;
+    .await?;
 
-    match res {
-        Ok(Ok(s)) => Ok(Json(s).into_response()),
-        Ok(Err(e)) => {
-            event!(Level::ERROR, "write feed fetch settings: {:?}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
-        }
-        Err(e) => {
-            event!(
-                Level::ERROR,
-                "task error in put feed fetch settings: {:?}",
-                e
-            );
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
-        }
-    }
+    Ok(Json(FeedFetchSettingsResponse::from(&settings.feed_fetch)).into_response())
 }

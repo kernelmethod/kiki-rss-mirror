@@ -34,7 +34,8 @@ pub async fn cleanup(State(state): State<AppState>) -> Result<Response, Response
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
-    let result = task::spawn_blocking(move || retention::cleanup_all(&conn)).await;
+    let max_age_days = state.config.current().retention.max_age_days;
+    let result = task::spawn_blocking(move || retention::cleanup_all(&conn, max_age_days)).await;
 
     match result {
         Ok(Ok(deleted_count)) => Ok(Json(CleanupResponse { deleted_count }).into_response()),

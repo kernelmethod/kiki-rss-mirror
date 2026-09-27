@@ -1,13 +1,10 @@
 //! Helpers for the feed asset cache.
 //!
 //! Cached asset bytes live on the filesystem; this module owns the SQLite
-//! index that maps `blake3` hashes and original URLs to those files, plus
-//! the two settings that govern the cache (enabled flag and size cap).
+//! index that maps `blake3` hashes and original URLs to those files. The
+//! settings that govern the cache live in [`crate::config::AssetCacheSettings`].
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
-
-const ENABLED_KEY: &str = "feed_asset_cache_enabled";
-const MAX_BYTES_KEY: &str = "feed_asset_cache_max_bytes";
 
 /// One row from the `feed_assets` table.
 #[derive(Debug, Clone)]
@@ -24,56 +21,6 @@ pub struct AssetRow {
 pub struct EntryAssetRow {
     pub asset: AssetRow,
     pub kind: String,
-}
-
-/// Returns whether the asset cache is enabled. Defaults to `true` if the
-/// setting row is missing (schema seeds it on init).
-pub fn get_cache_enabled(conn: &Connection) -> Result<bool> {
-    let value: Option<String> = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            [ENABLED_KEY],
-            |row| row.get(0),
-        )
-        .ok();
-    Ok(value.as_deref().map(|v| v == "true").unwrap_or(true))
-}
-
-/// Enable or disable asset caching.
-pub fn set_cache_enabled(conn: &Connection, enabled: bool) -> Result<()> {
-    let value = if enabled { "true" } else { "false" };
-    conn.execute(
-        "INSERT INTO settings (key, value, type) VALUES (?1, ?2, 'boolean')
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![ENABLED_KEY, value],
-    )
-    .with_context(|| "failed to upsert feed_asset_cache_enabled")?;
-    Ok(())
-}
-
-/// Returns the configured cache size cap in bytes.
-pub fn get_cache_max_bytes(conn: &Connection) -> Result<i64> {
-    let value: String = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            [MAX_BYTES_KEY],
-            |row| row.get(0),
-        )
-        .with_context(|| "failed to read feed_asset_cache_max_bytes setting")?;
-    value
-        .parse::<i64>()
-        .with_context(|| format!("invalid feed_asset_cache_max_bytes value: {}", value))
-}
-
-/// Set the cache size cap in bytes.
-pub fn set_cache_max_bytes(conn: &Connection, bytes: i64) -> Result<()> {
-    conn.execute(
-        "INSERT INTO settings (key, value, type) VALUES (?1, ?2, 'integer')
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![MAX_BYTES_KEY, bytes.to_string()],
-    )
-    .with_context(|| "failed to upsert feed_asset_cache_max_bytes")?;
-    Ok(())
 }
 
 /// Sum of `size_bytes` over all cached assets.
@@ -275,35 +222,6 @@ mod tests {
             .create()
             .build()
             .expect("build in-memory conn")
-    }
-
-    #[test]
-    fn default_enabled_is_true() {
-        let conn = mem_conn();
-        assert!(get_cache_enabled(&conn).unwrap());
-    }
-
-    #[test]
-    fn set_and_get_enabled() {
-        let conn = mem_conn();
-        set_cache_enabled(&conn, false).unwrap();
-        assert!(!get_cache_enabled(&conn).unwrap());
-        set_cache_enabled(&conn, true).unwrap();
-        assert!(get_cache_enabled(&conn).unwrap());
-    }
-
-    #[test]
-    fn default_max_bytes_seeded() {
-        let conn = mem_conn();
-        let n = get_cache_max_bytes(&conn).unwrap();
-        assert!(n > 0);
-    }
-
-    #[test]
-    fn set_and_get_max_bytes() {
-        let conn = mem_conn();
-        set_cache_max_bytes(&conn, 42).unwrap();
-        assert_eq!(get_cache_max_bytes(&conn).unwrap(), 42);
     }
 
     #[test]

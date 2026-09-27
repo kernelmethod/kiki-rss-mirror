@@ -346,12 +346,15 @@ async fn stress_refresh_vs_cleanup_race() -> Result<()> {
         let conn = tc.database_conn()?;
         let feed_ids = populate_n_feeds(&conn, 5, &feed_url);
 
-        // Set a retention policy so cleanup has work to do
-        conn.execute(
-            "UPDATE settings SET value = '1' WHERE key = 'retention_max_age_days'",
-            [],
-        )?;
         drop(conn);
+
+        // Set a retention policy so cleanup has work to do
+        let resp = client
+            .put(format!("{BASE}/v1/settings/retention"))
+            .json(&serde_json::json!({"max_age_days": 1}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), 200);
 
         // Trigger initial fetches and wait
         for fid in &feed_ids {

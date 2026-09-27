@@ -1,14 +1,13 @@
-use crate::db::retention as db_retention;
+use super::update_config;
 use crate::server::AppState;
 use axum::{
     extract::State,
-    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task;
-use tracing::{event, Level};
+
+const SECTION: &str = "retention";
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RetentionResponse {
@@ -17,6 +16,8 @@ pub struct RetentionResponse {
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RetentionRequest {
+    /// Delete entries published more than this many days ago. Must be at
+    /// least 1. `null` disables retention, keeping entries forever.
     pub max_age_days: Option<i64>,
 }
 
@@ -28,30 +29,13 @@ pub struct RetentionRequest {
     path = "/v1/settings/retention",
     responses(
         (status = 200, description = "Current retention settings", body = RetentionResponse),
-        (status = 500, description = "Internal server error"),
     ),
     tag = "settings"
 )]
 #[axum::debug_handler]
-pub async fn get_retention(State(state): State<AppState>) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
-
-    let result = task::spawn_blocking(move || db_retention::get_max_age_days(&conn)).await;
-
-    match result {
-        Ok(Ok(max_age_days)) => Ok(Json(RetentionResponse { max_age_days }).into_response()),
-        Ok(Err(e)) => {
-            event!(Level::ERROR, "error reading retention settings: {:?}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
-        }
-        Err(e) => {
-            event!(Level::ERROR, "task error in get_retention: {:?}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
-        }
-    }
+pub async fn get_retention(State(state): State<AppState>) -> Response {
+    let max_age_days = state.config.current().retention.max_age_days;
+    Json(RetentionResponse { max_age_days }).into_response()
 }
 
 /// Update retention policy
@@ -63,6 +47,8 @@ pub async fn get_retention(State(state): State<AppState>) -> Result<Response, Re
     request_body = RetentionRequest,
     responses(
         (status = 200, description = "Updated retention settings", body = RetentionResponse),
+        (status = 400, description = "Invalid value"),
+        (status = 409, description = "The config file on disk is invalid"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "settings"
@@ -72,26 +58,15 @@ pub async fn put_retention(
     State(state): State<AppState>,
     Json(payload): Json<RetentionRequest>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
-
-    let result = task::spawn_blocking(move || {
-        db_retention::set_max_age_days(&conn, payload.max_age_days)?;
-        db_retention::get_max_age_days(&conn)
+    let settings = update_config(&state, move |o| {
+        match payload.max_age_days {
+            Some(days) => o.set(SECTION, "max_age_days", days)?,
+            None => o.unset(SECTION, "max_age_days"),
+        }
+        Ok(())
     })
-    .await;
+    .await?;
 
-    match result {
-        Ok(Ok(max_age_days)) => Ok(Json(RetentionResponse { max_age_days }).into_response()),
-        Ok(Err(e)) => {
-            event!(Level::ERROR, "error updating retention settings: {:?}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
-        }
-        Err(e) => {
-            event!(Level::ERROR, "task error in put_retention: {:?}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
-        }
-    }
+    let max_age_days = settings.retention.max_age_days;
+    Ok(Json(RetentionResponse { max_age_days }).into_response())
 }

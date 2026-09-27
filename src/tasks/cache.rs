@@ -157,7 +157,8 @@ pub struct ServerHints {
 /// `max-age` takes precedence over `Expires` (RFC 9111 §5.3). When
 /// `max-age` is applied, the corrected-age adjustment from RFC 9111 §4.2.3
 /// is subtracted so a server's `Age` / `Date` headers reduce the effective
-/// freshness. If `cache-control` is absent entirely, an HTTP/1.0
+/// freshness. An `Expires` that is in the past or invalid gives no hint.
+/// If `cache-control` is absent entirely, an HTTP/1.0
 /// `Pragma: no-cache` (RFC 9111 §5.4) clears any freshness hint.
 pub fn extract_server_hints(resp_headers: &reqwest::header::HeaderMap, now_ts: i64) -> ServerHints {
     // RFC 9110 §5.3: multiple Cache-Control fields are combined.
@@ -176,12 +177,17 @@ pub fn extract_server_hints(resp_headers: &reqwest::header::HeaderMap, now_ts: i
     } else if let Some(max_age) = cc.max_age {
         hint_secs = Some(corrected_max_age(resp_headers, max_age, now_ts));
     } else {
-        // Fall back to Expires (RFC 9111 §5.3).
+        // Fall back to Expires (RFC 9111 §5.3). An Expires that is already
+        // in the past gives no freshness, the same as an invalid one such as
+        // `0`, which RFC 9111 §5.3 says to treat as already expired. Neither
+        // is a request to poll again right away, so both leave the feed on
+        // its per-feed interval rather than the min-cadence floor.
         hint_secs = resp_headers
             .get("expires")
             .and_then(|h| h.to_str().ok())
             .and_then(parse_http_date)
-            .map(|dt| (dt.timestamp() - now_ts).max(0) as u64);
+            .and_then(|dt| u64::try_from(dt.timestamp() - now_ts).ok())
+            .filter(|&secs| secs > 0);
     }
 
     if !has_cc {

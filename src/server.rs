@@ -1,4 +1,5 @@
 use crate::{
+    config::{self, ConfigHandle, ConfigStore},
     db::migrations,
     routes,
     scripting::ScriptRunnerHandle,
@@ -48,6 +49,10 @@ pub struct SharedAppState {
     /// Shared handle to the currently-installed scripting engine. Empty when the `lua`
     /// feature is disabled or when no scripts have been loaded.
     pub script_runner: ScriptRunnerHandle,
+
+    /// The server's settings, backed by the config file. The settings
+    /// routes write through it; everything else reads snapshots from it.
+    pub config: ConfigHandle,
 }
 
 pub type AppState = Arc<SharedAppState>;
@@ -55,6 +60,7 @@ pub type AppState = Arc<SharedAppState>;
 pub struct ServerBuilder<'a> {
     db_path: &'a Path,
     socket_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
     autofetch: bool,
     single_threaded: bool,
     worker_count: Option<usize>,
@@ -67,6 +73,7 @@ impl<'a> ServerBuilder<'a> {
         ServerBuilder {
             db_path,
             socket_path: None,
+            config_path: None,
             autofetch: false,
             single_threaded: false,
             worker_count: None,
@@ -77,6 +84,13 @@ impl<'a> ServerBuilder<'a> {
 
     pub fn socket_path(mut self, p: &'a Path) -> Self {
         self.socket_path = Some(p.to_path_buf());
+        self
+    }
+
+    /// Read and write settings at `p` instead of the default,
+    /// [`config::CONFIG_FILE_NAME`] in the data directory.
+    pub fn config_path(mut self, p: &Path) -> Self {
+        self.config_path = Some(p.to_path_buf());
         self
     }
 
@@ -133,8 +147,13 @@ impl<'a> ServerBuilder<'a> {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
 
+        let config_path = self
+            .config_path
+            .unwrap_or_else(|| data_dir.join(config::CONFIG_FILE_NAME));
+
         Server {
             db_path: PathBuf::from(self.db_path),
+            config_path,
             data_dir,
             socket_path,
             autofetch: self.autofetch,
@@ -178,6 +197,9 @@ pub struct Server {
 
     /// Root directory for on-disk state (cached assets live beneath this).
     data_dir: PathBuf,
+
+    /// Path of the config file holding settings overrides.
+    config_path: PathBuf,
 
     /// Path of the Unix domain socket the server listens on.
     socket_path: PathBuf,
@@ -283,6 +305,21 @@ impl Server {
             }
         }
 
+        // Load settings. An invalid config file is fatal here, at startup,
+        // where the operator is watching; later edits that fail to parse
+        // are logged and ignored by the watcher instead.
+        let config: ConfigHandle = Arc::new(
+            ConfigStore::open(&self.config_path)
+                .with_context(|| format!("failed to load config file {:?}", self.config_path))?,
+        );
+        if let Err(e) = config::watch::spawn_watcher(config.clone(), self.cancel_token.clone()) {
+            tracing::warn!(
+                "not watching config file {:?} for changes; edits will need a restart: {:#}",
+                self.config_path,
+                e
+            );
+        }
+
         // Create a multi-producer, multi-consumer channel so that web
         // service workers can send tasks to the feed-fetcher workers.
         let (tx, rx) = async_channel::bounded(1024);
@@ -347,6 +384,7 @@ impl Server {
             num_workers,
             metrics.clone(),
             self.data_dir.clone(),
+            config.clone(),
             script_runner.clone(),
             fetcher,
         );
@@ -409,6 +447,7 @@ impl Server {
             metrics.clone(),
             self.data_dir.clone(),
             script_runner.clone(),
+            config,
         ));
 
         self.cancel_token.cancelled().await;
@@ -754,6 +793,7 @@ async fn uds_server(
     metrics: Arc<crate::metrics::Metrics>,
     data_dir: PathBuf,
     script_runner: ScriptRunnerHandle,
+    config: ConfigHandle,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
         task_manager_tx: tx,
@@ -763,6 +803,7 @@ async fn uds_server(
         metrics: metrics.clone(),
         data_dir,
         script_runner,
+        config,
     });
     let app = routes::create_router(metrics).with_state(shared_state);
 
