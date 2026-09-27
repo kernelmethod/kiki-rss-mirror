@@ -213,7 +213,7 @@ mod tests {
     /// even though initialization runs inside a transaction.
     #[test]
     fn test_init_database_file_settings() -> Result<()> {
-        let td = tempdir::TempDir::new("kiki_")?;
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
         let path = td.path().join("kiki.db");
         ConnectionBuilder::default()
             .at_path(&path)
