@@ -97,14 +97,12 @@ impl ServeArgs {
             );
         }
 
-        let mut builder = server::ServerBuilder::new(&db_path)
+        let builder = server::ServerBuilder::new(&db_path)
             .autofetch()
             .feed_fetcher(feed_fetcher)
             .socket_path(&socket_path);
         #[cfg(all(unix, feature = "lua"))]
-        {
-            builder = builder.script_host(script_host);
-        }
+        let builder = builder.script_host(script_host);
         let server = builder.build();
 
         std::thread::spawn(|| server.run())
