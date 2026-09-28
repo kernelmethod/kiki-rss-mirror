@@ -856,7 +856,11 @@ fn render_feeds(resp: &ListFeedsResponse, page: u32) -> String {
     } else {
         html.push_str("<ol class=\"feeds\">\n");
         for feed in &resp.feeds {
-            let meta = render_feed_meta(&feed.url, feed.last_checked.as_deref());
+            let meta = render_feed_meta(
+                &feed.url,
+                &url_domain(&feed.url),
+                feed.last_checked.as_deref(),
+            );
             html.push_str(&format!(
                 "<li><a href=\"/feeds/{}\">{}</a>{meta}</li>\n",
                 feed.id,
@@ -881,7 +885,7 @@ fn render_feed_page(feed: &Feed, entries: &FeedEntriesResponse, listing: Listing
     let mut html = format!(
         "<header class=\"feed-header\">\n<h2>{}</h2>\n{}\n",
         escape(display_feed_title(&feed.title)),
-        render_feed_meta(&feed.url, feed.last_checked.as_deref()),
+        render_feed_meta(&feed.url, &feed.url, feed.last_checked.as_deref()),
     );
     // Feed descriptions are shown as plain text; they come from the feed.
     if let Some(description) = feed.description.as_deref().filter(|d| !d.trim().is_empty()) {
@@ -903,10 +907,19 @@ fn render_feed_page(feed: &Feed, entries: &FeedEntriesResponse, listing: Listing
     html
 }
 
-/// Render the line under a feed's title: its URL (`url`), shown but not
-/// linked, and when it was last checked (`last_checked`, in RFC 3339).
-fn render_feed_meta(url: &str, last_checked: Option<&str>) -> String {
-    let mut parts = vec![format!("<span class=\"url\">{}</span>", escape(url))];
+/// Render the line under a feed's title: its URL (`url`), shown as `label`
+/// but not linked, and when it was last checked (`last_checked`, in
+/// RFC 3339). When `label` isn't the whole URL, the URL is its tooltip.
+fn render_feed_meta(url: &str, label: &str, last_checked: Option<&str>) -> String {
+    let mut parts = vec![if label == url {
+        format!("<span class=\"url\">{}</span>", escape(url))
+    } else {
+        format!(
+            "<span class=\"url\" title=\"{}\">{}</span>",
+            escape(url),
+            escape(label)
+        )
+    }];
     match last_checked.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()) {
         Some(t) => parts.push(format!(
             "last checked <time datetime=\"{}\">{}</time>",
@@ -964,6 +977,15 @@ fn display_feed_title(title: &str) -> &str {
     } else {
         title
     }
+}
+
+/// Return the domain of `url`, or all of `url` if it has none (or doesn't
+/// parse), so that there is always something to show.
+fn url_domain(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| url.to_owned())
 }
 
 /// Return `url` if it is an `http` or `https` URL.
@@ -1600,7 +1622,8 @@ mod tests {
     }
 
     /// The list of feeds links each feed to its page. Titles and URLs come
-    /// from feeds, so they are escaped, and the URLs aren't linked.
+    /// from feeds, so they are escaped, and the URLs aren't linked. Only
+    /// each URL's domain is shown, with the full URL as its tooltip.
     #[tokio::test]
     async fn the_feeds_page_lists_every_feed() -> Result<()> {
         let tc = TestBuilder::all().build()?;
@@ -1625,6 +1648,13 @@ mod tests {
         );
         assert!(!body.contains(r#""><b>"#), "{body}");
         assert!(!body.contains(r#"href="http://example.com"#), "{body}");
+        assert!(
+            body.contains(
+                r#"<span class="url" title="http://example.com/2.xml">example.com</span>"#
+            ),
+            "{body}"
+        );
+        assert!(!body.contains(">http://example.com/2.xml<"), "{body}");
         assert!(body.contains("last checked"), "{body}");
         assert!(body.contains("not checked yet"), "{body}");
         assert!(body.contains("Page 1 of 1"), "{body}");
