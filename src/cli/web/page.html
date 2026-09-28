@@ -12,7 +12,7 @@
     .site-nav a { margin-right: 1rem; }
     .count { color: #666; }
     .entries { padding-left: 0; list-style: none; }
-    .entries li, .feeds li { padding: 0.5rem 0; border-bottom: 1px solid #ddd; }
+    .entries > li, .feeds > li { padding: 0.5rem 0; border-bottom: 1px solid #ddd; }
     .feeds { padding-left: 0; list-style: none; }
     .plugins { padding-left: 0; list-style: none; }
     .plugins li { padding: 0.5rem 0; border-bottom: 1px solid #ddd; }
@@ -50,6 +50,9 @@
     .entry .content { margin: 1rem 0; overflow-wrap: break-word; }
     .entry .content img { max-width: 100%; height: auto; }
     .entry .content pre { overflow-x: auto; }
+    .tags { display: flex; flex-wrap: wrap; gap: 0.25rem; margin: 0.25rem 0 0; padding: 0; list-style: none; }
+    .tags .tag { padding: 0 0.4rem; border: 1px solid #bbb; border-radius: 0.75rem; font-size: 0.75rem; color: #444; }
+    .tags .tag.system { border-style: dashed; color: #666; background: #f4f4f4; }
     .entry .links { margin: 1rem 0; padding-top: 0.5rem; border-top: 1px solid #ddd; }
   </style>
 </head>

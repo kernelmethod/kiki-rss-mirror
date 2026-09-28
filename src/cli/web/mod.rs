@@ -2,14 +2,17 @@ mod sanitize;
 mod settings;
 
 use crate::cli::serve::ServeArgs;
+use crate::db::tags::{TagKind, SYSTEM_TAG_PREFIX};
 use crate::plugins::settings::{Setting, SettingType};
 use crate::routes::v1::entries::entry_assets::ListEntryAssetsResponse;
+use crate::routes::v1::entries::entry_tags::GetEntryTagsResponse;
 use crate::routes::v1::entries::get_entry::GetEntryResponse;
 use crate::routes::v1::entries::{ListEntriesResponse, ListEntriesResponseEntry};
 use crate::routes::v1::feeds::feed_entries::FeedEntriesResponse;
 use crate::routes::v1::feeds::list_feeds::ListFeedsResponse;
 use crate::routes::v1::plugins::list_plugins::{ListPluginsResponse, PluginResponse};
 use crate::routes::v1::plugins::plugin_config::PluginConfigResponse;
+use crate::routes::v1::tags::list_tags::TagResponse;
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{Form, Path as UrlPath, Query, State},
@@ -340,13 +343,15 @@ async fn index(State(api): State<reqwest::Client>, Query(params): Query<PagePara
     let page = params.page();
     match fetch_entries(&api, page).await {
         Ok(entries) => {
-            let feeds =
-                fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)).await;
+            let (feeds, tags) = tokio::join!(
+                fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)),
+                fetch_entry_tags(&api, entries.entries.iter().map(|e| e.id)),
+            );
             let listing = Listing { feed: None, page };
             render_page(
                 StatusCode::OK,
                 "Kiki",
-                &render_entries(entries.count, &entries.entries, &feeds, listing),
+                &render_entries(entries.count, &entries.entries, &feeds, &tags, listing),
             )
         }
         Err(e) => server_unavailable(&e),
@@ -384,11 +389,22 @@ async fn entry_page(
             None => None,
         }
     };
-    let (feed_title, cached) = tokio::join!(feed_title, fetch_cached_assets(&api, id));
+    let (feed_title, cached, mut tags) = tokio::join!(
+        feed_title,
+        fetch_cached_assets(&api, id),
+        fetch_entry_tags(&api, [id])
+    );
+    let tags = tags.remove(&id).unwrap_or_default();
     render_page(
         StatusCode::OK,
         &format!("{} - Kiki", display_title(&entry.title)),
-        &render_entry_page(&entry, feed_title.as_deref(), &cached, params.listing()),
+        &render_entry_page(
+            &entry,
+            feed_title.as_deref(),
+            &tags,
+            &cached,
+            params.listing(),
+        ),
     )
 }
 
@@ -440,10 +456,11 @@ async fn feed_page(
         Err(e) => return server_unavailable(&e),
     };
 
+    let tags = fetch_entry_tags(&api, entries.entries.iter().map(|e| e.id)).await;
     render_page(
         StatusCode::OK,
         &format!("{} - Kiki", display_feed_title(&feed.title)),
-        &render_feed_page(&feed, &entries, listing),
+        &render_feed_page(&feed, &entries, &tags, listing),
     )
 }
 
@@ -974,14 +991,56 @@ async fn fetch_feed_titles(
     titles
 }
 
+/// Fetch the tags of the entries in `entry_ids` from the Kiki API, keyed by
+/// entry ID. Both user tags and system tags are included.
+///
+/// An entry whose tags cannot be fetched is logged and left out, so it is
+/// shown without tags rather than not at all.
+async fn fetch_entry_tags(
+    api: &reqwest::Client,
+    entry_ids: impl IntoIterator<Item = i64>,
+) -> HashMap<i64, Vec<TagResponse>> {
+    let mut tasks = JoinSet::new();
+    for id in entry_ids.into_iter().collect::<BTreeSet<_>>() {
+        let api = api.clone();
+        tasks.spawn(async move {
+            let tags: Result<GetEntryTagsResponse> = async {
+                Ok(api
+                    .get(format!("{API_BASE}/v1/entries/id/{id}/tags"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?)
+            }
+            .await;
+            (id, tags)
+        });
+    }
+
+    let mut tags = HashMap::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((id, Ok(resp))) => {
+                tags.insert(id, resp.tags);
+            }
+            Ok((id, Err(e))) => tracing::warn!(entry_id = id, "failed to fetch entry tags: {e:#}"),
+            Err(e) => tracing::warn!("entry tags fetch task failed: {e}"),
+        }
+    }
+    tags
+}
+
 /// Render the entry count (`count`, of all the entries in the list), the
 /// entries on this page of `listing`, and the page links. `feeds` maps feed
 /// IDs to the titles of the feeds; entries from feeds not in it are shown
-/// without their feed.
+/// without their feed. `tags` maps entry IDs to the entries' tags; entries
+/// not in it are shown without tags.
 fn render_entries(
     count: usize,
     entries: &[ListEntriesResponseEntry],
     feeds: &HashMap<i64, String>,
+    tags: &HashMap<i64, Vec<TagResponse>>,
     listing: Listing,
 ) -> String {
     let mut html = format!(
@@ -1000,8 +1059,14 @@ fn render_entries(
         html.push_str("<ol class=\"entries\">\n");
         for entry in entries {
             let feed = entry.feed_id.and_then(|id| feeds.get(&id));
+            let tags = tags.get(&entry.id).map_or(&[][..], Vec::as_slice);
             html.push_str("<li>");
-            html.push_str(&render_entry(entry, feed.map(String::as_str), listing));
+            html.push_str(&render_entry(
+                entry,
+                feed.map(String::as_str),
+                tags,
+                listing,
+            ));
             html.push_str("</li>\n");
         }
         html.push_str("</ol>\n");
@@ -1017,20 +1082,62 @@ fn render_entries(
 }
 
 /// Render a single entry in a list: its title, linked to the entry's page,
-/// and below it its publication date and the title of `feed`, the feed it
-/// came from. The entry's page links back to `listing`.
-fn render_entry(entry: &ListEntriesResponseEntry, feed: Option<&str>, listing: Listing) -> String {
+/// and below it its publication date, the title of `feed`, the feed it came
+/// from, and its `tags`. The entry's page links back to `listing`.
+fn render_entry(
+    entry: &ListEntriesResponseEntry,
+    feed: Option<&str>,
+    tags: &[TagResponse],
+    listing: Listing,
+) -> String {
     let href = listing.entry_href(entry.id);
     let meta = render_meta(entry.published_at.as_deref(), feed, None);
     format!(
-        "<a href=\"{href}\">{}</a>{meta}",
-        escape(display_title(&entry.title))
+        "<a href=\"{href}\">{}</a>{meta}{}",
+        escape(display_title(&entry.title)),
+        render_tags(tags)
     )
 }
 
-/// Render the page for `entry`: its title, date, feed (`feed`), author and
-/// categories, its content from the feed, and links to the entry itself and
-/// to anything else the feed links it to. The page links back to `listing`.
+/// Render `tags`, the tags attached to an entry, as a list, or nothing if
+/// there are none.
+///
+/// System tags come first, shown without their `system:` prefix and styled
+/// apart from user tags; each group is sorted by name.
+fn render_tags(tags: &[TagResponse]) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    let mut tags: Vec<&TagResponse> = tags.iter().collect();
+    tags.sort_by(|a, b| {
+        (a.kind != TagKind::System, &a.name).cmp(&(b.kind != TagKind::System, &b.name))
+    });
+
+    let items: Vec<String> = tags
+        .into_iter()
+        .map(|tag| match tag.kind {
+            TagKind::System => format!(
+                "<li class=\"tag system\" title=\"{}\">{}</li>",
+                escape(&tag.name),
+                escape(
+                    tag.name
+                        .strip_prefix(SYSTEM_TAG_PREFIX)
+                        .unwrap_or(&tag.name)
+                )
+            ),
+            TagKind::User => format!("<li class=\"tag\">{}</li>", escape(&tag.name)),
+        })
+        .collect();
+    format!(
+        "<ul class=\"tags\" aria-label=\"Tags\">{}</ul>",
+        items.concat()
+    )
+}
+
+/// Render the page for `entry`: its title, date, feed (`feed`), author,
+/// categories and `tags`, its content from the feed, and links to the entry
+/// itself and to anything else the feed links it to. The page links back to
+/// `listing`.
 ///
 /// Images in the content, and the entry's attachment, are taken from the
 /// asset cache: `cached` maps an asset's original URL to the URL of its
@@ -1039,6 +1146,7 @@ fn render_entry(entry: &ListEntriesResponseEntry, feed: Option<&str>, listing: L
 fn render_entry_page(
     entry: &GetEntryResponse,
     feed: Option<&str>,
+    tags: &[TagResponse],
     cached: &HashMap<String, String>,
     listing: Listing,
 ) -> String {
@@ -1074,6 +1182,7 @@ fn render_entry_page(
             categories.join(", ")
         ));
     }
+    html.push_str(&render_tags(tags));
 
     // Links and images in the content are resolved against the entry's own
     // URL, where the content was written to appear.
@@ -1563,8 +1672,14 @@ fn to_json_pretty(value: &Value) -> String {
 }
 
 /// Render the page for `feed`: its title, URL, description and when it was
-/// last checked, then `entries`, the entries on this page of `listing`.
-fn render_feed_page(feed: &Feed, entries: &FeedEntriesResponse, listing: Listing) -> String {
+/// last checked, then `entries`, the entries on this page of `listing`, with
+/// their tags from `tags`, keyed by entry ID.
+fn render_feed_page(
+    feed: &Feed,
+    entries: &FeedEntriesResponse,
+    tags: &HashMap<i64, Vec<TagResponse>>,
+    listing: Listing,
+) -> String {
     let mut html = format!(
         "<header class=\"feed-header\">\n<h2>{}</h2>\n{}\n",
         escape(display_feed_title(&feed.title)),
@@ -1584,6 +1699,7 @@ fn render_feed_page(feed: &Feed, entries: &FeedEntriesResponse, listing: Listing
         entries.count,
         &entries.entries,
         &HashMap::new(),
+        tags,
         listing,
     ));
     html.push_str("<p><a href=\"/feeds\">&larr; Back to feeds</a></p>\n");
@@ -1965,6 +2081,73 @@ mod tests {
         );
         assert!(!body.contains("http://example.com/a"), "{body}");
         assert_eq!(body.matches(r#"class="feed""#).count(), 2, "{body}");
+        Ok(())
+    }
+
+    /// Attach the tag named `name`, creating it as a user tag if there is
+    /// no such tag, to entry `entry_id`.
+    fn tag_entry(tc: &crate::test::TestConfig, entry_id: i64, name: &str) -> Result<()> {
+        let conn = tc.database_conn()?;
+        conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [name])?;
+        conn.execute(
+            "INSERT INTO entry_tags (entry_id, tag_id)
+             SELECT ?1, id FROM tags WHERE name = ?2",
+            rusqlite::params![entry_id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Entries on the index show their tags, system tags first and without
+    /// their prefix, with user tag names escaped.
+    #[tokio::test]
+    async fn the_index_page_shows_each_entrys_tags() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 2)?;
+        tag_entry(&tc, 1, "<b>news</b>")?;
+        tag_entry(&tc, 1, "system:read")?;
+        tag_entry(&tc, 1, "system:saved")?;
+
+        let (status, body) = get_index(tc.client()?).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(
+                r#"<ul class="tags" aria-label="Tags"><li class="tag system" title="system:read">read</li><li class="tag system" title="system:saved">saved</li><li class="tag">&lt;b&gt;news&lt;/b&gt;</li></ul>"#
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("<b>news"), "{body}");
+        // Entry 2 has no tags, so only entry 1 gets a list.
+        assert_eq!(body.matches(r#"class="tags""#).count(), 1, "{body}");
+        // The tags don't disturb the list of entries.
+        assert_eq!(listed_titles(&body), ["Entry 2", "Entry 1"]);
+        Ok(())
+    }
+
+    /// An entry's page, and its feed's page, show the entry's tags.
+    #[tokio::test]
+    async fn entry_and_feed_pages_show_tags() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (id, title, url) VALUES (1, 'Feed', 'http://example.com/feed.xml')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO entries (id, feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (3, 1, 'rss', 'a', 1, 'Tagged', 'http://example.com/a')",
+            [],
+        )?;
+        tag_entry(&tc, 3, "tech")?;
+        tag_entry(&tc, 3, "system:hidden")?;
+        let expected = r#"<ul class="tags" aria-label="Tags"><li class="tag system" title="system:hidden">hidden</li><li class="tag">tech</li></ul>"#;
+
+        let (status, body) = get_page(tc.client()?, "/entries/3").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(expected), "{body}");
+
+        let (status, body) = get_page(tc.client()?, "/feeds/1").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(expected), "{body}");
         Ok(())
     }
 
