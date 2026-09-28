@@ -226,6 +226,7 @@ items = { type = "choice", choices = ["title", "content"] }
 | `number`  | Any number                     | `min`, `max` |
 | `boolean` | `true` or `false`              | |
 | `choice`  | One of a fixed set of strings  | `choices` (required) |
+| `feed`    | A feed: its id, or the URL it is fetched from | |
 | `list`    | A list of values of one type   | `items` (required): a table with a `type` and its options |
 | `object`  | A table with named fields      | `fields` (required): an array of settings, written like the top-level ones |
 | `json`    | Anything; edited as JSON       | |

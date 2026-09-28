@@ -67,9 +67,9 @@ description = "The entry fields to match. None ticked means title and content."
 [[settings.items.fields]]
 name = "feeds"
 type = "list"
-items = { type = "integer", min = 1 }
+items = { type = "feed" }
 label = "Feeds"
-description = "Ids of the feeds the rule applies to. Leave empty for every feed."
+description = "The feeds the rule applies to, each by its id or the URL it is fetched from. Leave empty for every feed."
 
 [[settings]]
 name = "include"
@@ -103,9 +103,52 @@ description = "The entry fields to match. None ticked means title and content."
 [[settings.items.fields]]
 name = "feeds"
 type = "list"
-items = { type = "integer", min = 1 }
+items = { type = "feed" }
 label = "Feeds"
-description = "Ids of the feeds the rule applies to. Leave empty for every feed."
+description = "The feeds the rule applies to, each by its id or the URL it is fetched from. Leave empty for every feed."
+
+[[settings]]
+name = "tag"
+type = "list"
+label = "Tag rules"
+description = "Entries matching one of these rules, and not hidden, get its tag."
+
+[settings.items]
+type = "object"
+
+[[settings.items.fields]]
+name = "pattern"
+type = "string"
+required = true
+label = "Pattern"
+description = "A regular expression, in the syntax of kiki.regex."
+
+[[settings.items.fields]]
+name = "tag"
+type = "string"
+required = true
+label = "Tag"
+description = "The tag to add: a user tag, or a system tag such as system:saved."
+
+[[settings.items.fields]]
+name = "flags"
+type = "string"
+label = "Flags"
+description = "kiki.regex flags, such as \"i\" for case-insensitive."
+
+[[settings.items.fields]]
+name = "fields"
+type = "list"
+items = { type = "choice", choices = ["title", "url", "content", "authors", "categories", "guid"] }
+label = "Fields"
+description = "The entry fields to match. None ticked means title and content."
+
+[[settings.items.fields]]
+name = "feeds"
+type = "list"
+items = { type = "feed" }
+label = "Feeds"
+description = "The feeds the rule applies to, each by its id or the URL it is fetched from. Leave empty for every feed."
 
 [[settings]]
 name = "rescan"

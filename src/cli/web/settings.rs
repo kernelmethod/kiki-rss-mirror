@@ -79,7 +79,7 @@ fn fits(kind: &SettingType, value: &Value) -> bool {
         return false;
     }
     match (kind, value) {
-        // One line per item: items must be non-blank single lines.
+        // One line per item: string items must be non-blank single lines.
         (SettingType::List { items }, Value::Array(list))
             if matches!(**items, SettingType::String { multiline: false }) =>
         {
@@ -129,9 +129,9 @@ fn render_widget(kind: &SettingType, field: &Field, value: Option<&Value>, label
             "<textarea name=\"{path}\" id=\"{id}\" rows=\"4\" {aria}>{}</textarea>",
             escape(value.and_then(Value::as_str).unwrap_or_default())
         ),
-        SettingType::String { multiline: false } => format!(
+        SettingType::String { multiline: false } | SettingType::Feed => format!(
             "<input type=\"text\" name=\"{path}\" id=\"{id}\" value=\"{}\" {aria}>",
-            escape(value.and_then(Value::as_str).unwrap_or_default())
+            escape(value.map(line_text).unwrap_or_default())
         ),
         SettingType::Integer { min, max } => format!(
             "<input type=\"number\" step=\"1\"{}{} name=\"{path}\" id=\"{id}\" value=\"{}\" {aria}>",
@@ -211,16 +211,10 @@ fn render_list(items: &SettingType, field: &Field, value: Option<&Value>, label:
         }
         SettingType::String { multiline: false }
         | SettingType::Integer { .. }
-        | SettingType::Number { .. } => {
+        | SettingType::Number { .. }
+        | SettingType::Feed => {
             let lines: Vec<String> = list
-                .map(|l| {
-                    l.iter()
-                        .map(|v| match v {
-                            Value::String(s) => s.clone(),
-                            v => v.to_string(),
-                        })
-                        .collect()
-                })
+                .map(|l| l.iter().map(line_text).collect())
                 .unwrap_or_default();
             format!(
                 "<textarea name=\"{path}\" id=\"{id}\" rows=\"{}\" aria-label=\"{}\">{}</textarea>\
@@ -336,6 +330,15 @@ fn required_mark(setting: &Setting) -> &'static str {
     }
 }
 
+/// `value` as it is written in a text field or on a line of a list: a
+/// string as it is, anything else as JSON.
+fn line_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        v => v.to_string(),
+    }
+}
+
 fn attr(name: &str, value: Option<String>) -> String {
     value
         .map(|v| format!(" {name}=\"{}\"", escape(&v)))
@@ -430,6 +433,7 @@ fn parse(
             .any(|v| v == "true")
             .then_some(Value::Bool(true)),
         SettingType::Choice { .. } => Some(text).filter(|s| !s.is_empty()).map(Value::from),
+        SettingType::Feed => parse_feed(text.trim()),
         SettingType::List { items } => parse_list(items, name, path, form)?,
         SettingType::Object { fields } => parse_object(fields, name, path, form, false)?,
         SettingType::Json => parse_json(text).map_err(bad)?,
@@ -459,6 +463,17 @@ fn parse_number(text: &str) -> Result<Option<Value>, String> {
         .ok_or_else(|| format!("{text:?} is not a number"))
 }
 
+/// Reads a feed: an id if `text` is a whole number, and otherwise a URL.
+fn parse_feed(text: &str) -> Option<Value> {
+    if text.is_empty() {
+        return None;
+    }
+    Some(match text.parse::<i64>() {
+        Ok(id) => Value::from(id),
+        Err(_) => Value::from(text),
+    })
+}
+
 fn parse_json(text: &str) -> Result<Option<Value>, String> {
     if text.trim().is_empty() {
         return Ok(None);
@@ -486,7 +501,8 @@ fn parse_list(
         }
         SettingType::String { multiline: false }
         | SettingType::Integer { .. }
-        | SettingType::Number { .. } => {
+        | SettingType::Number { .. }
+        | SettingType::Feed => {
             let text = form.first(name).unwrap_or_default();
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
                 let item_path = path.index(list.len());
@@ -497,6 +513,7 @@ fn parse_list(
                 list.extend(match items {
                     SettingType::Integer { .. } => parse_integer(line.trim()).map_err(bad)?,
                     SettingType::Number { .. } => parse_number(line.trim()).map_err(bad)?,
+                    SettingType::Feed => parse_feed(line.trim()),
                     _ => Some(Value::from(line.trim_end_matches('\r'))),
                 });
             }
@@ -601,4 +618,55 @@ fn empty(kind: &SettingType, path: &ValuePath) -> Result<Option<Value>, InvalidV
         }
         _ => None,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn feeds() -> Setting {
+        Setting {
+            name: "feeds".into(),
+            label: None,
+            description: None,
+            required: false,
+            kind: SettingType::List {
+                items: Box::new(SettingType::Feed),
+            },
+        }
+    }
+
+    /// A list of feeds is one per line: whole numbers are feed ids, and
+    /// anything else a URL.
+    #[test]
+    fn feeds_are_read_one_per_line() {
+        let form = FormValues::new([(
+            "v".to_owned(),
+            "3\r\n https://example.com/feed.xml \r\n\r\n".to_owned(),
+        )]);
+        assert_eq!(
+            parse_input(&feeds(), "feeds", &form).unwrap(),
+            json!([3, "https://example.com/feed.xml"])
+        );
+
+        let form = FormValues::new([("v".to_owned(), "0".to_owned())]);
+        assert_eq!(
+            parse_input(&feeds(), "feeds", &form)
+                .unwrap_err()
+                .to_string(),
+            "feeds[0]: expected a feed id or URL"
+        );
+    }
+
+    #[test]
+    fn feeds_are_shown_one_per_line() {
+        let value = json!([3, "https://example.com/feed.xml"]);
+        let html = render_input(&feeds(), Some(&value), "s").unwrap();
+        assert!(
+            html.contains(">3\nhttps://example.com/feed.xml</textarea>"),
+            "{html}"
+        );
+    }
 }

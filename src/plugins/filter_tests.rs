@@ -151,10 +151,11 @@ fn exclude_rules_win_over_include_rules() {
 fn the_manifest_describes_the_rules() {
     let manifest = crate::plugins::PluginManifest::parse(MANIFEST).unwrap();
     let names: Vec<_> = manifest.settings.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["exclude", "include", "rescan"]);
+    assert_eq!(names, ["exclude", "include", "tag", "rescan"]);
     let config = json!({
         "exclude": [{"fields": ["title"], "pattern": "x", "flags": "i"}],
-        "include": [{"pattern": "rust", "feeds": [3]}],
+        "include": [{"pattern": "rust", "feeds": [3, "https://example.com/feed.xml"]}],
+        "tag": [{"pattern": "zero-day", "tag": "urgent", "feeds": ["https://example.com/a"]}],
         "rescan": false,
     });
     crate::plugins::settings::check_config(&manifest.settings, config.as_object().unwrap())

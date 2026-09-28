@@ -34,6 +34,7 @@
 //! | `number`  | Any number                             | `min`, `max`                     |
 //! | `boolean` | `true` or `false`                      |                                  |
 //! | `choice`  | One of a fixed set of strings          | `choices` (required)             |
+//! | `feed`    | A feed: its id, or the URL it is fetched from |                           |
 //! | `list`    | A list of values of one type           | `items` (required): a type       |
 //! | `object`  | A table with named fields              | `fields` (required): settings    |
 //! | `json`    | Any value; edited as JSON              |                                  |
@@ -127,6 +128,9 @@ pub enum SettingType {
         /// The allowed strings.
         choices: Vec<String>,
     },
+    /// A feed, given by its id (a positive integer) or by the URL it is
+    /// fetched from (a non-empty string).
+    Feed,
     /// A list whose items are all of one type.
     List {
         /// The type of the list's items.
@@ -195,6 +199,7 @@ impl SettingType {
             Self::Number { .. } => "a number".into(),
             Self::Boolean => "true or false".into(),
             Self::Choice { choices } => format!("one of {}", quoted_list(choices)),
+            Self::Feed => "a feed id or URL".into(),
             Self::List { .. } => "a list".into(),
             Self::Object { .. } => "a table".into(),
             Self::Json => "any value".into(),
@@ -247,6 +252,11 @@ impl SettingType {
                     return Err(wrong_type());
                 }
             }
+            Self::Feed => match value {
+                Value::Number(n) if n.as_i64().is_some_and(|id| id >= 1) => {}
+                Value::String(url) if !url.trim().is_empty() && !url.contains('\n') => {}
+                _ => return Err(wrong_type()),
+            },
             Self::List { items } => {
                 let list = value.as_array().ok_or_else(wrong_type)?;
                 for (i, item) in list.iter().enumerate() {
@@ -594,6 +604,32 @@ mod tests {
         assert!(line.check(&json!("a\nb"), &path).is_err());
         let text = SettingType::String { multiline: true };
         assert!(text.check(&json!("a\nb"), &path).is_ok());
+    }
+
+    #[test]
+    fn feeds_are_ids_or_urls() {
+        let path = ValuePath::key("f");
+        for ok in [json!(1), json!("https://example.com/feed.xml")] {
+            assert!(SettingType::Feed.check(&ok, &path).is_ok(), "{ok}");
+        }
+        for bad in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!(""),
+            json!(" "),
+            json!("a\nb"),
+            json!(true),
+        ] {
+            assert_eq!(
+                SettingType::Feed
+                    .check(&bad, &path)
+                    .unwrap_err()
+                    .to_string(),
+                "f: expected a feed id or URL",
+                "{bad}"
+            );
+        }
     }
 
     #[test]
