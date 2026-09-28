@@ -376,6 +376,10 @@ pub enum PluginError {
     #[error("{path} is too large: the limit is {limit} bytes")]
     TooLarge { path: PathBuf, limit: u64 },
 
+    /// A new config is too large to be saved to [`CONFIG_FILE_NAME`].
+    #[error("config is too large: saved as JSON, it must be at most {limit} bytes")]
+    ConfigTooLarge { limit: u64 },
+
     /// A source file is not valid UTF-8.
     #[error("{0} is not valid UTF-8")]
     NotUtf8(PathBuf),
@@ -414,12 +418,7 @@ impl Plugin {
             None => return Err(PluginError::MissingManifest),
         };
 
-        let mut config = manifest.config.clone();
-        if let Some(text) = read_small_file(&dir.join(CONFIG_FILE_NAME))? {
-            let overrides =
-                crate::scripting::parse_script_config(&text).map_err(PluginError::InvalidConfig)?;
-            config.extend(overrides);
-        }
+        let config = apply_config_overrides(&manifest.config, read_config_file(dir)?);
 
         if !dir.join(manifest.entrypoint()).is_file() {
             return Err(PluginError::MissingEntrypoint(
@@ -432,6 +431,99 @@ impl Plugin {
             manifest,
             config,
         })
+    }
+
+    /// Path of the plugin's [`CONFIG_FILE_NAME`], whether or not it exists.
+    pub fn config_path(&self) -> PathBuf {
+        self.dir.join(CONFIG_FILE_NAME)
+    }
+
+    /// Reads the config overrides currently in the plugin's
+    /// [`CONFIG_FILE_NAME`]. A missing file holds no overrides.
+    ///
+    /// Unlike [`Self::config`], which is fixed when the plugin is loaded,
+    /// this reflects the file as it is now.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, is too large, or is not
+    /// a JSON object.
+    pub fn read_config_overrides(
+        &self,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, PluginError> {
+        read_config_file(&self.dir)
+    }
+
+    /// Applies `edit` to the config overrides in the plugin's
+    /// [`CONFIG_FILE_NAME`] and saves the result. Returns the new overrides.
+    ///
+    /// The file is re-read first, so changes made to it by hand are kept.
+    /// Updates are serialized, so concurrent edits do not lose each other's
+    /// changes. See [`Self::replace_config_overrides`] for how the file is
+    /// saved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, and leaves the file untouched, if the file on disk
+    /// cannot be read or is not a JSON object, if `edit` fails, or if the
+    /// result cannot be saved.
+    pub fn update_config_overrides<F>(
+        &self,
+        edit: F,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, PluginError>
+    where
+        F: FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<(), PluginError>,
+    {
+        let _guard = lock_config_writes();
+        let mut overrides = self.read_config_overrides()?;
+        edit(&mut overrides)?;
+        write_config_file(&self.config_path(), &overrides)?;
+        Ok(overrides)
+    }
+
+    /// Replaces the plugin's [`CONFIG_FILE_NAME`] with `overrides`, whatever
+    /// the file held before (even if it was invalid).
+    ///
+    /// The file is replaced atomically. Empty overrides remove the file, so
+    /// the plugin is left with the defaults from its manifest.
+    ///
+    /// The new config takes effect the next time the server starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::ConfigTooLarge`] if the overrides would be
+    /// larger than [`MAX_MANIFEST_BYTES`] once saved, since such a file
+    /// would keep the plugin from loading, and [`PluginError::Io`] if the
+    /// file cannot be written.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::plugins::{discover, Plugin};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let plugin = dir.path().join("hello");
+    /// std::fs::create_dir(&plugin).unwrap();
+    /// std::fs::write(
+    ///     plugin.join("manifest.toml"),
+    ///     "name = 'hello'\nversion = '1.0.0'\nengine = 'lua'\n[config]\ngreeting = 'hi'\n",
+    /// ).unwrap();
+    /// std::fs::write(plugin.join("main.lua"), "").unwrap();
+    ///
+    /// let plugin = Plugin::load(&plugin).unwrap();
+    /// let overrides = serde_json::json!({"greeting": "hello"});
+    /// plugin.replace_config_overrides(overrides.as_object().unwrap()).unwrap();
+    ///
+    /// // The change is picked up the next time the plugin is loaded.
+    /// assert_eq!(plugin.config["greeting"], "hi");
+    /// assert_eq!(Plugin::load(&plugin.dir).unwrap().config["greeting"], "hello");
+    /// ```
+    pub fn replace_config_overrides(
+        &self,
+        overrides: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), PluginError> {
+        let _guard = lock_config_writes();
+        write_config_file(&self.config_path(), overrides)
     }
 
     /// The name of the plugin's directory.
@@ -486,6 +578,82 @@ impl Plugin {
             modules,
         })
     }
+}
+
+/// Returns `defaults` with the keys of `overrides` applied over it: the
+/// config a plugin with those defaults and overrides is loaded with.
+///
+/// Only top-level keys are replaced; objects are not merged. A key
+/// overridden with `null` is kept, as `null`.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::plugins::apply_config_overrides;
+/// use serde_json::json;
+///
+/// let defaults = json!({"a": 1, "b": {"x": 1}});
+/// let overrides = json!({"b": {"y": 2}, "c": 3});
+/// assert_eq!(
+///     apply_config_overrides(defaults.as_object().unwrap(), overrides.as_object().unwrap().clone()),
+///     *json!({"a": 1, "b": {"y": 2}, "c": 3}).as_object().unwrap(),
+/// );
+/// ```
+pub fn apply_config_overrides(
+    defaults: &serde_json::Map<String, serde_json::Value>,
+    overrides: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut config = defaults.clone();
+    config.extend(overrides);
+    config
+}
+
+/// Serializes writes to plugins' config files.
+fn lock_config_writes() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The guarded data is `()`, so a panic while holding the lock cannot
+    // have left anything half-updated.
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Reads the config overrides in plugin directory `dir`; a missing
+/// [`CONFIG_FILE_NAME`] holds none.
+fn read_config_file(dir: &Path) -> Result<serde_json::Map<String, serde_json::Value>, PluginError> {
+    match read_small_file(&dir.join(CONFIG_FILE_NAME))? {
+        Some(text) => {
+            crate::scripting::parse_script_config(&text).map_err(PluginError::InvalidConfig)
+        }
+        None => Ok(serde_json::Map::new()),
+    }
+}
+
+/// Saves `overrides` to the config file at `path`, or removes the file if
+/// there are none.
+fn write_config_file(
+    path: &Path,
+    overrides: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), PluginError> {
+    let io_err = |source| PluginError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    if overrides.is_empty() {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_err(e)),
+        };
+    }
+
+    // Serializing a map of JSON values cannot fail.
+    let mut text = serde_json::to_string_pretty(overrides).unwrap_or_default();
+    text.push('\n');
+    if text.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(PluginError::ConfigTooLarge {
+            limit: MAX_MANIFEST_BYTES,
+        });
+    }
+    crate::config::write_atomically(path, &text).map_err(io_err)
 }
 
 /// The name that the source file at `relative` (a path inside a plugin

@@ -148,6 +148,14 @@ manifest's defaults untouched, so a new version of a plugin can be dropped in
 without losing them. Each plugin sees only its own config. A plugin with no
 config gets an empty table.
 
+The API can edit `config.json` for you, under
+`/v1/plugins/name/{name}/config`: `GET` shows the plugin's defaults, its
+overrides, and the config they add up to; `PUT` replaces every override;
+`PATCH` sets some overrides and keeps the rest; `DELETE` removes every
+override; and `DELETE /v1/plugins/name/{name}/config/{key}` removes one. As
+with any other change to a plugin, a new config takes effect when the server
+restarts.
+
 Tables (and JSON objects) become Lua tables keyed by string, and arrays become
 sequences indexed from 1. TOML dates and times become strings in their
 RFC 3339 form, and `inf` and `nan` are not allowed. A `null` in `config.json`
