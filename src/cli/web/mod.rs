@@ -224,6 +224,9 @@ fn render_page(status: StatusCode, title: &str, content: &str) -> Response {
             // Following a link out of the reader shouldn't tell the site
             // what the reader was.
             (header::REFERRER_POLICY, "no-referrer"),
+            // Nor should merely showing a link: browsers may look up the
+            // hosts of links on a page before any are followed.
+            (header::X_DNS_PREFETCH_CONTROL, "off"),
         ],
         Html(html.into_owned()),
     )
@@ -360,6 +363,10 @@ async fn asset(
     out.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         header::HeaderValue::from_static("nosniff"),
+    );
+    out.insert(
+        header::X_DNS_PREFETCH_CONTROL,
+        header::HeaderValue::from_static("off"),
     );
     out.insert(
         header::CONTENT_SECURITY_POLICY,
@@ -1241,6 +1248,7 @@ mod tests {
         assert!(resp.headers()[header::CONTENT_SECURITY_POLICY]
             .to_str()?
             .ends_with("sandbox"));
+        assert_eq!(resp.headers()[header::X_DNS_PREFETCH_CONTROL], "off");
         let etag = resp.headers()[header::ETAG].clone();
         assert_eq!(resp.bytes().await?.as_ref(), bytes);
 
@@ -1264,7 +1272,8 @@ mod tests {
         Ok(())
     }
 
-    /// Pages forbid script, in case anything from a feed slips through.
+    /// Pages forbid script, in case anything from a feed slips through, and
+    /// ask the browser not to look up the hosts they link to.
     #[tokio::test]
     async fn pages_forbid_script() -> Result<()> {
         let tc = TestBuilder::all().build()?;
@@ -1279,6 +1288,11 @@ mod tests {
             let csp = resp.headers()[header::CONTENT_SECURITY_POLICY].to_str()?;
             assert!(csp.starts_with("default-src 'none';"), "{path}: {csp}");
             assert!(!csp.contains("script-src"), "{path}: {csp}");
+            assert_eq!(
+                resp.headers()[header::X_DNS_PREFETCH_CONTROL],
+                "off",
+                "{path}"
+            );
         }
 
         cancel.cancel();
