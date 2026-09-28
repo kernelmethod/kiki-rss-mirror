@@ -35,7 +35,6 @@ use utoipa::OpenApi;
         crate::routes::v1::tags::tag_entries::tag_entries,
         crate::routes::v1::plugins::list_plugins::list_plugins,
         crate::routes::v1::plugins::get_plugin::get_plugin,
-        crate::routes::v1::plugins::reload_plugins::reload_plugins,
         crate::routes::v1::settings::retention::get_retention,
         crate::routes::v1::settings::retention::put_retention,
         crate::routes::v1::settings::feed_fetch::get_feed_fetch_settings,
@@ -102,7 +101,7 @@ use utoipa::OpenApi;
         (name = "feeds", description = "Manage RSS/Atom feed subscriptions"),
         (name = "entries", description = "Access and manage feed entries"),
         (name = "tags", description = "Organize feeds and entries with tags"),
-        (name = "plugins", description = "Inspect and reload installed plugins"),
+        (name = "plugins", description = "Inspect installed plugins"),
         (name = "settings", description = "Global configuration settings"),
     ),
     info(

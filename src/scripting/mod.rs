@@ -306,10 +306,9 @@ pub trait ScriptRunner: Send + Sync {
     fn dispatch_observe(&self, event: Event, payload: EventPayload);
 }
 
-/// Shared, reload-safe access to the currently-installed [`ScriptRunner`].
+/// Shared access to the currently-installed [`ScriptRunner`].
 ///
-/// The runner is built once at server startup and replaced wholesale whenever scripts
-/// change. Workers and HTTP handlers consume a runner by calling [`Self::current`], which
+/// The runner is built once at server startup, from the plugins discovered then. Workers and HTTP handlers consume a runner by calling [`Self::current`], which
 /// returns a cheap clone of the shared [`Arc`]; they then dispatch events on that snapshot
 /// without blocking other readers.
 ///

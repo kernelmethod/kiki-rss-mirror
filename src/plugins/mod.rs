@@ -32,12 +32,12 @@
 //! an error for each directory that could not be loaded; one broken plugin
 //! never keeps the others from loading.
 //!
-//! Plugins are loaded in the order of their directory names, so prefixing
-//! directory names with a number (`10-filter`, `20-tag`) controls the order
-//! their handlers run in.
+//! The server discovers plugins once, when it starts: installing, removing
+//! or editing a plugin takes effect after a restart. Plugins are loaded in
+//! the order of their directory names, so prefixing directory names with a
+//! number (`10-filter`, `20-tag`) controls the order their handlers run in.
 
 mod legacy;
-pub mod watch;
 
 pub use legacy::export_legacy_scripts;
 
@@ -64,7 +64,7 @@ pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 /// Largest total size of the source files of one plugin.
 ///
 /// Every plugin's source is shipped to the script host in one message, so
-/// this also keeps a reload well inside the host's frame limit.
+/// this also keeps the message well inside the host's frame limit.
 pub const MAX_PLUGIN_SOURCE_BYTES: u64 = 1024 * 1024;
 
 /// How deep inside a plugin directory source files are looked for.
@@ -644,23 +644,11 @@ pub fn discover(plugins_dir: &Path) -> Result<Discovery, PluginError> {
     Ok(discovery)
 }
 
-/// Scans `plugins_dir` and reads the source of every enabled plugin whose
-/// engine is `engine`, logging each plugin that cannot be loaded.
-///
-/// # Errors
-///
-/// Returns an error only if `plugins_dir` exists but cannot be listed.
-pub fn load_sources(
-    plugins_dir: &Path,
-    engine: PluginEngine,
-) -> Result<Vec<ScriptSource>, PluginError> {
-    let discovery = discover(plugins_dir)?;
-    for e in &discovery.errors {
-        tracing::warn!(dir = %e.dir.display(), "skipping plugin: {}", e.error);
-    }
-
+/// Reads the source of every enabled plugin in `discovery` whose engine is
+/// `engine`, logging each plugin that cannot be loaded.
+pub fn load_sources(discovery: &Discovery, engine: PluginEngine) -> Vec<ScriptSource> {
     let mut sources = Vec::new();
-    for plugin in discovery.plugins {
+    for plugin in &discovery.plugins {
         let name = &plugin.manifest.name;
         if !plugin.manifest.enabled {
             tracing::debug!(plugin = %name, "skipping disabled plugin");
@@ -683,7 +671,7 @@ pub fn load_sources(
             }
         }
     }
-    Ok(sources)
+    sources
 }
 
 /// Installs a plugin into `plugins_dir`, in a directory named after it:
@@ -983,7 +971,7 @@ mod tests {
         off.enabled = false;
         install(td.path(), &off, "-- off").unwrap();
 
-        let sources = load_sources(td.path(), PluginEngine::Lua).unwrap();
+        let sources = load_sources(&discover(td.path()).unwrap(), PluginEngine::Lua);
         let names: Vec<_> = sources.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["on"]);
     }

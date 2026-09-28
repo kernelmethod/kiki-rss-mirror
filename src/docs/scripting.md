@@ -52,16 +52,17 @@ is written for:
 Other fields are ignored, so plugins may carry metadata of their own.
 
 To install a plugin, copy its directory into `plugins/`; to remove one, delete
-its directory. Kiki watches the plugins directory and reloads every plugin
-whenever anything in it changes, so there is no need to restart the server.
-(`POST /v1/plugins/reload` queues a reload by hand.) Plugins load in the order
-of their directory names, so prefixing directory names with numbers (`10-filter`,
-`20-tag`) controls the order their handlers run in.
+its directory. Kiki discovers plugins only when the server starts, so restart
+the server after installing, removing, or editing a plugin (including its
+`config.json`). Plugins load in the order of their directory names, so
+prefixing directory names with numbers (`10-filter`, `20-tag`) controls the
+order their handlers run in.
 
 A plugin whose manifest is missing or invalid is skipped with a warning in the
 server log, and listed with the reason under `errors` in `GET /v1/plugins`;
 the other plugins still load. `GET /v1/plugins/name/{name}` shows one plugin's
-manifest and config.
+manifest and config. Both show the plugins as they were when the server
+started.
 
 When the server runs sandboxed (the default), it can only read files inside
 Kiki's home, so a plugin directory that is a symbolic link to somewhere else
@@ -93,7 +94,7 @@ not visible to other plugins.
 
 The recommended shape for a plugin's entrypoint is to register one or more
 event handlers via `kiki.on` at the top level. The entrypoint's top-level chunk
-runs exactly once each time kiki loads its plugins; handlers fire later, each
+runs exactly once, when the server starts; handlers fire later, each
 time their event is emitted.
 
 ```lua

@@ -1,13 +1,10 @@
-use crate::plugins::{self, Plugin, PluginEngine};
+use crate::plugins::{Plugin, PluginEngine};
 use crate::server::AppState;
 use axum::{
     extract::State,
-    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use tokio::task;
-use tracing::{event, Level};
 
 /// A plugin installed in the plugins directory.
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
@@ -36,24 +33,22 @@ pub struct PluginResponse {
     pub config: serde_json::Map<String, serde_json::Value>,
 }
 
-impl From<Plugin> for PluginResponse {
-    fn from(plugin: Plugin) -> Self {
-        let directory = plugin.dir_name();
-        let entrypoint = plugin.manifest.entrypoint().to_string();
-        let m = plugin.manifest;
+impl From<&Plugin> for PluginResponse {
+    fn from(plugin: &Plugin) -> Self {
+        let m = &plugin.manifest;
         PluginResponse {
-            name: m.name,
-            version: m.version,
+            name: m.name.clone(),
+            version: m.version.clone(),
             engine: m.engine,
             engine_supported: m.engine.is_supported(),
             enabled: m.enabled,
-            entrypoint,
-            directory,
-            description: m.description,
-            authors: m.authors,
-            license: m.license,
-            homepage: m.homepage,
-            config: plugin.config,
+            entrypoint: m.entrypoint().to_string(),
+            directory: plugin.dir_name(),
+            description: m.description.clone(),
+            authors: m.authors.clone(),
+            license: m.license.clone(),
+            homepage: m.homepage.clone(),
+            config: plugin.config.clone(),
         }
     }
 }
@@ -77,30 +72,11 @@ pub struct ListPluginsResponse {
     pub errors: Vec<PluginErrorResponse>,
 }
 
-/// Scan the plugins directory, off the async runtime.
-///
-/// # Errors
-///
-/// Returns an error response if the plugins directory cannot be listed.
-pub(super) async fn discover(state: &AppState) -> Result<plugins::Discovery, Response> {
-    let dir = state.plugins_dir.clone();
-    match task::spawn_blocking(move || plugins::discover(&dir)).await {
-        Ok(Ok(discovery)) => Ok(discovery),
-        Ok(Err(e)) => {
-            event!(Level::ERROR, "failed to scan plugins directory: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
-        }
-        Err(e) => {
-            event!(Level::ERROR, "task error while scanning plugins: {:?}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
-        }
-    }
-}
-
 /// List plugins
 ///
-/// Return every plugin installed in the plugins directory, along with the directories
-/// in it that could not be loaded as plugins and why.
+/// Return every plugin that was found in the plugins directory when the server started,
+/// along with the directories in it that could not be loaded as plugins and why. Plugins
+/// installed or changed since then take effect, and appear here, after a restart.
 #[utoipa::path(
     get,
     path = "/v1/plugins",
@@ -111,12 +87,12 @@ pub(super) async fn discover(state: &AppState) -> Result<plugins::Discovery, Res
     tag = "plugins"
 )]
 #[axum::debug_handler]
-pub async fn list_plugins(State(state): State<AppState>) -> Result<Response, Response> {
-    let discovery = discover(&state).await?;
-    let plugins: Vec<PluginResponse> = discovery.plugins.into_iter().map(Into::into).collect();
-    let errors = discovery
+pub async fn list_plugins(State(state): State<AppState>) -> Response {
+    let plugins: Vec<PluginResponse> = state.plugins.plugins.iter().map(Into::into).collect();
+    let errors = state
+        .plugins
         .errors
-        .into_iter()
+        .iter()
         .map(|e| PluginErrorResponse {
             directory: e
                 .dir
@@ -126,12 +102,12 @@ pub async fn list_plugins(State(state): State<AppState>) -> Result<Response, Res
             error: e.error.to_string(),
         })
         .collect();
-    Ok(Json(ListPluginsResponse {
+    Json(ListPluginsResponse {
         count: plugins.len(),
         plugins,
         errors,
     })
-    .into_response())
+    .into_response()
 }
 
 #[cfg(test)]
@@ -140,18 +116,22 @@ mod test {
     use super::*;
     use crate::test::TestBuilder;
     use anyhow::Result;
+    use axum::http::StatusCode;
 
     #[tokio::test]
     async fn test_list_plugins() -> Result<()> {
-        let tc = TestBuilder::all().build()?;
-        let client = tc.client()?;
-
+        let tc = TestBuilder::default().init_database().build()?;
         tc.install_lua_plugin(
             "passthrough",
             r#"kiki.on("entry.ingest", function(entry) return entry end)"#,
             serde_json::json!({"x": 1}),
         )?;
         std::fs::create_dir_all(tc.plugins_dir().join("broken"))?;
+        let tc = tc.init_server()?;
+        let client = tc.client()?;
+
+        // Plugins installed after the server started are not picked up.
+        tc.install_lua_plugin("too-late", "", serde_json::json!({}))?;
 
         let resp = client.get("http://localhost/v1/plugins").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);

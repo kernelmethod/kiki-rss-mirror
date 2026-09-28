@@ -34,7 +34,7 @@ reconsidered some day:
 
 The Kiki API does not implement any sort of authentication. This means that
 **anybody** who can reach the API can retrieve all feed and entry information,
-add and delete feeds/entires, retrieve settings, reload plugins, and perform
+add and delete feeds/entires, retrieve settings, and perform
 any other action permitted by the API.
 
 It is the deployers' responsibility to ensure that Kiki is only accessible to

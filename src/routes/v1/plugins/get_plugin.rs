@@ -6,11 +6,12 @@ use axum::{
     Json,
 };
 
-use super::list_plugins::{discover, PluginResponse};
+use super::list_plugins::PluginResponse;
 
 /// Get plugin information
 ///
-/// Retrieve the manifest and config of an installed plugin by its name.
+/// Retrieve the manifest and config of a plugin, by its name, as they were when the
+/// server started.
 #[utoipa::path(
     get,
     path = "/v1/plugins/name/{name}",
@@ -25,18 +26,15 @@ use super::list_plugins::{discover, PluginResponse};
     tag = "plugins"
 )]
 #[axum::debug_handler]
-pub async fn get_plugin(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<Response, Response> {
-    let discovery = discover(&state).await?;
-    match discovery
+pub async fn get_plugin(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    match state
         .plugins
-        .into_iter()
+        .plugins
+        .iter()
         .find(|p| p.manifest.name == name)
     {
-        Some(plugin) => Ok(Json(PluginResponse::from(plugin)).into_response()),
-        None => Err((StatusCode::NOT_FOUND, "Plugin not found").into_response()),
+        Some(plugin) => Json(PluginResponse::from(plugin)).into_response(),
+        None => (StatusCode::NOT_FOUND, "Plugin not found").into_response(),
     }
 }
 
@@ -48,10 +46,10 @@ mod test {
 
     #[tokio::test]
     async fn test_get_plugin() -> Result<()> {
-        let tc = TestBuilder::all().build()?;
-        let client = tc.client()?;
-
+        let tc = TestBuilder::default().init_database().build()?;
         tc.install_lua_plugin("hello", "", serde_json::json!({}))?;
+        let tc = tc.init_server()?;
+        let client = tc.client()?;
 
         let resp = client
             .get("http://localhost/v1/plugins/name/hello")
