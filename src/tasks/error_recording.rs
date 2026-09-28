@@ -131,7 +131,7 @@ pub(super) fn set_feed_error(
             |row| row.get::<_, i64>(0),
         )
         .map(|v| v.max(0) as u64)
-        .unwrap_or(10800);
+        .unwrap_or(settings.default_fetch_interval_seconds);
 
     set_feed_error_with_schedule(
         conn,

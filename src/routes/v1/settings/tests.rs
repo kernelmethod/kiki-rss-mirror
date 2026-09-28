@@ -95,6 +95,60 @@ async fn feed_fetch_settings_omitted_field_is_a_no_op() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn default_fetch_interval_applies_to_new_feeds_only() -> Result<()> {
+    let tc = TestBuilder::all().build()?;
+    let client = tc.client()?;
+
+    let body = get_json(&client, "/v1/settings/feed-fetch").await?;
+    assert_eq!(
+        body["default_fetch_interval_seconds"].as_u64().unwrap(),
+        crate::config::DEFAULT_FETCH_INTERVAL_SECONDS
+    );
+
+    let create = |url: &'static str| {
+        client
+            .post("http://localhost/v1/feeds/create")
+            .json(&serde_json::json!({"title": "feed", "url": url}))
+            .send()
+    };
+    let resp = create("https://example.com/before.xml").await?;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let before: serde_json::Value = resp.json().await?;
+
+    let resp = client
+        .put("http://localhost/v1/settings/feed-fetch")
+        .json(&serde_json::json!({"default_fetch_interval_seconds": 900}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["default_fetch_interval_seconds"], 900);
+
+    let resp = create("https://example.com/after.xml").await?;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let after: serde_json::Value = resp.json().await?;
+
+    let feed = get_json(&client, &format!("/v1/feeds/id/{}", after["id"])).await?;
+    assert_eq!(feed["min_fetch_interval_seconds"], 900);
+    // A feed added before the change keeps the interval it was given.
+    let feed = get_json(&client, &format!("/v1/feeds/id/{}", before["id"])).await?;
+    assert_eq!(
+        feed["min_fetch_interval_seconds"].as_u64().unwrap(),
+        crate::config::DEFAULT_FETCH_INTERVAL_SECONDS
+    );
+
+    // Zero is rejected.
+    let resp = client
+        .put("http://localhost/v1/settings/feed-fetch")
+        .json(&serde_json::json!({"default_fetch_interval_seconds": 0}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
 fn config_path(tc: &crate::test::TestConfig) -> std::path::PathBuf {
     tc.database_path()
         .with_file_name(crate::config::CONFIG_FILE_NAME)

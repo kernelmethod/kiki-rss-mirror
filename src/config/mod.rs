@@ -96,6 +96,13 @@ pub struct FeedFetchSettings {
     /// so a misbehaving server cannot trigger hyperpolling.
     pub min_polling_cadence_seconds: u64,
 
+    /// Fetch interval, in seconds, given to newly added feeds. It becomes
+    /// the feed's `min_fetch_interval_seconds`: the longest the scheduler
+    /// waits between fetches, and the wait used when the server sends no
+    /// freshness hint. Feeds already added keep their own interval, which
+    /// can be changed per feed.
+    pub default_fetch_interval_seconds: u64,
+
     /// Cap on exponential backoff for transient errors, and the wait
     /// applied to permanent errors, in seconds.
     pub max_backoff_seconds: u64,
@@ -138,6 +145,9 @@ pub struct RetentionSettings {
 /// Feeds are text and even very long archive feeds sit far below this.
 pub const DEFAULT_MAX_FEED_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Default for [`FeedFetchSettings::default_fetch_interval_seconds`]: 3 hours.
+pub const DEFAULT_FETCH_INTERVAL_SECONDS: u64 = 3 * 60 * 60;
+
 /// Default for [`AssetCacheSettings::max_bytes`]: 1 GiB.
 pub const DEFAULT_ASSET_CACHE_MAX_BYTES: i64 = 1024 * 1024 * 1024;
 
@@ -153,6 +163,7 @@ impl Default for Settings {
             feed_fetch: FeedFetchSettings {
                 timeout_seconds: 15,
                 min_polling_cadence_seconds: 60,
+                default_fetch_interval_seconds: DEFAULT_FETCH_INTERVAL_SECONDS,
                 max_backoff_seconds: 24 * 60 * 60,
                 force_refresh_after_seconds: 7 * 24 * 60 * 60,
                 max_feed_bytes: DEFAULT_MAX_FEED_BYTES,
@@ -177,6 +188,16 @@ impl Settings {
 
         if self.feed_fetch.timeout_seconds == 0 {
             return invalid("feed_fetch.timeout_seconds must be greater than zero");
+        }
+        // Feed intervals are stored as SQLite INTEGERs and must be positive.
+        if self.feed_fetch.default_fetch_interval_seconds == 0 {
+            return invalid("feed_fetch.default_fetch_interval_seconds must be greater than zero");
+        }
+        if i64::try_from(self.feed_fetch.default_fetch_interval_seconds).is_err() {
+            return Err(ConfigError::Invalid(format!(
+                "feed_fetch.default_fetch_interval_seconds must be at most {}",
+                i64::MAX
+            )));
         }
         // A cap of zero would reject every feed.
         if self.feed_fetch.max_feed_bytes == 0 {
@@ -368,6 +389,7 @@ mod tests {
         for text in [
             "[feed_fetch]\nmax_feed_bytes = 0\n",
             "[feed_fetch]\ntimeout_seconds = 0\n",
+            "[feed_fetch]\ndefault_fetch_interval_seconds = 0\n",
             "[feed_fetch]\nmax_feed_bytes = -1\n",
             "[asset_cache]\nmax_bytes = -1\n",
             "[retention]\nmax_age_days = 0\n",
