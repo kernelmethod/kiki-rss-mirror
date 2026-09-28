@@ -60,6 +60,19 @@ kiki opml export -o subscriptions.opml
 Both commands work on the same database `kiki serve` uses, and a running
 server starts fetching imported feeds within a few seconds.
 
+To see the installed plugins, and to read or change a plugin's config as TOML:
+
+```bash
+kiki plugin ls
+kiki plugin config get hide-sponsored              # --defaults or --overrides for just one part
+echo 'patterns = ["sponsored", "webinar"]' | kiki plugin config set hide-sponsored
+kiki plugin config set hide-sponsored overrides.toml --replace
+```
+
+`config set` overrides the top-level keys it is given and keeps the plugin's
+other overrides, unless `--replace` is passed. A new config takes effect when
+the server restarts.
+
 ## Where Kiki keeps its files
 
 | | Default |

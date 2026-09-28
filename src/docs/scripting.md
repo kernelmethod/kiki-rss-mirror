@@ -150,6 +150,11 @@ the API under `/v1/plugins/name/{name}/config`: `GET` shows the plugin's
 defaults, its overrides, and the config they add up to; `PUT` replaces every
 override; `PATCH` sets some overrides and keeps the rest; `DELETE` removes
 every override; and `DELETE /v1/plugins/name/{name}/config/{key}` removes one.
+From the command line, `kiki plugin config get <name>` prints a plugin's
+config as TOML (`--defaults` or `--overrides` for just one part), and
+`kiki plugin config set <name> [FILE]` sets overrides from a TOML document,
+read from `FILE` or standard input, keeping the others unless `--replace` is
+given. `kiki plugin ls` lists the installed plugins.
 Since overrides live outside the plugin directory, a new version of a plugin
 can be dropped in without losing them. As with any other change to a plugin,
 a new config takes effect when the server restarts.
