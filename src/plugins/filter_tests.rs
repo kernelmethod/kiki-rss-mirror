@@ -3,10 +3,15 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use crate::scripting::lua::LuaScriptRunner;
-use crate::scripting::{FeedEntry, ScriptRunner, ScriptSource};
+use crate::scripting::{
+    Event, EventPayload, FeedEntry, FeedInfo, ScriptRunner, ScriptServices, ScriptSource,
+    ServiceCall, ServiceReply,
+};
 use crate::test::TestBuilder;
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MANIFEST: &str = include_str!("../../plugins/filter/manifest.toml");
@@ -37,8 +42,49 @@ fn entry(feed_id: i64, title: &str) -> FeedEntry {
 }
 
 fn hidden(runner: &LuaScriptRunner, entry: FeedEntry) -> bool {
-    let entry = runner.dispatch_transform_entry(entry).unwrap().unwrap();
-    entry.tags.iter().any(|t| t == "system:hidden")
+    tags(runner, entry).iter().any(|t| t == "system:hidden")
+}
+
+fn tags(runner: &LuaScriptRunner, entry: FeedEntry) -> Vec<String> {
+    runner
+        .dispatch_transform_entry(entry)
+        .unwrap()
+        .unwrap()
+        .tags
+}
+
+/// Answers `kiki.feeds.get` for feed `n` in 1..=3 with the URL
+/// `https://example.com/feed{n}`, counting the lookups.
+#[derive(Default)]
+struct Feeds {
+    lookups: AtomicUsize,
+}
+
+impl ScriptServices for Feeds {
+    fn call(&self, _plugin: &str, call: ServiceCall) -> Result<ServiceReply, String> {
+        match call {
+            ServiceCall::GetFeed { feed_id } => {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                Ok(ServiceReply::Feed((1..=3).contains(&feed_id).then(|| {
+                    FeedInfo {
+                        id: feed_id,
+                        url: Some(format!("https://example.com/feed{feed_id}")),
+                        title: "f".to_string(),
+                    }
+                })))
+            }
+            other => Err(format!("unexpected {other:?}")),
+        }
+    }
+}
+
+/// The filter, loaded with `config`, looking feeds up in `feeds`.
+fn filter_with_feeds(config: Value, feeds: &Arc<Feeds>) -> LuaScriptRunner {
+    let mut source = ScriptSource::new(MAIN);
+    source.name = "filter".to_string();
+    source.config = config.to_string();
+    LuaScriptRunner::from_sources_with(&[source], Some(feeds.clone() as Arc<dyn ScriptServices>))
+        .unwrap()
 }
 
 #[test]
@@ -100,6 +146,88 @@ fn exclude_rules_win_over_include_rules() {
 }
 
 #[test]
+fn rules_can_name_feeds_by_url() {
+    let feeds = Arc::new(Feeds::default());
+    let runner = filter_with_feeds(
+        json!({
+            "include": [{
+                "fields": "title",
+                "pattern": "rust",
+                "feeds": ["https://example.com/feed1", 2],
+            }],
+        }),
+        &feeds,
+    );
+    assert!(hidden(&runner, entry(1, "go news")));
+    assert!(!hidden(&runner, entry(1, "rust news")));
+    assert!(hidden(&runner, entry(2, "go news")));
+    assert!(!hidden(&runner, entry(3, "go news")));
+    assert!(!hidden(&runner, entry(9, "go news")));
+    // Feed 2 is named by id, so only feeds 1, 3 and 9 are looked up, once
+    // each.
+    assert!(hidden(&runner, entry(1, "go news")));
+    assert!(!hidden(&runner, entry(3, "go news")));
+    assert_eq!(feeds.lookups.load(Ordering::SeqCst), 3);
+
+    // A removed feed's id may be reused, so it is looked up again.
+    runner.dispatch_observe(
+        Event::FeedRemoved,
+        EventPayload::Feed {
+            id: 1,
+            url: "https://example.com/feed1".to_string(),
+            title: "f".to_string(),
+        },
+    );
+    assert!(hidden(&runner, entry(1, "go news")));
+    assert_eq!(feeds.lookups.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+fn rules_without_feed_urls_look_up_no_feeds() {
+    let feeds = Arc::new(Feeds::default());
+    let runner = filter_with_feeds(
+        json!({"exclude": [{"pattern": "x"}, {"pattern": "y", "feeds": [2]}]}),
+        &feeds,
+    );
+    assert!(hidden(&runner, entry(1, "x")));
+    assert!(!hidden(&runner, entry(1, "y")));
+    assert_eq!(feeds.lookups.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn tag_rules_tag_matching_entries() {
+    let feeds = Arc::new(Feeds::default());
+    let runner = filter_with_feeds(
+        json!({
+            "exclude": [{"fields": "title", "pattern": "webinar"}],
+            "tag": [
+                {"fields": "title", "pattern": r"zero-day|in the wild", "flags": "i", "tag": "urgent"},
+                {"fields": "title", "pattern": "rust", "tag": "system:saved",
+                 "feeds": ["https://example.com/feed2"]},
+            ],
+        }),
+        &feeds,
+    );
+    assert_eq!(tags(&runner, entry(1, "Zero-Day in Chrome")), ["urgent"]);
+    assert!(tags(&runner, entry(1, "quiet news")).is_empty());
+    // Every matching rule adds its tag.
+    assert_eq!(
+        tags(&runner, entry(2, "rust exploited in the wild")),
+        ["urgent", "system:saved"]
+    );
+    assert!(tags(&runner, entry(1, "rust")).is_empty());
+    // Hidden entries are not tagged.
+    assert_eq!(
+        tags(&runner, entry(1, "zero-day webinar")),
+        ["system:hidden"]
+    );
+    // A tag already there is not added twice.
+    let mut e = entry(1, "zero-day");
+    e.tags = vec!["urgent".into()];
+    assert_eq!(tags(&runner, e), ["urgent"]);
+}
+
+#[test]
 fn entries_are_hidden_once() {
     let runner = filter(json!({"exclude": [{"pattern": "x"}]})).unwrap();
     let mut e = entry(1, "x");
@@ -118,9 +246,11 @@ fn bad_rules_fail_to_load() {
         (json!({"exclude": [{"pattern": "("}]}), "exclude[1]"),
         (json!({"exclude": [{"fields": "title"}]}), "'pattern'"),
         (
-            json!({"include": [{"pattern": "x", "feeds": ["a"]}]}),
-            "feed ids",
+            json!({"include": [{"pattern": "x", "feeds": [1.5]}]}),
+            "feed ids or URLs",
         ),
+        (json!({"tag": [{"pattern": "x"}]}), "'tag'"),
+        (json!({"tag": [{"pattern": "x", "tag": ""}]}), "tag[1]"),
         (
             json!({"exclude": [{"pattern": "x", "flags": "z"}]}),
             "exclude[1]",
@@ -218,5 +348,76 @@ async fn stored_entries_are_filtered_when_the_rules_change() -> Result<()> {
     assert!(!is_hidden(ids[1])?);
     assert!(!is_hidden(ids[0])?);
 
+    Ok(())
+}
+
+/// End to end, through a server: tag rules naming a feed by URL tag the
+/// stored entries of that feed.
+#[tokio::test]
+async fn stored_entries_are_tagged_by_feed_url() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let ids: Vec<i64> = {
+        let conn = tc.database_conn()?;
+        let mut ids = Vec::new();
+        for (url, title) in [
+            ("https://example.com/a", "zero-day in foo"),
+            ("https://example.com/a", "release notes"),
+            ("https://example.com/b", "zero-day in bar"),
+        ] {
+            conn.execute(
+                "INSERT OR IGNORE INTO feeds (title, url) VALUES (?1, ?1)",
+                [url],
+            )?;
+            let feed: i64 =
+                conn.query_row("SELECT id FROM feeds WHERE url = ?1", [url], |r| r.get(0))?;
+            conn.execute(
+                "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+                 VALUES (?1, 'rss', ?2, 0, ?2, 'u')",
+                rusqlite::params![feed, title],
+            )?;
+            ids.push(conn.last_insert_rowid());
+        }
+        ids
+    };
+    let dir = tc.plugins_dir().join("filter");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("manifest.toml"), MANIFEST)?;
+    std::fs::write(dir.join("main.lua"), MAIN)?;
+    let overrides = json!({"tag": [{
+        "fields": "title",
+        "pattern": "zero-day",
+        "tag": "urgent",
+        "feeds": ["https://example.com/a"],
+    }]});
+    crate::db::plugins::set_config_overrides(
+        &tc.database_conn()?,
+        "filter",
+        overrides.as_object().unwrap(),
+    )?;
+
+    let db = tc.database_path();
+    let is_urgent = |id: i64| -> Result<bool> {
+        let conn = crate::db::ConnectionBuilder::default()
+            .at_path(&db)
+            .read_write()
+            .build()?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+             WHERE et.entry_id = ?1 AND t.name = 'urgent')",
+            [id],
+            |row| row.get(0),
+        )?)
+    };
+
+    let _tc = tc.init_server()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !is_urgent(ids[0])? {
+        anyhow::ensure!(Instant::now() < deadline, "entry was never tagged");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The scan has tagged the first entry; give it time to reach the rest.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!is_urgent(ids[1])?);
+    assert!(!is_urgent(ids[2])?);
     Ok(())
 }

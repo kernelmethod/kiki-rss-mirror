@@ -1,7 +1,7 @@
 name = "filter"
-version = "1.0.0"
+version = "1.1.0"
 engine = "lua"
-description = "Hide entries whose fields match, or fail to match, regular expressions"
+description = "Hide or tag entries whose fields match, or fail to match, regular expressions"
 license = "MIT"
 homepage = "https://github.com/kernelmethod/kiki-rss"
 
@@ -16,12 +16,20 @@ homepage = "https://github.com/kernelmethod/kiki-rss"
 #     [[include]]
 #     fields = ["categories"]
 #     pattern = "rust"
-#     feeds = [3]
+#     feeds = [3, "https://example.com/feed.xml"]
+#
+#     [[tag]]
+#     fields = ["title"]
+#     pattern = '\bzero-day\b'
+#     flags = "i"
+#     tag = "urgent"
 #
 # Entries matching an `exclude` rule are hidden. When an entry's feed has
-# `include` rules, entries matching none of them are hidden too. See
-# main.lua for every setting.
+# `include` rules, entries matching none of them are hidden too. Entries
+# matching a `tag` rule get its tag. A rule's `feeds` names feeds by id, or
+# by the URL they are fetched from. See main.lua for every setting.
 [config]
 exclude = []
 include = []
+tag = []
 rescan = true
