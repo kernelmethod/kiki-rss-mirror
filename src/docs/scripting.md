@@ -225,7 +225,9 @@ the plugins that were running keep running.
 Kiki ships a complete version of this plugin as `plugins/filter` in its
 source, and `kiki init` installs it by default (unless Kiki was built without
 the `default-plugins` feature, or `--no-default-plugins` is passed); see its
-`main.lua` for the settings it takes.
+`main.lua` for the settings it takes. `kiki init --check` installs it into an
+existing home directory too, and updates it when a new release of Kiki bundles
+a new version, unless its files have been edited.
 
 ## Events
 

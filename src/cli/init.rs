@@ -38,21 +38,31 @@ pub(crate) fn default_directory() -> Result<PathBuf> {
     paths::default_data_dir(&Env::from_process())
 }
 
-/// Installs the plugins bundled with Kiki into `plugins_dir`, skipping any
-/// that are already there. See [`crate::plugins::defaults`].
+/// Installs the plugins bundled with Kiki into `plugins_dir`, and updates
+/// the ones an earlier release installed, printing what changed. See
+/// [`crate::plugins::defaults::sync_default_plugins`].
 #[cfg(feature = "default-plugins")]
-fn install_default_plugins(plugins_dir: &Path) -> Result<()> {
-    let installed = crate::plugins::defaults::install_default_plugins(plugins_dir)
+fn sync_default_plugins(plugins_dir: &Path) -> Result<()> {
+    use crate::plugins::defaults::SyncOutcome;
+
+    let outcomes = crate::plugins::defaults::sync_default_plugins(plugins_dir)
         .context("failed to install the default plugins")?;
-    for name in installed {
-        println!("Installed plugin {name}");
+    for (name, outcome) in outcomes {
+        match outcome {
+            SyncOutcome::Installed => println!("Installed plugin {name}"),
+            SyncOutcome::Updated => println!("Updated plugin {name}"),
+            SyncOutcome::Modified => {
+                println!("Not updating plugin {name}: it differs from the version Kiki installed")
+            }
+            SyncOutcome::UpToDate | SyncOutcome::Removed => {}
+        }
     }
     Ok(())
 }
 
 /// Without the `default-plugins` feature there are no plugins to install.
 #[cfg(not(feature = "default-plugins"))]
-fn install_default_plugins(_plugins_dir: &Path) -> Result<()> {
+fn sync_default_plugins(_plugins_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -65,7 +75,8 @@ fn install_default_plugins(_plugins_dir: &Path) -> Result<()> {
 /// initialize somewhere else, name it with `$KIKI_HOME`.
 #[derive(Args)]
 pub struct InitArgs {
-    /// Do nothing if Kiki has already been configured
+    /// Only set Kiki up if it hasn't been already. When it has, just install
+    /// new default plugins and update the unmodified ones
     #[arg(short, long, conflicts_with = "force")]
     check: bool,
 
@@ -82,8 +93,9 @@ pub struct InitArgs {
 impl InitArgs {
     /// Create an `InitArgs` equivalent to `kiki init --check`.
     ///
-    /// This initializes Kiki's directory if it hasn't been set up yet, and
-    /// is a no-op otherwise.
+    /// This initializes Kiki's directory if it hasn't been set up yet.
+    /// Otherwise it only syncs the default plugins: see
+    /// [`crate::plugins::defaults::sync_default_plugins`].
     pub(crate) fn with_check() -> Self {
         Self {
             check: true,
@@ -108,7 +120,15 @@ impl InitArgs {
         let db_path = directory.join(paths::DB_FILE_NAME);
         if db_path.exists() {
             if self.check {
-                // Kiki has already been configured
+                // Kiki has already been configured, but this release may
+                // bundle new or updated plugins. A failure here is only
+                // reported: it shouldn't keep an existing install from
+                // starting.
+                if !self.no_default_plugins {
+                    if let Err(e) = sync_default_plugins(&crate::plugins::plugins_dir(directory)) {
+                        eprintln!("warning: {e:#}");
+                    }
+                }
                 return Ok(());
             }
 
@@ -135,7 +155,7 @@ impl InitArgs {
         fs::create_dir_all(&plugins_dir)
             .with_context(|| format!("unable to create plugins directory {plugins_dir:?}"))?;
         if !self.no_default_plugins {
-            install_default_plugins(&plugins_dir)?;
+            sync_default_plugins(&plugins_dir)?;
         }
 
         println!("Initialized Kiki in {}", directory.display());
@@ -237,6 +257,27 @@ mod test {
         .run_in(&path)?;
         let plugins_dir = crate::plugins::plugins_dir(&path);
         assert_eq!(fs::read_dir(plugins_dir)?.count(), 0);
+
+        Ok(())
+    }
+
+    /// `kiki init --check` brings the default plugins to a home directory
+    /// set up before they were bundled.
+    #[cfg(feature = "default-plugins")]
+    #[test]
+    fn test_check_installs_default_plugins() -> Result<()> {
+        let td = TempDir::with_prefix("kiki_")?;
+        let path = td.path();
+        InitArgs {
+            no_default_plugins: true,
+            ..args()
+        }
+        .run_in(path)?;
+        let filter = crate::plugins::plugins_dir(path).join("filter");
+        assert!(!filter.exists());
+
+        InitArgs::with_check().run_in(path)?;
+        assert!(filter.join(crate::plugins::MANIFEST_FILE_NAME).is_file());
 
         Ok(())
     }
