@@ -262,8 +262,14 @@ impl Server {
         let manager = SqliteConnectionManager::file(&self.db_path)
             .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .with_init(|c| {
+                // busy_timeout goes first so that the other pragmas wait
+                // for a lock too. synchronous=NORMAL is safe in WAL mode
+                // (a power loss can drop the last commits, never corrupt
+                // the database) and saves an fsync on every commit, which
+                // keeps the write lock free for other workers.
                 c.execute_batch(
-                    "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+                    "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; \
+                     PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
                 )?;
                 {
                     use rusqlite::functions::FunctionFlags;
