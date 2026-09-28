@@ -36,9 +36,6 @@ pub const MIGRATIONS: &[Migration] = &[
 ];
 
 /// The migration that drops the `scripts` table in favour of plugins.
-///
-/// Scripts in the table must be exported to plugin directories before it
-/// runs; see [`crate::plugins::export_legacy_scripts`].
 pub const PLUGINS_MIGRATION: &str = "0003_plugins";
 
 /// SQL to create the migrations table. Safe to run on databases that already

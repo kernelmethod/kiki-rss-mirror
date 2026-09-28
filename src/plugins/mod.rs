@@ -37,10 +37,6 @@
 //! the order of their directory names, so prefixing directory names with a
 //! number (`10-filter`, `20-tag`) controls the order their handlers run in.
 
-mod legacy;
-
-pub use legacy::export_legacy_scripts;
-
 use crate::scripting::{ScriptModule, ScriptSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -677,7 +673,7 @@ pub fn load_sources(discovery: &Discovery, engine: PluginEngine) -> Vec<ScriptSo
 /// Installs a plugin into `plugins_dir`, in a directory named after it:
 /// writes its manifest and its entrypoint, containing `text`.
 ///
-/// This is a convenience for tests and for exporting scripts; plugins are
+/// This is a convenience for tests; plugins are
 /// normally installed by copying their directory into the plugins directory.
 ///
 /// # Errors

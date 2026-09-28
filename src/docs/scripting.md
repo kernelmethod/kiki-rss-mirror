@@ -330,7 +330,5 @@ When a handler errors, times out, or exceeds the memory cap:
 ## Upgrading from database scripts
 
 Earlier versions of Kiki stored scripts in the database and managed them
-through the `/v1/scripts/*` API. `kiki migrate` exports each of those scripts
-to a plugin named `script-NNNN` (after the script's ID) in the plugins
-directory, with the script's config as the plugin's default config, before
-dropping the old tables. Rename or edit the exported plugins as you like.
+through the `/v1/scripts/*` API. `kiki migrate` drops those scripts along with
+the tables they were kept in; to keep using a script, install it as a plugin.
