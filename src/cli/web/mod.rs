@@ -1,27 +1,55 @@
+mod sanitize;
+
 use crate::cli::serve::ServeArgs;
+use crate::routes::v1::entries::entry_assets::ListEntryAssetsResponse;
+use crate::routes::v1::entries::get_entry::GetEntryResponse;
 use crate::routes::v1::entries::{ListEntriesResponse, ListEntriesResponseEntry};
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{Path as UrlPath, Query, State},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
     Router,
 };
 use clap::Args;
 use quick_xml::escape::escape;
+use regex::Regex;
 use serde::Deserialize;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitStatus;
+use std::sync::LazyLock;
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::signal;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-/// The page served at `/`. Its `{{content}}` placeholder is filled in per
-/// request, and `{{version}}` with Kiki's version; see [`index`].
-const INDEX_HTML: &str = include_str!("index.html");
+/// The layout every page is rendered into; see [`render_page`].
+const PAGE_HTML: &str = include_str!("page.html");
+
+/// Matches the `{{name}}` placeholders in [`PAGE_HTML`].
+static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new(r"\{\{(\w+)\}\}").expect("placeholder regex is valid")
+});
+
+/// `Content-Security-Policy` sent with every page.
+///
+/// Pages carry titles and content from feeds. They are escaped or
+/// sanitized, but as a second line of defence the pages may not run any
+/// script, load anything but images from the web UI's own asset cache, or
+/// submit forms.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src 'self'; \
+    style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// `Content-Security-Policy` sent with cached assets. They were downloaded
+/// from feeds, and are served from the web UI's origin, so one opened on
+/// its own — an SVG, say — must not be able to run script there either.
+const ASSET_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src 'self'; \
+    style-src 'unsafe-inline'; sandbox";
 
 /// Base URL for requests to the Kiki API. The client sends every request
 /// over the server's Unix socket, so the host is never resolved and only
@@ -150,7 +178,11 @@ async fn serve_ui(
     api: reqwest::Client,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let app = Router::new().route("/", get(index)).with_state(api);
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/entries/{id}", get(entry_page))
+        .route("/assets/{hash}", get(asset))
+        .with_state(api);
     axum::serve(listener, app)
         .with_graceful_shutdown(cancel.cancelled_owned())
         .await
@@ -160,35 +192,225 @@ async fn serve_ui(
 /// Number of entries shown on each page of the index.
 const PAGE_SIZE: u32 = 25;
 
-/// Query parameters accepted by the index page.
+/// Query parameters accepted by the index and entry pages.
 #[derive(Deserialize)]
-struct IndexParams {
-    /// The page of entries to show, counting from 1 (default: 1).
+struct PageParams {
+    /// The page of entries to show, or to link back to, counting from 1
+    /// (default: 1).
     page: Option<u32>,
 }
 
+impl PageParams {
+    fn page(&self) -> u32 {
+        self.page.unwrap_or(1).max(1)
+    }
+}
+
+/// Fill the layout in [`PAGE_HTML`] with `title` (plain text, which is
+/// escaped) and `content` (HTML), and wrap it in a response with `status`.
+fn render_page(status: StatusCode, title: &str, content: &str) -> Response {
+    // Fill every placeholder in one pass, so that a placeholder appearing in
+    // a feed's title or content is left alone.
+    let html = PLACEHOLDER.replace_all(PAGE_HTML, |caps: &regex::Captures| match &caps[1] {
+        "title" => escape(title).into_owned(),
+        "version" => env!("CARGO_PKG_VERSION").to_owned(),
+        "content" => content.to_owned(),
+        _ => caps[0].to_owned(),
+    });
+    (
+        status,
+        [
+            (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+            // Following a link out of the reader shouldn't tell the site
+            // what the reader was.
+            (header::REFERRER_POLICY, "no-referrer"),
+            // Nor should merely showing a link: browsers may look up the
+            // hosts of links on a page before any are followed.
+            (header::X_DNS_PREFETCH_CONTROL, "off"),
+        ],
+        Html(html.into_owned()),
+    )
+        .into_response()
+}
+
+/// Render the page for when the Kiki server cannot be reached — it may
+/// still be starting — as a 502, rather than an error the browser renders
+/// on its own.
+fn server_unavailable(e: &anyhow::Error) -> Response {
+    tracing::warn!("failed to reach the Kiki server: {e:#}");
+    render_page(
+        StatusCode::BAD_GATEWAY,
+        "Kiki",
+        "<p>The Kiki server is unavailable.</p>",
+    )
+}
+
 /// Render the index page: the total number of entries, and one page of
-/// them, newest first, with links to the neighbouring pages.
-///
-/// If the server cannot be reached — it may still be starting — the page
-/// says so and the response is a 502, rather than an error the browser
-/// renders on its own.
-async fn index(State(api): State<reqwest::Client>, Query(params): Query<IndexParams>) -> Response {
-    let page = params.page.unwrap_or(1).max(1);
-    let (status, content) = match fetch_entries(&api, page).await {
-        Ok(entries) => (StatusCode::OK, render_entries(&entries, page)),
-        Err(e) => {
-            tracing::warn!("failed to reach the Kiki server: {e:#}");
-            (
-                StatusCode::BAD_GATEWAY,
-                "<p>The Kiki server is unavailable.</p>".to_owned(),
+/// them, newest first, each with the feed it came from, and links to the
+/// neighbouring pages.
+async fn index(State(api): State<reqwest::Client>, Query(params): Query<PageParams>) -> Response {
+    let page = params.page();
+    match fetch_entries(&api, page).await {
+        Ok(entries) => {
+            let feeds =
+                fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)).await;
+            render_page(
+                StatusCode::OK,
+                "Kiki",
+                &render_entries(&entries, &feeds, page),
             )
         }
+        Err(e) => server_unavailable(&e),
+    }
+}
+
+/// Render the page for entry `id`: a summary of the entry built from what
+/// its feed says about it, with a link through to the entry itself.
+///
+/// `page` is the page of the index to link back to.
+async fn entry_page(
+    State(api): State<reqwest::Client>,
+    UrlPath(id): UrlPath<i64>,
+    Query(params): Query<PageParams>,
+) -> Response {
+    let entry = match fetch_entry(&api, id).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return render_page(
+                StatusCode::NOT_FOUND,
+                "Entry not found - Kiki",
+                &format!(
+                    "<p>Entry not found.</p>\n{}",
+                    render_back_link(params.page())
+                ),
+            )
+        }
+        Err(e) => return server_unavailable(&e),
     };
-    let html = INDEX_HTML
-        .replace("{{version}}", env!("CARGO_PKG_VERSION"))
-        .replace("{{content}}", &content);
-    (status, Html(html)).into_response()
+
+    let feed_title = async {
+        match entry.feed_id {
+            Some(feed_id) => fetch_feed_titles(&api, [feed_id]).await.remove(&feed_id),
+            None => None,
+        }
+    };
+    let (feed_title, cached) = tokio::join!(feed_title, fetch_cached_assets(&api, id));
+    render_page(
+        StatusCode::OK,
+        &format!("{} - Kiki", display_title(&entry.title)),
+        &render_entry_page(&entry, feed_title.as_deref(), &cached, params.page()),
+    )
+}
+
+/// Serve the cached asset with the blake3 hash `hash`, fetched from the
+/// Kiki API. Entry pages show images and link attachments from here, so
+/// that the browser never loads anything from the sites the feeds link to.
+///
+/// Images, audio and video are served for the browser to show; anything
+/// else is served as a download, rather than rendered from the web UI's
+/// origin.
+async fn asset(
+    State(api): State<reqwest::Client>,
+    UrlPath(hash): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    // Checked here as well as by the API, so that nothing but a hash is
+    // ever put into the API's URL.
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return (StatusCode::NOT_FOUND, "asset not found").into_response();
+    }
+
+    let mut req = api.get(format!("{API_BASE}/v1/assets/{hash}"));
+    if let Some(etag) = headers.get(header::IF_NONE_MATCH) {
+        req = req.header(header::IF_NONE_MATCH, etag);
+    }
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!("failed to reach the Kiki server: {e:#}");
+            return (StatusCode::BAD_GATEWAY, "The Kiki server is unavailable.").into_response();
+        }
+    };
+
+    let status = resp.status();
+    if status == StatusCode::NOT_FOUND {
+        return (StatusCode::NOT_FOUND, "asset not found").into_response();
+    }
+    if status != StatusCode::OK && status != StatusCode::NOT_MODIFIED {
+        tracing::warn!(%status, hash, "failed to fetch cached asset");
+        return (StatusCode::BAD_GATEWAY, "failed to fetch asset").into_response();
+    }
+
+    let mut out = HeaderMap::new();
+    for name in [header::CONTENT_TYPE, header::ETAG, header::CACHE_CONTROL] {
+        if let Some(value) = resp.headers().get(&name) {
+            out.insert(name, value.clone());
+        }
+    }
+    let shown_inline = out
+        .get(header::CONTENT_TYPE)
+        .and_then(|t| t.to_str().ok())
+        .is_some_and(|t| {
+            let t = t.trim_start().to_ascii_lowercase();
+            ["image/", "audio/", "video/"]
+                .iter()
+                .any(|prefix| t.starts_with(prefix))
+        });
+    out.insert(
+        header::CONTENT_DISPOSITION,
+        header::HeaderValue::from_static(if shown_inline { "inline" } else { "attachment" }),
+    );
+    out.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    out.insert(
+        header::X_DNS_PREFETCH_CONTROL,
+        header::HeaderValue::from_static("off"),
+    );
+    out.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(ASSET_CONTENT_SECURITY_POLICY),
+    );
+    match resp.bytes().await {
+        Ok(body) => (status, out, body).into_response(),
+        Err(e) => {
+            tracing::warn!(hash, "failed to read cached asset: {e:#}");
+            (StatusCode::BAD_GATEWAY, "failed to fetch asset").into_response()
+        }
+    }
+}
+
+/// Fetch the assets — images and enclosures — cached for entry `id` from
+/// the Kiki API, mapping each asset's original URL to the web UI URL that
+/// serves the cached copy.
+///
+/// If the list cannot be fetched it is logged and treated as empty, so the
+/// entry is still shown, linking to its images and attachments where they
+/// were found.
+async fn fetch_cached_assets(api: &reqwest::Client, id: i64) -> HashMap<String, String> {
+    let assets: Result<ListEntryAssetsResponse> = async {
+        Ok(api
+            .get(format!("{API_BASE}/v1/entries/id/{id}/assets"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+    .await;
+
+    match assets {
+        Ok(assets) => assets
+            .assets
+            .into_iter()
+            .map(|a| (a.original_url, format!("/assets/{}", a.blake3)))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(entry_id = id, "failed to fetch cached assets: {e:#}");
+            HashMap::new()
+        }
+    }
 }
 
 /// Fetch page `page` (counting from 1) of `/v1/entries` from the Kiki API.
@@ -205,8 +427,68 @@ async fn fetch_entries(api: &reqwest::Client, page: u32) -> Result<ListEntriesRe
         .await?)
 }
 
+/// Fetch entry `id` from the Kiki API, or `None` if there is no such entry.
+async fn fetch_entry(api: &reqwest::Client, id: i64) -> Result<Option<GetEntryResponse>> {
+    let resp = api
+        .get(format!("{API_BASE}/v1/entries/id/{id}"))
+        .send()
+        .await?;
+    if resp.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    Ok(Some(resp.error_for_status()?.json().await?))
+}
+
+/// The part of a `/v1/feeds/id/{id}` response the web UI uses.
+#[derive(Deserialize)]
+struct Feed {
+    title: String,
+}
+
+/// Fetch the titles of the feeds in `feed_ids` from the Kiki API, keyed by
+/// feed ID.
+///
+/// Each feed is fetched once, however often it appears in `feed_ids`. A
+/// feed that cannot be fetched is logged and left out, so its entries are
+/// shown without a feed rather than not at all.
+async fn fetch_feed_titles(
+    api: &reqwest::Client,
+    feed_ids: impl IntoIterator<Item = i64>,
+) -> HashMap<i64, String> {
+    let mut tasks = JoinSet::new();
+    for id in feed_ids.into_iter().collect::<BTreeSet<_>>() {
+        let api = api.clone();
+        tasks.spawn(async move {
+            let feed: Result<Feed> = async {
+                Ok(api
+                    .get(format!("{API_BASE}/v1/feeds/id/{id}"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?)
+            }
+            .await;
+            (id, feed)
+        });
+    }
+
+    let mut titles = HashMap::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((id, Ok(feed))) => {
+                titles.insert(id, feed.title);
+            }
+            Ok((id, Err(e))) => tracing::warn!(feed_id = id, "failed to fetch feed: {e:#}"),
+            Err(e) => tracing::warn!("feed fetch task failed: {e}"),
+        }
+    }
+    titles
+}
+
 /// Render the entry count, the entries on page `page`, and the page links.
-fn render_entries(resp: &ListEntriesResponse, page: u32) -> String {
+/// `feeds` maps feed IDs to the titles of the feeds.
+fn render_entries(resp: &ListEntriesResponse, feeds: &HashMap<i64, String>, page: u32) -> String {
     let mut html = format!(
         "<p class=\"count\">{} {}</p>\n",
         resp.count,
@@ -222,8 +504,9 @@ fn render_entries(resp: &ListEntriesResponse, page: u32) -> String {
     } else {
         html.push_str("<ol class=\"entries\">\n");
         for entry in &resp.entries {
+            let feed = entry.feed_id.and_then(|id| feeds.get(&id));
             html.push_str("<li>");
-            html.push_str(&render_entry(entry));
+            html.push_str(&render_entry(entry, feed.map(String::as_str), page));
             html.push_str("</li>\n");
         }
         html.push_str("</ol>\n");
@@ -233,34 +516,193 @@ fn render_entries(resp: &ListEntriesResponse, page: u32) -> String {
     html
 }
 
-/// Render a single entry: its title, linked to the entry when its URL is
-/// safe to link to, and its publication date.
-fn render_entry(entry: &ListEntriesResponseEntry) -> String {
-    let title = if entry.title.trim().is_empty() {
+/// Render a single entry in the index: its title, linked to the entry's
+/// page, and below it its publication date and the title of `feed`, the
+/// feed it came from. The entry's page links back to page `page` of the
+/// index.
+fn render_entry(entry: &ListEntriesResponseEntry, feed: Option<&str>, page: u32) -> String {
+    let href = if page > 1 {
+        format!("/entries/{}?page={page}", entry.id)
+    } else {
+        format!("/entries/{}", entry.id)
+    };
+    let meta = render_meta(entry.published_at.as_deref(), feed, None);
+    format!(
+        "<a href=\"{href}\">{}</a>{meta}",
+        escape(display_title(&entry.title))
+    )
+}
+
+/// Render the page for `entry`: its title, date, feed (`feed`), author and
+/// categories, its content from the feed, and links to the entry itself and
+/// to anything else the feed links it to. The page links back to page
+/// `page` of the index.
+///
+/// Images in the content, and the entry's attachment, are taken from the
+/// asset cache: `cached` maps an asset's original URL to the URL of its
+/// cached copy. Images that are not cached are shown as links instead, and
+/// an attachment that is not cached is linked where the feed says it is.
+fn render_entry_page(
+    entry: &GetEntryResponse,
+    feed: Option<&str>,
+    cached: &HashMap<String, String>,
+    page: u32,
+) -> String {
+    let authors: Vec<&str> = match (&entry.rss, &entry.atom) {
+        (Some(rss), _) => rss.author.as_deref().into_iter().collect(),
+        (None, Some(atom)) => atom.authors.iter().map(String::as_str).collect(),
+        (None, None) => Vec::new(),
+    };
+    let categories: Vec<&str> = match (&entry.rss, &entry.atom) {
+        (Some(rss), _) => rss.categories.iter().map(|c| c.category.as_str()).collect(),
+        (None, Some(atom)) => atom
+            .categories
+            .iter()
+            .map(|c| c.label.as_deref().unwrap_or(&c.term))
+            .collect(),
+        (None, None) => Vec::new(),
+    };
+    let authors = authors.join(", ");
+
+    let mut html = format!(
+        "<article class=\"entry\">\n<h2>{}</h2>\n{}\n",
+        escape(display_title(&entry.title)),
+        render_meta(
+            entry.published_at.as_deref(),
+            feed,
+            (!authors.trim().is_empty()).then_some(authors.as_str()),
+        ),
+    );
+    if !categories.is_empty() {
+        let categories: Vec<_> = categories.into_iter().map(escape).collect();
+        html.push_str(&format!(
+            "<span class=\"meta categories\">Filed under {}</span>\n",
+            categories.join(", ")
+        ));
+    }
+
+    // Links and images in the content are resolved against the entry's own
+    // URL, where the content was written to appear.
+    let base = url::Url::parse(&entry.url).ok();
+    let content = entry
+        .content
+        .as_deref()
+        .or_else(|| {
+            entry
+                .rss
+                .as_ref()
+                .and_then(|rss| rss.description.as_deref())
+        })
+        .filter(|c| !c.trim().is_empty());
+    match content
+        .map(|c| sanitize::sanitize_html(c, base.as_ref(), |url| cached.get(url.as_str()).cloned()))
+    {
+        Some(Ok(content)) => {
+            html.push_str(&format!("<div class=\"content\">\n{content}\n</div>\n"));
+        }
+        Some(Err(e)) => {
+            tracing::warn!(entry_id = entry.id, "failed to sanitize entry content: {e}");
+            html.push_str(
+                "<p class=\"content\"><em>This entry's summary could not be shown.</em></p>\n",
+            );
+        }
+        None => html.push_str(
+            "<p class=\"content\"><em>The feed gives no summary of this entry.</em></p>\n",
+        ),
+    }
+
+    let mut links = Vec::new();
+    if let Some(url) = safe_link(&entry.url) {
+        links.push(format!(
+            "<a href=\"{}\" rel=\"noopener noreferrer\">Read the full entry &rarr;</a>",
+            escape(url)
+        ));
+    }
+    if let Some(rss) = &entry.rss {
+        if let Some(url) = rss.comments.as_deref().and_then(safe_link) {
+            links.push(format!(
+                "<a href=\"{}\" rel=\"noopener noreferrer\">Comments</a>",
+                escape(url)
+            ));
+        }
+        if let Some(url) = rss.enclosure_url.as_deref().and_then(safe_link) {
+            // The cache keys an enclosure by its URL as `url` writes it.
+            let url = url::Url::parse(url)
+                .ok()
+                .and_then(|u| cached.get(u.as_str()))
+                .map_or(url, String::as_str);
+            let kind = rss
+                .enclosure_mime_type
+                .as_deref()
+                .map(|t| format!(" ({})", escape(t)))
+                .unwrap_or_default();
+            links.push(format!(
+                "<a href=\"{}\" rel=\"noopener noreferrer\">Attachment{kind}</a>",
+                escape(url)
+            ));
+        }
+    }
+    if !links.is_empty() {
+        html.push_str(&format!(
+            "<p class=\"links\">{}</p>\n",
+            links.join(" &middot; ")
+        ));
+    }
+
+    html.push_str("</article>\n");
+    html.push_str(&render_back_link(page));
+    html
+}
+
+/// Render the link back to page `page` of the index.
+fn render_back_link(page: u32) -> String {
+    let href = if page > 1 {
+        format!("/?page={page}")
+    } else {
+        "/".to_owned()
+    };
+    format!("<p><a href=\"{href}\">&larr; Back to entries</a></p>\n")
+}
+
+/// Render the line under an entry's title: its publication date
+/// (`published_at`, in RFC 3339), the title of `feed`, the feed it came
+/// from, and `author`, leaving out whichever are unknown.
+fn render_meta(published_at: Option<&str>, feed: Option<&str>, author: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    // Show just the date; the API reports times in RFC 3339.
+    if let Some(t) = published_at.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()) {
+        parts.push(format!(
+            "<time datetime=\"{}\">{}</time>",
+            t.to_rfc3339(),
+            t.format("%Y-%m-%d")
+        ));
+    }
+    if let Some(feed) = feed {
+        let feed = if feed.trim().is_empty() {
+            "(untitled feed)"
+        } else {
+            feed
+        };
+        parts.push(format!("<span class=\"feed\">{}</span>", escape(feed)));
+    }
+    if let Some(author) = author {
+        parts.push(format!("by {}", escape(author)));
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("<span class=\"meta\">{}</span>", parts.join(" &middot; "))
+    }
+}
+
+/// `title`, or a placeholder if it is blank.
+fn display_title(title: &str) -> &str {
+    if title.trim().is_empty() {
         "(untitled)"
     } else {
-        entry.title.as_str()
-    };
-    let title = match safe_link(&entry.url) {
-        Some(url) => format!("<a href=\"{}\">{}</a>", escape(url), escape(title)),
-        None => escape(title).into_owned(),
-    };
-
-    // Show just the date; the API reports times in RFC 3339.
-    let date = entry
-        .published_at
-        .as_deref()
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| {
-            format!(
-                " <time datetime=\"{}\">{}</time>",
-                t.to_rfc3339(),
-                t.format("%Y-%m-%d")
-            )
-        })
-        .unwrap_or_default();
-
-    format!("{title}{date}")
+        title
+    }
 }
 
 /// Return `url` if it is an `http` or `https` URL.
@@ -515,6 +957,372 @@ mod tests {
         );
         assert!(!body.contains("javascript:"), "{body}");
         assert!(!body.contains(r#""><b>"#), "{body}");
+        Ok(())
+    }
+
+    /// Each entry on the index names the feed it came from, and links to
+    /// its own page rather than straight to the entry's URL.
+    #[tokio::test]
+    async fn the_index_page_shows_each_entrys_feed() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (id, title, url)
+             VALUES (1, 'Feed <One>', 'http://example.com/1.xml'),
+                    (2, 'Feed Two', 'http://example.com/2.xml')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO entries (id, feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (1, 1, 'rss', 'a', 1, 'From one', 'http://example.com/a'),
+                    (2, 2, 'rss', 'b', 2, 'From two', 'http://example.com/b'),
+                    (3, NULL, 'rss', 'c', 3, 'Orphan', 'http://example.com/c')",
+            [],
+        )?;
+
+        let (status, body) = get_index(tc.client()?).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(r#"<a href="/entries/1">From one</a>"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<span class="feed">Feed &lt;One&gt;</span>"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<span class="feed">Feed Two</span>"#),
+            "{body}"
+        );
+        assert!(!body.contains("http://example.com/a"), "{body}");
+        assert_eq!(body.matches(r#"class="feed""#).count(), 2, "{body}");
+        Ok(())
+    }
+
+    /// On later pages of the index, entries link to pages that link back.
+    #[tokio::test]
+    async fn entry_pages_link_back_to_the_index_page() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 30)?;
+
+        let (_, body) = get_page(tc.client()?, "/?page=2").await?;
+        assert!(body.contains(r#"href="/entries/5?page=2""#), "{body}");
+
+        let (status, body) = get_page(tc.client()?, "/entries/5?page=2").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"<a href="/?page=2">"#), "{body}");
+        Ok(())
+    }
+
+    /// An entry's page summarizes it from the feed's data: its title, date,
+    /// feed, author, categories and content, with a link through to it.
+    #[tokio::test]
+    async fn the_entry_page_summarizes_the_entry() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (id, title, url) VALUES (1, 'Example Feed', 'http://example.com/feed.xml')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO entries (id, feed_id, syndication_format, guid, published_at, title, url, content)
+             VALUES (7, 1, 'rss', 'a', 1700000000, 'An <Entry>', 'http://example.com/posts/a',
+                     '<p onclick=\"x()\">Hello <a href=\"/about\">there</a></p><script>alert(1)</script>')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO rss_entry_data (entry_id, author, comments)
+             VALUES (7, 'Ann Author', 'http://example.com/posts/a#comments')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO rss_categories (entry_id, category) VALUES (7, 'news')",
+            [],
+        )?;
+
+        let (status, body) = get_page(tc.client()?, "/entries/7").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("<title>An &lt;Entry&gt; - Kiki</title>"),
+            "{body}"
+        );
+        assert!(body.contains("<h2>An &lt;Entry&gt;</h2>"), "{body}");
+        assert!(body.contains("2023-11-14"), "{body}");
+        assert!(
+            body.contains(r#"<span class="feed">Example Feed</span>"#),
+            "{body}"
+        );
+        assert!(body.contains("by Ann Author"), "{body}");
+        assert!(body.contains("Filed under news"), "{body}");
+        assert!(
+            body.contains(
+                r#"<p>Hello <a href="http://example.com/about" rel="noopener noreferrer nofollow">there</a></p>"#
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("<script>"), "{body}");
+        assert!(!body.contains("onclick"), "{body}");
+        assert!(
+            body.contains(r#"<a href="http://example.com/posts/a" rel="noopener noreferrer">Read the full entry"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<a href="http://example.com/posts/a#comments" rel="noopener noreferrer">Comments</a>"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<a href="/">&larr; Back to entries</a>"#),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// Cache `bytes` as the asset at `original_url`, of type `content_type`,
+    /// for entry `entry_id` as an asset of `kind`, and return its hash.
+    fn cache_asset(
+        tc: &crate::test::TestConfig,
+        entry_id: i64,
+        bytes: &[u8],
+        original_url: &str,
+        content_type: &str,
+        kind: &str,
+    ) -> Result<String> {
+        let conn = tc.database_conn()?;
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let path = crate::tasks::assets::asset_path(tc.config_dir(), &hash);
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, bytes)?;
+        let asset_id = crate::db::assets::insert_asset(
+            &conn,
+            &hash,
+            original_url,
+            Some(content_type),
+            bytes.len() as i64,
+            None,
+            None,
+        )?;
+        crate::db::assets::link_entry_asset(&conn, entry_id, asset_id, kind)?;
+        Ok(hash)
+    }
+
+    /// An entry's attachment links to its cached copy when there is one, and
+    /// to where the feed says it is when there isn't.
+    #[tokio::test]
+    async fn attachments_link_to_the_asset_cache() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO entries (id, syndication_format, guid, published_at, title, url)
+             VALUES (1, 'rss', 'a', 1, 'Cached', 'http://example.com/a'),
+                    (2, 'rss', 'b', 2, 'Uncached', 'http://example.com/b')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO rss_entry_data (entry_id, enclosure_url, enclosure_mime_type)
+             VALUES (1, 'HTTP://Example.com/episode.mp3', 'audio/mpeg'),
+                    (2, 'http://example.com/other.mp3', 'audio/mpeg')",
+            [],
+        )?;
+        let hash = cache_asset(
+            &tc,
+            1,
+            b"episode",
+            "http://example.com/episode.mp3",
+            "audio/mpeg",
+            "enclosure",
+        )?;
+
+        let (_, body) = get_page(tc.client()?, "/entries/1").await?;
+        assert!(
+            body.contains(&format!(
+                r#"<a href="/assets/{hash}" rel="noopener noreferrer">Attachment (audio/mpeg)</a>"#
+            )),
+            "{body}"
+        );
+        assert!(!body.contains("episode.mp3"), "{body}");
+
+        let (_, body) = get_page(tc.client()?, "/entries/2").await?;
+        assert!(
+            body.contains(
+                r#"<a href="http://example.com/other.mp3" rel="noopener noreferrer">Attachment"#
+            ),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// Cached media is shown in the browser; anything else is downloaded
+    /// rather than rendered from the web UI's origin.
+    #[tokio::test]
+    async fn only_media_assets_are_shown_inline() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        tc.database_conn()?.execute(
+            "INSERT INTO entries (id, syndication_format, guid, published_at, title, url)
+             VALUES (1, 'rss', 'a', 1, 'Entry', 'http://example.com/a')",
+            [],
+        )?;
+        let cases = [
+            ("image/png", "inline"),
+            ("audio/mpeg", "inline"),
+            ("video/mp4", "inline"),
+            ("text/html", "attachment"),
+            ("application/pdf", "attachment"),
+        ];
+        let mut hashes = Vec::new();
+        for (i, (content_type, _)) in cases.iter().enumerate() {
+            hashes.push(cache_asset(
+                &tc,
+                1,
+                format!("asset {i}").as_bytes(),
+                &format!("http://example.com/{i}"),
+                content_type,
+                "enclosure",
+            )?);
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
+
+        for ((content_type, disposition), hash) in cases.iter().zip(&hashes) {
+            let resp = reqwest::get(format!("http://{addr}/assets/{hash}")).await?;
+            assert_eq!(
+                resp.headers()[header::CONTENT_DISPOSITION],
+                *disposition,
+                "{content_type}"
+            );
+        }
+
+        cancel.cancel();
+        task.await??;
+        Ok(())
+    }
+
+    /// Cached images are shown from the web UI's asset route, which serves
+    /// the bytes from the cache; images that aren't cached become links.
+    #[tokio::test]
+    async fn entry_images_are_served_from_the_asset_cache() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO entries (id, syndication_format, guid, published_at, title, url, content)
+             VALUES (1, 'rss', 'a', 1, 'Pictures', 'http://example.com/posts/a',
+                     '<img src=\"cached.png\" alt=\"Cached\"><img src=\"http://example.com/missing.png\">')",
+            [],
+        )?;
+        let bytes = b"not really a png";
+        let hash = cache_asset(
+            &tc,
+            1,
+            bytes,
+            "http://example.com/posts/cached.png",
+            "image/png",
+            "inline_img",
+        )?;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
+
+        let resp = reqwest::get(format!("http://{addr}/entries/1")).await?;
+        let csp = resp.headers()[header::CONTENT_SECURITY_POLICY].to_str()?;
+        assert!(csp.contains("img-src 'self';"), "{csp}");
+        let body = resp.text().await?;
+        assert!(
+            body.contains(&format!(
+                r#"<img src="/assets/{hash}" alt="Cached" loading="lazy">"#
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<a href="http://example.com/missing.png" rel="noopener noreferrer nofollow">[Image]</a>"#),
+            "{body}"
+        );
+
+        let resp = reqwest::get(format!("http://{addr}/assets/{hash}")).await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert!(resp.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()?
+            .ends_with("sandbox"));
+        assert_eq!(resp.headers()[header::X_DNS_PREFETCH_CONTROL], "off");
+        let etag = resp.headers()[header::ETAG].clone();
+        assert_eq!(resp.bytes().await?.as_ref(), bytes);
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/assets/{hash}"))
+            .header(header::IF_NONE_MATCH, etag)
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+
+        for path in [
+            format!("/assets/{}", "0".repeat(64)),
+            "/assets/..%2Fentries".to_owned(),
+        ] {
+            let resp = reqwest::get(format!("http://{addr}{path}")).await?;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+
+        cancel.cancel();
+        task.await??;
+        Ok(())
+    }
+
+    /// Pages forbid script, in case anything from a feed slips through, and
+    /// ask the browser not to look up the hosts they link to.
+    #[tokio::test]
+    async fn pages_forbid_script() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 1)?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
+
+        for path in ["/", "/entries/1"] {
+            let resp = reqwest::get(format!("http://{addr}{path}")).await?;
+            let csp = resp.headers()[header::CONTENT_SECURITY_POLICY].to_str()?;
+            assert!(csp.starts_with("default-src 'none';"), "{path}: {csp}");
+            assert!(!csp.contains("script-src"), "{path}: {csp}");
+            assert_eq!(
+                resp.headers()[header::X_DNS_PREFETCH_CONTROL],
+                "off",
+                "{path}"
+            );
+        }
+
+        cancel.cancel();
+        task.await??;
+        Ok(())
+    }
+
+    /// Placeholders in a feed's text are shown as they are, not filled in.
+    #[tokio::test]
+    async fn placeholders_in_entries_are_not_filled_in() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        tc.database_conn()?.execute(
+            "INSERT INTO entries (id, syndication_format, guid, published_at, title, url, content)
+             VALUES (1, 'rss', 'a', 1, '{{content}}', 'http://example.com/a', '{{version}}')",
+            [],
+        )?;
+
+        let (_, body) = get_page(tc.client()?, "/entries/1").await?;
+        assert!(body.contains("<h2>{{content}}</h2>"), "{body}");
+        assert!(body.contains("{{version}}"), "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_entry_is_reported() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let (status, body) = get_page(tc.client()?, "/entries/42").await?;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("Entry not found."), "{body}");
         Ok(())
     }
 
