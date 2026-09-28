@@ -255,7 +255,7 @@ impl LuaScriptRunner {
     }
 
     /// Build a runner from scripts and their configs, answering the calls they make
-    /// through `kiki.store` and `kiki.entries` with `services`.
+    /// through `kiki.store`, `kiki.entries` and `kiki.feeds` with `services`.
     ///
     /// See [`Self::from_sources`]; without `services`, those calls raise an error.
     ///

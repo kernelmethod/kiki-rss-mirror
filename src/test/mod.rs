@@ -707,6 +707,7 @@ impl TestConfig {
             homepage: None,
             enabled: true,
             config,
+            settings: vec![],
         };
         crate::plugins::install(&self.plugins_dir(), &manifest, text)
     }

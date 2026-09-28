@@ -1,7 +1,7 @@
 //! The server's answers to the calls plugins make through the `kiki` Lua
 //! API: their key-value stores (`kiki.store`), tagging stored entries
-//! (`kiki.entries.tag` and `untag`), and scans of stored entries
-//! (`kiki.entries.scan`).
+//! (`kiki.entries.tag` and `untag`), scans of stored entries
+//! (`kiki.entries.scan`), and looking up feeds (`kiki.feeds.get`).
 //!
 //! # Scans
 //!
@@ -20,7 +20,7 @@
 use crate::db::plugins::{store_get, store_set};
 use crate::db::tags::{is_reserved_tag_name, SystemTag};
 use crate::scripting::{
-    FeedEntry, ScanOptions, ScanSummary, ScriptRunnerHandle, ScriptServices, ServiceCall,
+    FeedEntry, FeedInfo, ScanOptions, ScanSummary, ScriptRunnerHandle, ScriptServices, ServiceCall,
     ServiceReply,
 };
 use arc_swap::ArcSwap;
@@ -135,8 +135,28 @@ impl ScriptServices for ServerServices {
             ServiceCall::StartScan { options } => {
                 Ok(ServiceReply::ScanStarted(self.scans.start(plugin, options)))
             }
+            ServiceCall::GetFeed { feed_id } => {
+                Ok(ServiceReply::Feed(get_feed(&*self.conn()?, feed_id)?))
+            }
         }
     }
+}
+
+/// Looks up the feed with id `feed_id`, returning `None` if there is none.
+fn get_feed(conn: &Connection, feed_id: i64) -> Result<Option<FeedInfo>, String> {
+    conn.query_row(
+        "SELECT id, url, title FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| {
+            Ok(FeedInfo {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                title: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| format!("database error: {e}"))
 }
 
 /// Adds the tag named `tag` to the entry `entry_id`, or removes it when
@@ -822,6 +842,34 @@ mod tests {
         assert!(set_entry_tag(&conn, entry, " ", true).is_err());
         assert!(set_entry_tag(&conn, entry + 1, "news", true).is_err());
         assert_eq!(tags(&conn, entry), ["news"]);
+    }
+
+    #[test]
+    fn plugins_can_look_up_feeds() {
+        let pool = pool();
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO feeds (id, title, url) VALUES (4, 'Feed', 'https://example.com/f')",
+            [],
+        )
+        .unwrap();
+        let h = Harness::new(
+            pool.clone(),
+            r#"
+            kiki.on("plugin.load", function()
+                local feed = kiki.feeds.get(4)
+                assert(feed.id == 4 and feed.title == "Feed")
+                assert(feed.url == "https://example.com/f")
+                assert(kiki.feeds.get(5) == nil)
+                kiki.store.set("done", true)
+            end)
+            "#,
+        );
+        h.load();
+        assert_eq!(
+            store_get(&conn, "p", "done").unwrap(),
+            Some(serde_json::json!(true))
+        );
     }
 
     #[test]

@@ -49,8 +49,12 @@ flags = "i"
 | `description`, `authors`, `license`, `homepage` | No | Informational; shown by the API. |
 | `enabled`     | No       | Set to `false` to keep a plugin installed without running it. Defaults to `true`. |
 | `config`      | No       | A table holding the plugin's default config; see [Plugin config](#plugin-config). |
+| `settings`    | No       | An array describing the keys of `config`: their types, labels and descriptions; see [Describing settings](#describing-settings). |
 
-Other fields are ignored, so plugins may carry metadata of their own.
+Other fields are ignored, so plugins may carry metadata of their own. Kiki
+may give meaning to new fields in later versions, as it did to `settings`,
+so a plugin's own metadata is best kept under a name unlikely to clash, such
+as a table named after the plugin.
 
 To install a plugin, copy its directory into `plugins/`; to remove one, delete
 its directory. A running server watches the plugins directory and reloads its
@@ -89,6 +93,7 @@ that, kiki exposes a single additional global — the `kiki` table:
   [Storing data](#storing-data).
 - `kiki.entries` — tag the entries already stored, and scan through them.
   See [Stored entries](#stored-entries).
+- `kiki.feeds` — look up the feeds entries come from. See [Feeds](#feeds).
 
 The sandbox removes `dofile`, `loadfile`, `debug`, `io`, `package`, and the
 destructive `os.*` calls (`execute`, `exit`, `getenv`, `remove`, `rename`,
@@ -164,13 +169,81 @@ config as TOML (`--defaults` or `--overrides` for just one part), and
 read from `FILE` or standard input, keeping the others unless `--replace` is
 given. `kiki plugin ls` lists the installed plugins.
 In the web UI (`kiki web`), each plugin on the Plugins page links to a page
-that shows its config and has a form to set, reset or add each setting.
+that shows its config and has a form to set, reset or add each setting. Each
+setting gets fields that fit it (see [Describing settings](#describing-settings));
+any setting can also be edited as JSON.
 Since overrides live outside the plugin directory, a new version of a plugin
 can be dropped in without losing them. Changing a config reloads the plugins,
 so it takes effect at once. If the plugins fail to load with it, it is still
 saved, but the plugins keep running with the config they had; the API's
 response says why in `reload_error`, and `kiki plugin config set` and the web
 UI report it.
+
+### Describing settings
+
+A manifest can describe the keys of its `[config]` table with a
+`[[settings]]` array. The web UI then shows a form field that fits each one,
+such as a checkbox, a drop-down or a fieldset per rule, instead of asking for
+JSON, and the config API and `kiki plugin config set` refuse values of the
+wrong type (a described key may still be set to `null`). Keys that are not
+described get fields guessed from their defaults, and are not checked.
+
+```toml
+[config]
+limit = 10
+rules = []
+
+[[settings]]
+name = "limit"
+type = "integer"
+label = "Limit"
+description = "How many entries to look at."
+min = 1
+
+[[settings]]
+name = "rules"
+type = "list"
+label = "Rules"
+
+[settings.items]
+type = "object"
+
+[[settings.items.fields]]
+name = "pattern"
+type = "string"
+required = true
+
+[[settings.items.fields]]
+name = "fields"
+type = "list"
+items = { type = "choice", choices = ["title", "content"] }
+```
+
+| `type`    | Holds                          | Options |
+|-----------|--------------------------------|---------|
+| `string`  | A string                       | `multiline = true` for text over several lines |
+| `integer` | A whole number                 | `min`, `max` |
+| `number`  | Any number                     | `min`, `max` |
+| `boolean` | `true` or `false`              | |
+| `choice`  | One of a fixed set of strings  | `choices` (required) |
+| `feed`    | A feed: its id, or the URL it is fetched from | |
+| `list`    | A list of values of one type   | `items` (required): a table with a `type` and its options |
+| `object`  | A table with named fields      | `fields` (required): an array of settings, written like the top-level ones |
+| `json`    | Anything; edited as JSON       | |
+
+Every setting has a `name` (the config key, or the object field) and may have
+a `label` and a `description`. A field of an object may be `required`; the
+others may be left out. Top-level settings may not be `required`: they take
+their default from `[config]`, and can be reset to it. Options Kiki does not
+know are ignored, so a misspelt option (`mni = 1`) silently has no effect. Objects may not hold fields they do not describe, and
+field names are made of ASCII letters, digits, `_` and `-`. A manifest whose
+settings are malformed, or whose `[config]` defaults do not match them, is
+invalid.
+
+Values are checked when they are saved, not when plugins load. Overrides
+saved before a plugin described or tightened a setting keep running as they
+are; the web UI shows ones that no longer match as JSON, and saving that key
+again must give a value that matches.
 
 Tables (and JSON objects) become Lua tables keyed by string, and arrays become
 sequences indexed from 1. TOML dates and times become strings in their
@@ -387,9 +460,45 @@ kiki.on("plugin.load", function()
 end)
 ```
 
-Calls to `kiki.store` and `kiki.entries` go to the server, which answers them
-from the database. Time a handler spends waiting on them does not count
-against its [time budget](#resource-limits), up to a second per handler call.
+## Feeds
+
+An entry names its feed only by `feed_id`. `kiki.feeds.get(id)` looks the
+feed up, returning a table with its `id`, `url` (the URL it is fetched from,
+or `nil`) and `title`, or `nil` if there is no feed with that id. Feed ids
+depend on the order feeds were added in, so this is how a plugin can apply
+settings to feeds named by URL:
+
+```lua
+local config = ...
+local urls = {}
+for _, url in ipairs(config.feeds or {}) do
+    urls[url] = true
+end
+
+local seen = {}
+kiki.on("entry.ingest", function(entry)
+    if seen[entry.feed_id] == nil then
+        local feed = kiki.feeds.get(entry.feed_id)
+        seen[entry.feed_id] = feed ~= nil and urls[feed.url] == true
+    end
+    if seen[entry.feed_id] then
+        table.insert(entry.tags, "watched")
+    end
+    return entry
+end)
+```
+
+Each lookup is a call to the server, so a plugin that looks feeds up for
+every entry is best off remembering the answers, as above. A feed's URL
+changes when fetching it is permanently redirected, and a removed feed's id
+may be given to a feed added later (listen for `feed.removed` to forget it).
+
+## Calls to the server
+
+Calls to `kiki.store`, `kiki.entries` and `kiki.feeds` go to the server,
+which answers them from the database. Time a handler spends waiting on them
+does not count against its [time budget](#resource-limits), up to a second
+per handler call.
 
 ## Regular expressions
 
@@ -458,8 +567,8 @@ Every handler call runs under two hard limits:
   every 1000 VM instructions. Scripts stuck in long-running C-level calls
   (e.g. pathological `string.gsub` patterns) can exceed this slightly before
   control returns to the VM. Time spent waiting on the server in calls to
-  `kiki.store` and `kiki.entries` is not counted, up to one second per
-  invocation; past that, waiting counts like anything else.
+  `kiki.store`, `kiki.entries` and `kiki.feeds` is not counted, up to one
+  second per invocation; past that, waiting counts like anything else.
 - **Memory**: 16 MiB across the entire VM. Allocations that would exceed this
   cap fail the handler.
 - **Regexes**: compiled regexes live outside the VM, so the memory cap does not

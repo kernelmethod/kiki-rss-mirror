@@ -344,6 +344,19 @@ pub enum ServiceCall {
     /// them to the plugin in batches with [`ScriptRunner::dispatch_scan`]. Answered with
     /// [`ServiceReply::ScanStarted`], carrying the scan's id.
     StartScan { options: ScanOptions },
+    /// Look up the feed with id `feed_id`. Answered with [`ServiceReply::Feed`].
+    GetFeed { feed_id: i64 },
+}
+
+/// A feed, as plugins see it through `kiki.feeds.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedInfo {
+    /// The feed's id: the `feed_id` of its entries.
+    pub id: i64,
+    /// The URL the feed is fetched from, if it has one.
+    pub url: Option<String>,
+    /// The feed's title.
+    pub title: String,
 }
 
 /// The server's answer to a [`ServiceCall`].
@@ -355,6 +368,8 @@ pub enum ServiceReply {
     Changed(bool),
     /// A scan started, with this id.
     ScanStarted(u64),
+    /// A feed, or `None` if there is no feed with the id asked for.
+    Feed(Option<FeedInfo>),
     /// The call succeeded and has nothing to report.
     Done,
 }

@@ -12,9 +12,10 @@
 //! database, no filesystem (Landlock with an empty ruleset), and no way
 //! to open a socket (seccomp). Its entire view of the world is one
 //! inherited socket pair and whatever the server chooses to send down it.
-//! What plugins ask of the server (`kiki.store`, `kiki.entries`) goes back
-//! up that socket as a [`HostResponse::Call`], and the server decides how
-//! to answer: the child never touches the database itself.
+//! What plugins ask of the server (`kiki.store`, `kiki.entries`,
+//! `kiki.feeds`) goes back up that socket as a [`HostResponse::Call`], and
+//! the server decides how to answer: the child never touches the database
+//! itself.
 //!
 //! # Roles
 //!
@@ -179,8 +180,8 @@ impl ScriptHost {
         })
     }
 
-    /// Answer the calls plugins make through `kiki.store` and
-    /// `kiki.entries` with `services`.
+    /// Answer the calls plugins make through `kiki.store`, `kiki.entries`
+    /// and `kiki.feeds` with `services`.
     pub fn set_services(&self, services: Arc<dyn ScriptServices>) {
         *self.services.write().unwrap_or_else(|e| e.into_inner()) = Some(services);
     }
