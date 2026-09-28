@@ -20,7 +20,7 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
 /// The page served at `/`. Its `{{content}}` placeholder is filled in per
-/// request; see [`index`].
+/// request, and `{{version}}` with Kiki's version; see [`index`].
 const INDEX_HTML: &str = include_str!("index.html");
 
 /// Base URL for requests to the Kiki API. The client sends every request
@@ -185,7 +185,10 @@ async fn index(State(api): State<reqwest::Client>, Query(params): Query<IndexPar
             )
         }
     };
-    (status, Html(INDEX_HTML.replace("{{content}}", &content))).into_response()
+    let html = INDEX_HTML
+        .replace("{{version}}", env!("CARGO_PKG_VERSION"))
+        .replace("{{content}}", &content);
+    (status, Html(html)).into_response()
 }
 
 /// Fetch page `page` (counting from 1) of `/v1/entries` from the Kiki API.
@@ -435,6 +438,21 @@ mod tests {
         assert!(body.contains("No entries yet."), "{body}");
         assert!(body.contains("Page 1 of 1"), "{body}");
         assert!(!body.contains("{{content}}"), "{body}");
+        Ok(())
+    }
+
+    /// The header shows Kiki's version.
+    #[tokio::test]
+    async fn the_index_page_shows_the_version() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let (_, body) = get_index(tc.client()?).await?;
+
+        let version = format!(
+            r#"<small class="version">v{}</small>"#,
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(body.contains(&version), "{body}");
+        assert!(!body.contains("{{version}}"), "{body}");
         Ok(())
     }
 
