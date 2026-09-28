@@ -9,7 +9,7 @@ use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, TransactionBehavior};
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Store a parsed Atom feed: its feed-level data, then each entry after
 /// it has been through the script chain.
@@ -34,11 +34,7 @@ pub(super) fn process_atom_feed(
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
 ) -> Result<Vec<i64>> {
-    info!(
-        "Successfully fetched Atom feed {} with {} items",
-        feed_id,
-        entries.len()
-    );
+    debug!("Parsed Atom feed {} with {} items", feed_id, entries.len());
 
     let parsed_count = entries.len();
     let entries: Vec<_> = entries
@@ -96,11 +92,7 @@ pub(super) fn process_rss_feed(
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
 ) -> Result<Vec<i64>> {
-    info!(
-        "Successfully fetched RSS feed {} with {} items",
-        feed_id,
-        entries.len()
-    );
+    debug!("Parsed RSS feed {} with {} items", feed_id, entries.len());
 
     let parsed_count = entries.len();
     let entries: Vec<_> = entries

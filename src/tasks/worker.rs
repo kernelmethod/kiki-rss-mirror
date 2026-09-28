@@ -209,7 +209,7 @@ async fn run_worker(worker_id: usize, w: Worker) {
                             feed_id, e
                         );
                         if let Ok(conn) = w.pool.get() {
-                            set_feed_error(
+                            if let Some(schedule) = set_feed_error(
                                 &conn,
                                 feed_id,
                                 &FetchError::Other {
@@ -217,7 +217,9 @@ async fn run_worker(worker_id: usize, w: Worker) {
                                 },
                                 &settings.feed_fetch,
                                 &w.metrics,
-                            );
+                            ) {
+                                info!("Feed {}: next attempt {}", feed_id, schedule);
+                            }
                         }
                         "error"
                     }

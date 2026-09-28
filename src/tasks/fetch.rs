@@ -6,7 +6,7 @@ use crate::http::{FeedAuth, FeedAuthType};
 use crate::metrics::Metrics;
 use crate::scripting::ScriptRunner;
 use crate::tasks::backoff::{
-    compute_next_fetch_at, defer_past_skipped, parse_retry_after, FetchOutcome, SchedulerConfig,
+    format_duration, parse_retry_after, plan_next_fetch, FetchOutcome, Schedule, SchedulerConfig,
 };
 use crate::tasks::cache::{
     corrected_max_age, extract_server_hints, parse_http_date, CacheControl, ServerHints,
@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 /// cache validators, body fingerprint, and scheduling state that drive the
 /// fetch decision.
 struct FeedFetchRow {
+    title: String,
     url: String,
     header_etag: Option<String>,
     header_last_modified: Option<String>,
@@ -67,7 +68,8 @@ fn load_feed_fetch_row(
             feed_update_interval_seconds,
             feed_skip_hours,
             feed_skip_days,
-            header_expires
+            header_expires,
+            title
          FROM feeds
          WHERE id = ?1",
         [feed_id],
@@ -81,6 +83,7 @@ fn load_feed_fetch_row(
                 FeedAuthType::None
             });
             Ok(FeedFetchRow {
+                title: row.get(18)?,
                 url: row.get(0)?,
                 header_etag: row.get(1)?,
                 header_last_modified: row.get(2)?,
@@ -107,6 +110,52 @@ fn load_feed_fetch_row(
         },
     )?;
     Ok(row)
+}
+
+/// How a feed is named in the logs: its id, title, and URL, e.g.
+/// `Feed 17 "watchTowr Labs" <https://labs.watchtowr.com/rss/>`.
+fn feed_label(feed_id: i64, title: &str, url: &str) -> String {
+    format!("Feed {} {:?} <{}>", feed_id, title, url)
+}
+
+/// Describe where a freshness hint came from, for the schedule explanation.
+///
+/// `http_hint` is the hint read from `headers`; the feed document's own
+/// `<ttl>` / `sy:updatePeriod` is only used when there is none.
+pub(super) fn hint_source(
+    headers: &HeaderMap,
+    http_hint: Option<u64>,
+    feed_hints: &FeedHints,
+) -> Option<String> {
+    if http_hint.is_none() {
+        return feed_hints
+            .refresh_hint_secs()
+            .map(|_| "the feed's <ttl>/sy:updatePeriod".to_string());
+    }
+    let joined = |name: &str| {
+        let values: Vec<&str> = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|h| h.to_str().ok())
+            .collect();
+        (!values.is_empty()).then(|| values.join(", "))
+    };
+    let mut parts = Vec::new();
+    match joined("cache-control") {
+        Some(cc) if cc.to_ascii_lowercase().contains("max-age") => {
+            parts.push(format!("Cache-Control {:?}", cc));
+        }
+        _ => {
+            if let Some(expires) = joined("expires") {
+                parts.push(format!("Expires {:?}", expires));
+            }
+        }
+    }
+    // An `Age` shortens the hint (RFC 9111 §4.2.3), so show it too.
+    if let Some(age) = joined("age") {
+        parts.push(format!("Age {:?}", age));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// Refresh the feed corresponding to the provided `feed_id`.
@@ -139,6 +188,7 @@ pub(crate) async fn refresh_feed(
     let rec = Recorder {
         pool: &pool,
         feed_id,
+        label: feed_label(feed_id, &row.title, &row.url),
         cfg,
         max_feed_bytes: fetch_settings.max_feed_bytes,
         fetch_start,
@@ -160,9 +210,9 @@ pub(crate) async fn refresh_feed(
     if let Some(next_ts) = row.next_fetch_at {
         if now_ts < next_ts {
             debug!(
-                "Feed {} not yet eligible; next fetch in {} seconds",
-                feed_id,
-                next_ts - now_ts
+                "{} not yet eligible; next fetch in {}",
+                rec.label,
+                format_duration(u64::try_from(next_ts - now_ts).unwrap_or(0))
             );
             metrics.record_feed_cache_hit("next_fetch_at");
             rec.outcome("cache_hit");
@@ -174,7 +224,10 @@ pub(crate) async fn refresh_feed(
     // access, and only the parse is handed off.
     let fetched = if row.url.starts_with("file://") {
         match retrieve_file_feed(&row.url, feed_id, pool.clone(), cfg) {
-            Ok(content) => fetcher.parse(feed_id, content).await.map(Some),
+            Ok((content, schedule)) => fetcher
+                .parse(feed_id, content)
+                .await
+                .map(|parsed| Some((parsed, schedule))),
             Err(e) => {
                 rec.outcome("other");
                 return Err(e);
@@ -219,8 +272,8 @@ pub(crate) async fn refresh_feed(
         }
     };
 
-    let parsed = match fetched {
-        Ok(Some(parsed)) => parsed,
+    let (parsed, schedule) = match fetched {
+        Ok(Some(fetched)) => fetched,
         // The outcome (304, HTTP error, oversized body, ...) has been
         // recorded and there is nothing to store.
         Ok(None) => return Ok(()),
@@ -241,6 +294,7 @@ pub(crate) async fn refresh_feed(
         return Ok(());
     };
     metrics.record_feed_parse(feed.format(), parsed.seconds, feed.entry_count() as u64);
+    let entry_count = feed.entry_count();
     let inserted = match feed {
         ParsedFeed::Atom { feed, entries, .. } => {
             process_atom_feed(feed_id, *feed, entries, pool.get()?, script_runner, metrics)?
@@ -251,6 +305,13 @@ pub(crate) async fn refresh_feed(
     };
     enqueue_asset_caching(task_tx, metrics, &inserted);
     clear_feed_error(&conn, feed_id);
+    info!(
+        "{} refreshed with {} entries, {} new; next fetch {}",
+        rec.label,
+        entry_count,
+        inserted.len(),
+        schedule
+    );
     rec.outcome("success");
     Ok(())
 }
@@ -259,6 +320,8 @@ pub(crate) async fn refresh_feed(
 struct Recorder<'a> {
     pool: &'a Pool<SqliteConnectionManager>,
     feed_id: i64,
+    /// The feed as named in the logs; see [`feed_label`].
+    label: String,
     cfg: SchedulerConfig,
     /// The body-size cap this fetch was made with.
     max_feed_bytes: u64,
@@ -290,8 +353,7 @@ impl Recorder<'_> {
         retry_after_ts: Option<i64>,
         stale_if_error: Option<u64>,
     ) {
-        warn!("Feed {}: {}", self.feed_id, err);
-        match self.pool.get() {
+        let schedule = match self.pool.get() {
             Ok(conn) => set_feed_error_with_schedule(
                 &conn,
                 self.feed_id,
@@ -303,7 +365,14 @@ impl Recorder<'_> {
                 self.cfg.min_fetch_interval,
                 self.metrics,
             ),
-            Err(e) => warn!("Feed {}: could not record the error: {}", self.feed_id, e),
+            Err(e) => {
+                warn!("{}: could not record the error: {}", self.label, e);
+                None
+            }
+        };
+        match schedule {
+            Some(schedule) => warn!("{}: {}; next attempt {}", self.label, err, schedule),
+            None => warn!("{}: {}", self.label, err),
         }
         fire_fetch_error(
             self.script_runner,
@@ -320,8 +389,9 @@ impl Recorder<'_> {
 /// Write the outcome of an HTTP fetch into the `feeds` row, fire the
 /// matching script event, and record metrics.
 ///
-/// Returns the parse result when the server sent a `200 OK` whose body was
-/// read, and `None` for every outcome that leaves nothing to store.
+/// Returns the parse result, and when the feed is next due, when the server
+/// sent a `200 OK` whose body was read, and `None` for every outcome that
+/// leaves nothing to store.
 ///
 /// # Errors
 ///
@@ -332,7 +402,7 @@ fn record_fetch_reply(
     row: &FeedFetchRow,
     reply: FetchReply,
     force_conditionals_off: bool,
-) -> Result<Option<ParseOutcome>> {
+) -> Result<Option<(ParseOutcome, Schedule)>> {
     let (feed_id, cfg, metrics) = (rec.feed_id, rec.cfg, rec.metrics);
     let conn = rec.pool.get()?;
     let feed_url = row.url.as_str();
@@ -365,19 +435,20 @@ fn record_fetch_reply(
 
         FetchReply::NotModified { headers, redirects } => {
             metrics.record_feed_redirects(redirects);
-            info!("Feed {} was not modified since last check", feed_id);
             let now_ts = Utc::now().timestamp();
             let headers = headers.to_header_map();
             let hints = extract_server_hints(&headers, now_ts);
             let cache = revalidated_cache_state(row, &headers, &hints, now_ts);
-            let next_fetch_at = schedule_success(
+            let schedule = schedule_success(
                 FetchOutcome::NotModified {
                     server_hint_secs: hints.hint_secs.or(row.feed_hints.refresh_hint_secs()),
                 },
                 &row.feed_hints,
                 now_ts,
                 cfg,
-            );
+            )
+            .with_hint_source(hint_source(&headers, hints.hint_secs, &row.feed_hints));
+            let next_fetch_at = schedule.next_fetch_at;
             conn.execute(
                 "UPDATE feeds SET
                     header_etag = ?1,
@@ -399,6 +470,7 @@ fn record_fetch_reply(
                     feed_id,
                 ],
             )?;
+            info!("{} was not modified; next fetch {}", rec.label, schedule);
             metrics.record_feed_cache_hit("not_modified");
             metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
             rec.outcome("not_modified");
@@ -446,7 +518,7 @@ fn record_fetch_reply(
             redirects,
         } => {
             metrics.record_feed_redirects(redirects);
-            debug!("Feed {}: gave up on the body after {} bytes", feed_id, seen);
+            debug!("{}: gave up on the body after {} bytes", rec.label, seen);
             let limit = rec.max_feed_bytes;
             let url = final_url;
             let kind = "body_too_large";
@@ -472,8 +544,8 @@ fn record_fetch_reply(
     // If we followed a permanent redirect, update the stored URL in the database
     if permanent_redirect && final_url != feed_url {
         info!(
-            "Feed {} permanently redirected from {} to {}; updating stored URL",
-            feed_id, feed_url, final_url
+            "{} permanently redirected to {}; updating stored URL",
+            rec.label, final_url
         );
         conn.execute(
             "UPDATE feeds SET url = ?1 WHERE id = ?2",
@@ -500,14 +572,16 @@ fn record_fetch_reply(
 
     // HTTP freshness takes precedence (RFC 9111 is specific to this
     // representation); the feed's own <ttl> / sy:update* is the fallback.
-    let next_fetch_at = schedule_success(
+    let schedule = schedule_success(
         FetchOutcome::Success {
             server_hint_secs: hints.hint_secs.or(feed_hints.refresh_hint_secs()),
         },
         &feed_hints,
         now_ts,
         cfg,
-    );
+    )
+    .with_hint_source(hint_source(&headers, hints.hint_secs, &feed_hints));
+    let next_fetch_at = schedule.next_fetch_at;
 
     metrics.record_feed_response_bytes(body_len);
 
@@ -542,8 +616,8 @@ fn record_fetch_reply(
 
         if validators_unchanged && body_changed {
             warn!(
-                "Feed {} ({}): server returned unchanged ETag/Last-Modified but body hash differs; validators appear untrustworthy",
-                feed_id, feed_url
+                "{}: server returned unchanged ETag/Last-Modified but body hash differs; validators appear untrustworthy",
+                rec.label
             );
             metrics.record_feed_validator_lie();
         }
@@ -588,7 +662,7 @@ fn record_fetch_reply(
 
     fire_fetch_success(rec.script_runner, feed_id, 200, final_url, Some(body_len));
 
-    Ok(Some(parsed))
+    Ok(Some((parsed, schedule)))
 }
 
 /// The cache validators and freshness state stored on a feed row, derived
@@ -712,15 +786,15 @@ fn schedule_success(
     feed_hints: &FeedHints,
     now_ts: i64,
     cfg: SchedulerConfig,
-) -> i64 {
-    let next_fetch_at = compute_next_fetch_at(
+) -> Schedule {
+    plan_next_fetch(
         outcome,
         now_ts,
         cfg.min_cadence,
         cfg.max_backoff,
         cfg.min_fetch_interval,
-    );
-    defer_past_skipped(next_fetch_at, feed_hints.skip_hours, feed_hints.skip_days)
+    )
+    .defer_past_skipped(feed_hints.skip_hours, feed_hints.skip_days)
 }
 
 fn retrieve_file_feed(
@@ -728,7 +802,7 @@ fn retrieve_file_feed(
     feed_id: i64,
     pool: Pool<SqliteConnectionManager>,
     cfg: SchedulerConfig,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Schedule)> {
     let conn = pool.get()?;
 
     // Extract the file path from the URL
@@ -741,7 +815,7 @@ fn retrieve_file_feed(
     // File-backed feeds have no cache headers; schedule using the per-feed
     // interval (clamped to the global floor and ceiling).
     let now_ts = Utc::now().timestamp();
-    let next_fetch_at = compute_next_fetch_at(
+    let schedule = plan_next_fetch(
         FetchOutcome::Success {
             server_hint_secs: None,
         },
@@ -750,6 +824,7 @@ fn retrieve_file_feed(
         cfg.max_backoff,
         cfg.min_fetch_interval,
     );
+    let next_fetch_at = schedule.next_fetch_at;
     conn.execute(
         "UPDATE feeds SET
             last_checked = ?1,
@@ -760,5 +835,5 @@ fn retrieve_file_feed(
         (now_ts, next_fetch_at, feed_id),
     )?;
 
-    Ok(content)
+    Ok((content, schedule))
 }
