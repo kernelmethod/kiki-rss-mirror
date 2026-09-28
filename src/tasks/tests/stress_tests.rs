@@ -305,10 +305,14 @@ async fn stress_concurrent_tag_creation() -> Result<()> {
         assert_eq!(created_ids.len(), 5, "created IDs not all distinct");
 
         let conn = tc.database_conn()?;
-        let db_count: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))?;
-        assert_eq!(db_count, 5, "DB has {db_count} tags, expected 5");
+        // System tags are seeded by the schema, so only count user-created tags.
+        let db_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM tags WHERE kind = 'user'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(db_count, 5, "DB has {db_count} user tags, expected 5");
 
-        // GET /v1/tags returns exactly 5
+        // GET /v1/tags returns exactly the 5 user tags
         let resp = client.get(format!("{BASE}/v1/tags")).send().await?;
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await?;
@@ -316,6 +320,7 @@ async fn stress_concurrent_tag_creation() -> Result<()> {
             .as_array()
             .unwrap()
             .iter()
+            .filter(|t| t["kind"].as_str() != Some("system"))
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
         let expected_names: HashSet<String> = tag_names.into_iter().collect();

@@ -182,6 +182,7 @@ mod tests {
             "feed_tags",
             "feeds",
             "migrations",
+            "plugin_store",
             "plugins",
             "rss_categories",
             "rss_entry_data",

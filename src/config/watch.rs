@@ -87,7 +87,7 @@ pub fn spawn_watcher(store: ConfigHandle, cancel: CancellationToken) -> anyhow::
 ///
 /// Reads must be excluded: on Linux, reading the file raises access
 /// events, so reacting to them would make every reload trigger the next.
-fn is_change(kind: &EventKind) -> bool {
+pub(crate) fn is_change(kind: &EventKind) -> bool {
     match kind {
         EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
         EventKind::Access(_) => false,

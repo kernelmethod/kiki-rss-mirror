@@ -192,6 +192,7 @@ fn atom_entry_to_parts(feed_id: i64, entry: atom_syndication::Entry) -> AtomEntr
         categories: entry.categories.iter().map(atom_category).collect(),
     };
     let entry = FeedEntry {
+        id: None,
         feed_id,
         syndication_format: "atom".to_string(),
         guid: entry.id,
@@ -199,6 +200,8 @@ fn atom_entry_to_parts(feed_id: i64, entry: atom_syndication::Entry) -> AtomEntr
         title: entry.title.value,
         url: entry.links.into_iter().next().map(|l| l.href),
         content: entry.content.and_then(|c| c.value),
+        authors: data.authors.clone(),
+        categories: data.categories.iter().map(|c| c.term.clone()).collect(),
         tags: vec![],
     };
     AtomEntry { entry, data }
@@ -255,6 +258,7 @@ fn rss_item_to_parts(feed_id: i64, item: rss::Item) -> RssEntry {
     };
 
     let entry = FeedEntry {
+        id: None,
         feed_id,
         syndication_format: "rss".to_string(),
         guid,
@@ -262,6 +266,8 @@ fn rss_item_to_parts(feed_id: i64, item: rss::Item) -> RssEntry {
         title: title.unwrap_or_default(),
         url: link,
         content: description,
+        authors: data.author.iter().cloned().collect(),
+        categories: data.categories.iter().map(|c| c.name.clone()).collect(),
         tags: vec![],
     };
     RssEntry { entry, data }

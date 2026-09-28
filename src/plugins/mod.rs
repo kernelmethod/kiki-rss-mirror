@@ -39,10 +39,26 @@
 //! an error for each directory that could not be loaded; one broken plugin
 //! never keeps the others from loading.
 //!
-//! The server discovers plugins once, when it starts: installing, removing
-//! or editing a plugin takes effect after a restart. Plugins are loaded in
-//! the order of their directory names, so prefixing directory names with a
-//! number (`10-filter`, `20-tag`) controls the order their handlers run in.
+//! The server discovers plugins when it starts, and again whenever a file in
+//! the plugins directory or a plugin's config changes (see [`runtime`]).
+//! Plugins are loaded in the order of their directory names, so prefixing
+//! directory names with a number (`10-filter`, `20-tag`) controls the order
+//! their handlers run in.
+//!
+//! The calls plugins make to the server through the `kiki` Lua API, such as
+//! scanning stored entries, are answered by [`services`].
+//!
+//! With the `default-plugins` feature, Kiki also bundles plugins from its
+//! source tree into its binary, and `kiki init` installs them; see
+//! [`defaults`].
+
+#[cfg(feature = "default-plugins")]
+pub mod defaults;
+pub mod runtime;
+pub mod services;
+
+#[cfg(all(test, feature = "lua"))]
+mod filter_tests;
 
 use crate::scripting::{ScriptModule, ScriptSource};
 use serde::{Deserialize, Serialize};

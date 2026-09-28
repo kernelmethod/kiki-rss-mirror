@@ -52,20 +52,43 @@ pub(super) fn fire_fetch_success(
     }
 }
 
+/// Error returned when plugins could not be loaded into a script runner.
+#[cfg(feature = "lua")]
+#[derive(Debug, thiserror::Error)]
+pub enum LoadPluginsError {
+    /// A plugin's code failed to compile or its top-level chunk failed to run. The
+    /// plugins that were running before, if any, keep running.
+    #[error("failed to load plugins: {0}")]
+    Compile(String),
+
+    /// The sandboxed script host is gone, so no plugins can run until the server
+    /// restarts.
+    #[error("the script host is gone: {0}")]
+    HostDead(String),
+}
+
 /// Build a [`ScriptRunner`] from the Lua plugins in `discovery` and install it in
-/// `handle`.
+/// `handle`, replacing the runner it held.
 ///
-/// Plugins are loaded once, when the server starts; picking up a new or changed plugin
-/// takes a restart.
+/// Called when the server starts, and again whenever plugins are reloaded (see
+/// [`crate::plugins::runtime`]). Once the new runner is installed, the plugins'
+/// `plugin.load` handlers run. Returns the number of plugins loaded.
 ///
 /// When `host` carries a sandboxed script host, the sources are shipped to that child
 /// process and `handle` receives a [`SubprocessScriptRunner`] that forwards to it.
 /// Otherwise the VM is built in this process, which is the path the library tests and
-/// `--no-script-isolation` take.
+/// `--no-script-isolation` take, and the calls plugins make through the `kiki` API are
+/// answered by `services`. (The host answers them with the services set on it.)
 ///
 /// Plugins that cannot be loaded are logged and skipped (see
-/// [`crate::plugins::load_sources`]). Logs and clears the handle if the plugins fail to
-/// compile.
+/// [`crate::plugins::load_sources`]).
+///
+/// # Errors
+///
+/// Returns [`LoadPluginsError::Compile`] if the plugins fail to compile. `handle` is then
+/// left as it was: the plugins that were running keep running, as when an edit to the
+/// config file is invalid. Returns [`LoadPluginsError::HostDead`], and clears `handle`,
+/// if the script host has gone away.
 ///
 /// [`SubprocessScriptRunner`]: crate::process::script_host::SubprocessScriptRunner
 #[cfg(feature = "lua")]
@@ -74,8 +97,10 @@ pub fn load_script_runner(
     metrics: &Metrics,
     handle: &ScriptRunnerHandle,
     host: &crate::process::ScriptHostHandle,
-) {
+    services: Arc<dyn crate::scripting::ScriptServices>,
+) -> Result<usize, LoadPluginsError> {
     let sources = load_lua_sources(discovery);
+    let count = sources.len();
 
     // A runner with no handlers behaves exactly like no runner at all —
     // every dispatch site skips a `None` — so with no plugins installed,
@@ -87,7 +112,7 @@ pub fn load_script_runner(
     if let Some(host) = host {
         use crate::process::script_host::SubprocessScriptRunner;
 
-        match host.reload(sources) {
+        return match host.reload(sources) {
             Ok(loaded) => {
                 handle.set(if empty {
                     None
@@ -98,15 +123,15 @@ pub fn load_script_runner(
                 // Only after the swap, so that the gauge reaching a value
                 // means the plugins have taken effect.
                 metrics.set_scripts_loaded(loaded as f64);
+                fire_plugin_load(handle);
+                Ok(loaded)
             }
             Err(e) if host.is_alive() => {
                 // The host answered, it just could not compile what we
-                // sent. Plugins stay off until the operator fixes them and
-                // restarts the server.
+                // sent, and kept running what it had.
                 warn!("script host failed to compile Lua scripts: {}", e);
                 metrics.record_script_compile_error();
-                metrics.set_scripts_loaded(0.0);
-                handle.set(None);
+                Err(LoadPluginsError::Compile(e.to_string()))
             }
             Err(e) => {
                 // The channel itself is gone. Nothing can bring it back:
@@ -117,15 +142,14 @@ pub fn load_script_runner(
                 );
                 metrics.set_scripts_loaded(0.0);
                 handle.set(None);
+                Err(LoadPluginsError::HostDead(e.to_string()))
             }
-        }
-        return;
+        };
     }
 
     // No isolated host: compile into a VM in this process.
     let _ = host;
-    let count = sources.len() as f64;
-    match crate::scripting::lua::LuaScriptRunner::from_sources(&sources) {
+    match crate::scripting::lua::LuaScriptRunner::from_sources_with(&sources, Some(services)) {
         Ok(runner) => {
             handle.set(if empty {
                 None
@@ -133,14 +157,26 @@ pub fn load_script_runner(
                 Some(Arc::new(runner) as Arc<dyn ScriptRunner>)
             });
             // As above, only after the swap.
-            metrics.set_scripts_loaded(count);
+            metrics.set_scripts_loaded(count as f64);
+            fire_plugin_load(handle);
+            Ok(count)
         }
         Err(e) => {
             warn!("failed to compile Lua scripts: {}", e);
             metrics.record_script_compile_error();
-            metrics.set_scripts_loaded(0.0);
-            handle.set(None);
+            Err(LoadPluginsError::Compile(e.to_string()))
         }
+    }
+}
+
+/// Dispatch `plugin.load` to the runner in `handle`, if there is one.
+#[cfg(feature = "lua")]
+fn fire_plugin_load(handle: &ScriptRunnerHandle) {
+    if let Some(runner) = handle.current() {
+        runner.dispatch_observe(
+            crate::scripting::Event::PluginLoad,
+            crate::scripting::EventPayload::PluginLoad,
+        );
     }
 }
 

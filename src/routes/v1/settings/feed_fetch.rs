@@ -17,6 +17,8 @@ pub struct FeedFetchSettingsResponse {
     pub timeout_seconds: u64,
     /// Minimum interval, in seconds, between polls of any one feed.
     pub min_polling_cadence_seconds: u64,
+    /// Fetch interval, in seconds, given to newly added feeds.
+    pub default_fetch_interval_seconds: u64,
     /// Cap, in seconds, on backoff after failed fetches.
     pub max_backoff_seconds: u64,
     /// How often, in seconds, to skip conditional headers and force a full
@@ -31,6 +33,7 @@ impl From<&FeedFetchSettings> for FeedFetchSettingsResponse {
         FeedFetchSettingsResponse {
             timeout_seconds: s.timeout_seconds,
             min_polling_cadence_seconds: s.min_polling_cadence_seconds,
+            default_fetch_interval_seconds: s.default_fetch_interval_seconds,
             max_backoff_seconds: s.max_backoff_seconds,
             force_refresh_after_seconds: s.force_refresh_after_seconds,
             max_feed_bytes: s.max_feed_bytes,
@@ -48,6 +51,10 @@ pub struct FeedFetchSettingsRequest {
     /// Minimum interval, in seconds, between polls of any one feed.
     #[serde(default)]
     pub min_polling_cadence_seconds: Option<u64>,
+    /// Fetch interval, in seconds, given to newly added feeds. Must be
+    /// greater than zero. Feeds already added keep their own interval.
+    #[serde(default)]
+    pub default_fetch_interval_seconds: Option<u64>,
     /// Cap, in seconds, on backoff after failed fetches.
     #[serde(default)]
     pub max_backoff_seconds: Option<u64>,
@@ -81,7 +88,8 @@ pub async fn get_feed_fetch_settings(State(state): State<AppState>) -> Response 
 ///
 /// Changes apply to the next fetch of every feed; no restart is needed.
 /// Lowering `max_feed_bytes` does not retroactively affect already-stored
-/// entries.
+/// entries, and `default_fetch_interval_seconds` applies only to feeds
+/// added afterwards.
 #[utoipa::path(
     put,
     path = "/v1/settings/feed-fetch",
@@ -106,6 +114,10 @@ pub async fn put_feed_fetch_settings(
             (
                 "min_polling_cadence_seconds",
                 payload.min_polling_cadence_seconds,
+            ),
+            (
+                "default_fetch_interval_seconds",
+                payload.default_fetch_interval_seconds,
             ),
             ("max_backoff_seconds", payload.max_backoff_seconds),
             (

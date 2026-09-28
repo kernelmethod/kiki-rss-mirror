@@ -9,7 +9,7 @@ use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, TransactionBehavior};
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Store a parsed Atom feed: its feed-level data, then each entry after
 /// it has been through the script chain.
@@ -34,11 +34,7 @@ pub(super) fn process_atom_feed(
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
 ) -> Result<Vec<i64>> {
-    info!(
-        "Successfully fetched Atom feed {} with {} items",
-        feed_id,
-        entries.len()
-    );
+    debug!("Parsed Atom feed {} with {} items", feed_id, entries.len());
 
     let parsed_count = entries.len();
     let entries: Vec<_> = entries
@@ -96,11 +92,7 @@ pub(super) fn process_rss_feed(
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
 ) -> Result<Vec<i64>> {
-    info!(
-        "Successfully fetched RSS feed {} with {} items",
-        feed_id,
-        entries.len()
-    );
+    debug!("Parsed RSS feed {} with {} items", feed_id, entries.len());
 
     let parsed_count = entries.len();
     let entries: Vec<_> = entries
@@ -288,7 +280,9 @@ pub(super) fn enqueue_asset_caching(
 /// system tags. A name with the system tag prefix that is not a known system
 /// tag is skipped with a warning.
 ///
-/// For each other (user) tag name in `tags`:
+/// If `tags` holds only system tags, the entry's user tags are left alone,
+/// so that a script that only hides entries does not also untag them.
+/// Otherwise, for each other (user) tag name in `tags`:
 /// - ensures the tag row exists in `tags` (`INSERT OR IGNORE`)
 /// - looks up its `id`
 ///
@@ -296,6 +290,8 @@ pub(super) fn enqueue_asset_caching(
 /// not in the script-provided set, and inserts new associations (`INSERT OR
 /// IGNORE`).
 fn sync_entry_tags(conn: &Connection, entry_id: i64, tags: &[String], is_new: bool) -> Result<()> {
+    let has_user_tags = tags.iter().any(|name| !is_reserved_tag_name(name));
+
     // Upsert each tag and collect its id.
     let mut tag_ids: Vec<i64> = Vec::with_capacity(tags.len());
     for name in tags {
@@ -322,6 +318,10 @@ fn sync_entry_tags(conn: &Connection, entry_id: i64, tags: &[String], is_new: bo
             |row| row.get(0),
         )?;
         tag_ids.push(id);
+    }
+
+    if !has_user_tags {
+        return Ok(());
     }
 
     // Remove stale user-tag entry_tags rows (those not in the script-provided
@@ -435,6 +435,28 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(reserved, 0);
+
+        Ok(())
+    }
+
+    /// Tags holding only system tags, as from a script that just hides
+    /// entries, leave the entry's user tags alone.
+    #[test]
+    fn sync_entry_tags_with_only_system_tags_keeps_user_tags() -> Result<()> {
+        let conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute(
+            "INSERT INTO entries (syndication_format, guid, published_at, title, url)
+             VALUES ('rss', 'g', 0, 't', 'u')",
+            [],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+        sync_entry_tags(&conn, entry_id, &["a".into()], true)?;
+
+        sync_entry_tags(&conn, entry_id, &["system:hidden".into()], false)?;
+        assert_eq!(entry_tag_names(&conn, entry_id)?, ["a"]);
+
+        sync_entry_tags(&conn, entry_id, &["system:hidden".into()], true)?;
+        assert_eq!(entry_tag_names(&conn, entry_id)?, ["a", "system:hidden"]);
 
         Ok(())
     }

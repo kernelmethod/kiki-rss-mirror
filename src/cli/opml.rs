@@ -5,6 +5,7 @@
 //! the server is up. A running server picks up imported feeds on its next
 //! scheduling pass, since newly created feeds are immediately due for a fetch.
 use crate::cli::paths::{self, Env};
+use crate::config::{self, ConfigStore};
 use crate::db::ConnectionBuilder;
 use crate::opml;
 use anyhow::{Context, Result};
@@ -55,14 +56,14 @@ impl OpmlArgs {
     /// Returns an error if the database cannot be opened, the input cannot
     /// be read or parsed, or the output cannot be written.
     pub fn run(&self) -> Result<()> {
-        // The same database `kiki serve` would open
-        let database = paths::resolve_data_dir(&Env::from_process())?
-            .path
-            .join(paths::DB_FILE_NAME);
+        // The same database and config `kiki serve` would open
+        let data_dir = paths::resolve_data_dir(&Env::from_process())?.path;
+        let database = data_dir.join(paths::DB_FILE_NAME);
+        let config_path = data_dir.join(config::CONFIG_FILE_NAME);
 
         match &self.command {
             OpmlCommand::Import(args) => {
-                let summary = args.import(&database)?;
+                let summary = args.import(&database, &config_path)?;
                 println!(
                     "Imported {} feed(s); skipped {} already present.",
                     summary.imported.len(),
@@ -76,11 +77,17 @@ impl OpmlArgs {
 }
 
 impl ImportArgs {
-    /// Read and parse the OPML input, then add its feeds to `database`.
-    fn import(&self, database: &Path) -> Result<opml::ImportSummary> {
+    /// Read and parse the OPML input, then add its feeds to `database`
+    /// with the fetch interval configured in `config_path`.
+    fn import(&self, database: &Path, config_path: &Path) -> Result<opml::ImportSummary> {
         let xml = read_input(&self.file)?;
         let feeds = opml::parse_opml(&xml)
             .with_context(|| format!("failed to parse OPML from {:?}", self.file))?;
+        let fetch_interval = ConfigStore::open(config_path)
+            .with_context(|| format!("failed to load config from {config_path:?}"))?
+            .current()
+            .feed_fetch
+            .default_fetch_interval_seconds;
 
         let mut conn = ConnectionBuilder::default()
             .at_path(database)
@@ -88,7 +95,7 @@ impl ImportArgs {
             .build()
             .with_context(|| format!("failed to open database at {database:?}"))?;
 
-        opml::import_feeds(&mut conn, &feeds)
+        opml::import_feeds(&mut conn, &feeds, fetch_interval)
             .with_context(|| format!("failed to import feeds into {database:?}"))
     }
 }
@@ -158,13 +165,27 @@ mod tests {
 </body></opml>"#,
         )?;
 
+        // New feeds take their fetch interval from the config file
+        let config_path = dir.path().join(config::CONFIG_FILE_NAME);
+        std::fs::write(
+            &config_path,
+            "[feed_fetch]\ndefault_fetch_interval_seconds = 900\n",
+        )?;
+
         let import = ImportArgs { file: input };
-        let summary = import.import(&database)?;
+        let summary = import.import(&database, &config_path)?;
         assert_eq!(summary.imported.len(), 2);
         assert_eq!(summary.skipped, 0);
 
+        let conn = ConnectionBuilder::default().at_path(&database).build()?;
+        let intervals = conn
+            .prepare("SELECT min_fetch_interval_seconds FROM feeds")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(intervals, vec![900, 900]);
+
         // A second import finds every feed already present
-        let summary = import.import(&database)?;
+        let summary = import.import(&database, &config_path)?;
         assert!(summary.imported.is_empty());
         assert_eq!(summary.skipped, 2);
 
@@ -201,6 +222,11 @@ mod tests {
         std::fs::write(&input, "<opml><body/></opml>").unwrap();
 
         let import = ImportArgs { file: input };
-        assert!(import.import(&dir.path().join("missing.db")).is_err());
+        assert!(import
+            .import(
+                &dir.path().join("missing.db"),
+                &dir.path().join(config::CONFIG_FILE_NAME)
+            )
+            .is_err());
     }
 }

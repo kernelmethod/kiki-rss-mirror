@@ -70,8 +70,42 @@ kiki plugin config set hide-sponsored overrides.toml --replace
 ```
 
 `config set` overrides the top-level keys it is given and keeps the plugin's
-other overrides, unless `--replace` is passed. A new config takes effect when
-the server restarts.
+other overrides, unless `--replace` is passed. A running server reloads its
+plugins with the new config straight away; it also reloads them whenever a
+file in the plugins directory changes.
+
+### Filtering entries
+
+Kiki ships a `filter` plugin, in [`plugins/filter`](plugins/filter), that hides
+entries (tags them `system:hidden`) when their title, URL, content, authors,
+categories or GUID match regular expressions, or when they fail to match any of
+a feed's "include" rules. It is bundled into the `kiki` binary (the
+`default-plugins` Cargo feature, on by default) and `kiki init` installs it into
+the plugins directory, with no rules; pass `kiki init --no-default-plugins` to
+skip it. `kiki init --check` installs default plugins into a Kiki home set up
+before they were bundled, and updates the ones an earlier release installed,
+unless they've been edited since (their config overrides are kept in the
+database, so setting config doesn't count). A default plugin you delete isn't
+reinstalled; `plugins/.default-plugins.toml` records which were installed.
+Then give it some rules:
+
+```bash
+kiki plugin config set filter <<'EOF'
+[[exclude]]
+fields = ["title"]
+pattern = '\b(sponsored|webinar)\b'
+flags = "i"
+
+[[include]]              # for feed 3, hide everything not about Rust
+fields = ["title", "categories"]
+pattern = "(?i)rust"
+feeds = [3]
+EOF
+```
+
+Whenever its rules change, the filter also applies them to the entries already
+downloaded. It never unhides entries. See
+[`plugins/filter/main.lua`](plugins/filter/main.lua) for every setting.
 
 ## Where Kiki keeps its files
 

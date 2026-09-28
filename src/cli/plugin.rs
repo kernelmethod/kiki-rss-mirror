@@ -4,8 +4,9 @@
 //! Like the rest of the CLI, these work directly on Kiki's home directory:
 //! plugins are discovered in its plugins directory (see [`crate::plugins`])
 //! and config overrides are kept in its database (see
-//! [`crate::db::plugins`]), so they run whether or not the server is up. A
-//! running server picks up a new config when it restarts.
+//! [`crate::db::plugins`]), so they run whether or not the server is up.
+//! After saving a config, `config set` hands it to the running server, if
+//! there is one, which reloads its plugins with it.
 //!
 //! Configs are read and written as TOML, the format of the `[config]` table
 //! in a plugin's manifest.
@@ -58,8 +59,9 @@ enum ConfigCommand {
     ///
     /// Each top-level key of the TOML document replaces the whole of that
     /// key's override; nested tables are not merged. Other overrides are
-    /// kept unless `--replace` is given. The new config takes effect the next
-    /// time the server starts.
+    /// kept unless `--replace` is given. If the server is running, it
+    /// reloads its plugins with the new config; otherwise the config takes
+    /// effect when the server starts.
     Set(SetArgs),
 }
 
@@ -114,11 +116,19 @@ impl PluginArgs {
                 ConfigCommand::Get(args) => args.get(&home, &mut stdout),
                 ConfigCommand::Set(args) => {
                     let input = read_input(&args.file)?;
-                    args.set(&home, &input)?;
-                    eprintln!(
-                        "Saved the config of plugin {:?}. Restart the server for it to take effect.",
-                        args.name
-                    );
+                    let overrides = args.set(&home, &input)?;
+                    eprintln!("Saved the config of plugin {:?}.", args.name);
+                    match apply_to_server(&home, &args.name, &overrides) {
+                        Ok(None) => eprintln!("The server reloaded its plugins with it."),
+                        Ok(Some(e)) => eprintln!(
+                            "The server failed to load the plugins with it, and keeps running \
+                             them with the config they had: {e}"
+                        ),
+                        Err(e) => {
+                            tracing::debug!("could not reach the server: {e:#}");
+                            eprintln!("It takes effect when the server starts.");
+                        }
+                    }
                     Ok(())
                 }
             },
@@ -226,6 +236,48 @@ impl SetArgs {
         };
         result.with_context(|| format!("failed to save the config of plugin {:?}", self.name))
     }
+}
+
+/// Hands the config overrides `overrides` of plugin `name` to the server
+/// running on Kiki's home directory `home`, which reloads its plugins with
+/// them.
+///
+/// Returns why the plugins failed to load with the new config, if they did.
+///
+/// # Errors
+///
+/// Returns an error if no server can be reached, or it does not accept the
+/// config.
+fn apply_to_server(home: &Path, name: &str, overrides: &ConfigOverrides) -> Result<Option<String>> {
+    use crate::routes::v1::plugins::plugin_config::PluginConfigResponse;
+
+    let env = Env::from_process();
+    let data_dir = paths::resolve_data_dir(&env)?;
+    anyhow::ensure!(
+        data_dir.path == home,
+        "the server's home directory is not {home:?}"
+    );
+    let socket = paths::resolve_socket_path(None, &data_dir, &env);
+    if !socket.exists() {
+        bail!("no server socket at {socket:?}");
+    }
+
+    let url = format!(
+        "http://kiki/v1/plugins/name/{}/config",
+        url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>()
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let client = reqwest::Client::builder()
+                .unix_socket(socket.as_path())
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?;
+            let resp = client.put(url).json(overrides).send().await?;
+            let resp = resp.error_for_status()?;
+            Ok(resp.json::<PluginConfigResponse>().await?.reload_error)
+        })
 }
 
 /// The database in Kiki's home directory `home`.

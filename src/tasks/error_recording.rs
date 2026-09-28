@@ -1,5 +1,5 @@
 use crate::metrics::Metrics;
-use crate::tasks::backoff::{compute_next_fetch_at, defer_past_skipped, FetchOutcome};
+use crate::tasks::backoff::{plan_next_fetch, FetchOutcome, Schedule};
 use crate::tasks::error::FetchError;
 use chrono::Utc;
 use r2d2::PooledConnection;
@@ -15,6 +15,9 @@ use tracing::error;
 ///
 /// The `consecutive_failures` column is incremented atomically; the rescheduled
 /// `next_fetch_at` is computed from that new streak length.
+///
+/// Returns when the feed will next be attempted and why, or `None` if the
+/// error could not be recorded (which is logged here).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn set_feed_error_with_schedule(
     conn: &PooledConnection<SqliteConnectionManager>,
@@ -26,7 +29,7 @@ pub(super) fn set_feed_error_with_schedule(
     max_backoff: u64,
     min_fetch_interval: u64,
     metrics: &Metrics,
-) {
+) -> Option<Schedule> {
     let json = match serde_json::to_string(fetch_error) {
         Ok(j) => j,
         Err(e) => {
@@ -34,7 +37,7 @@ pub(super) fn set_feed_error_with_schedule(
                 "Failed to serialize fetch error for feed {}: {:?}",
                 feed_id, e
             );
-            return;
+            return None;
         }
     };
 
@@ -79,17 +82,15 @@ pub(super) fn set_feed_error_with_schedule(
         (FetchOutcome::PermanentErr, "permanent")
     };
 
-    let next_fetch_at = defer_past_skipped(
-        compute_next_fetch_at(
-            outcome,
-            now_ts,
-            min_cadence,
-            max_backoff,
-            min_fetch_interval,
-        ),
-        skip_hours,
-        skip_days,
-    );
+    let schedule = plan_next_fetch(
+        outcome,
+        now_ts,
+        min_cadence,
+        max_backoff,
+        min_fetch_interval,
+    )
+    .defer_past_skipped(skip_hours, skip_days);
+    let next_fetch_at = schedule.next_fetch_at;
 
     if let Err(e) = conn.execute(
         "UPDATE feeds SET
@@ -105,23 +106,25 @@ pub(super) fn set_feed_error_with_schedule(
             "Failed to persist fetch error for feed {}: {:?}",
             feed_id, e
         );
-        return;
+        return None;
     }
 
     metrics.record_feed_retry_scheduled(retry_kind, (next_fetch_at - now_ts) as f64);
     metrics.record_feed_consecutive_failures(new_failures);
+    Some(schedule)
 }
 
 /// Back-compat wrapper around [`set_feed_error_with_schedule`] for callsites
 /// that don't have a `Retry-After` timestamp. Takes the scheduler tuning
-/// from `settings`.
+/// from `settings`, and returns the same as
+/// [`set_feed_error_with_schedule`].
 pub(super) fn set_feed_error(
     conn: &PooledConnection<SqliteConnectionManager>,
     feed_id: i64,
     fetch_error: &FetchError,
     settings: &crate::config::FeedFetchSettings,
     metrics: &Metrics,
-) {
+) -> Option<Schedule> {
     let min_cadence = settings.min_polling_cadence_seconds;
     let max_backoff = settings.max_backoff_seconds;
     let min_fetch_interval = conn
@@ -131,7 +134,7 @@ pub(super) fn set_feed_error(
             |row| row.get::<_, i64>(0),
         )
         .map(|v| v.max(0) as u64)
-        .unwrap_or(10800);
+        .unwrap_or(settings.default_fetch_interval_seconds);
 
     set_feed_error_with_schedule(
         conn,
@@ -143,7 +146,7 @@ pub(super) fn set_feed_error(
         max_backoff,
         min_fetch_interval,
         metrics,
-    );
+    )
 }
 
 /// Clear any previously recorded fetch error for a feed and reset the failure
