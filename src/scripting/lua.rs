@@ -35,7 +35,7 @@ use mlua::prelude::*;
 use mlua::HookTriggers;
 use mlua::RegistryKey;
 use mlua::VmState;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -298,26 +298,12 @@ impl LuaScriptRunner {
             .set("kiki", kiki)
             .map_err(ScriptError::ScriptLoadError)?;
 
-        // Load each script, passing it its config. Chunks register handlers via
-        // `kiki.on(...)` side effects and must not return a value — any return (including a function) is treated as an
-        // error to catch accidentally-copied legacy scripts at load time rather than
-        // silently.
+        // Load each plugin, passing it its config. Chunks register handlers via
+        // `kiki.on(...)` side effects and must not return a value — any return (including a
+        // function) is treated as an error to catch accidentally-copied legacy scripts at
+        // load time rather than silently.
         for source in script_sources {
-            let config = parse_script_config(&source.config)?;
-            let config =
-                config::to_lua_table(&lua, &config).map_err(ScriptError::ScriptLoadError)?;
-            let value: LuaValue = lua
-                .load(source.text.as_str())
-                .call(config)
-                .map_err(ScriptError::ScriptLoadError)?;
-            match value {
-                LuaValue::Nil => {}
-                other => {
-                    return Err(ScriptError::InvalidReturnType(
-                        other.type_name().to_string(),
-                    ));
-                }
-            }
+            load_plugin(&lua, source)?;
         }
 
         Ok(Self {
@@ -349,6 +335,87 @@ impl LuaScriptRunner {
         }
         out
     }
+}
+
+/// Run a plugin's entrypoint, passing it its config.
+///
+/// Each plugin runs in an environment of its own, so the globals one plugin defines are
+/// not seen by the others, and its `require` loads only its own modules.
+fn load_plugin(lua: &Lua, source: &ScriptSource) -> Result<(), ScriptError> {
+    let config = parse_script_config(&source.config)?;
+    let config = config::to_lua_table(lua, &config).map_err(ScriptError::ScriptLoadError)?;
+    let env = plugin_env(lua, source).map_err(ScriptError::ScriptLoadError)?;
+    let value: LuaValue = lua
+        .load(source.text.as_str())
+        .set_name(format!("@{}", source.name))
+        .set_environment(env)
+        .call(config)
+        .map_err(ScriptError::ScriptLoadError)?;
+    match value {
+        LuaValue::Nil => Ok(()),
+        other => Err(ScriptError::InvalidReturnType(
+            other.type_name().to_string(),
+        )),
+    }
+}
+
+/// Build the environment a plugin's code runs in: a table that falls back to the VM's
+/// globals, with a `require` that loads the plugin's own modules.
+///
+/// `require(name)` runs the module named `name` the first time it is called, in the same
+/// environment, and returns what the module returned (or `true` if it returned nothing).
+/// Later calls return the same value without running the module again.
+fn plugin_env(lua: &Lua, source: &ScriptSource) -> LuaResult<LuaTable> {
+    let env = lua.create_table()?;
+    let meta = lua.create_table()?;
+    meta.set("__index", lua.globals())?;
+    env.set_metatable(Some(meta));
+
+    let plugin = source.name.clone();
+    let modules: HashMap<String, String> = source
+        .modules
+        .iter()
+        .map(|m| (m.name.clone(), m.text.clone()))
+        .collect();
+    let loaded = lua.create_table()?;
+    let loading: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+    let module_env = env.clone();
+
+    let require = lua.create_function(move |lua, name: String| {
+        let cached: LuaValue = loaded.raw_get(name.as_str())?;
+        if !cached.is_nil() {
+            return Ok(cached);
+        }
+        let text = modules.get(&name).ok_or_else(|| {
+            LuaError::RuntimeError(format!("module '{name}' not found in plugin '{plugin}'"))
+        })?;
+        let first = loading
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(name.clone());
+        if !first {
+            return Err(LuaError::RuntimeError(format!(
+                "module '{name}' in plugin '{plugin}' requires itself"
+            )));
+        }
+        let result = lua
+            .load(text.as_str())
+            .set_name(format!("@{plugin}:{name}"))
+            .set_environment(module_env.clone())
+            .call::<LuaValue>(name.as_str());
+        loading
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&name);
+        let value = match result? {
+            LuaValue::Nil => LuaValue::Boolean(true),
+            value => value,
+        };
+        loaded.raw_set(name.as_str(), value.clone())?;
+        Ok(value)
+    })?;
+    env.raw_set("require", require)?;
+    Ok(env)
 }
 
 /// Invoke `handler(payload)` with the timeout hook installed for the duration of the call.
@@ -503,6 +570,7 @@ mod tests {
             .to_string(),
             config: r#"{"prefix": "[x] ", "suffixes": ["a", "b"], "count": 3, "missing": null}"#
                 .to_string(),
+            ..ScriptSource::new("")
         }])
         .unwrap();
         let out = runner
@@ -525,10 +593,12 @@ mod tests {
             ScriptSource {
                 text: script.to_string(),
                 config: r#"{"tag": "-1"}"#.to_string(),
+                ..ScriptSource::new("")
             },
             ScriptSource {
                 text: script.to_string(),
                 config: r#"{"tag": "-2"}"#.to_string(),
+                ..ScriptSource::new("")
             },
         ])
         .unwrap();
@@ -556,6 +626,7 @@ mod tests {
             let err = LuaScriptRunner::from_sources(&[ScriptSource {
                 text: String::new(),
                 config: config.to_string(),
+                ..ScriptSource::new("")
             }])
             .err()
             .unwrap();
@@ -571,10 +642,114 @@ mod tests {
         let err = LuaScriptRunner::from_sources(&[ScriptSource {
             text: "local config = ...; kiki.regex(config.pattern)".to_string(),
             config: r#"{"pattern": "("}"#.to_string(),
+            ..ScriptSource::new("")
         }])
         .err()
         .unwrap();
         assert!(matches!(err, ScriptError::ScriptLoadError(_)), "{err}");
+    }
+
+    /// A plugin with the given entrypoint and modules, and an empty config.
+    fn plugin(name: &str, text: &str, modules: &[(&str, &str)]) -> ScriptSource {
+        ScriptSource {
+            name: name.to_string(),
+            modules: modules
+                .iter()
+                .map(|(name, text)| crate::scripting::ScriptModule {
+                    name: name.to_string(),
+                    text: text.to_string(),
+                })
+                .collect(),
+            ..ScriptSource::new(text)
+        }
+    }
+
+    #[test]
+    fn plugins_can_require_their_modules() {
+        let runner = LuaScriptRunner::from_sources(&[plugin(
+            "a",
+            r#"
+                local prefix = require("lib.prefix")
+                assert(require("lib.prefix") == prefix, "modules are cached")
+                assert(require("side_effect") == true)
+                kiki.on("entry.ingest", function(entry)
+                    entry.title = prefix.apply(entry.title)
+                    return entry
+                end)
+            "#,
+            &[
+                (
+                    "lib.prefix",
+                    "local count = 0; return { apply = function(t) return '[a] ' .. t end }",
+                ),
+                ("side_effect", "kiki.log('debug', 'loaded')"),
+            ],
+        )])
+        .unwrap();
+        let out = runner
+            .dispatch_transform_entry(make_entry())
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.title, "[a] Test Title");
+    }
+
+    #[test]
+    fn plugins_cannot_require_each_others_modules() {
+        let err = LuaScriptRunner::from_sources(&[
+            plugin("a", "", &[("shared", "return 1")]),
+            plugin("b", "require('shared')", &[]),
+        ])
+        .err()
+        .unwrap();
+        assert!(
+            err.to_string()
+                .contains("module 'shared' not found in plugin 'b'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn circular_requires_fail() {
+        let err = LuaScriptRunner::from_sources(&[plugin(
+            "a",
+            "require('x')",
+            &[("x", "require('y')"), ("y", "require('x')")],
+        )])
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("requires itself"), "{err}");
+    }
+
+    #[test]
+    fn plugins_have_their_own_globals() {
+        let runner = LuaScriptRunner::from_sources(&[
+            plugin("a", "counter = 'a'", &[]),
+            plugin(
+                "b",
+                r#"
+                    assert(counter == nil, "globals of plugin a leaked into plugin b")
+                    kiki.on("entry.ingest", function(entry)
+                        entry.title = tostring(counter)
+                        return entry
+                    end)
+                "#,
+                &[],
+            ),
+        ])
+        .unwrap();
+        let out = runner
+            .dispatch_transform_entry(make_entry())
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.title, "nil");
+    }
+
+    #[test]
+    fn errors_name_the_plugin() {
+        let err = LuaScriptRunner::from_sources(&[plugin("broken-plugin", "error('boom')", &[])])
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("broken-plugin"), "{err}");
     }
 
     #[test]

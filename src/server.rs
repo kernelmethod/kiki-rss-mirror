@@ -1,7 +1,7 @@
 use crate::{
     config::{self, ConfigHandle, ConfigStore},
     db::migrations,
-    routes,
+    plugins, routes,
     scripting::ScriptRunnerHandle,
     tasks::{self, TaskManagerCommand},
 };
@@ -27,8 +27,8 @@ pub struct SharedAppState {
     /// to worker tasks used to fetch and process feeds.
     pub task_manager_tx: async_channel::Sender<TaskManagerCommand>,
 
-    /// A [`tokio::sync::watch::Sender`] used to signal all workers to reload
-    /// their configuration (e.g. Lua script runners).
+    /// A [`tokio::sync::watch::Sender`] used to signal that plugins should be
+    /// reloaded from the plugins directory.
     pub reload_tx: tokio::sync::watch::Sender<()>,
 
     /// A [`r2d2::Pool`] instance that intermediates connections to the
@@ -46,6 +46,9 @@ pub struct SharedAppState {
     /// filesystem under `{data_dir}/assets/`.
     pub data_dir: PathBuf,
 
+    /// Directory plugins are discovered in. See [`crate::plugins`].
+    pub plugins_dir: PathBuf,
+
     /// Shared handle to the currently-installed scripting engine. Empty when the `lua`
     /// feature is disabled or when no scripts have been loaded.
     pub script_runner: ScriptRunnerHandle,
@@ -61,6 +64,7 @@ pub struct ServerBuilder<'a> {
     db_path: &'a Path,
     socket_path: Option<PathBuf>,
     config_path: Option<PathBuf>,
+    plugins_dir: Option<PathBuf>,
     autofetch: bool,
     single_threaded: bool,
     worker_count: Option<usize>,
@@ -74,6 +78,7 @@ impl<'a> ServerBuilder<'a> {
             db_path,
             socket_path: None,
             config_path: None,
+            plugins_dir: None,
             autofetch: false,
             single_threaded: false,
             worker_count: None,
@@ -91,6 +96,13 @@ impl<'a> ServerBuilder<'a> {
     /// [`config::CONFIG_FILE_NAME`] in the data directory.
     pub fn config_path(mut self, p: &Path) -> Self {
         self.config_path = Some(p.to_path_buf());
+        self
+    }
+
+    /// Discover plugins in `p` instead of the default,
+    /// [`plugins::PLUGINS_DIR_NAME`] in the data directory.
+    pub fn plugins_dir(mut self, p: &Path) -> Self {
+        self.plugins_dir = Some(p.to_path_buf());
         self
     }
 
@@ -151,9 +163,14 @@ impl<'a> ServerBuilder<'a> {
             .config_path
             .unwrap_or_else(|| data_dir.join(config::CONFIG_FILE_NAME));
 
+        let plugins_dir = self
+            .plugins_dir
+            .unwrap_or_else(|| plugins::plugins_dir(&data_dir));
+
         Server {
             db_path: PathBuf::from(self.db_path),
             config_path,
+            plugins_dir,
             data_dir,
             socket_path,
             autofetch: self.autofetch,
@@ -200,6 +217,9 @@ pub struct Server {
 
     /// Path of the config file holding settings overrides.
     config_path: PathBuf,
+
+    /// Directory plugins are discovered in.
+    plugins_dir: PathBuf,
 
     /// Path of the Unix domain socket the server listens on.
     socket_path: PathBuf,
@@ -337,12 +357,39 @@ impl Server {
         // through it.
         let script_runner = ScriptRunnerHandle::empty();
 
+        // Plugins live in a directory Kiki creates, so that there is always
+        // somewhere to install one and something to watch.
+        if let Err(e) = fs::create_dir_all(&self.plugins_dir) {
+            tracing::warn!(
+                "failed to create plugins directory {:?}: {}",
+                self.plugins_dir,
+                e
+            );
+        }
+
         // Build the initial runner and spawn the reloader task (lua feature only).
         #[cfg(feature = "lua")]
         {
-            tasks::reload_script_runner(&pool, &metrics, &script_runner, &self.script_host);
+            tasks::reload_script_runner(
+                &self.plugins_dir,
+                &metrics,
+                &script_runner,
+                &self.script_host,
+            );
+            if let Err(e) = plugins::watch::spawn_watcher(
+                &self.plugins_dir,
+                reload_tx.clone(),
+                self.cancel_token.clone(),
+            ) {
+                tracing::warn!(
+                    "not watching plugins directory {:?} for changes; reload plugins with \
+                     POST /v1/plugins/reload after changing them: {:#}",
+                    self.plugins_dir,
+                    e
+                );
+            }
             tokio::spawn(tasks::run_script_reloader(
-                pool.clone(),
+                self.plugins_dir.clone(),
                 metrics.clone(),
                 script_runner.clone(),
                 self.script_host.clone(),
@@ -453,6 +500,7 @@ impl Server {
             self.cancel_token.clone(),
             metrics.clone(),
             self.data_dir.clone(),
+            self.plugins_dir.clone(),
             script_runner.clone(),
             config,
         ));
@@ -818,6 +866,7 @@ async fn uds_server(
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
     data_dir: PathBuf,
+    plugins_dir: PathBuf,
     script_runner: ScriptRunnerHandle,
     config: ConfigHandle,
 ) -> Result<()> {
@@ -828,6 +877,7 @@ async fn uds_server(
         cancel_token: cancel_token.clone(),
         metrics: metrics.clone(),
         data_dir,
+        plugins_dir,
         script_runner,
         config,
     });

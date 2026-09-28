@@ -9,9 +9,11 @@
 //!
 //! # Events
 //!
-//! Scripts subscribe to server events by calling `kiki.on(event_name, handler)` in their
-//! top-level chunk. The full set of events is described by the [`Event`] enum. A script's
-//! top-level chunk must not return a value — returning anything is rejected at load time.
+//! Scripts are shipped as plugins: directories in Kiki's home with a manifest, discovered
+//! by [`crate::plugins`]. Each plugin's entrypoint subscribes to server events by calling
+//! `kiki.on(event_name, handler)` in its top-level chunk. The full set of events is
+//! described by the [`Event`] enum. A script's top-level chunk must not return a value —
+//! returning anything is rejected at load time.
 //!
 //! # Script contract
 //!
@@ -78,28 +80,45 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 
-/// A script's source code together with its configuration.
+/// A plugin's source code together with its configuration.
 ///
-/// Each script's top-level chunk is called with its config as its only argument, so a
-/// script reads it with `local config = ...`. That keeps one script's config out of reach
-/// of the others that share its VM, and lets several copies of the same script run with
-/// different configs.
+/// Each plugin's entrypoint is called with its config as its only argument, so a
+/// plugin reads it with `local config = ...`. That keeps one plugin's config out of reach
+/// of the others that share its VM.
+///
+/// A plugin's other source files travel with it as [`ScriptModule`]s, which its code
+/// loads with `require`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptSource {
-    /// The script's source code.
+    /// The name of the plugin the source belongs to, used in error messages and stack
+    /// traces.
+    pub name: String,
+    /// The source code of the plugin's entrypoint.
     pub text: String,
     /// The script's config, as the text of a JSON object (see [`parse_script_config`]).
     ///
     /// Kept as text rather than as a parsed value because the script host's IPC codec is
     /// not self-describing, and so cannot carry a [`serde_json::Value`].
     pub config: String,
+    /// The plugin's other source files, which its code can `require`.
+    pub modules: Vec<ScriptModule>,
+}
+
+/// A source file of a plugin other than its entrypoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptModule {
+    /// The name the module is loaded under, such as `lib.rules` for `lib/rules.lua`. See
+    /// [`crate::plugins::module_name`].
+    pub name: String,
+    /// The module's source code.
+    pub text: String,
 }
 
 impl ScriptSource {
     /// The config a script has when none has been set: an empty JSON object.
     pub const EMPTY_CONFIG: &'static str = "{}";
 
-    /// A script with an empty config.
+    /// A single-file script named `script`, with an empty config.
     ///
     /// # Examples
     ///
@@ -108,11 +127,14 @@ impl ScriptSource {
     ///
     /// let source = ScriptSource::new("local config = ...");
     /// assert_eq!(source.config, "{}");
+    /// assert!(source.modules.is_empty());
     /// ```
     pub fn new(text: impl Into<String>) -> Self {
         Self {
+            name: "script".to_string(),
             text: text.into(),
             config: Self::EMPTY_CONFIG.to_string(),
+            modules: Vec::new(),
         }
     }
 }

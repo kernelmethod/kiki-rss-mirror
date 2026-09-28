@@ -600,20 +600,12 @@ async fn stress_script_reload_during_processing() -> Result<()> {
         let conn = tc.database_conn()?;
         let feed_ids = populate_n_feeds(&conn, 10, &feed_url);
 
-        // Insert a simple pass-through Lua script
-        conn.execute(
-            "INSERT INTO scripts (engine, text, kind) VALUES ('lua', 'return entry', 'user')",
-            [],
+        // Install a simple pass-through Lua plugin
+        tc.install_lua_plugin(
+            "passthrough",
+            r#"kiki.on("entry.ingest", function(entry) return entry end)"#,
+            serde_json::json!({}),
         )?;
-        let script_id = conn.last_insert_rowid();
-
-        // Associate the script with all feeds
-        for fid in &feed_ids {
-            conn.execute(
-                "INSERT INTO feed_scripts (feed_id, script_id) VALUES (?1, ?2)",
-                rusqlite::params![fid, script_id],
-            )?;
-        }
         drop(conn);
 
         let mut js = JoinSet::new();
@@ -632,12 +624,12 @@ async fn stress_script_reload_during_processing() -> Result<()> {
             });
         }
 
-        // 20 script reload requests
+        // 20 plugin reload requests
         for _ in 0..20 {
             let c = client.clone();
             js.spawn(async move {
                 let resp = c
-                    .post(format!("{BASE}/v1/scripts/reload"))
+                    .post(format!("{BASE}/v1/plugins/reload"))
                     .send()
                     .await
                     .unwrap();

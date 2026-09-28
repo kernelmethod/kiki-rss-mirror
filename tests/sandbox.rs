@@ -666,23 +666,26 @@ mod script_isolation {
             .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
     }
 
-    /// Add a script and wait for the reloaded runner to report it loaded.
+    /// Install a plugin and wait for the reloaded runner to report it loaded.
     fn install_script(kiki: &mut Kiki, source: &str) {
         install_script_with_config(kiki, source, serde_json::json!({}));
     }
 
-    /// Add a script with a config and wait for the reloaded runner to
-    /// report it loaded.
+    /// Install a plugin with a config into the server's plugins directory,
+    /// and wait for the reloaded runner to report it loaded.
     fn install_script_with_config(kiki: &mut Kiki, source: &str, config: serde_json::Value) {
-        let body = serde_json::json!({
+        let manifest = serde_json::json!({
+            "name": "test-plugin",
+            "version": "1.0.0",
             "engine": "lua",
-            "text": source,
-            "kind": "user",
             "config": config,
         });
-        kiki.post_json("/v1/scripts/create", &body.to_string())
-            .assert_success();
-        kiki.post_json("/v1/scripts/reload", "").assert_success();
+        let plugin = kiki._dir.path().join("plugins").join("test-plugin");
+        std::fs::create_dir_all(&plugin).expect("create plugin directory");
+        std::fs::write(plugin.join("main.lua"), source).expect("write main.lua");
+        std::fs::write(plugin.join("manifest.json"), manifest.to_string())
+            .expect("write manifest.json");
+        kiki.post_json("/v1/plugins/reload", "").assert_success();
         kiki.wait_for_scripts_loaded(1, Duration::from_secs(10));
     }
 
@@ -759,7 +762,7 @@ mod script_isolation {
         kiki.shutdown();
     }
 
-    /// End to end: a script registered through the API transforms a real
+    /// End to end: a script installed as a plugin transforms a real
     /// entry, with the VM in the sandboxed child and the database in the
     /// server. This is the test that fails if anything in the IPC path —
     /// framing, serialisation, the child's sandbox — is wrong.
@@ -867,7 +870,7 @@ mod script_isolation {
         install_script(&mut kiki, TITLE_STAMPING_SCRIPT);
         let before = kiki.script_host_pids();
 
-        kiki.post_json("/v1/scripts/reload", "").assert_success();
+        kiki.post_json("/v1/plugins/reload", "").assert_success();
         kiki.wait_for_scripts_loaded(1, Duration::from_secs(10));
 
         let after = kiki.script_host_pids();

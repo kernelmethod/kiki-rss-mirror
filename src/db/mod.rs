@@ -178,13 +178,11 @@ mod tests {
             "entry_sources",
             "entry_tags",
             "feed_assets",
-            "feed_scripts",
             "feed_tags",
             "feeds",
             "migrations",
             "rss_categories",
             "rss_entry_data",
-            "scripts",
             "tags",
             "task_queue",
         ]

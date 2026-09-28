@@ -1,8 +1,9 @@
 use crate::cli::paths::{self, Env};
 use crate::db::{migrations, ConnectionBuilder};
+use crate::plugins;
 use anyhow::{Context, Result};
 use clap::Args;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Args)]
 pub struct MigrateArgs {
@@ -54,6 +55,20 @@ impl MigrateArgs {
                 for migration in &pending {
                     println!("  - {}", migration.name);
                 }
+                if pending
+                    .iter()
+                    .any(|m| m.name == migrations::PLUGINS_MIGRATION)
+                {
+                    let count: i64 = conn
+                        .query_row("SELECT COUNT(*) FROM scripts", [], |row| row.get(0))
+                        .unwrap_or(0);
+                    if count > 0 {
+                        println!(
+                            "{count} script(s) would be exported to plugins in {}",
+                            plugins_dir_for(&database).display()
+                        );
+                    }
+                }
             }
         } else {
             let mut conn = ConnectionBuilder::default()
@@ -61,6 +76,20 @@ impl MigrateArgs {
                 .read_write()
                 .build()
                 .with_context(|| format!("failed to open database at {database:?}"))?;
+
+            // The plugins migration drops the table scripts used to be kept
+            // in, so export them first.
+            if migrations::pending_migrations(&conn)?
+                .iter()
+                .any(|m| m.name == migrations::PLUGINS_MIGRATION)
+            {
+                let plugins_dir = plugins_dir_for(&database);
+                let exported = plugins::export_legacy_scripts(&conn, &plugins_dir)
+                    .context("failed to export scripts to plugins; no migrations were applied")?;
+                for dir in &exported {
+                    println!("Exported script to plugin {}", dir.display());
+                }
+            }
 
             let count = migrations::run_pending_migrations(&mut conn)?;
             if count == 0 {
@@ -72,4 +101,14 @@ impl MigrateArgs {
 
         Ok(())
     }
+}
+
+/// The plugins directory that belongs with the database at `database`: the
+/// one in the same directory, where `kiki serve` looks for it.
+fn plugins_dir_for(database: &Path) -> PathBuf {
+    let home = database
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    plugins::plugins_dir(home)
 }

@@ -29,7 +29,17 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0002_script_config",
         sql: include_str!("include/migrations/0002_script_config.sql"),
     },
+    Migration {
+        name: PLUGINS_MIGRATION,
+        sql: include_str!("include/migrations/0003_plugins.sql"),
+    },
 ];
+
+/// The migration that drops the `scripts` table in favour of plugins.
+///
+/// Scripts in the table must be exported to plugin directories before it
+/// runs; see [`crate::plugins::export_legacy_scripts`].
+pub const PLUGINS_MIGRATION: &str = "0003_plugins";
 
 /// SQL to create the migrations table. Safe to run on databases that already
 /// have it (uses `IF NOT EXISTS`).
@@ -245,16 +255,42 @@ mod tests {
     /// `0002_script_config` gives existing scripts an empty config.
     #[test]
     fn test_script_config_migration() -> Result<()> {
-        let mut conn = rusqlite::Connection::open_in_memory()?;
+        let conn = rusqlite::Connection::open_in_memory()?;
         conn.execute_batch(LEGACY_SCHEMA)?;
         conn.execute_batch(
             "INSERT INTO scripts (engine, text, kind) VALUES ('lua', '-- x', 'user');",
         )?;
 
-        run_pending_migrations(&mut conn)?;
+        for migration in MIGRATIONS
+            .iter()
+            .take_while(|m| m.name != PLUGINS_MIGRATION)
+        {
+            conn.execute_batch(migration.sql)?;
+        }
 
         let config: String = conn.query_row("SELECT config FROM scripts", [], |row| row.get(0))?;
         assert_eq!(config, "{}");
+
+        Ok(())
+    }
+
+    /// `0003_plugins` drops the tables scripts used to be stored in.
+    #[test]
+    fn test_plugins_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        conn.execute_batch(
+            "CREATE TABLE feed_scripts (feed_id INTEGER NOT NULL, script_id INTEGER NOT NULL);",
+        )?;
+
+        run_pending_migrations(&mut conn)?;
+
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('scripts', 'feed_scripts')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 0);
 
         Ok(())
     }
