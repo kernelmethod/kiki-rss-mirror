@@ -1,3 +1,4 @@
+use crate::routes::v1::entries::list_entries::not_hidden_unless;
 use crate::routes::v1::entries::ListEntriesResponseEntry;
 use crate::server::AppState;
 use axum::{
@@ -22,6 +23,9 @@ pub struct FeedEntriesQueryParams {
     /// Maximum number of records to return (default: 50, max: 200). Larger
     /// values are clamped to 200; the response reports the limit that was applied.
     pub limit: Option<usize>,
+    /// Also list entries tagged `system:hidden`, which are left out by
+    /// default (default: false).
+    pub include_hidden: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
@@ -44,7 +48,9 @@ enum FeedEntriesTaskError {
 /// List entries
 ///
 /// List all of the entries belonging to a specific feed, newest first. Entries
-/// with the same publication time are ordered by descending ID.
+/// with the same publication time are ordered by descending ID. Entries tagged
+/// `system:hidden` are left out, and not counted, unless `include_hidden` is
+/// true.
 #[utoipa::path(
     get,
     path = "/v1/feeds/id/{id}/entries",
@@ -71,6 +77,7 @@ pub async fn feed_entries(
     })?;
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let include_hidden = params.include_hidden.unwrap_or(false);
 
     let result = task::spawn_blocking(move || {
         // Check if feed exists
@@ -86,37 +93,44 @@ pub async fn feed_entries(
         }
 
         let count: usize = conn
-            .prepare("SELECT COUNT(*) FROM entries WHERE feed_id = ?1")
+            .prepare(&format!(
+                "SELECT COUNT(*) FROM entries e WHERE feed_id = ?1 AND {}",
+                not_hidden_unless(2)
+            ))
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
-            .query_row([id], |row| row.get(0))?;
+            .query_row(rusqlite::params![id, include_hidden], |row| row.get(0))?;
 
         let entries = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT id, feed_id, source_id, syndication_format,
                         guid, published_at, title, url, content
-                 FROM entries WHERE feed_id = ?1
+                 FROM entries e WHERE feed_id = ?1 AND {}
                  ORDER BY published_at DESC, id DESC
                  LIMIT ?2 OFFSET ?3",
-            )
+                not_hidden_unless(4)
+            ))
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
-            .query_map(rusqlite::params![id, limit, offset], |row| {
-                Ok(ListEntriesResponseEntry {
-                    id: row.get(0)?,
-                    feed_id: row.get(1)?,
-                    source_id: row.get(2)?,
-                    syndication_format: row.get(3)?,
-                    guid: row.get(4)?,
-                    published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
-                        .map(|d| d.to_rfc3339()),
-                    title: row.get(6)?,
-                    url: row.get(7)?,
-                    content: row.get(8)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![id, limit, offset, include_hidden],
+                |row| {
+                    Ok(ListEntriesResponseEntry {
+                        id: row.get(0)?,
+                        feed_id: row.get(1)?,
+                        source_id: row.get(2)?,
+                        syndication_format: row.get(3)?,
+                        guid: row.get(4)?,
+                        published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
+                            .map(|d| d.to_rfc3339()),
+                        title: row.get(6)?,
+                        url: row.get(7)?,
+                        content: row.get(8)?,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok::<FeedEntriesResponse, FeedEntriesTaskError>(FeedEntriesResponse {
@@ -229,6 +243,40 @@ mod test {
         assert_eq!(body.count, 0);
         assert_eq!(body.offset, 0);
         assert_eq!(body.limit, DEFAULT_LIMIT);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_feed_entries_leaves_out_hidden_entries() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let feed_id = insert_feed(&tc, "hiding")?;
+        let [first, second, third]: [i64; 3] = insert_entries(&tc, feed_id, 3)?
+            .try_into()
+            .map_err(|ids| anyhow::anyhow!("expected 3 entries, got {ids:?}"))?;
+        {
+            let conn = tc.database_conn()?;
+            let hidden = crate::db::tags::SystemTag::Hidden.id(&conn)?;
+            conn.execute(
+                "INSERT INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+                [second, hidden],
+            )?;
+        }
+
+        let body = get_entries(&client, feed_id, "")
+            .await?
+            .json::<FeedEntriesResponse>()
+            .await?;
+        assert_eq!(body.count, 2);
+        assert_eq!(ids(&body), HashSet::from([first, third]));
+
+        let body = get_entries(&client, feed_id, "?include_hidden=true")
+            .await?
+            .json::<FeedEntriesResponse>()
+            .await?;
+        assert_eq!(body.count, 3);
+        assert_eq!(ids(&body), HashSet::from([first, second, third]));
 
         Ok(())
     }

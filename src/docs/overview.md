@@ -21,7 +21,9 @@ out of scope for this project:
     `system:read`, `system:saved`, and `system:hidden`. They cannot be renamed
     or deleted, and are applied to entries with
     `PUT`/`DELETE /v1/entries/id/{id}/system-tags/{name}`. The `system:`
-    prefix is reserved, so user tags cannot start with it.
+    prefix is reserved, so user tags cannot start with it. Entries tagged
+    `system:hidden` are left out of entry lists unless asked for with
+    `include_hidden=true`.
 
 The following is currently out-of-scope, although these features may be
 reconsidered some day:
