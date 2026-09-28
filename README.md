@@ -79,7 +79,9 @@ file in the plugins directory changes.
 Kiki ships a `filter` plugin, in [`plugins/filter`](plugins/filter), that hides
 entries (tags them `system:hidden`) when their title, URL, content, authors,
 categories or GUID match regular expressions, or when they fail to match any of
-a feed's "include" rules. It is bundled into the `kiki` binary (the
+a feed's "include" rules. Hidden entries are left out of the web UI, and of
+`GET /v1/entries` and `GET /v1/feeds/id/{id}/entries` unless those are passed
+`include_hidden=true`. It is bundled into the `kiki` binary (the
 `default-plugins` Cargo feature, on by default) and `kiki init` installs it into
 the plugins directory, with no rules; pass `kiki init --no-default-plugins` to
 skip it. `kiki init --check` installs default plugins into a Kiki home set up

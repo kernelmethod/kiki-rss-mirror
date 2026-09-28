@@ -2009,6 +2009,28 @@ mod tests {
         Ok(())
     }
 
+    /// Entries a plugin, or the user, hid are left out of the list.
+    #[tokio::test]
+    async fn the_index_page_leaves_out_hidden_entries() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 3)?;
+        tag_entry(&tc, 2, "system:hidden")?;
+
+        let (status, body) = get_index(tc.client()?).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("2 entries"), "{body}");
+        assert_eq!(listed_titles(&body), ["Entry 3", "Entry 1"]);
+
+        // Its own page still shows it, tagged hidden.
+        let (status, body) = get_page(tc.client()?, "/entries/2").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(r#"<li class="tag system" title="system:hidden">hidden</li>"#),
+            "{body}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_page_past_the_end_links_back_to_the_last_page() -> Result<()> {
         let tc = TestBuilder::all().build()?;
@@ -2138,8 +2160,8 @@ mod tests {
             [],
         )?;
         tag_entry(&tc, 3, "tech")?;
-        tag_entry(&tc, 3, "system:hidden")?;
-        let expected = r#"<ul class="tags" aria-label="Tags"><li class="tag system" title="system:hidden">hidden</li><li class="tag">tech</li></ul>"#;
+        tag_entry(&tc, 3, "system:saved")?;
+        let expected = r#"<ul class="tags" aria-label="Tags"><li class="tag system" title="system:saved">saved</li><li class="tag">tech</li></ul>"#;
 
         let (status, body) = get_page(tc.client()?, "/entries/3").await?;
         assert_eq!(status, StatusCode::OK);
