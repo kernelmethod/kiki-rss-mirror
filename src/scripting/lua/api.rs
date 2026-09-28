@@ -1,4 +1,5 @@
-//! The parts of the `kiki` Lua API that reach the server: `kiki.store` and `kiki.entries`.
+//! The parts of the `kiki` Lua API that reach the server: `kiki.store`, `kiki.entries` and
+//! `kiki.feeds`.
 //!
 //! Each plugin sees its own `kiki` table, which holds these functions bound to the plugin's
 //! name and falls back to the shared `kiki` table (`kiki.on`, `kiki.log`, `kiki.regex`)
@@ -25,9 +26,10 @@ pub(super) struct ScanCallbacks {
 /// The scans plugins have started, keyed by scan id.
 pub(super) type Scans = Arc<Mutex<HashMap<u64, ScanCallbacks>>>;
 
-/// How much of the time a handler spends waiting on the server, in calls to `kiki.store`
-/// and `kiki.entries`, does not count against its time budget. Past this, waiting counts
-/// as usual, so a handler cannot run for ever by calling the server in a loop.
+/// How much of the time a handler spends waiting on the server, in calls to `kiki.store`,
+/// `kiki.entries` and `kiki.feeds`, does not count against its time budget. Past this,
+/// waiting counts as usual, so a handler cannot run for ever by calling the server in a
+/// loop.
 pub const MAX_CALL_ALLOWANCE: Duration = Duration::from_secs(1);
 
 /// The time budget of the handler call in progress, if any.
@@ -131,7 +133,32 @@ pub(super) fn plugin_kiki_table(lua: &Lua, plugin: &str, ctx: &ApiContext) -> Lu
 
     kiki.raw_set("store", store_table(lua, plugin, ctx)?)?;
     kiki.raw_set("entries", entries_table(lua, plugin, ctx)?)?;
+    kiki.raw_set("feeds", feeds_table(lua, plugin, ctx)?)?;
     Ok(kiki)
+}
+
+fn feeds_table(lua: &Lua, plugin: &str, ctx: &ApiContext) -> LuaResult<LuaTable> {
+    let feeds = lua.create_table()?;
+
+    let (p, c) = (plugin.to_string(), ctx.clone());
+    feeds.set(
+        "get",
+        lua.create_function(move |lua, feed_id: i64| {
+            match c.call(&p, "feeds.get", ServiceCall::GetFeed { feed_id })? {
+                ServiceReply::Feed(None) => Ok(LuaValue::Nil),
+                ServiceReply::Feed(Some(feed)) => {
+                    let table = lua.create_table()?;
+                    table.set("id", feed.id)?;
+                    table.set("url", feed.url)?;
+                    table.set("title", feed.title)?;
+                    Ok(LuaValue::Table(table))
+                }
+                other => Err(unexpected("feeds.get", other)),
+            }
+        })?,
+    )?;
+
+    Ok(feeds)
 }
 
 fn store_table(lua: &Lua, plugin: &str, ctx: &ApiContext) -> LuaResult<LuaTable> {

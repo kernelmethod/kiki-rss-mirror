@@ -89,6 +89,7 @@ that, kiki exposes a single additional global — the `kiki` table:
   [Storing data](#storing-data).
 - `kiki.entries` — tag the entries already stored, and scan through them.
   See [Stored entries](#stored-entries).
+- `kiki.feeds` — look up the feeds entries come from. See [Feeds](#feeds).
 
 The sandbox removes `dofile`, `loadfile`, `debug`, `io`, `package`, and the
 destructive `os.*` calls (`execute`, `exit`, `getenv`, `remove`, `rename`,
@@ -387,9 +388,45 @@ kiki.on("plugin.load", function()
 end)
 ```
 
-Calls to `kiki.store` and `kiki.entries` go to the server, which answers them
-from the database. Time a handler spends waiting on them does not count
-against its [time budget](#resource-limits), up to a second per handler call.
+## Feeds
+
+An entry names its feed only by `feed_id`. `kiki.feeds.get(id)` looks the
+feed up, returning a table with its `id`, `url` (the URL it is fetched from,
+or `nil`) and `title`, or `nil` if there is no feed with that id. Feed ids
+depend on the order feeds were added in, so this is how a plugin can apply
+settings to feeds named by URL:
+
+```lua
+local config = ...
+local urls = {}
+for _, url in ipairs(config.feeds or {}) do
+    urls[url] = true
+end
+
+local seen = {}
+kiki.on("entry.ingest", function(entry)
+    if seen[entry.feed_id] == nil then
+        local feed = kiki.feeds.get(entry.feed_id)
+        seen[entry.feed_id] = feed ~= nil and urls[feed.url] == true
+    end
+    if seen[entry.feed_id] then
+        table.insert(entry.tags, "watched")
+    end
+    return entry
+end)
+```
+
+Each lookup is a call to the server, so a plugin that looks feeds up for
+every entry is best off remembering the answers, as above. A feed's URL
+changes when fetching it is permanently redirected, and a removed feed's id
+may be given to a feed added later (listen for `feed.removed` to forget it).
+
+## Calls to the server
+
+Calls to `kiki.store`, `kiki.entries` and `kiki.feeds` go to the server,
+which answers them from the database. Time a handler spends waiting on them
+does not count against its [time budget](#resource-limits), up to a second
+per handler call.
 
 ## Regular expressions
 
@@ -458,8 +495,8 @@ Every handler call runs under two hard limits:
   every 1000 VM instructions. Scripts stuck in long-running C-level calls
   (e.g. pathological `string.gsub` patterns) can exceed this slightly before
   control returns to the VM. Time spent waiting on the server in calls to
-  `kiki.store` and `kiki.entries` is not counted, up to one second per
-  invocation; past that, waiting counts like anything else.
+  `kiki.store`, `kiki.entries` and `kiki.feeds` is not counted, up to one
+  second per invocation; past that, waiting counts like anything else.
 - **Memory**: 16 MiB across the entire VM. Allocations that would exceed this
   cap fail the handler.
 - **Regexes**: compiled regexes live outside the VM, so the memory cap does not
