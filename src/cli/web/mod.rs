@@ -4,6 +4,8 @@ use crate::cli::serve::ServeArgs;
 use crate::routes::v1::entries::entry_assets::ListEntryAssetsResponse;
 use crate::routes::v1::entries::get_entry::GetEntryResponse;
 use crate::routes::v1::entries::{ListEntriesResponse, ListEntriesResponseEntry};
+use crate::routes::v1::feeds::feed_entries::FeedEntriesResponse;
+use crate::routes::v1::feeds::list_feeds::ListFeedsResponse;
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{Path as UrlPath, Query, State},
@@ -181,6 +183,8 @@ async fn serve_ui(
     let app = Router::new()
         .route("/", get(index))
         .route("/entries/{id}", get(entry_page))
+        .route("/feeds", get(feeds_page))
+        .route("/feeds/{id}", get(feed_page))
         .route("/assets/{hash}", get(asset))
         .with_state(api);
     axum::serve(listener, app)
@@ -189,20 +193,77 @@ async fn serve_ui(
         .context("error encountered while running the web UI")
 }
 
-/// Number of entries shown on each page of the index.
+/// Number of entries, or feeds, shown on each page of a list.
 const PAGE_SIZE: u32 = 25;
 
-/// Query parameters accepted by the index and entry pages.
+/// Query parameters accepted by the index, feed and entry pages.
 #[derive(Deserialize)]
 struct PageParams {
     /// The page of entries to show, or to link back to, counting from 1
     /// (default: 1).
     page: Option<u32>,
+    /// On an entry page, the feed whose page to link back to, rather than
+    /// the index.
+    feed: Option<i64>,
 }
 
 impl PageParams {
     fn page(&self) -> u32 {
         self.page.unwrap_or(1).max(1)
+    }
+
+    /// The list of entries an entry page links back to.
+    fn listing(&self) -> Listing {
+        Listing {
+            feed: self.feed,
+            page: self.page(),
+        }
+    }
+}
+
+/// A page of a list of entries: of the index, or of a feed's page. Entry
+/// pages link back to the listing they were opened from.
+#[derive(Clone, Copy)]
+struct Listing {
+    /// The feed whose entries are listed, or `None` for the index.
+    feed: Option<i64>,
+    /// The page of the list, counting from 1.
+    page: u32,
+}
+
+impl Listing {
+    /// The path of the list, without a page.
+    fn path(&self) -> String {
+        match self.feed {
+            Some(id) => format!("/feeds/{id}"),
+            None => "/".to_owned(),
+        }
+    }
+
+    /// The URL of this page of the list.
+    fn href(&self) -> String {
+        if self.page > 1 {
+            format!("{}?page={}", self.path(), self.page)
+        } else {
+            self.path()
+        }
+    }
+
+    /// The URL of entry `id`'s page, linking back to this page of the list,
+    /// escaped for use in an attribute.
+    fn entry_href(&self, id: i64) -> String {
+        let mut query = Vec::new();
+        if let Some(feed) = self.feed {
+            query.push(format!("feed={feed}"));
+        }
+        if self.page > 1 {
+            query.push(format!("page={}", self.page));
+        }
+        if query.is_empty() {
+            format!("/entries/{id}")
+        } else {
+            format!("/entries/{id}?{}", query.join("&amp;"))
+        }
     }
 }
 
@@ -254,10 +315,11 @@ async fn index(State(api): State<reqwest::Client>, Query(params): Query<PagePara
         Ok(entries) => {
             let feeds =
                 fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)).await;
+            let listing = Listing { feed: None, page };
             render_page(
                 StatusCode::OK,
                 "Kiki",
-                &render_entries(&entries, &feeds, page),
+                &render_entries(entries.count, &entries.entries, &feeds, listing),
             )
         }
         Err(e) => server_unavailable(&e),
@@ -267,7 +329,8 @@ async fn index(State(api): State<reqwest::Client>, Query(params): Query<PagePara
 /// Render the page for entry `id`: a summary of the entry built from what
 /// its feed says about it, with a link through to the entry itself.
 ///
-/// `page` is the page of the index to link back to.
+/// The page links back to the list of entries it was opened from: the
+/// index, or a feed's page.
 async fn entry_page(
     State(api): State<reqwest::Client>,
     UrlPath(id): UrlPath<i64>,
@@ -281,7 +344,7 @@ async fn entry_page(
                 "Entry not found - Kiki",
                 &format!(
                     "<p>Entry not found.</p>\n{}",
-                    render_back_link(params.page())
+                    render_back_link(params.listing())
                 ),
             )
         }
@@ -298,7 +361,62 @@ async fn entry_page(
     render_page(
         StatusCode::OK,
         &format!("{} - Kiki", display_title(&entry.title)),
-        &render_entry_page(&entry, feed_title.as_deref(), &cached, params.page()),
+        &render_entry_page(&entry, feed_title.as_deref(), &cached, params.listing()),
+    )
+}
+
+/// Render the list of feeds: the total number of feeds, and one page of
+/// them, each linked to its page.
+async fn feeds_page(
+    State(api): State<reqwest::Client>,
+    Query(params): Query<PageParams>,
+) -> Response {
+    let page = params.page();
+    match fetch_feeds(&api, page).await {
+        Ok(feeds) => render_page(StatusCode::OK, "Feeds - Kiki", &render_feeds(&feeds, page)),
+        Err(e) => server_unavailable(&e),
+    }
+}
+
+/// Render the page for feed `id`: what the feed says about itself, and one
+/// page of the entries retrieved from it, newest first.
+async fn feed_page(
+    State(api): State<reqwest::Client>,
+    UrlPath(id): UrlPath<i64>,
+    Query(params): Query<PageParams>,
+) -> Response {
+    let listing = Listing {
+        feed: Some(id),
+        page: params.page(),
+    };
+    let not_found = || {
+        render_page(
+            StatusCode::NOT_FOUND,
+            "Feed not found - Kiki",
+            "<p>Feed not found.</p>\n<p><a href=\"/feeds\">&larr; Back to feeds</a></p>\n",
+        )
+    };
+
+    let (feed, entries) = tokio::join!(
+        fetch_feed(&api, id),
+        fetch_feed_entries(&api, id, listing.page)
+    );
+    let feed = match feed {
+        Ok(Some(feed)) => feed,
+        Ok(None) => return not_found(),
+        Err(e) => return server_unavailable(&e),
+    };
+    let entries = match entries {
+        Ok(Some(entries)) => entries,
+        // The feed was deleted between the two requests.
+        Ok(None) => return not_found(),
+        Err(e) => return server_unavailable(&e),
+    };
+
+    render_page(
+        StatusCode::OK,
+        &format!("{} - Kiki", display_feed_title(&feed.title)),
+        &render_feed_page(&feed, &entries, listing),
     )
 }
 
@@ -439,10 +557,60 @@ async fn fetch_entry(api: &reqwest::Client, id: i64) -> Result<Option<GetEntryRe
     Ok(Some(resp.error_for_status()?.json().await?))
 }
 
+/// Fetch page `page` (counting from 1) of `/v1/feeds` from the Kiki API.
+async fn fetch_feeds(api: &reqwest::Client, page: u32) -> Result<ListFeedsResponse> {
+    let offset = u64::from(page - 1) * u64::from(PAGE_SIZE);
+    Ok(api
+        .get(format!(
+            "{API_BASE}/v1/feeds?offset={offset}&limit={PAGE_SIZE}"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Fetch feed `id` from the Kiki API, or `None` if there is no such feed.
+async fn fetch_feed(api: &reqwest::Client, id: i64) -> Result<Option<Feed>> {
+    let resp = api
+        .get(format!("{API_BASE}/v1/feeds/id/{id}"))
+        .send()
+        .await?;
+    if resp.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    Ok(Some(resp.error_for_status()?.json().await?))
+}
+
+/// Fetch page `page` (counting from 1) of the entries of feed `id` from the
+/// Kiki API, or `None` if there is no such feed.
+async fn fetch_feed_entries(
+    api: &reqwest::Client,
+    id: i64,
+    page: u32,
+) -> Result<Option<FeedEntriesResponse>> {
+    let offset = u64::from(page - 1) * u64::from(PAGE_SIZE);
+    let resp = api
+        .get(format!(
+            "{API_BASE}/v1/feeds/id/{id}/entries?offset={offset}&limit={PAGE_SIZE}"
+        ))
+        .send()
+        .await?;
+    if resp.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    Ok(Some(resp.error_for_status()?.json().await?))
+}
+
 /// The part of a `/v1/feeds/id/{id}` response the web UI uses.
 #[derive(Deserialize)]
 struct Feed {
     title: String,
+    url: String,
+    description: Option<String>,
+    /// When the feed was last checked, in RFC 3339.
+    last_checked: Option<String>,
 }
 
 /// Fetch the titles of the feeds in `feed_ids` from the Kiki API, keyed by
@@ -486,46 +654,53 @@ async fn fetch_feed_titles(
     titles
 }
 
-/// Render the entry count, the entries on page `page`, and the page links.
-/// `feeds` maps feed IDs to the titles of the feeds.
-fn render_entries(resp: &ListEntriesResponse, feeds: &HashMap<i64, String>, page: u32) -> String {
+/// Render the entry count (`count`, of all the entries in the list), the
+/// entries on this page of `listing`, and the page links. `feeds` maps feed
+/// IDs to the titles of the feeds; entries from feeds not in it are shown
+/// without their feed.
+fn render_entries(
+    count: usize,
+    entries: &[ListEntriesResponseEntry],
+    feeds: &HashMap<i64, String>,
+    listing: Listing,
+) -> String {
     let mut html = format!(
         "<p class=\"count\">{} {}</p>\n",
-        resp.count,
-        if resp.count == 1 { "entry" } else { "entries" }
+        count,
+        if count == 1 { "entry" } else { "entries" }
     );
 
-    if resp.entries.is_empty() {
-        html.push_str(if resp.count == 0 {
+    if entries.is_empty() {
+        html.push_str(if count == 0 {
             "<p>No entries yet.</p>\n"
         } else {
             "<p>No entries on this page.</p>\n"
         });
     } else {
         html.push_str("<ol class=\"entries\">\n");
-        for entry in &resp.entries {
+        for entry in entries {
             let feed = entry.feed_id.and_then(|id| feeds.get(&id));
             html.push_str("<li>");
-            html.push_str(&render_entry(entry, feed.map(String::as_str), page));
+            html.push_str(&render_entry(entry, feed.map(String::as_str), listing));
             html.push_str("</li>\n");
         }
         html.push_str("</ol>\n");
     }
 
-    html.push_str(&render_pagination(resp.count, page));
+    html.push_str(&render_pagination(
+        count,
+        listing.page,
+        &listing.path(),
+        ("&larr; Newer", "Older &rarr;"),
+    ));
     html
 }
 
-/// Render a single entry in the index: its title, linked to the entry's
-/// page, and below it its publication date and the title of `feed`, the
-/// feed it came from. The entry's page links back to page `page` of the
-/// index.
-fn render_entry(entry: &ListEntriesResponseEntry, feed: Option<&str>, page: u32) -> String {
-    let href = if page > 1 {
-        format!("/entries/{}?page={page}", entry.id)
-    } else {
-        format!("/entries/{}", entry.id)
-    };
+/// Render a single entry in a list: its title, linked to the entry's page,
+/// and below it its publication date and the title of `feed`, the feed it
+/// came from. The entry's page links back to `listing`.
+fn render_entry(entry: &ListEntriesResponseEntry, feed: Option<&str>, listing: Listing) -> String {
+    let href = listing.entry_href(entry.id);
     let meta = render_meta(entry.published_at.as_deref(), feed, None);
     format!(
         "<a href=\"{href}\">{}</a>{meta}",
@@ -535,8 +710,7 @@ fn render_entry(entry: &ListEntriesResponseEntry, feed: Option<&str>, page: u32)
 
 /// Render the page for `entry`: its title, date, feed (`feed`), author and
 /// categories, its content from the feed, and links to the entry itself and
-/// to anything else the feed links it to. The page links back to page
-/// `page` of the index.
+/// to anything else the feed links it to. The page links back to `listing`.
 ///
 /// Images in the content, and the entry's attachment, are taken from the
 /// asset cache: `cached` maps an asset's original URL to the URL of its
@@ -546,7 +720,7 @@ fn render_entry_page(
     entry: &GetEntryResponse,
     feed: Option<&str>,
     cached: &HashMap<String, String>,
-    page: u32,
+    listing: Listing,
 ) -> String {
     let authors: Vec<&str> = match (&entry.rss, &entry.atom) {
         (Some(rss), _) => rss.author.as_deref().into_iter().collect(),
@@ -650,18 +824,98 @@ fn render_entry_page(
     }
 
     html.push_str("</article>\n");
-    html.push_str(&render_back_link(page));
+    html.push_str(&render_back_link(listing));
     html
 }
 
-/// Render the link back to page `page` of the index.
-fn render_back_link(page: u32) -> String {
-    let href = if page > 1 {
-        format!("/?page={page}")
+/// Render the link back to `listing`.
+fn render_back_link(listing: Listing) -> String {
+    let label = if listing.feed.is_some() {
+        "Back to feed"
     } else {
-        "/".to_owned()
+        "Back to entries"
     };
-    format!("<p><a href=\"{href}\">&larr; Back to entries</a></p>\n")
+    format!("<p><a href=\"{}\">&larr; {label}</a></p>\n", listing.href())
+}
+
+/// Render the feed count, the feeds on page `page`, each linked to its
+/// page, and the page links.
+fn render_feeds(resp: &ListFeedsResponse, page: u32) -> String {
+    let mut html = format!(
+        "<h2>Feeds</h2>\n<p class=\"count\">{} {}</p>\n",
+        resp.count,
+        if resp.count == 1 { "feed" } else { "feeds" }
+    );
+
+    if resp.feeds.is_empty() {
+        html.push_str(if resp.count == 0 {
+            "<p>No feeds have been added yet.</p>\n"
+        } else {
+            "<p>No feeds on this page.</p>\n"
+        });
+    } else {
+        html.push_str("<ol class=\"feeds\">\n");
+        for feed in &resp.feeds {
+            let meta = render_feed_meta(&feed.url, feed.last_checked.as_deref());
+            html.push_str(&format!(
+                "<li><a href=\"/feeds/{}\">{}</a>{meta}</li>\n",
+                feed.id,
+                escape(display_feed_title(&feed.title))
+            ));
+        }
+        html.push_str("</ol>\n");
+    }
+
+    html.push_str(&render_pagination(
+        resp.count,
+        page,
+        "/feeds",
+        ("&larr; Previous", "Next &rarr;"),
+    ));
+    html
+}
+
+/// Render the page for `feed`: its title, URL, description and when it was
+/// last checked, then `entries`, the entries on this page of `listing`.
+fn render_feed_page(feed: &Feed, entries: &FeedEntriesResponse, listing: Listing) -> String {
+    let mut html = format!(
+        "<header class=\"feed-header\">\n<h2>{}</h2>\n{}\n",
+        escape(display_feed_title(&feed.title)),
+        render_feed_meta(&feed.url, feed.last_checked.as_deref()),
+    );
+    // Feed descriptions are shown as plain text; they come from the feed.
+    if let Some(description) = feed.description.as_deref().filter(|d| !d.trim().is_empty()) {
+        html.push_str(&format!(
+            "<p class=\"description\">{}</p>\n",
+            escape(description)
+        ));
+    }
+    html.push_str("</header>\n");
+
+    // Every entry here comes from this feed, so none is labelled with it.
+    html.push_str(&render_entries(
+        entries.count,
+        &entries.entries,
+        &HashMap::new(),
+        listing,
+    ));
+    html.push_str("<p><a href=\"/feeds\">&larr; Back to feeds</a></p>\n");
+    html
+}
+
+/// Render the line under a feed's title: its URL (`url`), shown but not
+/// linked, and when it was last checked (`last_checked`, in RFC 3339).
+fn render_feed_meta(url: &str, last_checked: Option<&str>) -> String {
+    let mut parts = vec![format!("<span class=\"url\">{}</span>", escape(url))];
+    match last_checked.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()) {
+        Some(t) => parts.push(format!(
+            "last checked <time datetime=\"{}\">{}</time>",
+            t.to_rfc3339(),
+            t.format("%Y-%m-%d %H:%M UTC")
+        )),
+        None => parts.push("not checked yet".to_owned()),
+    }
+    format!("<span class=\"meta\">{}</span>", parts.join(" &middot; "))
 }
 
 /// Render the line under an entry's title: its publication date
@@ -678,12 +932,10 @@ fn render_meta(published_at: Option<&str>, feed: Option<&str>, author: Option<&s
         ));
     }
     if let Some(feed) = feed {
-        let feed = if feed.trim().is_empty() {
-            "(untitled feed)"
-        } else {
-            feed
-        };
-        parts.push(format!("<span class=\"feed\">{}</span>", escape(feed)));
+        parts.push(format!(
+            "<span class=\"feed\">{}</span>",
+            escape(display_feed_title(feed))
+        ));
     }
     if let Some(author) = author {
         parts.push(format!("by {}", escape(author)));
@@ -705,6 +957,15 @@ fn display_title(title: &str) -> &str {
     }
 }
 
+/// `title`, a feed's title, or a placeholder if it is blank.
+fn display_feed_title(title: &str) -> &str {
+    if title.trim().is_empty() {
+        "(untitled feed)"
+    } else {
+        title
+    }
+}
+
 /// Return `url` if it is an `http` or `https` URL.
 ///
 /// Entry URLs come from the feeds, so they are untrusted. Linking to
@@ -715,8 +976,11 @@ fn safe_link(url: &str) -> Option<&str> {
     matches!(parsed.scheme(), "http" | "https").then_some(url)
 }
 
-/// Render the "page X of Y" line with links to the newer and older pages.
-fn render_pagination(count: usize, page: u32) -> String {
+/// Render the "page X of Y" line for page `page` of a list of `count`
+/// items at `path`, with links to the pages before and after it, labelled
+/// with `labels`.
+fn render_pagination(count: usize, page: u32, path: &str, labels: (&str, &str)) -> String {
+    let (prev_label, next_label) = labels;
     let pages = count.div_ceil(PAGE_SIZE as usize).max(1);
     let page_usize = page as usize;
 
@@ -726,13 +990,13 @@ fn render_pagination(count: usize, page: u32) -> String {
         // (equally empty) page before it.
         let prev = page_usize.min(pages + 1) - 1;
         links.push(format!(
-            "<a href=\"/?page={prev}\" rel=\"prev\">&larr; Newer</a>"
+            "<a href=\"{path}?page={prev}\" rel=\"prev\">{prev_label}</a>"
         ));
     }
     links.push(format!("Page {page} of {pages}"));
     if page_usize < pages {
         links.push(format!(
-            "<a href=\"/?page={}\" rel=\"next\">Older &rarr;</a>",
+            "<a href=\"{path}?page={}\" rel=\"next\">{next_label}</a>",
             page_usize + 1
         ));
     }
@@ -1278,12 +1542,16 @@ mod tests {
     async fn pages_forbid_script() -> Result<()> {
         let tc = TestBuilder::all().build()?;
         insert_entries(&tc, 1)?;
+        tc.database_conn()?.execute(
+            "INSERT INTO feeds (id, title, url) VALUES (1, 'Feed', 'http://example.com/1.xml')",
+            [],
+        )?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let cancel = CancellationToken::new();
         let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
 
-        for path in ["/", "/entries/1"] {
+        for path in ["/", "/entries/1", "/feeds", "/feeds/1"] {
             let resp = reqwest::get(format!("http://{addr}{path}")).await?;
             let csp = resp.headers()[header::CONTENT_SECURITY_POLICY].to_str()?;
             assert!(csp.starts_with("default-src 'none';"), "{path}: {csp}");
@@ -1313,6 +1581,199 @@ mod tests {
         let (_, body) = get_page(tc.client()?, "/entries/1").await?;
         assert!(body.contains("<h2>{{content}}</h2>"), "{body}");
         assert!(body.contains("{{version}}"), "{body}");
+        Ok(())
+    }
+
+    /// Every page links to the index and to the list of feeds.
+    #[tokio::test]
+    async fn pages_link_to_the_list_of_feeds() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 1)?;
+        for path in ["/", "/entries/1", "/feeds"] {
+            let (_, body) = get_page(tc.client()?, path).await?;
+            assert!(
+                body.contains(r#"<nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a></nav>"#),
+                "{path}: {body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The list of feeds links each feed to its page. Titles and URLs come
+    /// from feeds, so they are escaped, and the URLs aren't linked.
+    #[tokio::test]
+    async fn the_feeds_page_lists_every_feed() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        tc.database_conn()?.execute(
+            "INSERT INTO feeds (id, title, url, last_checked)
+             VALUES (1, 'Feed <One>', 'http://example.com/1.xml?a=\"><b>', 1700000000),
+                    (2, '', 'http://example.com/2.xml', NULL)",
+            [],
+        )?;
+
+        let (status, body) = get_page(tc.client()?, "/feeds").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("<title>Feeds - Kiki</title>"), "{body}");
+        assert!(body.contains("2 feeds"), "{body}");
+        assert!(
+            body.contains(r#"<a href="/feeds/1">Feed &lt;One&gt;</a>"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<a href="/feeds/2">(untitled feed)</a>"#),
+            "{body}"
+        );
+        assert!(!body.contains(r#""><b>"#), "{body}");
+        assert!(!body.contains(r#"href="http://example.com"#), "{body}");
+        assert!(body.contains("last checked"), "{body}");
+        assert!(body.contains("not checked yet"), "{body}");
+        assert!(body.contains("Page 1 of 1"), "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_feeds_page_says_when_there_are_no_feeds() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let (status, body) = get_page(tc.client()?, "/feeds").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("0 feeds"), "{body}");
+        assert!(body.contains("No feeds have been added yet."), "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_feeds_page_pages_through_the_feeds() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let conn = tc.database_conn()?;
+        for i in 1..=30 {
+            conn.execute(
+                "INSERT INTO feeds (id, title, url) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    i,
+                    format!("Feed {i}"),
+                    format!("http://example.com/{i}.xml")
+                ],
+            )?;
+        }
+
+        let (_, body) = get_page(tc.client()?, "/feeds").await?;
+        assert!(body.contains("30 feeds"), "{body}");
+        assert!(body.contains("Page 1 of 2"), "{body}");
+        assert!(
+            body.contains(r#"href="/feeds?page=2" rel="next""#),
+            "{body}"
+        );
+        assert_eq!(body.matches(r#"<li><a href="/feeds/"#).count(), 25);
+
+        let (_, body) = get_page(tc.client()?, "/feeds?page=2").await?;
+        assert!(
+            body.contains(r#"href="/feeds?page=1" rel="prev""#),
+            "{body}"
+        );
+        assert_eq!(body.matches(r#"<li><a href="/feeds/"#).count(), 5);
+        Ok(())
+    }
+
+    /// A feed's page lists only that feed's entries, newest first, and its
+    /// entries link to pages that link back to it.
+    #[tokio::test]
+    async fn the_feed_page_lists_the_feeds_entries() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (id, title, url, description)
+             VALUES (1, 'Feed <One>', 'http://example.com/1.xml', 'About <b>one</b>'),
+                    (2, 'Feed Two', 'http://example.com/2.xml', NULL)",
+            [],
+        )?;
+        for i in 1..=30 {
+            conn.execute(
+                "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+                 VALUES (?1, 'rss', ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    if i % 2 == 0 { 1 } else { 2 },
+                    format!("guid-{i}"),
+                    1_700_000_000 + i * 86_400,
+                    format!("Entry {i}"),
+                    format!("http://example.com/{i}"),
+                ],
+            )?;
+        }
+
+        let (status, body) = get_page(tc.client()?, "/feeds/1").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("<title>Feed &lt;One&gt; - Kiki</title>"),
+            "{body}"
+        );
+        assert!(body.contains("<h2>Feed &lt;One&gt;</h2>"), "{body}");
+        assert!(body.contains("About &lt;b&gt;one&lt;/b&gt;"), "{body}");
+        assert!(body.contains("15 entries"), "{body}");
+        let expected: Vec<_> = (1..=15).rev().map(|i| format!("Entry {}", i * 2)).collect();
+        assert_eq!(listed_titles(&body), expected);
+        // Every entry is from this feed, so none is labelled with it.
+        assert!(!body.contains(r#"class="feed""#), "{body}");
+        assert!(body.contains(r#"href="/entries/30?feed=1""#), "{body}");
+        assert!(
+            body.contains(r#"<a href="/feeds">&larr; Back to feeds</a>"#),
+            "{body}"
+        );
+
+        let (status, body) = get_page(tc.client()?, "/entries/30?feed=1").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(r#"<a href="/feeds/1">&larr; Back to feed</a>"#),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_feed_page_pages_through_the_entries() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (id, title, url) VALUES (1, 'Feed', 'http://example.com/1.xml')",
+            [],
+        )?;
+        insert_entries(&tc, 30)?;
+        conn.execute("UPDATE entries SET feed_id = 1", [])?;
+
+        let (_, body) = get_page(tc.client()?, "/feeds/1").await?;
+        assert!(body.contains("Page 1 of 2"), "{body}");
+        assert!(
+            body.contains(r#"href="/feeds/1?page=2" rel="next""#),
+            "{body}"
+        );
+
+        let (_, body) = get_page(tc.client()?, "/feeds/1?page=2").await?;
+        assert!(body.contains("Page 2 of 2"), "{body}");
+        assert!(
+            body.contains(r#"href="/feeds/1?page=1" rel="prev""#),
+            "{body}"
+        );
+        let expected: Vec<_> = (1..=5).rev().map(|i| format!("Entry {i}")).collect();
+        assert_eq!(listed_titles(&body), expected);
+        assert!(
+            body.contains(r#"href="/entries/5?feed=1&amp;page=2""#),
+            "{body}"
+        );
+
+        let (_, body) = get_page(tc.client()?, "/entries/5?feed=1&page=2").await?;
+        assert!(
+            body.contains(r#"<a href="/feeds/1?page=2">&larr; Back to feed</a>"#),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_feed_is_reported() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let (status, body) = get_page(tc.client()?, "/feeds/42").await?;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("Feed not found."), "{body}");
         Ok(())
     }
 
