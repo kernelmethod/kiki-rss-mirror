@@ -1,8 +1,73 @@
-# Writing scripts for Kiki
+# Writing plugins for Kiki
 
-Kiki has a Lua scripting engine that user-supplied scripts use to hook into
-server events — transforming incoming entries, reacting to feed lifecycle
-changes, or logging when something interesting happens.
+Kiki has a Lua scripting engine that plugins use to hook into server events —
+transforming incoming entries, reacting to feed lifecycle changes, or logging
+when something interesting happens.
+
+## Plugins
+
+A plugin is a directory inside the `plugins/` directory in Kiki's home (next
+to `kiki.db`; `kiki init` creates it). Every plugin has a manifest,
+`manifest.toml`, at its root, and its code alongside:
+
+```text
+plugins/
+└── hide-sponsored/
+    ├── manifest.toml
+    ├── main.lua
+    └── lib/
+        └── rules.lua
+```
+
+The manifest is a [TOML](https://toml.io) file declaring the plugin's name,
+its version, and the engine its code is written for:
+
+```toml
+name = "hide-sponsored"
+version = "1.0.0"
+engine = "lua"
+description = "Hide sponsored posts"
+authors = ["Jane Doe <jane@example.com>"]
+license = "MIT"
+homepage = "https://example.com/hide-sponsored"
+entrypoint = "main.lua"
+enabled = true
+
+[config]
+[[config.rules]]
+field = "title"
+pattern = '\bsponsored\b'
+flags = "i"
+```
+
+| Field         | Required | Meaning |
+|---------------|----------|---------|
+| `name`        | Yes      | The plugin's name: lowercase letters, digits, `-` and `_`, starting with a letter or digit, at most 64 characters. Must be unique among installed plugins. |
+| `version`     | Yes      | The plugin's version, as `MAJOR.MINOR.PATCH` with an optional pre-release or build suffix ([Semantic Versioning](https://semver.org)). |
+| `engine`      | Yes      | The engine the plugin's code is written for. Currently only `"lua"`. |
+| `entrypoint`  | No       | The file that runs when the plugin loads, relative to the plugin directory. Defaults to `main.lua`. |
+| `description`, `authors`, `license`, `homepage` | No | Informational; shown by the API. |
+| `enabled`     | No       | Set to `false` to keep a plugin installed without running it. Defaults to `true`. |
+| `config`      | No       | A table holding the plugin's default config; see [Plugin config](#plugin-config). |
+
+Other fields are ignored, so plugins may carry metadata of their own.
+
+To install a plugin, copy its directory into `plugins/`; to remove one, delete
+its directory. Kiki discovers plugins only when the server starts, so restart
+the server after installing, removing, or editing a plugin, or changing its
+config. Plugins load in the order of their directory names, so
+prefixing directory names with numbers (`10-filter`, `20-tag`) controls the
+order their handlers run in.
+
+A plugin whose manifest is missing or invalid is skipped with a warning in the
+server log, and listed with the reason under `errors` in `GET /v1/plugins`;
+the other plugins still load. `GET /v1/plugins/name/{name}` shows one plugin's
+manifest and config. Both show the plugins as they were when the server
+started.
+
+When the server runs sandboxed (the default), it can only read files inside
+Kiki's home, so a plugin directory that is a symbolic link to somewhere else
+cannot be loaded. Symbolic links *inside* a plugin directory are ignored.
 
 ## The `kiki` global
 
@@ -17,17 +82,21 @@ that, kiki exposes a single additional global — the `kiki` table:
 - `kiki.regex(pattern [, flags])` — compile a regular expression. See
   [Regular expressions](#regular-expressions) below.
 
-The sandbox removes `require`, `dofile`, `loadfile`, `debug`, `io`, `package`,
-and the destructive `os.*` calls (`execute`, `exit`, `getenv`, `remove`,
-`rename`, `tmpname`). Scripts cannot read from disk, make network requests, or
-spawn processes.
+The sandbox removes `dofile`, `loadfile`, `debug`, `io`, `package`, and the
+destructive `os.*` calls (`execute`, `exit`, `getenv`, `remove`, `rename`,
+`tmpname`). Scripts cannot read from disk, make network requests, or spawn
+processes. `require` loads only the plugin's own modules; see
+[Modules](#modules).
+
+Each plugin runs in an environment of its own: globals a plugin defines are
+not visible to other plugins.
 
 ## Script structure
 
-The recommended shape for a script is to register one or more event handlers
-via `kiki.on` at the top level. The script's top-level chunk runs exactly once
-when kiki loads its scripts; handlers fire later, each time their event is
-emitted.
+The recommended shape for a plugin's entrypoint is to register one or more
+event handlers via `kiki.on` at the top level. The entrypoint's top-level chunk
+runs exactly once, when the server starts; handlers fire later, each
+time their event is emitted.
 
 ```lua
 kiki.on("entry.ingest", function(entry)
@@ -43,6 +112,103 @@ end)
 A script's top-level chunk must not return a value — scripts register
 handlers through `kiki.on` side effects only. Returning anything from the
 chunk is rejected at load time.
+
+## Modules
+
+A plugin can split its code across several files. Every `.lua` file in the
+plugin directory other than the entrypoint is a module, named after its path
+with `/` replaced by `.` and the extension dropped: `lib/rules.lua` is
+`lib.rules`, and `lib/init.lua` is `lib`. `require(name)` runs a module the
+first time it is called and returns what the module returned (or `true` if it
+returned nothing); later calls return the same value.
+
+```lua
+-- lib/rules.lua
+local M = {}
+function M.compile(rules) --[[ ... ]] end
+return M
+```
+
+```lua
+-- main.lua
+local rules = require("lib.rules")
+```
+
+A plugin can only `require` its own modules. A plugin's source files may total
+at most 1 MiB.
+
+## Plugin config
+
+Every plugin has a config, handed to the plugin's entrypoint as its argument,
+converted to a Lua table, so a plugin reads it with `local config = ...`. The
+config is the `[config]` table in the plugin's manifest (its defaults), with
+the keys of its config overrides (a JSON object) applied over it. Each plugin
+sees only its own config. A plugin with no config gets an empty table.
+
+Overrides are kept in Kiki's database, keyed by plugin name, and set through
+the API under `/v1/plugins/name/{name}/config`: `GET` shows the plugin's
+defaults, its overrides, and the config they add up to; `PUT` replaces every
+override; `PATCH` sets some overrides and keeps the rest; `DELETE` removes
+every override; and `DELETE /v1/plugins/name/{name}/config/{key}` removes one.
+From the command line, `kiki plugin config get <name>` prints a plugin's
+config as TOML (`--defaults` or `--overrides` for just one part), and
+`kiki plugin config set <name> [FILE]` sets overrides from a TOML document,
+read from `FILE` or standard input, keeping the others unless `--replace` is
+given. `kiki plugin ls` lists the installed plugins.
+In the web UI (`kiki web`), each plugin on the Plugins page links to a page
+that shows its config and has a form to set, reset or add each setting.
+Since overrides live outside the plugin directory, a new version of a plugin
+can be dropped in without losing them. As with any other change to a plugin,
+a new config takes effect when the server restarts.
+
+Tables (and JSON objects) become Lua tables keyed by string, and arrays become
+sequences indexed from 1. TOML dates and times become strings in their
+RFC 3339 form, and `inf` and `nan` are not allowed. A `null` override
+becomes `nil`, so a key set to `null` is absent from its table.
+
+For example, this script hides entries whose fields match a configured
+regular expression, or whose fields do *not* match one when `invert` is set:
+
+```lua
+local config = ...
+
+local rules = {}
+for _, rule in ipairs(config.rules or {}) do
+    table.insert(rules, {
+        field = rule.field,
+        re = kiki.regex(rule.pattern, rule.flags),
+        invert = rule.invert == true,
+    })
+end
+
+kiki.on("entry.ingest", function(entry)
+    for _, rule in ipairs(rules) do
+        local value = entry[rule.field] or ""
+        if rule.re:is_match(value) ~= rule.invert then
+            table.insert(entry.tags, "system:hidden")
+            break
+        end
+    end
+    return entry
+end)
+```
+
+configured with, say, these overrides (sent with
+`PUT /v1/plugins/name/{name}/config`):
+
+```json
+{
+  "rules": [
+    { "field": "title", "pattern": "\\b(sponsored|webinar)\\b", "flags": "i" },
+    { "field": "content", "pattern": "rust", "flags": "i", "invert": true }
+  ]
+}
+```
+
+Compiling the regexes in the top-level chunk means a bad pattern in the
+config fails when the plugin loads, not on every entry. Note that if any
+plugin's code fails to load, no plugins run until it is fixed (a plugin whose
+*manifest* is invalid is merely skipped).
 
 ## Events
 
@@ -75,6 +241,15 @@ following fields:
 | `content`           | string (HTML) or `nil` | Yes |
 | `tags`              | array of strings  | Yes     |
 
+`tags` starts empty. A non-empty `tags` replaces the entry's user tags.
+
+Scripts may also add the system tags `system:read`, `system:saved`, and
+`system:hidden` to `tags`. These are applied only when the entry is first
+stored: after that an entry's system tags record what the user has done with
+it (read it, saved it, hidden or unhidden it), and later refreshes leave them
+alone. Scripts never remove system tags. Any other name starting with
+`system:` is reserved, and is ignored with a warning.
+
 `feed_id`, `syndication_format`, and `guid` are identity fields. Handlers may
 read them, but any modifications are discarded when the entry is converted back
 out of Lua.
@@ -82,8 +257,8 @@ out of Lua.
 ### Handler chaining
 
 Multiple handlers may be registered for the same event; they run in
-registration order (which matches the order their owning scripts were
-inserted into the `scripts` table). For `entry.ingest`, the output of one
+registration order (which matches the order of their plugins' directory
+names). For `entry.ingest`, the output of one
 handler becomes the input to the next — if any handler returns `nil`, the
 entry is dropped immediately and subsequent handlers do not run.
 
@@ -168,10 +343,8 @@ When a handler errors, times out, or exceeds the memory cap:
   a broken script will never silently drop entries.
 - For observe events, the failure is logged and dropped.
 
-## Managing scripts
+## Upgrading from database scripts
 
-Scripts are stored in the `scripts` table and managed via the
-`/v1/scripts/*` HTTP API. Changes take effect immediately: the server
-rebuilds its scripting VM on every script create / update / delete, replacing
-the old runner atomically so in-flight events always see a consistent handler
-set.
+Earlier versions of Kiki stored scripts in the database and managed them
+through the `/v1/scripts/*` API. `kiki migrate` drops those scripts along with
+the tables they were kept in; to keep using a script, install it as a plugin.

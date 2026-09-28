@@ -22,7 +22,7 @@
 //! silently desynchronised stream. The feed fetcher's protocol is
 //! multiplexed instead; see [`crate::process::feed_fetcher`].
 
-use crate::scripting::{Event, EventPayload, FeedEntry};
+use crate::scripting::{Event, EventPayload, FeedEntry, ScriptSource};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -38,11 +38,11 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// A message from the server to the script host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HostRequest {
-    /// Discard the current VM and rebuild it from `sources`.
+    /// Discard the current VM, if any, and build a new one from
+    /// `sources`, each script with its config.
     ///
-    /// Sent at startup and on every script reload, so the host never
-    /// needs to be respawned to pick up new scripts.
-    Reload { sources: Vec<String> },
+    /// Sent once, when the server starts and has discovered its plugins.
+    Reload { sources: Vec<ScriptSource> },
 
     /// Run `entry` through the `entry.ingest` handler chain.
     TransformEntry { entry: FeedEntry },

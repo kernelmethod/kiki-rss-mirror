@@ -3,8 +3,8 @@ pub mod docs;
 pub mod entries;
 pub mod feeds;
 pub mod health;
+pub mod plugins;
 pub mod root;
-pub mod scripts;
 pub mod settings;
 pub mod shutdown;
 pub mod tags;
@@ -23,7 +23,7 @@ pub fn create_router() -> Router<AppState> {
         .nest("/assets", assets::create_router())
         .nest("/feeds", feeds::create_router())
         .nest("/entries", entries::create_router())
-        .nest("/scripts", scripts::create_router())
+        .nest("/plugins", plugins::create_router())
         .nest("/settings", settings::create_router())
         .nest("/tags", tags::create_router())
 }

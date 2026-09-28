@@ -6,7 +6,9 @@ use std::path::Path;
 pub mod assets;
 pub mod log;
 pub mod migrations;
+pub mod plugins;
 pub mod retention;
+pub mod tags;
 pub mod task_queue;
 
 enum ConnectionType<'a> {
@@ -177,13 +179,12 @@ mod tests {
             "entry_sources",
             "entry_tags",
             "feed_assets",
-            "feed_scripts",
             "feed_tags",
             "feeds",
             "migrations",
+            "plugins",
             "rss_categories",
             "rss_entry_data",
-            "scripts",
             "tags",
             "task_queue",
         ]

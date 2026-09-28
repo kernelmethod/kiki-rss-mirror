@@ -10,7 +10,7 @@ pub mod search_entries;
 use cleanup::cleanup;
 use delete_entry::delete_entry;
 use entry_assets::list_entry_assets;
-use entry_tags::{get_entry_tags, set_entry_tags};
+use entry_tags::{add_entry_system_tag, get_entry_tags, remove_entry_system_tag, set_entry_tags};
 use get_entry::get_entry;
 #[allow(unused_imports)]
 pub use list_entries::{list_entries, ListEntriesResponse, ListEntriesResponseEntry};
@@ -18,7 +18,7 @@ use search_entries::search_entries;
 
 use crate::server::AppState;
 use axum::{
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 
@@ -29,6 +29,10 @@ pub fn create_router() -> Router<AppState> {
         .route("/search", post(search_entries))
         .route("/id/{id}", get(get_entry).delete(delete_entry))
         .route("/id/{id}/tags", get(get_entry_tags).put(set_entry_tags))
+        .route(
+            "/id/{id}/system-tags/{name}",
+            put(add_entry_system_tag).delete(remove_entry_system_tag),
+        )
         .route("/id/{id}/assets", get(list_entry_assets))
 }
 
@@ -36,6 +40,7 @@ pub fn create_router() -> Router<AppState> {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used)]
 mod test {
     use super::*;
+    use crate::db::tags::{SystemTag, TagKind};
     use crate::test::{TestBuilder, TestConfig};
     use anyhow::Result;
     use axum::http::StatusCode;
@@ -429,13 +434,24 @@ mod test {
         let resp = client
             .put("http://localhost/v1/entries/id/1/tags")
             .json(&entry_tags::SetEntryTagsRequest {
-                tag_ids: vec![1, 3],
+                tag_ids: vec![4, 6],
             })
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<entry_tags::GetEntryTagsResponse>().await?;
         assert_eq!(json.tags.len(), 2);
+
+        // System tags can't be set through this endpoint
+        let read_id = SystemTag::Read.id(&tc.database_conn()?)?;
+        let resp = client
+            .put("http://localhost/v1/entries/id/1/tags")
+            .json(&entry_tags::SetEntryTagsRequest {
+                tag_ids: vec![4, read_id],
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         // Non-existent entry
         let resp = client
@@ -447,12 +463,100 @@ mod test {
         Ok(())
     }
 
+    /// System tags are managed through `/system-tags/{name}`, and survive
+    /// replacing the entry's user tags.
+    #[tokio::test]
+    async fn test_entry_system_tags() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        populate_tags(&tc)?;
+        populate_feeds_and_entries(&tc)?;
+
+        let names = |json: &entry_tags::GetEntryTagsResponse| {
+            json.tags.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
+        };
+
+        // Mark as read, by short name, then saved, by full name
+        let resp = client
+            .put("http://localhost/v1/entries/id/1/system-tags/read")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = client
+            .put("http://localhost/v1/entries/id/1/system-tags/system:saved")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<entry_tags::GetEntryTagsResponse>().await?;
+        assert_eq!(names(&json), ["system:read", "system:saved"]);
+        assert!(json.tags.iter().all(|t| t.kind == TagKind::System));
+
+        // Adding again is a no-op
+        let resp = client
+            .put("http://localhost/v1/entries/id/1/system-tags/read")
+            .send()
+            .await?;
+        let json = resp.json::<entry_tags::GetEntryTagsResponse>().await?;
+        assert_eq!(names(&json), ["system:read", "system:saved"]);
+
+        // Setting user tags leaves the system tags alone
+        let resp = client
+            .put("http://localhost/v1/entries/id/1/tags")
+            .json(&entry_tags::SetEntryTagsRequest { tag_ids: vec![5] })
+            .send()
+            .await?;
+        let json = resp.json::<entry_tags::GetEntryTagsResponse>().await?;
+        assert_eq!(names(&json), ["system:read", "system:saved", "tech"]);
+        let resp = client
+            .put("http://localhost/v1/entries/id/1/tags")
+            .json(&entry_tags::SetEntryTagsRequest { tag_ids: vec![] })
+            .send()
+            .await?;
+        let json = resp.json::<entry_tags::GetEntryTagsResponse>().await?;
+        assert_eq!(names(&json), ["system:read", "system:saved"]);
+
+        // Mark as unread
+        let resp = client
+            .delete("http://localhost/v1/entries/id/1/system-tags/read")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<entry_tags::GetEntryTagsResponse>().await?;
+        assert_eq!(names(&json), ["system:saved"]);
+
+        // Unknown system tag, user tag name, and unknown entry
+        for url in [
+            "http://localhost/v1/entries/id/1/system-tags/starred",
+            "http://localhost/v1/entries/id/1/system-tags/news",
+            "http://localhost/v1/entries/id/999/system-tags/read",
+        ] {
+            let resp = client.put(url).send().await?;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{url}");
+        }
+
+        // System tags can be used in search filters, e.g. to find unread
+        // entries.
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"tags": {"not": "system:saved"}}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].entry.title, "Entry 2");
+
+        Ok(())
+    }
+
     /// Helper to populate search test data: 4 entries with various tags, dates,
     /// titles, content, and URLs.
     fn populate_search_data(tc: &TestConfig) -> Result<()> {
         let conn = tc.database_conn()?;
 
-        // Tags: news(1), tech(2), science(3), sports(4)
+        // Tags: news(4), tech(5), science(6), sports(7); IDs 1-3 are the
+        // system tags.
         conn.execute("INSERT INTO tags (name) VALUES (?)", ["news"])?;
         conn.execute("INSERT INTO tags (name) VALUES (?)", ["tech"])?;
         conn.execute("INSERT INTO tags (name) VALUES (?)", ["science"])?;
@@ -477,11 +581,11 @@ mod test {
             ],
         )?;
         conn.execute(
-            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (1, 1)",
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (1, 4)",
             [],
         )?;
         conn.execute(
-            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (1, 2)",
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (1, 5)",
             [],
         )?;
 
@@ -498,7 +602,7 @@ mod test {
             ],
         )?;
         conn.execute(
-            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (2, 3)",
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (2, 6)",
             [],
         )?;
 
@@ -515,11 +619,11 @@ mod test {
             ],
         )?;
         conn.execute(
-            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (3, 2)",
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (3, 5)",
             [],
         )?;
         conn.execute(
-            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (3, 3)",
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (3, 6)",
             [],
         )?;
 
@@ -539,7 +643,7 @@ mod test {
             ],
         )?;
         conn.execute(
-            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (4, 4)",
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (4, 7)",
             [],
         )?;
 

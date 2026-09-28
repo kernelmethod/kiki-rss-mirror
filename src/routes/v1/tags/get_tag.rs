@@ -1,3 +1,4 @@
+use crate::db::tags::TagKind;
 use crate::server::AppState;
 use axum::{
     extract::{Path, State},
@@ -13,6 +14,8 @@ use tracing::{event, Level};
 pub struct GetTagResponse {
     pub id: i64,
     pub name: String,
+    /// Whether this is a user tag or a system tag.
+    pub kind: TagKind,
 }
 
 /// Get tag information
@@ -42,7 +45,7 @@ pub async fn get_tag(
     })?;
 
     let result = task::spawn_blocking(move || {
-        conn.prepare("SELECT id, name FROM tags WHERE id = ?1")
+        conn.prepare("SELECT id, name, kind FROM tags WHERE id = ?1")
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
@@ -50,6 +53,7 @@ pub async fn get_tag(
                 Ok(GetTagResponse {
                     id: row.get(0)?,
                     name: row.get(1)?,
+                    kind: row.get(2)?,
                 })
             })
     })

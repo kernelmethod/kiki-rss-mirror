@@ -2,19 +2,11 @@
 use crate::metrics::Metrics;
 use crate::scripting::ScriptRunner;
 #[cfg(feature = "lua")]
-use crate::scripting::ScriptRunnerHandle;
-#[cfg(feature = "lua")]
-use anyhow::Result;
-#[cfg(feature = "lua")]
-use r2d2::Pool;
-#[cfg(feature = "lua")]
-use r2d2_sqlite::SqliteConnectionManager;
+use crate::scripting::{ScriptRunnerHandle, ScriptSource};
 #[cfg(feature = "lua")]
 use std::sync::Arc;
 #[cfg(feature = "lua")]
-use tokio_util::sync::CancellationToken;
-#[cfg(feature = "lua")]
-use tracing::{debug, error, info, warn};
+use tracing::{error, warn};
 
 /// Dispatch `fetch.error` to the scripting engine, if one is installed.
 pub(super) fn fire_fetch_error(
@@ -60,61 +52,35 @@ pub(super) fn fire_fetch_success(
     }
 }
 
-/// Load all Lua script source texts from the database.
-#[cfg(feature = "lua")]
-pub(super) fn load_all_script_sources(
-    conn: &r2d2::PooledConnection<SqliteConnectionManager>,
-) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT text FROM scripts ORDER BY id")?;
-    let rows = stmt.query_map([], |row| row.get(0))?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
-}
-
-/// Build a fresh [`ScriptRunner`] from the current `scripts` table and install it in
-/// `handle`, replacing any previous runner.
+/// Build a [`ScriptRunner`] from the Lua plugins in `discovery` and install it in
+/// `handle`.
+///
+/// Plugins are loaded once, when the server starts; picking up a new or changed plugin
+/// takes a restart.
 ///
 /// When `host` carries a sandboxed script host, the sources are shipped to that child
-/// process and `handle` receives a [`SubprocessScriptRunner`] that forwards to it; the
-/// VM is rebuilt inside the child, so no respawn is needed. Otherwise the VM is built
-/// in this process, which is the path the library tests and `--no-script-isolation`
-/// take.
+/// process and `handle` receives a [`SubprocessScriptRunner`] that forwards to it.
+/// Otherwise the VM is built in this process, which is the path the library tests and
+/// `--no-script-isolation` take.
 ///
-/// Logs and clears the handle if loading sources or compiling scripts fails.
+/// Plugins that cannot be loaded are logged and skipped (see
+/// [`crate::plugins::load_sources`]). Logs and clears the handle if the plugins fail to
+/// compile.
 ///
 /// [`SubprocessScriptRunner`]: crate::process::script_host::SubprocessScriptRunner
 #[cfg(feature = "lua")]
-pub fn reload_script_runner(
-    pool: &Pool<SqliteConnectionManager>,
+pub fn load_script_runner(
+    discovery: &crate::plugins::Discovery,
     metrics: &Metrics,
     handle: &ScriptRunnerHandle,
     host: &crate::process::ScriptHostHandle,
 ) {
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(e) => {
-            error!(
-                "failed to get DB connection while building script runner: {}",
-                e
-            );
-            handle.set(None);
-            return;
-        }
-    };
-    let sources = match load_all_script_sources(&conn) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("failed to load script sources from database: {}", e);
-            handle.set(None);
-            return;
-        }
-    };
+    let sources = load_lua_sources(discovery);
 
     // A runner with no handlers behaves exactly like no runner at all —
-    // every dispatch site skips a `None` — so with no scripts installed,
+    // every dispatch site skips a `None` — so with no plugins installed,
     // install nothing. For the isolated host that also spares every
     // ingested entry two IPC round trips that could only ever be no-ops.
-    // The host is still told, so it drops any VM left over from scripts
-    // that have since been deleted.
     let empty = sources.is_empty();
 
     #[cfg(all(unix, feature = "lua"))]
@@ -130,13 +96,13 @@ pub fn reload_script_runner(
                         as Arc<dyn ScriptRunner>)
                 });
                 // Only after the swap, so that the gauge reaching a value
-                // means the reload has taken effect.
+                // means the plugins have taken effect.
                 metrics.set_scripts_loaded(loaded as f64);
             }
             Err(e) if host.is_alive() => {
                 // The host answered, it just could not compile what we
-                // sent. Scripts stay off until the operator fixes them,
-                // and a later reload will be picked up normally.
+                // sent. Plugins stay off until the operator fixes them and
+                // restarts the server.
                 warn!("script host failed to compile Lua scripts: {}", e);
                 metrics.record_script_compile_error();
                 metrics.set_scripts_loaded(0.0);
@@ -159,7 +125,7 @@ pub fn reload_script_runner(
     // No isolated host: compile into a VM in this process.
     let _ = host;
     let count = sources.len() as f64;
-    match crate::scripting::lua::LuaScriptRunner::new(&sources) {
+    match crate::scripting::lua::LuaScriptRunner::from_sources(&sources) {
         Ok(runner) => {
             handle.set(if empty {
                 None
@@ -178,40 +144,8 @@ pub fn reload_script_runner(
     }
 }
 
-/// Listen on `reload_rx` and rebuild the script runner each time a reload signal arrives.
-///
-/// Exits cleanly on cancellation or when the watch channel is closed.
+/// Read the source of every enabled Lua plugin in `discovery`.
 #[cfg(feature = "lua")]
-pub async fn run_script_reloader(
-    pool: Pool<SqliteConnectionManager>,
-    metrics: Arc<Metrics>,
-    handle: ScriptRunnerHandle,
-    host: crate::process::ScriptHostHandle,
-    mut reload_rx: tokio::sync::watch::Receiver<()>,
-    token: CancellationToken,
-) {
-    loop {
-        tokio::select! {
-            res = reload_rx.changed() => {
-                if res.is_err() {
-                    // Sender dropped — no more reloads possible.
-                    return;
-                }
-                debug!("Reloading script runner from database");
-                let pool = pool.clone();
-                let metrics = metrics.clone();
-                let handle = handle.clone();
-                let host = host.clone();
-                // Compilation can be CPU-heavy — and, with an isolated host, is a
-                // blocking round trip to another process. Either way, keep it off
-                // the async runtime.
-                let _ = tokio::task::spawn_blocking(move || {
-                    reload_script_runner(&pool, &metrics, &handle, &host);
-                })
-                .await;
-                info!("Script runner reloaded");
-            }
-            _ = token.cancelled() => return,
-        }
-    }
+pub(super) fn load_lua_sources(discovery: &crate::plugins::Discovery) -> Vec<ScriptSource> {
+    crate::plugins::load_sources(discovery, crate::plugins::PluginEngine::Lua)
 }

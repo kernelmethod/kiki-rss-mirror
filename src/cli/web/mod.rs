@@ -6,18 +6,22 @@ use crate::routes::v1::entries::get_entry::GetEntryResponse;
 use crate::routes::v1::entries::{ListEntriesResponse, ListEntriesResponseEntry};
 use crate::routes::v1::feeds::feed_entries::FeedEntriesResponse;
 use crate::routes::v1::feeds::list_feeds::ListFeedsResponse;
+use crate::routes::v1::plugins::list_plugins::{ListPluginsResponse, PluginResponse};
+use crate::routes::v1::plugins::plugin_config::PluginConfigResponse;
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
-    extract::{Path as UrlPath, Query, State},
+    extract::{Form, Path as UrlPath, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Response},
-    routing::get,
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::{get, post},
     Router,
 };
 use clap::Args;
 use quick_xml::escape::escape;
 use regex::Regex;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -46,6 +50,13 @@ static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
 /// submit forms.
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src 'self'; \
     style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// `Content-Security-Policy` sent with pages that hold forms, such as a
+/// plugin's config page. It is [`CONTENT_SECURITY_POLICY`], except that
+/// forms may be submitted to the web UI itself. These pages show nothing
+/// from feeds.
+const FORM_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src 'self'; \
+    style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// `Content-Security-Policy` sent with cached assets. They were downloaded
 /// from feeds, and are served from the web UI's origin, so one opened on
@@ -185,6 +196,9 @@ async fn serve_ui(
         .route("/entries/{id}", get(entry_page))
         .route("/feeds", get(feeds_page))
         .route("/feeds/{id}", get(feed_page))
+        .route("/plugins", get(plugins_page))
+        .route("/plugins/{name}", get(plugin_page))
+        .route("/plugins/{name}/config", post(update_plugin_config))
         .route("/assets/{hash}", get(asset))
         .with_state(api);
     axum::serve(listener, app)
@@ -270,6 +284,17 @@ impl Listing {
 /// Fill the layout in [`PAGE_HTML`] with `title` (plain text, which is
 /// escaped) and `content` (HTML), and wrap it in a response with `status`.
 fn render_page(status: StatusCode, title: &str, content: &str) -> Response {
+    render_page_with_csp(status, title, content, CONTENT_SECURITY_POLICY)
+}
+
+/// [`render_page`], for a page with forms: the page is sent with
+/// [`FORM_CONTENT_SECURITY_POLICY`], so that its forms can be submitted.
+fn render_form_page(status: StatusCode, title: &str, content: &str) -> Response {
+    render_page_with_csp(status, title, content, FORM_CONTENT_SECURITY_POLICY)
+}
+
+/// [`render_page`], sent with the `Content-Security-Policy` `csp`.
+fn render_page_with_csp(status: StatusCode, title: &str, content: &str, csp: &str) -> Response {
     // Fill every placeholder in one pass, so that a placeholder appearing in
     // a feed's title or content is left alone.
     let html = PLACEHOLDER.replace_all(PAGE_HTML, |caps: &regex::Captures| match &caps[1] {
@@ -281,7 +306,7 @@ fn render_page(status: StatusCode, title: &str, content: &str) -> Response {
     (
         status,
         [
-            (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+            (header::CONTENT_SECURITY_POLICY, csp),
             // Following a link out of the reader shouldn't tell the site
             // what the reader was.
             (header::REFERRER_POLICY, "no-referrer"),
@@ -417,6 +442,195 @@ async fn feed_page(
         StatusCode::OK,
         &format!("{} - Kiki", display_feed_title(&feed.title)),
         &render_feed_page(&feed, &entries, listing),
+    )
+}
+
+/// Render the list of installed plugins, and of the directories in the
+/// plugins directory that could not be loaded as plugins.
+async fn plugins_page(State(api): State<reqwest::Client>) -> Response {
+    match fetch_plugins(&api).await {
+        Ok(plugins) => render_page(StatusCode::OK, "Plugins - Kiki", &render_plugins(&plugins)),
+        Err(e) => server_unavailable(&e),
+    }
+}
+
+/// Render the page for plugin `name`: what its manifest says about it, and
+/// its config, with a form to change each setting.
+async fn plugin_page(
+    State(api): State<reqwest::Client>,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
+    render_plugin_config_page(&api, &name, StatusCode::OK, None).await
+}
+
+/// What a form on a plugin's page asks to do to its config.
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum ConfigAction {
+    /// Override setting `key` with `value`.
+    Set,
+    /// Remove the override of setting `key`, restoring its default.
+    Reset,
+    /// Remove every override, restoring every setting to its default.
+    ResetAll,
+}
+
+/// A form submitted from a plugin's page.
+#[derive(Deserialize)]
+struct ConfigForm {
+    action: ConfigAction,
+    /// The setting to change; unused by [`ConfigAction::ResetAll`].
+    #[serde(default)]
+    key: String,
+    /// The setting's new value, as JSON; used only by [`ConfigAction::Set`].
+    #[serde(default)]
+    value: String,
+}
+
+/// Change plugin `name`'s config as a form on its page asks, then send the
+/// browser back to the page.
+///
+/// A value that is not valid JSON, or a config too large for the server to
+/// save, is reported on the plugin's page, and nothing is changed. Forms
+/// submitted from other sites are refused with `403 Forbidden`; see
+/// [`is_same_origin`].
+async fn update_plugin_config(
+    State(api): State<reqwest::Client>,
+    UrlPath(name): UrlPath<String>,
+    headers: HeaderMap,
+    Form(form): Form<ConfigForm>,
+) -> Response {
+    if !is_same_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "Forms may only be submitted from the web UI's own pages.",
+        )
+            .into_response();
+    }
+
+    let config_url = plugin_api_url(&name, &["config"]);
+    let req = match form.action {
+        ConfigAction::Set => {
+            if form.key.is_empty() {
+                return render_plugin_config_page(
+                    &api,
+                    &name,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Some("Give the setting a name."),
+                )
+                .await;
+            }
+            let value: Value = match serde_json::from_str(&form.value) {
+                Ok(value) => value,
+                Err(e) => {
+                    let error = format!(
+                        "The value for {} is not valid JSON ({e}). Strings must be in \
+                         double quotes.",
+                        form.key
+                    );
+                    return render_plugin_config_page(
+                        &api,
+                        &name,
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Some(&error),
+                    )
+                    .await;
+                }
+            };
+            let mut changes = Map::new();
+            changes.insert(form.key, value);
+            api.patch(config_url).json(&changes)
+        }
+        ConfigAction::Reset => api.delete(plugin_api_url(&name, &["config", &form.key])),
+        ConfigAction::ResetAll => api.delete(config_url),
+    };
+
+    let status = match req.send().await {
+        Ok(resp) => resp.status(),
+        Err(e) => return server_unavailable(&e.into()),
+    };
+    match status {
+        StatusCode::OK => {
+            Redirect::to(&format!("/plugins/{}", encode_path_segment(&name))).into_response()
+        }
+        StatusCode::NOT_FOUND => plugin_not_found(),
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            render_plugin_config_page(
+                &api,
+                &name,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Some("The config is too large to save."),
+            )
+            .await
+        }
+        status => {
+            tracing::warn!(%status, plugin = name, "failed to update plugin config");
+            render_plugin_config_page(
+                &api,
+                &name,
+                StatusCode::BAD_GATEWAY,
+                Some("The config could not be saved."),
+            )
+            .await
+        }
+    }
+}
+
+/// Whether a form was submitted from one of the web UI's own pages, going
+/// by the headers the browser sent with it, `headers`.
+///
+/// The web UI has no login, so any site open in the same browser could
+/// otherwise submit a form to it and change a plugin's config. Browsers say
+/// where a form came from in `Sec-Fetch-Site` or, failing that, `Origin`;
+/// a request with neither did not come from a browser that would submit a
+/// form for another site, and is let through.
+fn is_same_origin(headers: &HeaderMap) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return site == "same-origin";
+    }
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
+    origin
+        .to_str()
+        .ok()
+        .and_then(|o| {
+            o.strip_prefix("http://")
+                .or_else(|| o.strip_prefix("https://"))
+        })
+        .is_some_and(|authority| Some(authority) == host)
+}
+
+/// Render the page for plugin `name` with `status`, showing `error` above
+/// its config if there is one.
+async fn render_plugin_config_page(
+    api: &reqwest::Client,
+    name: &str,
+    status: StatusCode,
+    error: Option<&str>,
+) -> Response {
+    let (plugin, config) = tokio::join!(
+        fetch_optional::<PluginResponse>(api, plugin_api_url(name, &[])),
+        fetch_optional::<PluginConfigResponse>(api, plugin_api_url(name, &["config"])),
+    );
+    match (plugin, config) {
+        (Ok(Some(plugin)), Ok(Some(config))) => render_form_page(
+            status,
+            &format!("{} - Plugins - Kiki", plugin.name),
+            &render_plugin_page(&plugin, &config, error),
+        ),
+        (Err(e), _) | (_, Err(e)) => server_unavailable(&e),
+        _ => plugin_not_found(),
+    }
+}
+
+/// Render the page for a plugin that is not installed.
+fn plugin_not_found() -> Response {
+    render_page(
+        StatusCode::NOT_FOUND,
+        "Plugin not found - Kiki",
+        "<p>Plugin not found.</p>\n<p><a href=\"/plugins\">&larr; Back to plugins</a></p>\n",
     )
 }
 
@@ -601,6 +815,55 @@ async fn fetch_feed_entries(
         return Ok(None);
     }
     Ok(Some(resp.error_for_status()?.json().await?))
+}
+
+/// Fetch `/v1/plugins` from the Kiki API.
+async fn fetch_plugins(api: &reqwest::Client) -> Result<ListPluginsResponse> {
+    Ok(api
+        .get(format!("{API_BASE}/v1/plugins"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Fetch `url` from the Kiki API, or `None` if it is not found.
+async fn fetch_optional<T: DeserializeOwned>(
+    api: &reqwest::Client,
+    url: String,
+) -> Result<Option<T>> {
+    let resp = api.get(url).send().await?;
+    if resp.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    Ok(Some(resp.error_for_status()?.json().await?))
+}
+
+/// The Kiki API URL of plugin `name`, followed by the path segments in
+/// `rest`, each percent-encoded.
+fn plugin_api_url(name: &str, rest: &[&str]) -> String {
+    let mut url = format!("{API_BASE}/v1/plugins/name/{}", encode_path_segment(name));
+    for segment in rest {
+        url.push('/');
+        url.push_str(&encode_path_segment(segment));
+    }
+    url
+}
+
+/// Percent-encode `s` for use as one segment of a URL's path, leaving only
+/// ASCII letters, digits, `-`, `.`, `_` and `~` as they are. The result
+/// needs no further escaping to go in HTML.
+fn encode_path_segment(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }
 
 /// The part of a `/v1/feeds/id/{id}` response the web UI uses.
@@ -856,7 +1119,11 @@ fn render_feeds(resp: &ListFeedsResponse, page: u32) -> String {
     } else {
         html.push_str("<ol class=\"feeds\">\n");
         for feed in &resp.feeds {
-            let meta = render_feed_meta(&feed.url, feed.last_checked.as_deref());
+            let meta = render_feed_meta(
+                &feed.url,
+                &url_domain(&feed.url),
+                feed.last_checked.as_deref(),
+            );
             html.push_str(&format!(
                 "<li><a href=\"/feeds/{}\">{}</a>{meta}</li>\n",
                 feed.id,
@@ -875,13 +1142,245 @@ fn render_feeds(resp: &ListFeedsResponse, page: u32) -> String {
     html
 }
 
+/// Render the plugin count, each plugin in `resp` with what its manifest
+/// says about it, and the directories that could not be loaded as plugins.
+fn render_plugins(resp: &ListPluginsResponse) -> String {
+    let mut html = format!(
+        "<h2>Plugins</h2>\n<p class=\"count\">{} {}</p>\n",
+        resp.count,
+        if resp.count == 1 { "plugin" } else { "plugins" }
+    );
+
+    if resp.plugins.is_empty() {
+        html.push_str("<p>No plugins are installed.</p>\n");
+    } else {
+        html.push_str("<ol class=\"plugins\">\n");
+        for plugin in &resp.plugins {
+            html.push_str("<li>");
+            html.push_str(&render_plugin(plugin));
+            html.push_str("</li>\n");
+        }
+        html.push_str("</ol>\n");
+    }
+
+    if !resp.errors.is_empty() {
+        html.push_str("<h3>Could not be loaded</h3>\n<ol class=\"plugins\">\n");
+        for error in &resp.errors {
+            html.push_str(&format!(
+                "<li><strong>{}</strong><span class=\"meta\">{}</span></li>\n",
+                escape(&error.directory),
+                escape(&error.error)
+            ));
+        }
+        html.push_str("</ol>\n");
+    }
+
+    html.push_str(
+        "<p class=\"meta\">Plugins installed or changed take effect after the server restarts.</p>\n",
+    );
+    html
+}
+
+/// Render a single plugin in the list: its name, linked to its page, and
+/// version, then [`render_plugin_details`].
+fn render_plugin(plugin: &PluginResponse) -> String {
+    format!(
+        "<a href=\"/plugins/{}\"><strong>{}</strong></a> <span class=\"version\">v{}</span>{}",
+        encode_path_segment(&plugin.name),
+        escape(&plugin.name),
+        escape(&plugin.version),
+        render_plugin_details(plugin)
+    )
+}
+
+/// Render a plugin's description, and a line with its engine, whether it
+/// runs, its authors, license and homepage.
+fn render_plugin_details(plugin: &PluginResponse) -> String {
+    let mut html = String::new();
+    if let Some(description) = plugin
+        .description
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+    {
+        html.push_str(&format!(
+            "<p class=\"description\">{}</p>",
+            escape(description)
+        ));
+    }
+
+    let mut parts = vec![plugin.engine.name().to_owned()];
+    parts.push(
+        if !plugin.engine_supported {
+            "engine not supported by this build"
+        } else if plugin.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+        .to_owned(),
+    );
+    if !plugin.authors.is_empty() {
+        let authors: Vec<_> = plugin.authors.iter().map(escape).collect();
+        parts.push(format!("by {}", authors.join(", ")));
+    }
+    if let Some(license) = &plugin.license {
+        parts.push(escape(license).into_owned());
+    }
+    if let Some(url) = plugin.homepage.as_deref().and_then(safe_link) {
+        parts.push(format!(
+            "<a href=\"{}\" rel=\"noopener noreferrer\">Homepage</a>",
+            escape(url)
+        ));
+    }
+    html.push_str(&format!(
+        "<span class=\"meta\">{}</span>",
+        parts.join(" &middot; ")
+    ));
+    html
+}
+
+/// Render the page for `plugin`: its name, version and
+/// [`render_plugin_details`], then its config, `config`, with a form for
+/// each setting, a form to add one and a form to reset them all. `error`,
+/// if there is one, is shown above the config.
+fn render_plugin_page(
+    plugin: &PluginResponse,
+    config: &PluginConfigResponse,
+    error: Option<&str>,
+) -> String {
+    let action = format!("/plugins/{}/config", encode_path_segment(&plugin.name));
+    let mut html = format!(
+        "<article class=\"plugin\">\n<h2>{} <small class=\"version\">v{}</small></h2>\n{}\n",
+        escape(&plugin.name),
+        escape(&plugin.version),
+        render_plugin_details(plugin)
+    );
+    if let Some(error) = error {
+        html.push_str(&format!("<p class=\"error\">{}</p>\n", escape(error)));
+    }
+    if config.restart_required {
+        html.push_str(
+            "<p class=\"notice\">The config has changed since the server started. \
+             Restart the server for the plugin to use it.</p>\n",
+        );
+    }
+
+    html.push_str("<h3>Config</h3>\n");
+    // Settings the plugin is running with but that are no longer set are
+    // listed too, until a restart drops them.
+    let keys: BTreeSet<&String> = config.config.keys().chain(config.active.keys()).collect();
+    if keys.is_empty() {
+        html.push_str("<p>This plugin has no settings.</p>\n");
+    } else {
+        html.push_str(
+            "<p class=\"meta\">Values are JSON: strings go in double quotes, as in \
+             <code>\"hello\"</code>; numbers, <code>true</code>, <code>false</code>, \
+             <code>null</code>, lists and objects are written as they are.</p>\n\
+             <table class=\"config\">\n",
+        );
+        for key in keys {
+            html.push_str(&render_config_setting(&action, key, config));
+        }
+        html.push_str("</table>\n");
+    }
+
+    html.push_str(&format!(
+        "<h3>Add a setting</h3>\n\
+         <form method=\"post\" action=\"{action}\" class=\"config-form\">\
+         <input type=\"hidden\" name=\"action\" value=\"set\">\
+         <input type=\"text\" name=\"key\" placeholder=\"name\" aria-label=\"Name\" required>\
+         <input type=\"text\" name=\"value\" placeholder=\"value, as JSON\" aria-label=\"Value\" required>\
+         <button type=\"submit\">Add</button></form>\n"
+    ));
+    if !config.overrides.is_empty() {
+        html.push_str(&format!(
+            "<form method=\"post\" action=\"{action}\" class=\"config-form\">\
+             <button type=\"submit\" name=\"action\" value=\"reset_all\">\
+             Reset every setting to its default</button></form>\n"
+        ));
+    }
+    html.push_str("<p class=\"meta\">Changes take effect after the server restarts.</p>\n");
+    html.push_str("</article>\n<p><a href=\"/plugins\">&larr; Back to plugins</a></p>\n");
+    html
+}
+
+/// Render the row of the config table for setting `key` of `config`: a
+/// form, submitted to `action`, to change its value or restore its
+/// default, and where its value comes from.
+fn render_config_setting(action: &str, key: &str, config: &PluginConfigResponse) -> String {
+    let default = config.defaults.get(key);
+    let overridden = config.overrides.contains_key(key);
+    let value = config.config.get(key);
+    let active = config.active.get(key);
+    let key_html = escape(key);
+
+    // Lists and objects get room to be written out over several lines.
+    let shown = value.or(active);
+    let field = if shown.is_some_and(|v| v.is_array() || v.is_object()) {
+        format!(
+            "<textarea name=\"value\" rows=\"4\" aria-label=\"Value of {key_html}\">{}</textarea>",
+            escape(shown.map(to_json_pretty).unwrap_or_default())
+        )
+    } else {
+        format!(
+            "<input type=\"text\" name=\"value\" value=\"{}\" aria-label=\"Value of {key_html}\">",
+            escape(shown.map(to_json).unwrap_or_default())
+        )
+    };
+    let reset = match (overridden, default.is_some()) {
+        (true, true) => {
+            "<button type=\"submit\" name=\"action\" value=\"reset\">Reset to default</button>"
+        }
+        (true, false) => "<button type=\"submit\" name=\"action\" value=\"reset\">Remove</button>",
+        (false, _) => "",
+    };
+
+    let mut notes = vec![match (overridden, default) {
+        (true, Some(default)) => format!(
+            "overrides the default, <code>{}</code>",
+            escape(to_json(default))
+        ),
+        (true, None) => "set here; the manifest has no default".to_owned(),
+        (false, Some(_)) => "default".to_owned(),
+        (false, None) => "no longer set".to_owned(),
+    }];
+    if value != active {
+        notes.push(match active {
+            Some(active) => format!(
+                "running with <code>{}</code> until the server restarts",
+                escape(to_json(active))
+            ),
+            None => "not set when the server started".to_owned(),
+        });
+    }
+
+    format!(
+        "<tr><th scope=\"row\"><code>{key_html}</code></th><td>\
+         <form method=\"post\" action=\"{action}\" class=\"config-form\">\
+         <input type=\"hidden\" name=\"key\" value=\"{key_html}\">{field}\
+         <button type=\"submit\" name=\"action\" value=\"set\">Save</button>{reset}</form>\
+         <span class=\"meta\">{}</span></td></tr>\n",
+        notes.join(" &middot; ")
+    )
+}
+
+/// `value` as compact JSON.
+fn to_json(value: &Value) -> String {
+    value.to_string()
+}
+
+/// `value` as JSON spread over several lines.
+fn to_json_pretty(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
 /// Render the page for `feed`: its title, URL, description and when it was
 /// last checked, then `entries`, the entries on this page of `listing`.
 fn render_feed_page(feed: &Feed, entries: &FeedEntriesResponse, listing: Listing) -> String {
     let mut html = format!(
         "<header class=\"feed-header\">\n<h2>{}</h2>\n{}\n",
         escape(display_feed_title(&feed.title)),
-        render_feed_meta(&feed.url, feed.last_checked.as_deref()),
+        render_feed_meta(&feed.url, &feed.url, feed.last_checked.as_deref()),
     );
     // Feed descriptions are shown as plain text; they come from the feed.
     if let Some(description) = feed.description.as_deref().filter(|d| !d.trim().is_empty()) {
@@ -903,10 +1402,19 @@ fn render_feed_page(feed: &Feed, entries: &FeedEntriesResponse, listing: Listing
     html
 }
 
-/// Render the line under a feed's title: its URL (`url`), shown but not
-/// linked, and when it was last checked (`last_checked`, in RFC 3339).
-fn render_feed_meta(url: &str, last_checked: Option<&str>) -> String {
-    let mut parts = vec![format!("<span class=\"url\">{}</span>", escape(url))];
+/// Render the line under a feed's title: its URL (`url`), shown as `label`
+/// but not linked, and when it was last checked (`last_checked`, in
+/// RFC 3339). When `label` isn't the whole URL, the URL is its tooltip.
+fn render_feed_meta(url: &str, label: &str, last_checked: Option<&str>) -> String {
+    let mut parts = vec![if label == url {
+        format!("<span class=\"url\">{}</span>", escape(url))
+    } else {
+        format!(
+            "<span class=\"url\" title=\"{}\">{}</span>",
+            escape(url),
+            escape(label)
+        )
+    }];
     match last_checked.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()) {
         Some(t) => parts.push(format!(
             "last checked <time datetime=\"{}\">{}</time>",
@@ -964,6 +1472,15 @@ fn display_feed_title(title: &str) -> &str {
     } else {
         title
     }
+}
+
+/// Return the domain of `url`, or all of `url` if it has none (or doesn't
+/// parse), so that there is always something to show.
+fn url_domain(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| url.to_owned())
 }
 
 /// Return `url` if it is an `http` or `https` URL.
@@ -1551,7 +2068,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
 
-        for path in ["/", "/entries/1", "/feeds", "/feeds/1"] {
+        for path in ["/", "/entries/1", "/feeds", "/feeds/1", "/plugins"] {
             let resp = reqwest::get(format!("http://{addr}{path}")).await?;
             let csp = resp.headers()[header::CONTENT_SECURITY_POLICY].to_str()?;
             assert!(csp.starts_with("default-src 'none';"), "{path}: {csp}");
@@ -1584,15 +2101,16 @@ mod tests {
         Ok(())
     }
 
-    /// Every page links to the index and to the list of feeds.
+    /// Every page links to the index, to the list of feeds and to the list
+    /// of plugins.
     #[tokio::test]
-    async fn pages_link_to_the_list_of_feeds() -> Result<()> {
+    async fn pages_link_to_the_site_sections() -> Result<()> {
         let tc = TestBuilder::all().build()?;
         insert_entries(&tc, 1)?;
-        for path in ["/", "/entries/1", "/feeds"] {
+        for path in ["/", "/entries/1", "/feeds", "/plugins"] {
             let (_, body) = get_page(tc.client()?, path).await?;
             assert!(
-                body.contains(r#"<nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a></nav>"#),
+                body.contains(r#"<nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a><a href="/plugins">Plugins</a></nav>"#),
                 "{path}: {body}"
             );
         }
@@ -1600,7 +2118,8 @@ mod tests {
     }
 
     /// The list of feeds links each feed to its page. Titles and URLs come
-    /// from feeds, so they are escaped, and the URLs aren't linked.
+    /// from feeds, so they are escaped, and the URLs aren't linked. Only
+    /// each URL's domain is shown, with the full URL as its tooltip.
     #[tokio::test]
     async fn the_feeds_page_lists_every_feed() -> Result<()> {
         let tc = TestBuilder::all().build()?;
@@ -1625,6 +2144,13 @@ mod tests {
         );
         assert!(!body.contains(r#""><b>"#), "{body}");
         assert!(!body.contains(r#"href="http://example.com"#), "{body}");
+        assert!(
+            body.contains(
+                r#"<span class="url" title="http://example.com/2.xml">example.com</span>"#
+            ),
+            "{body}"
+        );
+        assert!(!body.contains(">http://example.com/2.xml<"), "{body}");
         assert!(body.contains("last checked"), "{body}");
         assert!(body.contains("not checked yet"), "{body}");
         assert!(body.contains("Page 1 of 1"), "{body}");
@@ -1764,6 +2290,295 @@ mod tests {
             body.contains(r#"<a href="/feeds/1?page=2">&larr; Back to feed</a>"#),
             "{body}"
         );
+        Ok(())
+    }
+
+    /// The list of plugins shows each installed plugin, and each directory
+    /// that could not be loaded as one and why.
+    #[tokio::test]
+    async fn the_plugins_page_lists_every_plugin() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        tc.install_lua_plugin("passthrough", "", serde_json::json!({}))?;
+        std::fs::create_dir_all(tc.plugins_dir().join("broken"))?;
+        let tc = tc.init_server()?;
+
+        let (status, body) = get_page(tc.client()?, "/plugins").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("<title>Plugins - Kiki</title>"), "{body}");
+        assert!(body.contains("1 plugin<"), "{body}");
+        assert!(
+            body.contains(r#"<a href="/plugins/passthrough"><strong>passthrough</strong></a> <span class="version">v1.0.0</span>"#),
+            "{body}"
+        );
+        assert!(body.contains("Could not be loaded"), "{body}");
+        assert!(body.contains("<strong>broken</strong>"), "{body}");
+        assert!(body.contains("manifest.toml"), "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_plugins_page_says_when_there_are_no_plugins() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let (status, body) = get_page(tc.client()?, "/plugins").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("0 plugins"), "{body}");
+        assert!(body.contains("No plugins are installed."), "{body}");
+        assert!(!body.contains("Could not be loaded"), "{body}");
+        Ok(())
+    }
+
+    /// Serve the web UI on an ephemeral port with `api` as its API client,
+    /// and submit `form` to `path` from it, sending `headers` as well. The
+    /// client follows redirects.
+    async fn post_form(
+        api: reqwest::Client,
+        path: &str,
+        form: &[(&str, &str)],
+        headers: &[(&str, &str)],
+    ) -> Result<(StatusCode, String)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve_ui(listener, api, cancel.clone()));
+
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(form)
+            .finish();
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{addr}{path}"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body);
+        for (name, value) in headers {
+            req = req.header(*name, value.replace("{addr}", &addr.to_string()));
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+
+        cancel.cancel();
+        task.await??;
+        Ok((status, body))
+    }
+
+    /// A test context with one plugin, `hello`, whose defaults are
+    /// `{"greeting": "hi", "count": 1, "tags": ["a"]}`, and the server running.
+    fn hello_plugin() -> Result<crate::test::TestConfig> {
+        let tc = TestBuilder::default().init_database().build()?;
+        tc.install_lua_plugin(
+            "hello",
+            "",
+            serde_json::json!({"greeting": "hi", "count": 1, "tags": ["a"]}),
+        )?;
+        tc.init_server()
+    }
+
+    /// The overrides stored in the database for `hello`.
+    fn stored_overrides(tc: &crate::test::TestConfig) -> Result<Value> {
+        Ok(Value::Object(crate::db::plugins::get_config_overrides(
+            &tc.database_conn()?,
+            "hello",
+        )?))
+    }
+
+    /// A plugin's page shows its config, one form per setting, and allows
+    /// forms to be submitted to the web UI.
+    #[tokio::test]
+    async fn the_plugin_page_shows_the_config() -> Result<()> {
+        let tc = hello_plugin()?;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
+        let resp = reqwest::get(format!("http://{addr}/plugins/hello")).await?;
+        let csp = resp.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()?
+            .to_owned();
+        let status = resp.status();
+        let body = resp.text().await?;
+        cancel.cancel();
+        task.await??;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(csp.contains("form-action 'self'"), "{csp}");
+        assert!(!csp.contains("script-src"), "{csp}");
+        assert!(
+            body.contains("<title>hello - Plugins - Kiki</title>"),
+            "{body}"
+        );
+        assert!(body.contains("<h2>hello <small"), "{body}");
+        assert!(
+            body.contains(r#"<form method="post" action="/plugins/hello/config""#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<input type="hidden" name="key" value="greeting"><input type="text" name="value" value="&quot;hi&quot;""#),
+            "{body}"
+        );
+        assert!(body.contains(r#"name="value" value="1""#), "{body}");
+        assert!(body.contains("<textarea name=\"value\""), "{body}");
+        assert!(!body.contains("Reset to default"), "{body}");
+        assert!(!body.contains("reset_all"), "{body}");
+        assert!(!body.contains(r#"class="notice""#), "{body}");
+        Ok(())
+    }
+
+    /// Saving a setting overrides it, and the page then says so and that
+    /// the server must restart; resetting it restores the default.
+    #[tokio::test]
+    async fn settings_can_be_changed_from_the_plugin_page() -> Result<()> {
+        let tc = hello_plugin()?;
+        let path = "/plugins/hello/config";
+
+        let (status, body) = post_form(
+            tc.client()?,
+            path,
+            &[
+                ("action", "set"),
+                ("key", "greeting"),
+                ("value", "\"hello\""),
+            ],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            stored_overrides(&tc)?,
+            serde_json::json!({"greeting": "hello"})
+        );
+        assert!(body.contains("<h2>hello <small"), "{body}");
+        assert!(body.contains(r#"value="&quot;hello&quot;""#), "{body}");
+        assert!(
+            body.contains("overrides the default, <code>&quot;hi&quot;</code>"),
+            "{body}"
+        );
+        assert!(
+            body.contains("running with <code>&quot;hi&quot;</code> until the server restarts"),
+            "{body}"
+        );
+        assert!(body.contains(r#"class="notice""#), "{body}");
+        assert!(body.contains("Reset to default"), "{body}");
+
+        // Settings the manifest has no default for can be added, too.
+        let (status, _) = post_form(
+            tc.client()?,
+            path,
+            &[
+                ("action", "set"),
+                ("key", "extra/key"),
+                ("value", "{\"a\": [1, 2]}"),
+            ],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            stored_overrides(&tc)?,
+            serde_json::json!({"greeting": "hello", "extra/key": {"a": [1, 2]}})
+        );
+
+        // Keys are sent to the API as one path segment.
+        let (status, body) = post_form(
+            tc.client()?,
+            path,
+            &[("action", "reset"), ("key", "extra/key"), ("value", "")],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            stored_overrides(&tc)?,
+            serde_json::json!({"greeting": "hello"})
+        );
+        assert!(body.contains("reset_all"), "{body}");
+
+        let (status, body) = post_form(tc.client()?, path, &[("action", "reset_all")], &[]).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stored_overrides(&tc)?, serde_json::json!({}));
+        assert!(!body.contains(r#"class="notice""#), "{body}");
+        Ok(())
+    }
+
+    /// A value that is not JSON is reported on the page, and not saved.
+    #[tokio::test]
+    async fn invalid_settings_are_reported() -> Result<()> {
+        let tc = hello_plugin()?;
+        let path = "/plugins/hello/config";
+
+        let (status, body) = post_form(
+            tc.client()?,
+            path,
+            &[("action", "set"), ("key", "greeting"), ("value", "<hello>")],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            body.contains(r#"<p class="error">The value for greeting is not valid JSON"#),
+            "{body}"
+        );
+        assert!(!body.contains("<hello>"), "{body}");
+
+        let (status, body) = post_form(
+            tc.client()?,
+            path,
+            &[("action", "set"), ("key", ""), ("value", "1")],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("Give the setting a name."), "{body}");
+
+        assert_eq!(stored_overrides(&tc)?, serde_json::json!({}));
+        Ok(())
+    }
+
+    /// Forms submitted from other sites are refused; forms from the web
+    /// UI's own pages are not.
+    #[tokio::test]
+    async fn cross_site_forms_are_refused() -> Result<()> {
+        let tc = hello_plugin()?;
+        let path = "/plugins/hello/config";
+        let form = [("action", "set"), ("key", "count"), ("value", "2")];
+
+        for headers in [
+            &[("Sec-Fetch-Site", "cross-site")][..],
+            &[("Sec-Fetch-Site", "same-site")],
+            &[("Origin", "http://evil.example")],
+            &[("Origin", "null")],
+        ] {
+            let (status, _) = post_form(tc.client()?, path, &form, headers).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{headers:?}");
+        }
+        assert_eq!(stored_overrides(&tc)?, serde_json::json!({}));
+
+        for headers in [
+            &[("Sec-Fetch-Site", "same-origin")][..],
+            &[("Origin", "http://{addr}")],
+        ] {
+            let (status, _) = post_form(tc.client()?, path, &form, headers).await?;
+            assert_eq!(status, StatusCode::OK, "{headers:?}");
+        }
+        assert_eq!(stored_overrides(&tc)?, serde_json::json!({"count": 2}));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_plugin_is_reported() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let (status, body) = get_page(tc.client()?, "/plugins/missing").await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("Plugin not found."), "{body}");
+
+        let (status, body) = post_form(
+            tc.client()?,
+            "/plugins/missing/config",
+            &[("action", "set"), ("key", "a"), ("value", "1")],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("Plugin not found."), "{body}");
         Ok(())
     }
 

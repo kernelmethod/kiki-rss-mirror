@@ -14,6 +14,17 @@
     .entries { padding-left: 0; list-style: none; }
     .entries li, .feeds li { padding: 0.5rem 0; border-bottom: 1px solid #ddd; }
     .feeds { padding-left: 0; list-style: none; }
+    .plugins { padding-left: 0; list-style: none; }
+    .plugins li { padding: 0.5rem 0; border-bottom: 1px solid #ddd; }
+    .plugins .description { margin: 0.25rem 0; }
+    .plugin .error { padding: 0.5rem; border: 1px solid #c00; color: #900; }
+    .plugin .notice { padding: 0.5rem; border: 1px solid #ca0; background: #fff8dd; }
+    .config { width: 100%; border-collapse: collapse; }
+    .config th, .config td { padding: 0.5rem 0.5rem 0.5rem 0; border-bottom: 1px solid #ddd; text-align: left; vertical-align: top; }
+    .config th { width: 1%; white-space: nowrap; }
+    .config-form { display: flex; flex-wrap: wrap; gap: 0.25rem; margin: 0.5rem 0; }
+    .config-form input[type=text] { flex: 1 1 10rem; font-family: monospace; }
+    .config-form textarea { flex: 1 1 100%; font-family: monospace; }
     .feed-header h2 { margin-bottom: 0.25rem; }
     .feed-header .description { margin: 0.5rem 0; }
     .meta { display: block; font-size: 0.875rem; color: #666; }
@@ -27,7 +38,7 @@
 </head>
 <body>
   <h1><a href="/">Kiki</a> <small class="version">v{{version}}</small></h1>
-  <nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a></nav>
+  <nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a><a href="/plugins">Plugins</a></nav>
   {{content}}
 </body>
 </html>

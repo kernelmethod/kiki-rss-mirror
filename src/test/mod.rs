@@ -680,6 +680,37 @@ impl TestConfig {
         PathBuf::from(self.config_dir()).join("kiki.db")
     }
 
+    /// The directory the test server discovers plugins in.
+    pub fn plugins_dir(&self) -> PathBuf {
+        crate::plugins::plugins_dir(self.config_dir())
+    }
+
+    /// Install a Lua plugin named `name` whose entrypoint is `text`, with
+    /// config `config`, into [`Self::plugins_dir`].
+    pub fn install_lua_plugin(
+        &self,
+        name: &str,
+        text: &str,
+        config: serde_json::Value,
+    ) -> Result<PathBuf> {
+        let serde_json::Value::Object(config) = config else {
+            bail!("plugin config must be a JSON object");
+        };
+        let manifest = crate::plugins::PluginManifest {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            engine: crate::plugins::PluginEngine::Lua,
+            entrypoint: None,
+            description: None,
+            authors: vec![],
+            license: None,
+            homepage: None,
+            enabled: true,
+            config,
+        };
+        crate::plugins::install(&self.plugins_dir(), &manifest, text)
+    }
+
     pub fn socket_path(&self) -> PathBuf {
         PathBuf::from(self.config_dir()).join("kiki.sock")
     }

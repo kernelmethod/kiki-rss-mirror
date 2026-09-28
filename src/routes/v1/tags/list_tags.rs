@@ -1,3 +1,4 @@
+use crate::db::tags::TagKind;
 use crate::server::AppState;
 use axum::{
     extract::{Query, State},
@@ -17,12 +18,28 @@ pub struct ListTagsQueryParams {
     pub offset: Option<usize>,
     /// Maximum number of records to return (default: 50).
     pub limit: Option<usize>,
+    /// Only return tags of this kind (default: all tags).
+    pub kind: Option<TagKind>,
 }
 
 #[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct TagResponse {
     pub id: i64,
     pub name: String,
+    /// Whether this is a user tag or a system tag.
+    pub kind: TagKind,
+}
+
+impl TagResponse {
+    /// Build a response from a row whose first three columns are the tag's
+    /// `id`, `name`, and `kind`.
+    pub fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(TagResponse {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: row.get(2)?,
+        })
+    }
 }
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
@@ -35,7 +52,8 @@ pub struct ListTagsResponse {
 
 /// List all tags
 ///
-/// Retrieve a paginated list of all tags that are known to the server.
+/// Retrieve a paginated list of all tags that are known to the server, optionally
+/// restricted to user tags or system tags.
 #[utoipa::path(
     get,
     path = "/v1/tags",
@@ -57,26 +75,28 @@ pub async fn list_tags(
     })?;
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
+    let kind = params.kind.map(TagKind::as_str);
 
     let result = task::spawn_blocking(move || {
         let count = conn
-            .prepare("SELECT COUNT(*) FROM tags")
+            .prepare("SELECT COUNT(*) FROM tags WHERE ?1 IS NULL OR kind = ?1")
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
-            .query_row([], |count| count.get(0))?;
+            .query_row([kind], |count| count.get(0))?;
 
         let tags = conn
-            .prepare("SELECT id, name FROM tags LIMIT ?1 OFFSET ?2")
+            .prepare(
+                "SELECT id, name, kind FROM tags WHERE ?1 IS NULL OR kind = ?1
+                 ORDER BY id LIMIT ?2 OFFSET ?3",
+            )
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
-            .query_map([limit, offset], |row| {
-                Ok(TagResponse {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![kind, limit, offset],
+                TagResponse::from_row,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok::<ListTagsResponse, rusqlite::Error>(ListTagsResponse {
