@@ -20,16 +20,10 @@ pub struct Migration {
 /// When adding a new migration:
 /// 1. Create the SQL file in `src/db/include/migrations/`
 /// 2. Append an entry to this array
-pub const MIGRATIONS: &[Migration] = &[
-    Migration {
-        name: "0001_system_tags",
-        sql: include_str!("include/migrations/0001_system_tags.sql"),
-    },
-    Migration {
-        name: "0002_unique_tag_links",
-        sql: include_str!("include/migrations/0002_unique_tag_links.sql"),
-    },
-];
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    name: "0001_system_tags",
+    sql: include_str!("include/migrations/0001_system_tags.sql"),
+}];
 
 /// SQL to create the migrations table. Safe to run on databases that already
 /// have it (uses `IF NOT EXISTS`).
@@ -202,7 +196,7 @@ mod tests {
         Ok(())
     }
 
-    /// `0002_unique_tag_links` removes duplicate tag links and prevents new
+    /// `0001_system_tags` also removes duplicate tag links and prevents new
     /// ones.
     #[test]
     fn test_unique_tag_links_migration() -> Result<()> {
