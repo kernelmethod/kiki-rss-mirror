@@ -4,6 +4,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
 pub mod assets;
+pub mod log;
 pub mod migrations;
 pub mod retention;
 pub mod task_queue;
