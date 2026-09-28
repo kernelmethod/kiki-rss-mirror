@@ -1,4 +1,4 @@
-use crate::db::tags::is_reserved_tag_name;
+use crate::db::tags::{is_reserved_tag_name, SystemTag};
 use crate::fetcher::{AtomEntry, AtomFeedIngestData, RssEntry};
 use crate::metrics::Metrics;
 use crate::scripting::{FeedEntry, ScriptRunner};
@@ -65,10 +65,10 @@ pub(super) fn process_atom_feed(
     let mut inserted_entry_ids: Vec<i64> = Vec::with_capacity(entries.len());
     let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
     for (feed_entry, ingest) in entries {
-        let entry_id = upsert_entry(&tx, feed_id, "atom", &feed_entry)?;
+        let (entry_id, is_new) = upsert_entry(&tx, feed_id, "atom", &feed_entry)?;
         insert_atom_entry_data(&tx, entry_id, &ingest)?;
         if !feed_entry.tags.is_empty() {
-            sync_entry_tags(&tx, entry_id, &feed_entry.tags)?;
+            sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
         }
         inserted_entry_ids.push(entry_id);
         seen_guids.push(feed_entry.guid);
@@ -126,10 +126,10 @@ pub(super) fn process_rss_feed(
     let mut inserted_entry_ids: Vec<i64> = Vec::with_capacity(entries.len());
     let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
     for (feed_entry, ingest) in entries {
-        let entry_id = upsert_entry(&tx, feed_id, "rss", &feed_entry)?;
+        let (entry_id, is_new) = upsert_entry(&tx, feed_id, "rss", &feed_entry)?;
         insert_rss_entry_data(&tx, entry_id, &ingest, feed_entry.content.as_deref())?;
         if !feed_entry.tags.is_empty() {
-            sync_entry_tags(&tx, entry_id, &feed_entry.tags)?;
+            sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
         }
         inserted_entry_ids.push(entry_id);
         seen_guids.push(feed_entry.guid);
@@ -185,7 +185,8 @@ fn run_scripts(
 }
 
 /// Insert an entry, or update the existing row for the same
-/// `(feed_id, guid)` in place, and return its id.
+/// `(feed_id, guid)` in place, and return its id and whether it was newly
+/// inserted.
 ///
 /// Updating in place keeps the entry's id stable across refreshes, and
 /// with it everything keyed on that id (tags, cached assets, the search
@@ -195,7 +196,12 @@ fn upsert_entry(
     feed_id: i64,
     syndication_format: &str,
     entry: &FeedEntry,
-) -> Result<i64> {
+) -> Result<(i64, bool)> {
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entries WHERE feed_id = ?1 AND guid = ?2)",
+        rusqlite::params![feed_id, entry.guid],
+        |row| row.get(0),
+    )?;
     let entry_id = tx.query_row(
         "INSERT INTO entries (
             feed_id,
@@ -225,7 +231,7 @@ fn upsert_entry(
         ],
         |row| row.get(0),
     )?;
-    Ok(entry_id)
+    Ok((entry_id, !exists))
 }
 
 /// Mark the feed's stored entries that this refresh did not store as
@@ -275,23 +281,38 @@ pub(super) fn enqueue_asset_caching(
 
 /// Sync the script-provided tags for the entry `entry_id`.
 ///
-/// For each tag name in `tags`:
-/// - skips it, with a warning, if the name is reserved for system tags
+/// System tags (such as `system:hidden`) in `tags` are applied only when
+/// `is_new`, i.e. when the entry is first stored: from then on the entry's
+/// system tags record the user's own actions (reading, saving, hiding or
+/// unhiding it), which a later refresh must not undo. Scripts never remove
+/// system tags. A name with the system tag prefix that is not a known system
+/// tag is skipped with a warning.
+///
+/// For each other (user) tag name in `tags`:
 /// - ensures the tag row exists in `tags` (`INSERT OR IGNORE`)
 /// - looks up its `id`
 ///
 /// Then removes any user-tag `entry_tags` rows for this entry whose `tag_id` is
 /// not in the script-provided set, and inserts new associations (`INSERT OR
-/// IGNORE`). System tags (read, saved, ...) on the entry are left untouched.
-fn sync_entry_tags(conn: &Connection, entry_id: i64, tags: &[String]) -> Result<()> {
+/// IGNORE`).
+fn sync_entry_tags(conn: &Connection, entry_id: i64, tags: &[String], is_new: bool) -> Result<()> {
     // Upsert each tag and collect its id.
     let mut tag_ids: Vec<i64> = Vec::with_capacity(tags.len());
     for name in tags {
         if is_reserved_tag_name(name) {
-            warn!(
-                "ignoring tag {:?} set by a script on entry {}: names starting with \"system:\" are reserved for system tags",
-                name, entry_id
-            );
+            match SystemTag::ALL.into_iter().find(|tag| tag.name() == name) {
+                Some(tag) if is_new => {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+                        rusqlite::params![entry_id, tag.id(conn)?],
+                    )?;
+                }
+                Some(_) => {}
+                None => warn!(
+                    "ignoring tag {:?} set by a script on entry {}: it is not a system tag, and names starting with \"system:\" are reserved for system tags",
+                    name, entry_id
+                ),
+            }
             continue;
         }
         conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [name])?;
@@ -362,7 +383,7 @@ mod tests {
     }
 
     /// Script-provided tags replace the entry's user tags, but leave its
-    /// system tags alone, and scripts cannot apply system tags.
+    /// system tags alone. Scripts apply system tags only to new entries.
     #[test]
     fn sync_entry_tags_preserves_system_tags() -> Result<()> {
         let conn = ConnectionBuilder::default().in_memory().create().build()?;
@@ -377,15 +398,36 @@ mod tests {
             [entry_id, SystemTag::Read.id(&conn)?],
         )?;
 
-        sync_entry_tags(&conn, entry_id, &["a".into(), "b".into()])?;
+        sync_entry_tags(&conn, entry_id, &["a".into(), "b".into()], false)?;
         assert_eq!(entry_tag_names(&conn, entry_id)?, ["a", "b", "system:read"]);
 
+        // The entry is not new, so its system tags are the user's.
         sync_entry_tags(
             &conn,
             entry_id,
             &["b".into(), "system:hidden".into(), "System:new".into()],
+            false,
         )?;
         assert_eq!(entry_tag_names(&conn, entry_id)?, ["b", "system:read"]);
+
+        // On a new entry, known system tags are applied and others ignored.
+        sync_entry_tags(
+            &conn,
+            entry_id,
+            &["b".into(), "system:hidden".into(), "system:new".into()],
+            true,
+        )?;
+        assert_eq!(
+            entry_tag_names(&conn, entry_id)?,
+            ["b", "system:hidden", "system:read"]
+        );
+
+        // Scripts never remove system tags.
+        sync_entry_tags(&conn, entry_id, &["c".into()], false)?;
+        assert_eq!(
+            entry_tag_names(&conn, entry_id)?,
+            ["c", "system:hidden", "system:read"]
+        );
 
         let reserved: i64 = conn.query_row(
             "SELECT COUNT(*) FROM tags WHERE kind = 'user' AND name LIKE 'system:%'",

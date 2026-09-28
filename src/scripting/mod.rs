@@ -78,6 +78,82 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 
+/// A script's source code together with its configuration.
+///
+/// Each script's top-level chunk is called with its config as its only argument, so a
+/// script reads it with `local config = ...`. That keeps one script's config out of reach
+/// of the others that share its VM, and lets several copies of the same script run with
+/// different configs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptSource {
+    /// The script's source code.
+    pub text: String,
+    /// The script's config, as the text of a JSON object (see [`parse_script_config`]).
+    ///
+    /// Kept as text rather than as a parsed value because the script host's IPC codec is
+    /// not self-describing, and so cannot carry a [`serde_json::Value`].
+    pub config: String,
+}
+
+impl ScriptSource {
+    /// The config a script has when none has been set: an empty JSON object.
+    pub const EMPTY_CONFIG: &'static str = "{}";
+
+    /// A script with an empty config.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::scripting::ScriptSource;
+    ///
+    /// let source = ScriptSource::new("local config = ...");
+    /// assert_eq!(source.config, "{}");
+    /// ```
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            config: Self::EMPTY_CONFIG.to_string(),
+        }
+    }
+}
+
+/// Error returned when a script's config is not a JSON object.
+#[derive(Debug, thiserror::Error)]
+pub enum ScriptConfigError {
+    /// The config is not valid JSON.
+    #[error("script config is not valid JSON: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// The config is valid JSON, but not an object.
+    #[error("script config must be a JSON object")]
+    NotAnObject,
+}
+
+/// Parses a script's config, which must be a JSON object.
+///
+/// # Errors
+///
+/// Returns [`ScriptConfigError::Json`] if `text` is not valid JSON, and
+/// [`ScriptConfigError::NotAnObject`] if it is some other JSON value.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::scripting::parse_script_config;
+///
+/// let config = parse_script_config(r#"{"rules": []}"#).unwrap();
+/// assert!(config.contains_key("rules"));
+/// assert!(parse_script_config("[]").is_err());
+/// ```
+pub fn parse_script_config(
+    text: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, ScriptConfigError> {
+    match serde_json::from_str(text)? {
+        serde_json::Value::Object(map) => Ok(map),
+        _ => Err(ScriptConfigError::NotAnObject),
+    }
+}
+
 /// Represents a feed entry at the scripting boundary.
 ///
 /// This struct mirrors the fields that scripts can see and modify. The identity fields
@@ -102,6 +178,9 @@ pub struct FeedEntry {
     pub content: Option<String>,
     /// Tag names to attach to this entry. Scripts can add or remove tags; duplicates are
     /// deduplicated on the Rust side. Starts empty when the entry is first extracted.
+    ///
+    /// System tag names (such as `system:hidden`) are applied only when the entry is first
+    /// stored, and never removed; see `sync_entry_tags` in [`crate::tasks`].
     pub tags: Vec<String>,
 }
 

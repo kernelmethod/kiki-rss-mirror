@@ -40,7 +40,9 @@ CREATE TABLE scripts (
     id      INTEGER PRIMARY KEY,
     engine  VARCHAR NOT NULL,
     text    VARCHAR NOT NULL,
-    kind    VARCHAR NOT NULL
+    kind    VARCHAR NOT NULL,
+    -- JSON object handed to the script's top-level chunk as its argument.
+    config  VARCHAR NOT NULL DEFAULT '{}'
 );
 CREATE INDEX idx_scripts_kind ON scripts(kind);
 

@@ -38,7 +38,7 @@
 use crate::process::ipc::{
     decode, encode, read_frame, write_frame, HostRequest, HostResponse, MAX_FRAME_BYTES,
 };
-use crate::scripting::{Event, EventPayload, FeedEntry, ScriptRunner};
+use crate::scripting::{Event, EventPayload, FeedEntry, ScriptRunner, ScriptSource};
 use anyhow::{Context, Result};
 use std::io;
 use std::os::unix::io::RawFd;
@@ -208,7 +208,7 @@ impl ScriptHost {
     /// running.
     ///
     /// Returns the number of scripts the child compiled.
-    pub fn reload(&self, sources: Vec<String>) -> Result<usize, HostError> {
+    pub fn reload(&self, sources: Vec<ScriptSource>) -> Result<usize, HostError> {
         match self.request(&HostRequest::Reload { sources })? {
             HostResponse::Reloaded { loaded } => Ok(loaded),
             other => Err(HostError::Protocol(format!(
@@ -386,7 +386,7 @@ fn serve(
     match request {
         HostRequest::Reload { sources } => {
             let count = sources.len();
-            match crate::scripting::lua::LuaScriptRunner::new(&sources) {
+            match crate::scripting::lua::LuaScriptRunner::from_sources(&sources) {
                 Ok(new_runner) => {
                     *runner = Some(new_runner);
                     HostResponse::Reloaded { loaded: count }

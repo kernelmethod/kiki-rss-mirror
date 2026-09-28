@@ -668,10 +668,17 @@ mod script_isolation {
 
     /// Add a script and wait for the reloaded runner to report it loaded.
     fn install_script(kiki: &mut Kiki, source: &str) {
+        install_script_with_config(kiki, source, serde_json::json!({}));
+    }
+
+    /// Add a script with a config and wait for the reloaded runner to
+    /// report it loaded.
+    fn install_script_with_config(kiki: &mut Kiki, source: &str, config: serde_json::Value) {
         let body = serde_json::json!({
             "engine": "lua",
             "text": source,
             "kind": "user",
+            "config": config,
         });
         kiki.post_json("/v1/scripts/create", &body.to_string())
             .assert_success();
@@ -769,6 +776,34 @@ mod script_isolation {
         assert!(
             title.starts_with("[scripted] "),
             "entry title was not transformed by the isolated script host: {title:?}"
+        );
+        kiki.shutdown();
+    }
+
+    /// A script's config crosses the IPC channel to the script host and
+    /// reaches the script's top-level chunk.
+    #[test]
+    fn an_isolated_script_receives_its_config() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&[]);
+
+        install_script_with_config(
+            &mut kiki,
+            r#"
+            local config = ...
+            kiki.on("entry.ingest", function(entry)
+                entry.title = config.prefix .. entry.title
+                return entry
+            end)
+            "#,
+            serde_json::json!({"prefix": "[configured] "}),
+        );
+
+        let feed_id = create_local_feed(&mut kiki, addr);
+        let title = refresh_and_read_title(&mut kiki, feed_id);
+        assert!(
+            title.starts_with("[configured] "),
+            "entry title was not transformed using the script's config: {title:?}"
         );
         kiki.shutdown();
     }

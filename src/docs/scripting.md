@@ -44,6 +44,61 @@ A script's top-level chunk must not return a value — scripts register
 handlers through `kiki.on` side effects only. Returning anything from the
 chunk is rejected at load time.
 
+## Script config
+
+Every script has a config: a JSON object, set alongside the script's text
+through the `/v1/scripts/*` API. It is handed to the script's top-level chunk
+as its argument, converted to a Lua table, so a script reads it with
+`local config = ...`. Each script sees only its own config, so the same
+script can be installed several times with different configs. A script with
+no config set gets an empty table.
+
+JSON objects become tables keyed by string and arrays become sequences
+indexed from 1. `null` becomes `nil`, so a key set to `null` is absent from
+its table.
+
+For example, this script hides entries whose fields match a configured
+regular expression, or whose fields do *not* match one when `invert` is set:
+
+```lua
+local config = ...
+
+local rules = {}
+for _, rule in ipairs(config.rules or {}) do
+    table.insert(rules, {
+        field = rule.field,
+        re = kiki.regex(rule.pattern, rule.flags),
+        invert = rule.invert == true,
+    })
+end
+
+kiki.on("entry.ingest", function(entry)
+    for _, rule in ipairs(rules) do
+        local value = entry[rule.field] or ""
+        if rule.re:is_match(value) ~= rule.invert then
+            table.insert(entry.tags, "system:hidden")
+            break
+        end
+    end
+    return entry
+end)
+```
+
+configured with, say:
+
+```json
+{
+  "rules": [
+    { "field": "title", "pattern": "\\b(sponsored|webinar)\\b", "flags": "i" },
+    { "field": "content", "pattern": "rust", "flags": "i", "invert": true }
+  ]
+}
+```
+
+Compiling the regexes in the top-level chunk means a bad pattern in the
+config fails when the script loads, not on every entry. Note that if any
+script fails to load, no scripts run until it is fixed.
+
 ## Events
 
 | Event            | Payload                                    | Purpose |
@@ -75,10 +130,14 @@ following fields:
 | `content`           | string (HTML) or `nil` | Yes |
 | `tags`              | array of strings  | Yes     |
 
-`tags` holds the entry's user tags. Tag names starting with `system:` are
-reserved for system tags (such as `system:read`); scripts cannot set them, and
-any such names are ignored with a warning. An entry's system tags are never
-affected by scripts.
+`tags` starts empty. A non-empty `tags` replaces the entry's user tags.
+
+Scripts may also add the system tags `system:read`, `system:saved`, and
+`system:hidden` to `tags`. These are applied only when the entry is first
+stored: after that an entry's system tags record what the user has done with
+it (read it, saved it, hidden or unhidden it), and later refreshes leave them
+alone. Scripts never remove system tags. Any other name starting with
+`system:` is reserved, and is ignored with a warning.
 
 `feed_id`, `syndication_format`, and `guid` are identity fields. Handlers may
 read them, but any modifications are discarded when the entry is converted back
@@ -175,8 +234,10 @@ When a handler errors, times out, or exceeds the memory cap:
 
 ## Managing scripts
 
-Scripts are stored in the `scripts` table and managed via the
-`/v1/scripts/*` HTTP API. Changes take effect immediately: the server
+Scripts are stored, with their configs, in the `scripts` table and managed
+via the `/v1/scripts/*` HTTP API: `config` may be given when a script is
+created (`POST /v1/scripts/create`) and replaced on update
+(`PUT /v1/scripts/id/{id}`). Changes take effect immediately: the server
 rebuilds its scripting VM on every script create / update / delete, replacing
 the old runner atomically so in-flight events always see a consistent handler
 set.

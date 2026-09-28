@@ -20,10 +20,16 @@ pub struct Migration {
 /// When adding a new migration:
 /// 1. Create the SQL file in `src/db/include/migrations/`
 /// 2. Append an entry to this array
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_system_tags",
-    sql: include_str!("include/migrations/0001_system_tags.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_system_tags",
+        sql: include_str!("include/migrations/0001_system_tags.sql"),
+    },
+    Migration {
+        name: "0002_script_config",
+        sql: include_str!("include/migrations/0002_script_config.sql"),
+    },
+];
 
 /// SQL to create the migrations table. Safe to run on databases that already
 /// have it (uses `IF NOT EXISTS`).
@@ -150,8 +156,15 @@ mod tests {
         Ok(())
     }
 
-    /// The tag-related parts of the schema before any migrations.
-    const LEGACY_TAG_SCHEMA: &str = "
+    /// The parts of the schema that migrations touch, as they were before
+    /// any migrations.
+    const LEGACY_SCHEMA: &str = "
+        CREATE TABLE scripts (
+            id      INTEGER PRIMARY KEY,
+            engine  VARCHAR NOT NULL,
+            text    VARCHAR NOT NULL,
+            kind    VARCHAR NOT NULL
+        );
         CREATE TABLE tags (
             id      INTEGER PRIMARY KEY,
             name    VARCHAR UNIQUE NOT NULL
@@ -168,7 +181,7 @@ mod tests {
     #[test]
     fn test_system_tags_migration() -> Result<()> {
         let mut conn = rusqlite::Connection::open_in_memory()?;
-        conn.execute_batch(LEGACY_TAG_SCHEMA)?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
         conn.execute_batch(
             "INSERT INTO tags (name) VALUES ('news'), ('system:read'), ('System:Other');",
         )?;
@@ -201,7 +214,7 @@ mod tests {
     #[test]
     fn test_unique_tag_links_migration() -> Result<()> {
         let mut conn = rusqlite::Connection::open_in_memory()?;
-        conn.execute_batch(LEGACY_TAG_SCHEMA)?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
         conn.execute_batch(
             "INSERT INTO entry_tags VALUES (1, 1), (1, 1), (1, 2), (2, 1), (1, 1);
              INSERT INTO feed_tags VALUES (1, 1), (1, 1), (2, 1);",
@@ -225,6 +238,23 @@ mod tests {
         assert!(conn
             .execute("INSERT INTO feed_tags VALUES (2, 1)", [])
             .is_err());
+
+        Ok(())
+    }
+
+    /// `0002_script_config` gives existing scripts an empty config.
+    #[test]
+    fn test_script_config_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        conn.execute_batch(
+            "INSERT INTO scripts (engine, text, kind) VALUES ('lua', '-- x', 'user');",
+        )?;
+
+        run_pending_migrations(&mut conn)?;
+
+        let config: String = conn.query_row("SELECT config FROM scripts", [], |row| row.get(0))?;
+        assert_eq!(config, "{}");
 
         Ok(())
     }

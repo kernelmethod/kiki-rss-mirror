@@ -60,7 +60,7 @@ async fn integration_filter_script_drops_all_entries() -> Result<()> {
     let runner = {
         let conn = pool.get()?;
         let sources = load_all_script_sources(&conn)?;
-        crate::scripting::lua::LuaScriptRunner::new(&sources)?
+        crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     refresh_feed(
         &client,
@@ -99,7 +99,7 @@ async fn integration_modify_script_changes_titles() -> Result<()> {
     let runner = {
         let conn = pool.get()?;
         let sources = load_all_script_sources(&conn)?;
-        crate::scripting::lua::LuaScriptRunner::new(&sources)?
+        crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     refresh_feed(
         &client,
@@ -151,7 +151,7 @@ async fn integration_content_script_preserves_rss_description() -> Result<()> {
     let runner = {
         let conn = pool.get()?;
         let sources = load_all_script_sources(&conn)?;
-        crate::scripting::lua::LuaScriptRunner::new(&sources)?
+        crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     refresh_feed(
         &client,
@@ -197,7 +197,7 @@ async fn integration_tagging_script_adds_tags() -> Result<()> {
     let runner = {
         let conn = pool.get()?;
         let sources = load_all_script_sources(&conn)?;
-        crate::scripting::lua::LuaScriptRunner::new(&sources)?
+        crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     refresh_feed(
         &client,
@@ -278,7 +278,7 @@ async fn integration_filter_script_prevents_tagging_script() -> Result<()> {
     let runner = {
         let conn = pool.get()?;
         let sources = load_all_script_sources(&conn)?;
-        crate::scripting::lua::LuaScriptRunner::new(&sources)?
+        crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     refresh_feed(
         &client,
@@ -309,6 +309,93 @@ async fn integration_filter_script_prevents_tagging_script() -> Result<()> {
     assert_eq!(
         tag_count, 0,
         "tagging script should not have run after filter script dropped the entry"
+    );
+
+    Ok(())
+}
+
+/// A filter script configured with regexes hides matching entries when they
+/// are first stored, and does not re-hide an entry the user has unhidden.
+#[tokio::test]
+async fn integration_configured_regex_filter_hides_entries() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let (feed_id, client, pool) = setup_feed_with_script(
+        &tc,
+        r#"
+        local config = ...
+        local rules = {}
+        for _, rule in ipairs(config.rules) do
+            table.insert(rules, { field = rule.field, re = kiki.regex(rule.pattern, rule.flags) })
+        end
+        kiki.on("entry.ingest", function(entry)
+            for _, rule in ipairs(rules) do
+                local value = entry[rule.field]
+                if value ~= nil and rule.re:is_match(value) then
+                    table.insert(entry.tags, "system:hidden")
+                end
+            end
+            return entry
+        end)
+        "#,
+    )
+    .await?;
+    tc.database_conn()?.execute(
+        "UPDATE scripts SET config = ?1",
+        [r#"{"rules": [{"field": "title", "pattern": "\\blinux\\b", "flags": "i"}]}"#],
+    )?;
+
+    let runner = {
+        let conn = pool.get()?;
+        let sources = load_all_script_sources(&conn)?;
+        crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
+    };
+    let metrics = super::test_metrics();
+    let task_tx = super::test_tx();
+    let refresh = |pool| {
+        refresh_feed(
+            &client,
+            feed_id,
+            pool,
+            Some(&runner as &dyn ScriptRunner),
+            &metrics,
+            &task_tx,
+        )
+    };
+    let hidden_titles = || -> Result<Vec<String>> {
+        let conn = tc.database_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT e.title FROM entries e
+             JOIN entry_tags et ON et.entry_id = e.id
+             JOIN tags t ON t.id = et.tag_id
+             WHERE e.feed_id = ?1 AND t.name = 'system:hidden'
+             ORDER BY e.title",
+        )?;
+        let titles = stmt
+            .query_map([feed_id], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(titles)
+    };
+
+    refresh(pool.clone()).await?;
+    assert_eq!(
+        hidden_titles()?,
+        [
+            "A short note on setting up a Linux kernel debugging environment",
+            "Linux Security Modules",
+        ]
+    );
+
+    // The user unhides an entry; refreshing the feed leaves it unhidden.
+    tc.database_conn()?.execute(
+        "DELETE FROM entry_tags
+         WHERE tag_id = (SELECT id FROM tags WHERE name = 'system:hidden')
+           AND entry_id = (SELECT id FROM entries WHERE title = 'Linux Security Modules')",
+        [],
+    )?;
+    refresh(pool).await?;
+    assert_eq!(
+        hidden_titles()?,
+        ["A short note on setting up a Linux kernel debugging environment"]
     );
 
     Ok(())

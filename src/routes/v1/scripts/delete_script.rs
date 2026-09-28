@@ -87,6 +87,7 @@ mod test {
                 engine: "lua".to_string(),
                 text: "kiki.on(\"entry.ingest\", function(entry) return entry end)".to_string(),
                 kind: "user".to_string(),
+                config: Default::default(),
             })
             .send()
             .await?;
@@ -148,6 +149,7 @@ mod test {
                 engine: "lua".to_string(),
                 text: "kiki.on(\"entry.ingest\", function(entry) return nil end)".to_string(),
                 kind: "user".to_string(),
+                config: Default::default(),
             })
             .send()
             .await?;
