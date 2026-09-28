@@ -6,6 +6,7 @@ use crate::routes::v1::entries::get_entry::GetEntryResponse;
 use crate::routes::v1::entries::{ListEntriesResponse, ListEntriesResponseEntry};
 use crate::routes::v1::feeds::feed_entries::FeedEntriesResponse;
 use crate::routes::v1::feeds::list_feeds::ListFeedsResponse;
+use crate::routes::v1::plugins::list_plugins::{ListPluginsResponse, PluginResponse};
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{Path as UrlPath, Query, State},
@@ -185,6 +186,7 @@ async fn serve_ui(
         .route("/entries/{id}", get(entry_page))
         .route("/feeds", get(feeds_page))
         .route("/feeds/{id}", get(feed_page))
+        .route("/plugins", get(plugins_page))
         .route("/assets/{hash}", get(asset))
         .with_state(api);
     axum::serve(listener, app)
@@ -420,6 +422,15 @@ async fn feed_page(
     )
 }
 
+/// Render the list of installed plugins, and of the directories in the
+/// plugins directory that could not be loaded as plugins.
+async fn plugins_page(State(api): State<reqwest::Client>) -> Response {
+    match fetch_plugins(&api).await {
+        Ok(plugins) => render_page(StatusCode::OK, "Plugins - Kiki", &render_plugins(&plugins)),
+        Err(e) => server_unavailable(&e),
+    }
+}
+
 /// Serve the cached asset with the blake3 hash `hash`, fetched from the
 /// Kiki API. Entry pages show images and link attachments from here, so
 /// that the browser never loads anything from the sites the feeds link to.
@@ -601,6 +612,17 @@ async fn fetch_feed_entries(
         return Ok(None);
     }
     Ok(Some(resp.error_for_status()?.json().await?))
+}
+
+/// Fetch `/v1/plugins` from the Kiki API.
+async fn fetch_plugins(api: &reqwest::Client) -> Result<ListPluginsResponse> {
+    Ok(api
+        .get(format!("{API_BASE}/v1/plugins"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
 }
 
 /// The part of a `/v1/feeds/id/{id}` response the web UI uses.
@@ -875,6 +897,96 @@ fn render_feeds(resp: &ListFeedsResponse, page: u32) -> String {
         page,
         "/feeds",
         ("&larr; Previous", "Next &rarr;"),
+    ));
+    html
+}
+
+/// Render the plugin count, each plugin in `resp` with what its manifest
+/// says about it, and the directories that could not be loaded as plugins.
+fn render_plugins(resp: &ListPluginsResponse) -> String {
+    let mut html = format!(
+        "<h2>Plugins</h2>\n<p class=\"count\">{} {}</p>\n",
+        resp.count,
+        if resp.count == 1 { "plugin" } else { "plugins" }
+    );
+
+    if resp.plugins.is_empty() {
+        html.push_str("<p>No plugins are installed.</p>\n");
+    } else {
+        html.push_str("<ol class=\"plugins\">\n");
+        for plugin in &resp.plugins {
+            html.push_str("<li>");
+            html.push_str(&render_plugin(plugin));
+            html.push_str("</li>\n");
+        }
+        html.push_str("</ol>\n");
+    }
+
+    if !resp.errors.is_empty() {
+        html.push_str("<h3>Could not be loaded</h3>\n<ol class=\"plugins\">\n");
+        for error in &resp.errors {
+            html.push_str(&format!(
+                "<li><strong>{}</strong><span class=\"meta\">{}</span></li>\n",
+                escape(&error.directory),
+                escape(&error.error)
+            ));
+        }
+        html.push_str("</ol>\n");
+    }
+
+    html.push_str(
+        "<p class=\"meta\">Plugins installed or changed take effect after the server restarts.</p>\n",
+    );
+    html
+}
+
+/// Render a single plugin: its name and version, its description, and a
+/// line with its engine, whether it runs, its authors, license and
+/// homepage.
+fn render_plugin(plugin: &PluginResponse) -> String {
+    let mut html = format!(
+        "<strong>{}</strong> <span class=\"version\">v{}</span>",
+        escape(&plugin.name),
+        escape(&plugin.version)
+    );
+    if let Some(description) = plugin
+        .description
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+    {
+        html.push_str(&format!(
+            "<p class=\"description\">{}</p>",
+            escape(description)
+        ));
+    }
+
+    let mut parts = vec![plugin.engine.name().to_owned()];
+    parts.push(
+        if !plugin.engine_supported {
+            "engine not supported by this build"
+        } else if plugin.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+        .to_owned(),
+    );
+    if !plugin.authors.is_empty() {
+        let authors: Vec<_> = plugin.authors.iter().map(escape).collect();
+        parts.push(format!("by {}", authors.join(", ")));
+    }
+    if let Some(license) = &plugin.license {
+        parts.push(escape(license).into_owned());
+    }
+    if let Some(url) = plugin.homepage.as_deref().and_then(safe_link) {
+        parts.push(format!(
+            "<a href=\"{}\" rel=\"noopener noreferrer\">Homepage</a>",
+            escape(url)
+        ));
+    }
+    html.push_str(&format!(
+        "<span class=\"meta\">{}</span>",
+        parts.join(" &middot; ")
     ));
     html
 }
@@ -1573,7 +1685,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
 
-        for path in ["/", "/entries/1", "/feeds", "/feeds/1"] {
+        for path in ["/", "/entries/1", "/feeds", "/feeds/1", "/plugins"] {
             let resp = reqwest::get(format!("http://{addr}{path}")).await?;
             let csp = resp.headers()[header::CONTENT_SECURITY_POLICY].to_str()?;
             assert!(csp.starts_with("default-src 'none';"), "{path}: {csp}");
@@ -1606,15 +1718,16 @@ mod tests {
         Ok(())
     }
 
-    /// Every page links to the index and to the list of feeds.
+    /// Every page links to the index, to the list of feeds and to the list
+    /// of plugins.
     #[tokio::test]
-    async fn pages_link_to_the_list_of_feeds() -> Result<()> {
+    async fn pages_link_to_the_site_sections() -> Result<()> {
         let tc = TestBuilder::all().build()?;
         insert_entries(&tc, 1)?;
-        for path in ["/", "/entries/1", "/feeds"] {
+        for path in ["/", "/entries/1", "/feeds", "/plugins"] {
             let (_, body) = get_page(tc.client()?, path).await?;
             assert!(
-                body.contains(r#"<nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a></nav>"#),
+                body.contains(r#"<nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a><a href="/plugins">Plugins</a></nav>"#),
                 "{path}: {body}"
             );
         }
@@ -1794,6 +1907,40 @@ mod tests {
             body.contains(r#"<a href="/feeds/1?page=2">&larr; Back to feed</a>"#),
             "{body}"
         );
+        Ok(())
+    }
+
+    /// The list of plugins shows each installed plugin, and each directory
+    /// that could not be loaded as one and why.
+    #[tokio::test]
+    async fn the_plugins_page_lists_every_plugin() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        tc.install_lua_plugin("passthrough", "", serde_json::json!({}))?;
+        std::fs::create_dir_all(tc.plugins_dir().join("broken"))?;
+        let tc = tc.init_server()?;
+
+        let (status, body) = get_page(tc.client()?, "/plugins").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("<title>Plugins - Kiki</title>"), "{body}");
+        assert!(body.contains("1 plugin<"), "{body}");
+        assert!(
+            body.contains(r#"<strong>passthrough</strong> <span class="version">v1.0.0</span>"#),
+            "{body}"
+        );
+        assert!(body.contains("Could not be loaded"), "{body}");
+        assert!(body.contains("<strong>broken</strong>"), "{body}");
+        assert!(body.contains("manifest.toml"), "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_plugins_page_says_when_there_are_no_plugins() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let (status, body) = get_page(tc.client()?, "/plugins").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("0 plugins"), "{body}");
+        assert!(body.contains("No plugins are installed."), "{body}");
+        assert!(!body.contains("Could not be loaded"), "{body}");
         Ok(())
     }
 
