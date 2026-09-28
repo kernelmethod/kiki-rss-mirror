@@ -361,8 +361,8 @@ impl Server {
         }
 
         // Plugins are discovered once, here: installing, removing or editing
-        // one takes a restart.
-        let plugins = match plugins::discover(&self.plugins_dir) {
+        // one, or changing its config, takes a restart.
+        let mut plugins = match plugins::discover(&self.plugins_dir) {
             Ok(discovery) => discovery,
             Err(e) => {
                 tracing::error!("failed to scan for plugins: {}", e);
@@ -371,6 +371,16 @@ impl Server {
         };
         for e in &plugins.errors {
             tracing::warn!(dir = %e.dir.display(), "skipping plugin: {}", e.error);
+        }
+        // Running a plugin with its defaults instead of the config it was
+        // given could quietly change what it does, so this is fatal.
+        {
+            let conn = pool
+                .get()
+                .with_context(|| "failed to get connection to load plugin configs")?;
+            let overrides = crate::db::plugins::all_config_overrides(&conn)
+                .with_context(|| "failed to load plugin configs")?;
+            plugins.apply_config_overrides(overrides);
         }
         let plugins = Arc::new(plugins);
 

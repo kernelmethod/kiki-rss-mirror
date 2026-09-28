@@ -28,6 +28,12 @@
 //! patterns = ["sponsored"]
 //! ```
 //!
+//! The config a plugin runs with is these defaults with the plugin's
+//! overrides, kept in the database's `plugins` table (see
+//! [`crate::db::plugins`]), applied over them by
+//! [`Discovery::apply_config_overrides`]. Overrides are keyed by plugin name,
+//! so they survive a new version of the plugin being dropped in.
+//!
 //! See [`PluginManifest`] for every field. [`discover`] scans the plugins
 //! directory and returns every plugin whose manifest is valid, together with
 //! an error for each directory that could not be loaded; one broken plugin
@@ -51,12 +57,14 @@ pub const PLUGINS_DIR_NAME: &str = "plugins";
 /// Name of the manifest file at the root of every plugin directory.
 pub const MANIFEST_FILE_NAME: &str = "manifest.toml";
 
-/// Name of the optional file, at the root of a plugin directory, that
-/// overrides the default config given in the plugin's manifest.
-pub const CONFIG_FILE_NAME: &str = "config.json";
-
-/// Largest manifest or config file that will be read.
+/// Largest manifest file that will be read.
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+
+/// Largest config overrides, serialized as JSON, that a plugin may have.
+///
+/// A plugin's config is shipped to the script host along with its source,
+/// so it is kept small.
+pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
 /// Largest total size of the source files of one plugin.
 ///
@@ -182,8 +190,8 @@ pub struct PluginManifest {
     pub enabled: bool,
 
     /// The plugin's default config, the manifest's `[config]` table, handed
-    /// to its entrypoint as its argument. Keys in the plugin's
-    /// [`CONFIG_FILE_NAME`], if it has one, override these.
+    /// to its entrypoint as its argument. The plugin's config overrides, kept
+    /// in the database, replace these key by key.
     ///
     /// The table is held as JSON, the form configs take everywhere else; see
     /// [`toml_to_json`] for how TOML values are converted.
@@ -368,10 +376,6 @@ pub enum PluginError {
     #[error("entrypoint {0:?} not found")]
     MissingEntrypoint(String),
 
-    /// The plugin's [`CONFIG_FILE_NAME`] is not a JSON object.
-    #[error("invalid {CONFIG_FILE_NAME}: {0}")]
-    InvalidConfig(#[source] crate::scripting::ScriptConfigError),
-
     /// A file is larger than Kiki will read.
     #[error("{path} is too large: the limit is {limit} bytes")]
     TooLarge { path: PathBuf, limit: u64 },
@@ -392,34 +396,28 @@ pub struct Plugin {
     pub dir: PathBuf,
     /// The plugin's manifest.
     pub manifest: PluginManifest,
-    /// The plugin's config: the manifest's default config, with the keys of
-    /// its [`CONFIG_FILE_NAME`] applied over it.
+    /// The plugin's config: the manifest's default config, with the
+    /// plugin's overrides applied over it by
+    /// [`Discovery::apply_config_overrides`]. Until then, just the defaults.
     pub config: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Plugin {
     /// Loads the plugin in directory `dir`, reading and validating its
-    /// manifest and config.
+    /// manifest. Its config is the manifest's defaults.
     ///
     /// Source files are not read until [`Self::load_source`].
     ///
     /// # Errors
     ///
-    /// Returns an error if the manifest or config is missing, unreadable or
-    /// invalid, or if the manifest's entrypoint does not exist.
+    /// Returns an error if the manifest is missing, unreadable or invalid, or
+    /// if the manifest's entrypoint does not exist.
     pub fn load(dir: &Path) -> Result<Self, PluginError> {
         let manifest_path = dir.join(MANIFEST_FILE_NAME);
         let manifest = match read_small_file(&manifest_path)? {
             Some(text) => PluginManifest::parse(&text)?,
             None => return Err(PluginError::MissingManifest),
         };
-
-        let mut config = manifest.config.clone();
-        if let Some(text) = read_small_file(&dir.join(CONFIG_FILE_NAME))? {
-            let overrides =
-                crate::scripting::parse_script_config(&text).map_err(PluginError::InvalidConfig)?;
-            config.extend(overrides);
-        }
 
         if !dir.join(manifest.entrypoint()).is_file() {
             return Err(PluginError::MissingEntrypoint(
@@ -429,8 +427,8 @@ impl Plugin {
 
         Ok(Self {
             dir: dir.to_path_buf(),
+            config: manifest.config.clone(),
             manifest,
-            config,
         })
     }
 
@@ -486,6 +484,34 @@ impl Plugin {
             modules,
         })
     }
+}
+
+/// Returns `defaults` with the keys of `overrides` applied over it: the
+/// config a plugin with those defaults and overrides is loaded with.
+///
+/// Only top-level keys are replaced; objects are not merged. A key
+/// overridden with `null` is kept, as `null`.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::plugins::apply_config_overrides;
+/// use serde_json::json;
+///
+/// let defaults = json!({"a": 1, "b": {"x": 1}});
+/// let overrides = json!({"b": {"y": 2}, "c": 3});
+/// assert_eq!(
+///     apply_config_overrides(defaults.as_object().unwrap(), overrides.as_object().unwrap().clone()),
+///     *json!({"a": 1, "b": {"y": 2}, "c": 3}).as_object().unwrap(),
+/// );
+/// ```
+pub fn apply_config_overrides(
+    defaults: &serde_json::Map<String, serde_json::Value>,
+    overrides: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut config = defaults.clone();
+    config.extend(overrides);
+    config
 }
 
 /// The name that the source file at `relative` (a path inside a plugin
@@ -591,7 +617,7 @@ fn read_source_file(path: &Path, total: &mut u64) -> Result<String, PluginError>
     String::from_utf8(bytes).map_err(|_| PluginError::NotUtf8(path.to_path_buf()))
 }
 
-/// Reads a manifest or config file, returning `None` if it does not exist.
+/// Reads a manifest file, returning `None` if it does not exist.
 fn read_small_file(path: &Path) -> Result<Option<String>, PluginError> {
     let io_err = |source| PluginError::Io {
         path: path.to_path_buf(),
@@ -630,6 +656,50 @@ pub struct Discovery {
     pub plugins: Vec<Plugin>,
     /// The directories that could not be loaded as plugins.
     pub errors: Vec<DiscoveryError>,
+}
+
+impl Discovery {
+    /// Applies each plugin's config overrides, from `overrides` keyed by
+    /// plugin name, over the defaults in its manifest. Plugins with no
+    /// entry keep their defaults; entries naming no discovered plugin are
+    /// ignored.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::plugins::discover;
+    /// use serde_json::json;
+    /// use std::collections::HashMap;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let plugin = dir.path().join("hello");
+    /// std::fs::create_dir(&plugin).unwrap();
+    /// std::fs::write(
+    ///     plugin.join("manifest.toml"),
+    ///     "name = 'hello'\nversion = '1.0.0'\nengine = 'lua'\n[config]\na = 1\nb = 2\n",
+    /// ).unwrap();
+    /// std::fs::write(plugin.join("main.lua"), "").unwrap();
+    ///
+    /// let mut found = discover(dir.path()).unwrap();
+    /// let overrides = json!({"b": 3});
+    /// found.apply_config_overrides(HashMap::from([
+    ///     ("hello".to_string(), overrides.as_object().unwrap().clone()),
+    /// ]));
+    /// assert_eq!(found.plugins[0].config, *json!({"a": 1, "b": 3}).as_object().unwrap());
+    /// ```
+    pub fn apply_config_overrides(
+        &mut self,
+        mut overrides: std::collections::HashMap<
+            String,
+            serde_json::Map<String, serde_json::Value>,
+        >,
+    ) {
+        for plugin in &mut self.plugins {
+            if let Some(o) = overrides.remove(&plugin.manifest.name) {
+                plugin.config = apply_config_overrides(&plugin.manifest.config, o);
+            }
+        }
+    }
 }
 
 /// Scans `plugins_dir` for plugins.
@@ -1024,27 +1094,29 @@ mod tests {
     }
 
     #[test]
-    fn config_file_overrides_manifest_defaults() {
+    fn config_overrides_replace_manifest_defaults() {
         let td = TempDir::new().unwrap();
         let mut m = manifest("a");
         m.config = serde_json::from_str(r#"{"x": 1, "y": 2}"#).unwrap();
         install(td.path(), &m, "").unwrap();
-        write(
-            &td.path().join("a").join(CONFIG_FILE_NAME),
-            r#"{"y": 3, "z": 4}"#,
-        );
+        install(td.path(), &manifest("b"), "").unwrap();
 
-        let plugin = Plugin::load(&td.path().join("a")).unwrap();
+        let mut found = discover(td.path()).unwrap();
+        assert_eq!(found.plugins[0].config, m.config);
+
+        let overrides = |v: serde_json::Value| v.as_object().unwrap().clone();
+        found.apply_config_overrides(std::collections::HashMap::from([
+            (
+                "a".to_string(),
+                overrides(serde_json::json!({"y": 3, "z": 4})),
+            ),
+            ("gone".to_string(), overrides(serde_json::json!({"x": 5}))),
+        ]));
         assert_eq!(
-            serde_json::Value::Object(plugin.config),
+            serde_json::Value::Object(found.plugins[0].config.clone()),
             serde_json::json!({"x": 1, "y": 3, "z": 4})
         );
-
-        write(&td.path().join("a").join(CONFIG_FILE_NAME), "[]");
-        assert!(matches!(
-            Plugin::load(&td.path().join("a")),
-            Err(PluginError::InvalidConfig(_))
-        ));
+        assert!(found.plugins[1].config.is_empty());
     }
 
     #[test]

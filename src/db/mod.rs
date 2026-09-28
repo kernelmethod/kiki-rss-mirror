@@ -6,6 +6,7 @@ use std::path::Path;
 pub mod assets;
 pub mod log;
 pub mod migrations;
+pub mod plugins;
 pub mod retention;
 pub mod tags;
 pub mod task_queue;
@@ -181,6 +182,7 @@ mod tests {
             "feed_tags",
             "feeds",
             "migrations",
+            "plugins",
             "rss_categories",
             "rss_entry_data",
             "tags",

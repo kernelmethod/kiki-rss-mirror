@@ -54,8 +54,8 @@ Other fields are ignored, so plugins may carry metadata of their own.
 
 To install a plugin, copy its directory into `plugins/`; to remove one, delete
 its directory. Kiki discovers plugins only when the server starts, so restart
-the server after installing, removing, or editing a plugin (including its
-`config.json`). Plugins load in the order of their directory names, so
+the server after installing, removing, or editing a plugin, or changing its
+config. Plugins load in the order of their directory names, so
 prefixing directory names with numbers (`10-filter`, `20-tag`) controls the
 order their handlers run in.
 
@@ -141,16 +141,22 @@ at most 1 MiB.
 
 Every plugin has a config, handed to the plugin's entrypoint as its argument,
 converted to a Lua table, so a plugin reads it with `local config = ...`. The
-config is the `[config]` table in the plugin's manifest, with the keys of an
-optional `config.json` file (a JSON object) in the plugin directory applied
-over it. Keeping your settings in `config.json` leaves the
-manifest's defaults untouched, so a new version of a plugin can be dropped in
-without losing them. Each plugin sees only its own config. A plugin with no
-config gets an empty table.
+config is the `[config]` table in the plugin's manifest (its defaults), with
+the keys of its config overrides (a JSON object) applied over it. Each plugin
+sees only its own config. A plugin with no config gets an empty table.
+
+Overrides are kept in Kiki's database, keyed by plugin name, and set through
+the API under `/v1/plugins/name/{name}/config`: `GET` shows the plugin's
+defaults, its overrides, and the config they add up to; `PUT` replaces every
+override; `PATCH` sets some overrides and keeps the rest; `DELETE` removes
+every override; and `DELETE /v1/plugins/name/{name}/config/{key}` removes one.
+Since overrides live outside the plugin directory, a new version of a plugin
+can be dropped in without losing them. As with any other change to a plugin,
+a new config takes effect when the server restarts.
 
 Tables (and JSON objects) become Lua tables keyed by string, and arrays become
 sequences indexed from 1. TOML dates and times become strings in their
-RFC 3339 form, and `inf` and `nan` are not allowed. A `null` in `config.json`
+RFC 3339 form, and `inf` and `nan` are not allowed. A `null` override
 becomes `nil`, so a key set to `null` is absent from its table.
 
 For example, this script hides entries whose fields match a configured
@@ -180,7 +186,8 @@ kiki.on("entry.ingest", function(entry)
 end)
 ```
 
-configured with, say, this `config.json`:
+configured with, say, these overrides (sent with
+`PUT /v1/plugins/name/{name}/config`):
 
 ```json
 {
