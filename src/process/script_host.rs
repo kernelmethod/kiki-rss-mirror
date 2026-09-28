@@ -342,11 +342,31 @@ impl ScriptRunner for SubprocessScriptRunner {
         }
     }
 
+    /// Sends the host as many of `entries` as fit in one request; see
+    /// [`scan_prefix_len`]. The scan hands the rest back on its next
+    /// dispatch, as it does when the handler runs out of time.
+    ///
+    /// An entry too large to send even on its own is skipped, and reported
+    /// as if the handler had returned `nil` for it, so it is left as it is
+    /// and the rest of the scan carries on. A new entry too large to send
+    /// to `entry.ingest` is likewise stored without the scripts' changes.
     fn dispatch_scan(
         &self,
         scan_id: u64,
-        entries: Vec<FeedEntry>,
+        mut entries: Vec<FeedEntry>,
     ) -> Result<Option<Vec<Option<FeedEntry>>>> {
+        let fit = scan_prefix_len(&entries, SCAN_REQUEST_BUDGET)?;
+        if fit == 0 {
+            if let Some(entry) = entries.first() {
+                warn!(
+                    entry_id = entry.id,
+                    guid = %entry.guid,
+                    "script host: entry too large to send to a scan handler; skipping it"
+                );
+                return Ok(Some(vec![None]));
+            }
+        }
+        entries.truncate(fit);
         match self.host.request(&HostRequest::Scan { scan_id, entries })? {
             HostResponse::Scanned { entries } => Ok(entries),
             other => anyhow::bail!("script host: expected a Scanned response, got {other:?}"),
@@ -361,6 +381,38 @@ impl ScriptRunner for SubprocessScriptRunner {
             warn!(error = %e, "script host: finishing scan {scan_id} failed");
         }
     }
+}
+
+/// Most bytes of entries [`SubprocessScriptRunner::dispatch_scan`] puts in
+/// one request. The response carries the entries back, so this leaves the
+/// host room to answer within [`MAX_FRAME_BYTES`] even if the handler grows
+/// them.
+const SCAN_REQUEST_BUDGET: usize = MAX_FRAME_BYTES / 2;
+
+/// Bytes a [`HostRequest::Scan`] adds to its entries' own encoding: the
+/// variant, the scan id and the list's length, each a varint.
+const SCAN_REQUEST_OVERHEAD: usize = 32;
+
+/// How many of `entries`, from the start, to send in one scan request:
+/// as many as fit in `budget` bytes, and always the first if it fits in a
+/// frame on its own, so the scan makes progress. Zero means the first
+/// entry is too large to send at all.
+///
+/// # Errors
+///
+/// Returns an error if an entry cannot be encoded.
+fn scan_prefix_len(entries: &[FeedEntry], budget: usize) -> Result<usize> {
+    let mut total = SCAN_REQUEST_OVERHEAD;
+    for (i, entry) in entries.iter().enumerate() {
+        total += encode(entry)
+            .context("could not encode an entry for a scan")?
+            .len();
+        let limit = if i == 0 { MAX_FRAME_BYTES } else { budget };
+        if total > limit {
+            return Ok(i);
+        }
+    }
+    Ok(entries.len())
 }
 
 // ------------------------------------------------------------------
@@ -541,5 +593,84 @@ fn serve(
         HostRequest::CallResult { .. } => HostResponse::Failed {
             message: "a call result arrived with no call outstanding".to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    /// A stored entry whose content is `content_bytes` long.
+    fn entry(id: i64, content_bytes: usize) -> FeedEntry {
+        FeedEntry {
+            id: Some(id),
+            feed_id: 1,
+            syndication_format: "rss".to_string(),
+            guid: format!("guid-{id}"),
+            published_at: Some(0),
+            title: format!("entry {id}"),
+            url: None,
+            content: Some("x".repeat(content_bytes)),
+            authors: Vec::new(),
+            categories: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+
+    /// The request the server would send for `entries`.
+    fn request_len(entries: &[FeedEntry]) -> usize {
+        encode(&HostRequest::Scan {
+            scan_id: u64::MAX,
+            entries: entries.to_vec(),
+        })
+        .unwrap()
+        .len()
+    }
+
+    #[test]
+    fn small_entries_are_all_sent() {
+        let entries: Vec<_> = (1..=25).map(|id| entry(id, 1_000)).collect();
+        assert_eq!(scan_prefix_len(&entries, SCAN_REQUEST_BUDGET).unwrap(), 25);
+        assert_eq!(scan_prefix_len(&[], SCAN_REQUEST_BUDGET).unwrap(), 0);
+    }
+
+    /// Entries that are large together are split over several requests,
+    /// each within the budget.
+    #[test]
+    fn large_entries_are_split_to_fit_the_budget() {
+        // 25 entries of 480 KiB, about 12 MB in all, as on nixdev.
+        let mut entries: Vec<_> = (1..=25).map(|id| entry(id, 480 * 1024)).collect();
+        let mut requests = 0;
+        while !entries.is_empty() {
+            let fit = scan_prefix_len(&entries, SCAN_REQUEST_BUDGET).unwrap();
+            assert!(fit > 0);
+            assert!(request_len(&entries[..fit]) <= SCAN_REQUEST_BUDGET);
+            if fit < entries.len() {
+                assert!(request_len(&entries[..=fit]) > SCAN_REQUEST_BUDGET);
+            }
+            entries.drain(..fit);
+            requests += 1;
+        }
+        assert!(requests > 1);
+    }
+
+    /// An entry over the budget but within a frame still goes, alone.
+    #[test]
+    fn a_first_entry_over_the_budget_is_sent_alone() {
+        let entries = [entry(1, SCAN_REQUEST_BUDGET + 1), entry(2, 10)];
+        assert_eq!(scan_prefix_len(&entries, SCAN_REQUEST_BUDGET).unwrap(), 1);
+        assert!(request_len(&entries[..1]) <= MAX_FRAME_BYTES);
+    }
+
+    /// An entry too large for a frame can't be sent at all.
+    #[test]
+    fn a_first_entry_over_the_frame_limit_is_not_sent() {
+        let entries = [entry(1, MAX_FRAME_BYTES), entry(2, 10)];
+        assert_eq!(scan_prefix_len(&entries, SCAN_REQUEST_BUDGET).unwrap(), 0);
+        assert_eq!(
+            scan_prefix_len(&entries[1..], SCAN_REQUEST_BUDGET).unwrap(),
+            1
+        );
     }
 }

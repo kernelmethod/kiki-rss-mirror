@@ -1009,4 +1009,90 @@ mod script_isolation {
         kiki.assert_still_running();
         kiki.shutdown();
     }
+
+    /// A scan over entries too large to send to the host together, as
+    /// full-text feeds make them, goes through every entry. One too large
+    /// to send at all is skipped, and the scan carries on past it.
+    #[test]
+    fn scans_of_large_entries_go_through_every_entry() {
+        const SCRIPT: &str = r#"
+            kiki.on("plugin.load", function()
+                kiki.entries.scan(function(entry)
+                    table.insert(entry.tags, "system:hidden")
+                    return entry
+                end, function(summary)
+                    kiki.store.set("scanned", summary.scanned)
+                end)
+            end)
+        "#;
+        let manifest = "name = 'scanner'\nversion = '1.0.0'\nengine = 'lua'\n";
+        // 25 entries of 480 KiB, about 12 MB: one dispatch's worth, which
+        // used to fail the scan for exceeding the 8 MiB frame limit.
+        let large = "x".repeat(480 * 1024);
+        let huge = "x".repeat(9 * 1024 * 1024);
+        let mut kiki = Kiki::spawn_with(&[], |home| {
+            let conn = rusqlite::Connection::open(home.join("kiki.db")).expect("open db");
+            conn.execute("INSERT INTO feeds (title) VALUES ('f')", [])
+                .expect("insert feed");
+            let feed = conn.last_insert_rowid();
+            let insert = |guid: String, content: &str| {
+                conn.execute(
+                    "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url, content)
+                     VALUES (?1, 'rss', ?2, 0, ?2, 'u', ?3)",
+                    rusqlite::params![feed, guid, content],
+                )
+                .expect("insert entry");
+            };
+            for i in 0..25 {
+                insert(format!("large-{i}"), &large);
+            }
+            insert("huge".to_string(), &huge);
+            insert("small".to_string(), "x");
+            let plugin = home.join("plugins").join("scanner");
+            std::fs::create_dir_all(&plugin).expect("create plugin directory");
+            std::fs::write(plugin.join("manifest.toml"), manifest).expect("write manifest");
+            std::fs::write(plugin.join("main.lua"), SCRIPT).expect("write main.lua");
+        });
+
+        let db = kiki._dir.path().join("kiki.db");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let scanned = loop {
+            kiki.assert_still_running();
+            let conn = rusqlite::Connection::open(&db).expect("open db");
+            let scanned: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM plugin_store WHERE plugin = 'scanner' AND key = 'scanned'",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(scanned) = scanned {
+                break scanned;
+            }
+            assert!(Instant::now() < deadline, "the scan never finished");
+            thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(scanned, "27");
+
+        let conn = rusqlite::Connection::open(&db).expect("open db");
+        let hidden: Vec<String> = conn
+            .prepare(
+                "SELECT e.guid FROM entries e
+                 JOIN entry_tags et ON et.entry_id = e.id
+                 JOIN tags t ON t.id = et.tag_id
+                 WHERE t.name = 'system:hidden' ORDER BY e.id",
+            )
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        let mut expected: Vec<String> = (0..25).map(|i| format!("large-{i}")).collect();
+        expected.push("small".to_string());
+        assert_eq!(hidden, expected);
+
+        assert_eq!(kiki.script_host_pids().len(), 1);
+        kiki.assert_still_running();
+        kiki.shutdown();
+    }
 }
