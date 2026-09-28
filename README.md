@@ -79,11 +79,14 @@ file in the plugins directory changes.
 Kiki ships a `filter` plugin, in [`plugins/filter`](plugins/filter), that hides
 entries (tags them `system:hidden`) when their title, URL, content, authors,
 categories or GUID match regular expressions, or when they fail to match any of
-a feed's "include" rules. Copy the directory into the plugins directory, then
-give it some rules:
+a feed's "include" rules. It is bundled into the `kiki` binary (the
+`default-plugins` Cargo feature, on by default) and `kiki init` installs it into
+the plugins directory, with no rules; pass `kiki init --no-default-plugins` to
+skip it. For a Kiki home set up before it was bundled, copy the directory in
+yourself (`cp -r plugins/filter ~/.local/share/kiki/plugins/`). Then give it
+some rules:
 
 ```bash
-cp -r plugins/filter ~/.local/share/kiki/plugins/
 kiki plugin config set filter <<'EOF'
 [[exclude]]
 fields = ["title"]

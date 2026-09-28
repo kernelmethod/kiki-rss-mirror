@@ -47,7 +47,13 @@
 //!
 //! The calls plugins make to the server through the `kiki` Lua API, such as
 //! scanning stored entries, are answered by [`services`].
+//!
+//! With the `default-plugins` feature, Kiki also bundles plugins from its
+//! source tree into its binary, and `kiki init` installs them; see
+//! [`defaults`].
 
+#[cfg(feature = "default-plugins")]
+pub mod defaults;
 pub mod runtime;
 pub mod services;
 

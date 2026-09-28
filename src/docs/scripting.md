@@ -223,7 +223,9 @@ fixed (a plugin whose *manifest* is invalid is merely skipped); on a reload,
 the plugins that were running keep running.
 
 Kiki ships a complete version of this plugin as `plugins/filter` in its
-source; see its `main.lua` for the settings it takes.
+source, and `kiki init` installs it by default (unless Kiki was built without
+the `default-plugins` feature, or `--no-default-plugins` is passed); see its
+`main.lua` for the settings it takes.
 
 ## Events
 

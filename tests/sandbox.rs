@@ -55,6 +55,8 @@ impl Kiki {
 
         let init_status = Command::new(KIKI_BIN)
             .arg("init")
+            // The tests count the plugins they load themselves.
+            .arg("--no-default-plugins")
             .env("KIKI_HOME", dir.path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
