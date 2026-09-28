@@ -165,12 +165,18 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
         SandboxProfile::Server {
             data_dir,
             socket_dir,
+            temp_dir,
         } => {
             // The socket usually lives in the data directory, in which case
             // the one rule already covers it.
             let mut rw_paths: Vec<PathBuf> = vec![data_dir.clone()];
             if !paths_equal(data_dir, socket_dir) {
                 rw_paths.push(socket_dir.clone());
+            }
+            // So does SQLite's temp directory, unless `SQLITE_TMPDIR`
+            // named one elsewhere.
+            if !rw_paths.iter().any(|p| path_within(temp_dir, p)) {
+                rw_paths.push(temp_dir.clone());
             }
             let ro_paths: Vec<PathBuf> = resolver_paths()
                 .into_iter()
@@ -240,6 +246,15 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `path` is `dir` or lies below it, comparing canonical paths
+/// where both exist.
+fn path_within(path: &Path, dir: &Path) -> bool {
+    match (std::fs::canonicalize(path), std::fs::canonicalize(dir)) {
+        (Ok(path), Ok(dir)) => path.starts_with(dir),
+        _ => path.starts_with(dir),
+    }
 }
 
 fn paths_equal(a: &Path, b: &Path) -> bool {
@@ -519,6 +534,7 @@ mod tests {
         let (rw, _) = landlock_paths(&SandboxProfile::Server {
             data_dir: PathBuf::from("/var/lib/kiki"),
             socket_dir: PathBuf::from("/run/kiki"),
+            temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
         });
         assert_eq!(
             rw,
@@ -531,8 +547,28 @@ mod tests {
         let (rw, _) = landlock_paths(&SandboxProfile::Server {
             data_dir: PathBuf::from("/var/lib/kiki"),
             socket_dir: PathBuf::from("/var/lib/kiki"),
+            temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
         });
         assert_eq!(rw, vec![PathBuf::from("/var/lib/kiki")]);
+    }
+
+    /// A temp directory outside the data directory — one named by
+    /// `SQLITE_TMPDIR` — is granted too, or SQLite could not create its
+    /// temporary files there.
+    #[test]
+    fn server_profile_grants_a_temp_dir_outside_the_data_dir() {
+        let (rw, _) = landlock_paths(&SandboxProfile::Server {
+            data_dir: PathBuf::from("/var/lib/kiki"),
+            socket_dir: PathBuf::from("/var/lib/kiki"),
+            temp_dir: PathBuf::from("/var/tmp/kiki"),
+        });
+        assert_eq!(
+            rw,
+            vec![
+                PathBuf::from("/var/lib/kiki"),
+                PathBuf::from("/var/tmp/kiki")
+            ]
+        );
     }
 
     #[test]

@@ -261,7 +261,27 @@ impl Server {
         // the threads that we spawn.
         let manager = SqliteConnectionManager::file(&self.db_path)
             .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-            .with_init(init_connection);
+            .with_init(|c| {
+                c.execute_batch(
+                    "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+                )?;
+                {
+                    use rusqlite::functions::FunctionFlags;
+                    c.create_scalar_function(
+                        "regexp",
+                        2,
+                        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                        |ctx| {
+                            let pattern = ctx.get_raw(0).as_str()?;
+                            let text = ctx.get_raw(1).as_str().unwrap_or("");
+                            let re = regex::Regex::new(pattern)
+                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                            Ok(re.is_match(text))
+                        },
+                    )?;
+                }
+                Ok(())
+            });
         let pool = r2d2::Pool::new(manager).with_context(|| {
             format!(
                 "Unable to open connection pool to database at {:?}",
@@ -560,38 +580,6 @@ async fn cleanup_loop(
     Ok(())
 }
 
-/// Configure a freshly opened connection in the server's pool.
-///
-/// Besides WAL mode, the busy timeout, foreign keys and the `regexp`
-/// function, this keeps SQLite's temporary files in memory. SQLite writes
-/// them — statement journals, sorts and temporary indexes that outgrow
-/// the page cache, temporary tables — to the system's temp directory, not
-/// the data directory, and the server's sandbox only lets it write to the
-/// latter. On disk, whichever statement first needed one would fail with
-/// "unable to open database file".
-fn init_connection(c: &mut rusqlite::Connection) -> rusqlite::Result<()> {
-    c.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; \
-         PRAGMA temp_store=MEMORY;",
-    )?;
-    {
-        use rusqlite::functions::FunctionFlags;
-        c.create_scalar_function(
-            "regexp",
-            2,
-            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let pattern = ctx.get_raw(0).as_str()?;
-                let text = ctx.get_raw(1).as_str().unwrap_or("");
-                let re = regex::Regex::new(pattern)
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                Ok(re.is_match(text))
-            },
-        )?;
-    }
-    Ok(())
-}
-
 /// Wait for every task worker in `handles` to finish, logging any that
 /// panicked.
 async fn wait_for_workers(handles: Vec<tokio::task::JoinHandle<()>>) {
@@ -884,18 +872,6 @@ mod test {
             .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
         Ok(r2d2::Pool::new(manager)?)
-    }
-
-    /// The server's sandbox forbids writing to the system temp directory,
-    /// so its connections must keep SQLite's temporary files in memory.
-    #[test]
-    fn server_connections_keep_temp_files_in_memory() -> Result<()> {
-        let td = tempfile::TempDir::with_prefix("kiki_")?;
-        let mut conn = rusqlite::Connection::open(td.path().join("kiki.db"))?;
-        init_connection(&mut conn)?;
-        let temp_store: i64 = conn.query_row("PRAGMA temp_store", [], |r| r.get(0))?;
-        assert_eq!(temp_store, 2, "expected temp_store=MEMORY");
-        Ok(())
     }
 
     /// Nothing at the path means nothing to clean up.

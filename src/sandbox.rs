@@ -10,7 +10,8 @@
 //! * **Landlock** restricts filesystem access to the paths the profile
 //!   actually needs — for the server that is the data directory holding
 //!   the SQLite DB and cached assets, the Unix socket's parent directory,
-//!   and a small read-only set of system paths needed for DNS and TLS
+//!   SQLite's temp directory (normally inside the data directory), and a
+//!   small read-only set of system paths needed for DNS and TLS
 //!   trust stores. The feed fetcher gets only the TLS trust stores (it
 //!   has the server resolve hostnames for it), and the script host gets
 //!   *nothing at all*. Where the kernel
@@ -54,6 +55,12 @@ pub enum SandboxProfile {
         /// Parent directory of the Unix domain socket. Granted read-write
         /// access so the socket file can be created and unlinked.
         socket_dir: PathBuf,
+
+        /// Directory SQLite puts its temporary files in (statement
+        /// journals, and sorts, indexes and tables too big for the page
+        /// cache). Granted read-write access. Normally inside `data_dir`,
+        /// which already covers it.
+        temp_dir: PathBuf,
     },
 
     /// The Lua script host: evaluates user-supplied scripts and talks to
@@ -91,11 +98,17 @@ pub struct SandboxConfig {
 
 impl SandboxConfig {
     /// Configuration for the main server process.
-    pub fn server(data_dir: PathBuf, socket_dir: PathBuf, log_only: bool) -> Self {
+    pub fn server(
+        data_dir: PathBuf,
+        socket_dir: PathBuf,
+        temp_dir: PathBuf,
+        log_only: bool,
+    ) -> Self {
         SandboxConfig {
             profile: SandboxProfile::Server {
                 data_dir,
                 socket_dir,
+                temp_dir,
             },
             log_only,
         }
