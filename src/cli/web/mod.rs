@@ -291,17 +291,21 @@ async fn entry_page(
             None => None,
         }
     };
-    let (feed_title, images) = tokio::join!(feed_title, fetch_cached_images(&api, id));
+    let (feed_title, cached) = tokio::join!(feed_title, fetch_cached_assets(&api, id));
     render_page(
         StatusCode::OK,
         &format!("{} - Kiki", display_title(&entry.title)),
-        &render_entry_page(&entry, feed_title.as_deref(), &images, params.page()),
+        &render_entry_page(&entry, feed_title.as_deref(), &cached, params.page()),
     )
 }
 
 /// Serve the cached asset with the blake3 hash `hash`, fetched from the
-/// Kiki API. Entry pages show images from here, so that the browser never
-/// loads anything from the sites the feeds link to.
+/// Kiki API. Entry pages show images and link attachments from here, so
+/// that the browser never loads anything from the sites the feeds link to.
+///
+/// Images, audio and video are served for the browser to show; anything
+/// else is served as a download, rather than rendered from the web UI's
+/// origin.
 async fn asset(
     State(api): State<reqwest::Client>,
     UrlPath(hash): UrlPath<String>,
@@ -340,6 +344,19 @@ async fn asset(
             out.insert(name, value.clone());
         }
     }
+    let shown_inline = out
+        .get(header::CONTENT_TYPE)
+        .and_then(|t| t.to_str().ok())
+        .is_some_and(|t| {
+            let t = t.trim_start().to_ascii_lowercase();
+            ["image/", "audio/", "video/"]
+                .iter()
+                .any(|prefix| t.starts_with(prefix))
+        });
+    out.insert(
+        header::CONTENT_DISPOSITION,
+        header::HeaderValue::from_static(if shown_inline { "inline" } else { "attachment" }),
+    );
     out.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         header::HeaderValue::from_static("nosniff"),
@@ -357,12 +374,14 @@ async fn asset(
     }
 }
 
-/// Fetch the images cached for entry `id` from the Kiki API, mapping each
-/// image's original URL to the web UI URL that serves the cached copy.
+/// Fetch the assets — images and enclosures — cached for entry `id` from
+/// the Kiki API, mapping each asset's original URL to the web UI URL that
+/// serves the cached copy.
 ///
 /// If the list cannot be fetched it is logged and treated as empty, so the
-/// entry is still shown, with links in place of its images.
-async fn fetch_cached_images(api: &reqwest::Client, id: i64) -> HashMap<String, String> {
+/// entry is still shown, linking to its images and attachments where they
+/// were found.
+async fn fetch_cached_assets(api: &reqwest::Client, id: i64) -> HashMap<String, String> {
     let assets: Result<ListEntryAssetsResponse> = async {
         Ok(api
             .get(format!("{API_BASE}/v1/entries/id/{id}/assets"))
@@ -378,7 +397,6 @@ async fn fetch_cached_images(api: &reqwest::Client, id: i64) -> HashMap<String, 
         Ok(assets) => assets
             .assets
             .into_iter()
-            .filter(|a| a.kind == "inline_img")
             .map(|a| (a.original_url, format!("/assets/{}", a.blake3)))
             .collect(),
         Err(e) => {
@@ -513,13 +531,14 @@ fn render_entry(entry: &ListEntriesResponseEntry, feed: Option<&str>, page: u32)
 /// to anything else the feed links it to. The page links back to page
 /// `page` of the index.
 ///
-/// Images in the content are shown from the asset cache: `images` maps an
-/// image's original URL to the URL of its cached copy. Images that are not
-/// cached are shown as links instead.
+/// Images in the content, and the entry's attachment, are taken from the
+/// asset cache: `cached` maps an asset's original URL to the URL of its
+/// cached copy. Images that are not cached are shown as links instead, and
+/// an attachment that is not cached is linked where the feed says it is.
 fn render_entry_page(
     entry: &GetEntryResponse,
     feed: Option<&str>,
-    images: &HashMap<String, String>,
+    cached: &HashMap<String, String>,
     page: u32,
 ) -> String {
     let authors: Vec<&str> = match (&entry.rss, &entry.atom) {
@@ -569,7 +588,7 @@ fn render_entry_page(
         })
         .filter(|c| !c.trim().is_empty());
     match content
-        .map(|c| sanitize::sanitize_html(c, base.as_ref(), |url| images.get(url.as_str()).cloned()))
+        .map(|c| sanitize::sanitize_html(c, base.as_ref(), |url| cached.get(url.as_str()).cloned()))
     {
         Some(Ok(content)) => {
             html.push_str(&format!("<div class=\"content\">\n{content}\n</div>\n"));
@@ -600,6 +619,11 @@ fn render_entry_page(
             ));
         }
         if let Some(url) = rss.enclosure_url.as_deref().and_then(safe_link) {
+            // The cache keys an enclosure by its URL as `url` writes it.
+            let url = url::Url::parse(url)
+                .ok()
+                .and_then(|u| cached.get(u.as_str()))
+                .map_or(url, String::as_str);
             let kind = rss
                 .enclosure_mime_type
                 .as_deref()
@@ -1046,6 +1070,128 @@ mod tests {
         Ok(())
     }
 
+    /// Cache `bytes` as the asset at `original_url`, of type `content_type`,
+    /// for entry `entry_id` as an asset of `kind`, and return its hash.
+    fn cache_asset(
+        tc: &crate::test::TestConfig,
+        entry_id: i64,
+        bytes: &[u8],
+        original_url: &str,
+        content_type: &str,
+        kind: &str,
+    ) -> Result<String> {
+        let conn = tc.database_conn()?;
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let path = crate::tasks::assets::asset_path(tc.config_dir(), &hash);
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, bytes)?;
+        let asset_id = crate::db::assets::insert_asset(
+            &conn,
+            &hash,
+            original_url,
+            Some(content_type),
+            bytes.len() as i64,
+            None,
+            None,
+        )?;
+        crate::db::assets::link_entry_asset(&conn, entry_id, asset_id, kind)?;
+        Ok(hash)
+    }
+
+    /// An entry's attachment links to its cached copy when there is one, and
+    /// to where the feed says it is when there isn't.
+    #[tokio::test]
+    async fn attachments_link_to_the_asset_cache() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO entries (id, syndication_format, guid, published_at, title, url)
+             VALUES (1, 'rss', 'a', 1, 'Cached', 'http://example.com/a'),
+                    (2, 'rss', 'b', 2, 'Uncached', 'http://example.com/b')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO rss_entry_data (entry_id, enclosure_url, enclosure_mime_type)
+             VALUES (1, 'HTTP://Example.com/episode.mp3', 'audio/mpeg'),
+                    (2, 'http://example.com/other.mp3', 'audio/mpeg')",
+            [],
+        )?;
+        let hash = cache_asset(
+            &tc,
+            1,
+            b"episode",
+            "http://example.com/episode.mp3",
+            "audio/mpeg",
+            "enclosure",
+        )?;
+
+        let (_, body) = get_page(tc.client()?, "/entries/1").await?;
+        assert!(
+            body.contains(&format!(
+                r#"<a href="/assets/{hash}" rel="noopener noreferrer">Attachment (audio/mpeg)</a>"#
+            )),
+            "{body}"
+        );
+        assert!(!body.contains("episode.mp3"), "{body}");
+
+        let (_, body) = get_page(tc.client()?, "/entries/2").await?;
+        assert!(
+            body.contains(
+                r#"<a href="http://example.com/other.mp3" rel="noopener noreferrer">Attachment"#
+            ),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// Cached media is shown in the browser; anything else is downloaded
+    /// rather than rendered from the web UI's origin.
+    #[tokio::test]
+    async fn only_media_assets_are_shown_inline() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        tc.database_conn()?.execute(
+            "INSERT INTO entries (id, syndication_format, guid, published_at, title, url)
+             VALUES (1, 'rss', 'a', 1, 'Entry', 'http://example.com/a')",
+            [],
+        )?;
+        let cases = [
+            ("image/png", "inline"),
+            ("audio/mpeg", "inline"),
+            ("video/mp4", "inline"),
+            ("text/html", "attachment"),
+            ("application/pdf", "attachment"),
+        ];
+        let mut hashes = Vec::new();
+        for (i, (content_type, _)) in cases.iter().enumerate() {
+            hashes.push(cache_asset(
+                &tc,
+                1,
+                format!("asset {i}").as_bytes(),
+                &format!("http://example.com/{i}"),
+                content_type,
+                "enclosure",
+            )?);
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
+
+        for ((content_type, disposition), hash) in cases.iter().zip(&hashes) {
+            let resp = reqwest::get(format!("http://{addr}/assets/{hash}")).await?;
+            assert_eq!(
+                resp.headers()[header::CONTENT_DISPOSITION],
+                *disposition,
+                "{content_type}"
+            );
+        }
+
+        cancel.cancel();
+        task.await??;
+        Ok(())
+    }
+
     /// Cached images are shown from the web UI's asset route, which serves
     /// the bytes from the cache; images that aren't cached become links.
     #[tokio::test]
@@ -1059,20 +1205,14 @@ mod tests {
             [],
         )?;
         let bytes = b"not really a png";
-        let hash = blake3::hash(bytes).to_hex().to_string();
-        let path = crate::tasks::assets::asset_path(tc.config_dir(), &hash);
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(&path, bytes)?;
-        let asset_id = crate::db::assets::insert_asset(
-            &conn,
-            &hash,
+        let hash = cache_asset(
+            &tc,
+            1,
+            bytes,
             "http://example.com/posts/cached.png",
-            Some("image/png"),
-            bytes.len() as i64,
-            None,
-            None,
+            "image/png",
+            "inline_img",
         )?;
-        crate::db::assets::link_entry_asset(&conn, 1, asset_id, "inline_img")?;
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
