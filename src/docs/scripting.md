@@ -150,6 +150,8 @@ the API under `/v1/plugins/name/{name}/config`: `GET` shows the plugin's
 defaults, its overrides, and the config they add up to; `PUT` replaces every
 override; `PATCH` sets some overrides and keeps the rest; `DELETE` removes
 every override; and `DELETE /v1/plugins/name/{name}/config/{key}` removes one.
+In the web UI (`kiki web`), each plugin on the Plugins page links to a page
+that shows its config and has a form to set, reset or add each setting.
 Since overrides live outside the plugin directory, a new version of a plugin
 can be dropped in without losing them. As with any other change to a plugin,
 a new config takes effect when the server restarts.
