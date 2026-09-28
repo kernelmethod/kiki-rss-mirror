@@ -110,7 +110,9 @@ CREATE TABLE feeds (
     -- a ceiling on polling interval: even if the server advertises a
     -- longer max-age, we will refresh at least this often. Also used as
     -- the fallback interval when the server sends no cache hint.
-    -- Defaults to 3 hours (10800 seconds).
+    -- New feeds are given `feed_fetch.default_fetch_interval_seconds` from
+    -- the config; the column default of 3 hours (10800 seconds) only
+    -- covers rows inserted without it.
     min_fetch_interval_seconds  INTEGER NOT NULL DEFAULT 10800,
 
     -- Unix timestamp (seconds) of the earliest moment this feed is

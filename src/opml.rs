@@ -324,7 +324,10 @@ pub fn export_feeds(conn: &Connection) -> Result<Vec<OpmlFeed>, OpmlError> {
 /// Add feeds to the database in a single transaction.
 ///
 /// Feeds whose URL already exists in the database are skipped and left
-/// untouched. New feeds are created along with any tags they carry, except
+/// untouched. New feeds are given `fetch_interval_seconds` as their
+/// `min_fetch_interval_seconds` (normally
+/// [`FeedFetchSettings::default_fetch_interval_seconds`](crate::config::FeedFetchSettings::default_fetch_interval_seconds))
+/// and are created along with any tags they carry, except
 /// for tag names reserved for system tags (see
 /// [`is_reserved_tag_name`](crate::db::tags::is_reserved_tag_name)), which
 /// are ignored. The
@@ -336,14 +339,20 @@ pub fn export_feeds(conn: &Connection) -> Result<Vec<OpmlFeed>, OpmlError> {
 ///
 /// Returns [`OpmlError::Database`] if a query fails, in which case no feeds
 /// are imported.
-pub fn import_feeds(conn: &mut Connection, feeds: &[OpmlFeed]) -> Result<ImportSummary, OpmlError> {
+pub fn import_feeds(
+    conn: &mut Connection,
+    feeds: &[OpmlFeed],
+    fetch_interval_seconds: u64,
+) -> Result<ImportSummary, OpmlError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut summary = ImportSummary::default();
 
     {
         let mut exists_stmt = tx.prepare("SELECT 1 FROM feeds WHERE url = ?1 LIMIT 1")?;
-        let mut insert_feed_stmt =
-            tx.prepare("INSERT INTO feeds (title, url) VALUES (?1, ?2) RETURNING id")?;
+        let mut insert_feed_stmt = tx.prepare(
+            "INSERT INTO feeds (title, url, min_fetch_interval_seconds)
+             VALUES (?1, ?2, ?3) RETURNING id",
+        )?;
         let mut insert_tag_stmt = tx.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?1)")?;
         let mut tag_id_stmt = tx.prepare("SELECT id FROM tags WHERE name = ?1")?;
         let mut feed_tag_stmt =
@@ -359,8 +368,10 @@ pub fn import_feeds(conn: &mut Connection, feeds: &[OpmlFeed]) -> Result<ImportS
                 continue;
             }
 
-            let feed_id: i64 =
-                insert_feed_stmt.query_row((&feed.title, &feed.url), |row| row.get(0))?;
+            let feed_id: i64 = insert_feed_stmt
+                .query_row((&feed.title, &feed.url, fetch_interval_seconds), |row| {
+                    row.get(0)
+                })?;
             summary.imported.push(feed_id);
 
             for tag in &feed.tags {
@@ -485,12 +496,21 @@ mod tests {
             feed("B", "http://example.com/b", &["tech"]),
             feed("A", "http://example.com/a", &[]),
         ];
-        let summary = import_feeds(&mut conn, &feeds).unwrap();
+        let summary = import_feeds(&mut conn, &feeds, 600).unwrap();
         assert_eq!(summary.imported.len(), 2);
         assert_eq!(summary.skipped, 0);
 
+        let intervals = conn
+            .prepare("SELECT min_fetch_interval_seconds FROM feeds")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(intervals, vec![600, 600]);
+
         // Importing the same feeds again skips them all
-        let summary = import_feeds(&mut conn, &feeds).unwrap();
+        let summary = import_feeds(&mut conn, &feeds, 600).unwrap();
         assert!(summary.imported.is_empty());
         assert_eq!(summary.skipped, 2);
 

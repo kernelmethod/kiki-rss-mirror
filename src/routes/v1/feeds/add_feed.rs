@@ -76,6 +76,11 @@ pub async fn add_feed(
 
     let title = payload.title;
     let url = payload.url;
+    let fetch_interval = state
+        .config
+        .current()
+        .feed_fetch
+        .default_fetch_interval_seconds;
     let title_for_event = title.clone();
     let url_for_event = url.clone();
 
@@ -84,8 +89,9 @@ pub async fn add_feed(
     let task_result = task::spawn_blocking(move || -> Result<i64, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "INSERT INTO feeds
-                (title, url, auth_type, auth_username, auth_password, auth_bearer_token)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                (title, url, auth_type, auth_username, auth_password, auth_bearer_token,
+                 min_fetch_interval_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              RETURNING id",
         )?;
         stmt.query_row(
@@ -96,6 +102,7 @@ pub async fn add_feed(
                 auth.username,
                 auth.password,
                 auth.bearer_token,
+                fetch_interval,
             ],
             |row| Ok(AddFeedQueryResult(row.get(0)?)),
         )
