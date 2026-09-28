@@ -53,17 +53,21 @@ flags = "i"
 Other fields are ignored, so plugins may carry metadata of their own.
 
 To install a plugin, copy its directory into `plugins/`; to remove one, delete
-its directory. Kiki discovers plugins only when the server starts, so restart
-the server after installing, removing, or editing a plugin, or changing its
-config. Plugins load in the order of their directory names, so
+its directory. A running server watches the plugins directory and reloads its
+plugins whenever a file in it changes (hidden files, such as editors' swap
+files, are ignored), and whenever a plugin's config is changed. A reload
+rebuilds every plugin: each entrypoint runs again, and then the
+[`plugin.load`](#events) handlers run. If the plugins fail to load, say
+because of a syntax error or a bad regex in a config, the plugins that were
+running keep running, as they were, and the error is logged.
+Plugins load in the order of their directory names, so
 prefixing directory names with numbers (`10-filter`, `20-tag`) controls the
 order their handlers run in.
 
 A plugin whose manifest is missing or invalid is skipped with a warning in the
 server log, and listed with the reason under `errors` in `GET /v1/plugins`;
 the other plugins still load. `GET /v1/plugins/name/{name}` shows one plugin's
-manifest and config. Both show the plugins as they were when the server
-started.
+manifest and config. Both show the plugins as they were last loaded.
 
 When the server runs sandboxed (the default), it can only read files inside
 Kiki's home, so a plugin directory that is a symbolic link to somewhere else
@@ -81,6 +85,10 @@ that, kiki exposes a single additional global — the `kiki` table:
   level. `level` must be one of `"debug"`, `"info"`, `"warn"`, or `"error"`.
 - `kiki.regex(pattern [, flags])` — compile a regular expression. See
   [Regular expressions](#regular-expressions) below.
+- `kiki.store` — the plugin's own key-value store, kept in the database. See
+  [Storing data](#storing-data).
+- `kiki.entries` — tag the entries already stored, and scan through them.
+  See [Stored entries](#stored-entries).
 
 The sandbox removes `dofile`, `loadfile`, `debug`, `io`, `package`, and the
 destructive `os.*` calls (`execute`, `exit`, `getenv`, `remove`, `rename`,
@@ -95,8 +103,8 @@ not visible to other plugins.
 
 The recommended shape for a plugin's entrypoint is to register one or more
 event handlers via `kiki.on` at the top level. The entrypoint's top-level chunk
-runs exactly once, when the server starts; handlers fire later, each
-time their event is emitted.
+runs when plugins load: when the server starts, and again on every reload.
+Handlers fire later, each time their event is emitted.
 
 ```lua
 kiki.on("entry.ingest", function(entry)
@@ -158,8 +166,11 @@ given. `kiki plugin ls` lists the installed plugins.
 In the web UI (`kiki web`), each plugin on the Plugins page links to a page
 that shows its config and has a form to set, reset or add each setting.
 Since overrides live outside the plugin directory, a new version of a plugin
-can be dropped in without losing them. As with any other change to a plugin,
-a new config takes effect when the server restarts.
+can be dropped in without losing them. Changing a config reloads the plugins,
+so it takes effect at once. If the plugins fail to load with it, it is still
+saved, but the plugins keep running with the config they had; the API's
+response says why in `reload_error`, and `kiki plugin config set` and the web
+UI report it.
 
 Tables (and JSON objects) become Lua tables keyed by string, and arrays become
 sequences indexed from 1. TOML dates and times become strings in their
@@ -207,8 +218,12 @@ configured with, say, these overrides (sent with
 
 Compiling the regexes in the top-level chunk means a bad pattern in the
 config fails when the plugin loads, not on every entry. Note that if any
-plugin's code fails to load, no plugins run until it is fixed (a plugin whose
-*manifest* is invalid is merely skipped).
+plugin's code fails to load when the server starts, no plugins run until it is
+fixed (a plugin whose *manifest* is invalid is merely skipped); on a reload,
+the plugins that were running keep running.
+
+Kiki ships a complete version of this plugin as `plugins/filter` in its
+source; see its `main.lua` for the settings it takes.
 
 ## Events
 
@@ -220,6 +235,7 @@ plugin's code fails to load, no plugins run until it is fixed (a plugin whose
 | `fetch.error`    | `{ feed_id, kind, status, message, retry_after }` | Fires when a feed fetch fails. `kind` is one of `"http"`, `"timeout"`, `"network"`, `"too_many_redirects"`, `"body_too_large"`, `"parse"`, or `"fetcher"` (the isolated feed fetcher itself failed, e.g. its worker crashed while handling this feed). `status` and `retry_after` are populated only when available. |
 | `feed.added`     | `{ id, url, title }`                       | Fires after a feed is created via the HTTP API. |
 | `feed.removed`   | `{ id, url, title }`                       | Fires after a feed is deleted via the HTTP API. `id`, `url`, `title` reflect the feed's state immediately before deletion. |
+| `plugin.load`    | none                                       | Fires once plugins have loaded: when the server starts, and after every reload. Where to start a [scan](#stored-entries) of stored entries. |
 
 Only `entry.ingest` is a **transform** event — its handlers can modify or
 filter the payload. All other events are observe-only; their return values are
@@ -232,6 +248,7 @@ following fields:
 
 | Field               | Lua type          | Mutable |
 |---------------------|-------------------|---------|
+| `id`                | integer, or `nil` for entries being ingested | No |
 | `feed_id`           | integer           | No      |
 | `syndication_format`| string (`"rss"` or `"atom"`) | No |
 | `guid`              | string            | No      |
@@ -239,20 +256,29 @@ following fields:
 | `title`             | string            | Yes     |
 | `url`               | string or `nil`   | Yes     |
 | `content`           | string (HTML) or `nil` | Yes |
+| `authors`           | array of strings  | No      |
+| `categories`        | array of strings  | No      |
 | `tags`              | array of strings  | Yes     |
 
-`tags` starts empty. A non-empty `tags` replaces the entry's user tags.
+`authors` holds an RSS item's `<author>`, or the names of an Atom entry's
+`<author>`s; `categories` holds an RSS item's `<category>` values, or the terms
+of an Atom entry's `<category>`s.
+
+`tags` starts empty. A `tags` holding any user tag replaces the entry's user
+tags; one holding only system tags leaves them alone.
 
 Scripts may also add the system tags `system:read`, `system:saved`, and
 `system:hidden` to `tags`. These are applied only when the entry is first
 stored: after that an entry's system tags record what the user has done with
 it (read it, saved it, hidden or unhidden it), and later refreshes leave them
-alone. Scripts never remove system tags. Any other name starting with
-`system:` is reserved, and is ignored with a warning.
+alone. Handlers never remove system tags through `tags` (though a plugin can
+with `kiki.entries.untag`). Any other name starting with `system:` is
+reserved, and is ignored with a warning.
 
-`feed_id`, `syndication_format`, and `guid` are identity fields. Handlers may
-read them, but any modifications are discarded when the entry is converted back
-out of Lua.
+`id`, `feed_id`, `syndication_format`, and `guid` are identity fields, and
+`authors` and `categories` describe the entry as its feed published it.
+Handlers may read them, but any modifications are discarded when the entry is
+converted back out of Lua.
 
 ### Handler chaining
 
@@ -261,6 +287,105 @@ registration order (which matches the order of their plugins' directory
 names). For `entry.ingest`, the output of one
 handler becomes the input to the next — if any handler returns `nil`, the
 entry is dropped immediately and subsequent handlers do not run.
+
+## Storing data
+
+`kiki.store` keeps data for the plugin in Kiki's database, so it outlives
+reloads and restarts. Each plugin has a store of its own.
+
+- `kiki.store.get(key)` returns the value stored under the string `key`, or
+  `nil`.
+- `kiki.store.set(key, value)` stores `value` under `key`, or removes the key
+  when `value` is `nil`.
+
+Values are kept as JSON: `nil`, booleans, numbers, strings, and tables of
+them. A table whose keys are exactly `1..n` is kept as a list, and any other
+as an object, whose keys must be strings; tables may nest 32 deep. Keys are 1
+to 256 bytes long, a value may take up 64 KiB as JSON, and a plugin may keep
+1024 keys.
+
+## Stored entries
+
+`entry.ingest` sees each entry once, as it arrives. `kiki.entries` reaches the
+entries already stored, such as those fetched before a plugin was installed or
+its config changed:
+
+- `kiki.entries.tag(id, name)` adds the tag `name` to the stored entry with id
+  `id`, creating the tag if it is a new user tag, and returns whether the
+  entry did not already have it. `name` may be a system tag, such as
+  `system:hidden`. Plugins cannot create new user tags once there are 10,000
+  user tags; they can still use the ones that exist.
+- `kiki.entries.untag(id, name)` removes the tag, returning whether the entry
+  had it. System tags can be removed too, so a plugin can mark as unread,
+  unsave or unhide entries the user marked; use this with care.
+- `kiki.entries.scan([options,] handler [, on_done])` starts a scan: in the
+  background, every stored entry that `options` selects is passed to
+  `handler`, oldest first, as an entry table with its `id` set and `tags`
+  empty. As with a new entry, the system tags the handler adds to `tags` are
+  applied to the entry; nothing else it changes is kept, and returning `nil`
+  leaves the entry as it is. To change anything else, the handler calls
+  `kiki.entries.tag` or `untag`. Once the scan has gone through every entry,
+  `on_done`, if given, is called with a table holding `scanned`, how many
+  entries the handler saw, and `updated`, how many gained a system tag. It is
+  not called for a scan that ends early. Returns the scan's id.
+
+User tags added with `kiki.entries.tag` last only until an `entry.ingest`
+handler next sets the entry's user tags: when an entry is fetched again and a
+handler returns any user tag for it, its user tags are replaced with the ones
+returned, as they would be for tags added by hand. Tags that must last are best
+set by the same plugin, on ingest as well as on stored entries.
+
+`options` is a table with any of:
+
+| Option           | Meaning |
+|------------------|---------|
+| `feed_id`        | Only scan the entries of this feed. |
+| `since`          | Only scan entries published at or after this Unix timestamp. |
+| `include_hidden` | Also scan entries tagged `system:hidden`, which are skipped by default. |
+
+Each call of the handler has the usual [time budget](#resource-limits), so a
+scan can visit any number of entries. Scans and feed refreshes take turns
+with the plugins: entries are handed to a scan a few at a time, and after
+about 50 ms of handling, any events a refresh has queued up go first. A scan
+therefore slows refreshes down by a little, rather than holding them up for
+long. A plugin runs one scan at a time: starting another cancels the first.
+Reloading the plugins ends every scan, and so does stopping the server; a scan
+is not resumed afterwards, and its `on_done` is not called.
+
+Scans cannot start while plugins are loading, from the top-level chunk:
+start them from a `plugin.load` handler. Since `plugin.load` fires on every
+reload, including those for other plugins' changes, keep track in
+`kiki.store` of what a scan has already applied, and record it from `on_done`,
+once the scan has finished: a scan that was cut short then runs again on the
+next load. This plugin hides stored entries matching a configured pattern, but
+only when the pattern changes, so that entries the user has since unhidden
+stay unhidden:
+
+```lua
+local config = ...
+local re = kiki.regex(config.pattern, "i")
+
+local function hide(entry)
+    if re:is_match(entry.title) then
+        table.insert(entry.tags, "system:hidden")
+    end
+    return entry
+end
+
+kiki.on("entry.ingest", hide)
+
+kiki.on("plugin.load", function()
+    if kiki.store.get("pattern") ~= config.pattern then
+        kiki.entries.scan(hide, function()
+            kiki.store.set("pattern", config.pattern)
+        end)
+    end
+end)
+```
+
+Calls to `kiki.store` and `kiki.entries` go to the server, which answers them
+from the database. Time a handler spends waiting on them does not count
+against its [time budget](#resource-limits), up to a second per handler call.
 
 ## Regular expressions
 
@@ -328,7 +453,9 @@ Every handler call runs under two hard limits:
 - **Time**: 100 ms per invocation. Enforced by a Lua debug hook that fires
   every 1000 VM instructions. Scripts stuck in long-running C-level calls
   (e.g. pathological `string.gsub` patterns) can exceed this slightly before
-  control returns to the VM.
+  control returns to the VM. Time spent waiting on the server in calls to
+  `kiki.store` and `kiki.entries` is not counted, up to one second per
+  invocation; past that, waiting counts like anything else.
 - **Memory**: 16 MiB across the entire VM. Allocations that would exceed this
   cap fail the handler.
 - **Regexes**: compiled regexes live outside the VM, so the memory cap does not

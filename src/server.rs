@@ -42,8 +42,9 @@ pub struct SharedAppState {
     /// filesystem under `{data_dir}/assets/`.
     pub data_dir: PathBuf,
 
-    /// The plugins discovered when the server started. See [`crate::plugins`].
-    pub plugins: Arc<plugins::Discovery>,
+    /// The plugins the server is running, and reloading them. See
+    /// [`crate::plugins::runtime`].
+    pub plugins: Arc<plugins::runtime::PluginRuntime>,
 
     /// Shared handle to the currently-installed scripting engine. Empty when the `lua`
     /// feature is disabled or when no scripts have been loaded.
@@ -360,37 +361,27 @@ impl Server {
             );
         }
 
-        // Plugins are discovered once, here: installing, removing or editing
-        // one, or changing its config, takes a restart.
-        let mut plugins = match plugins::discover(&self.plugins_dir) {
-            Ok(discovery) => discovery,
-            Err(e) => {
-                tracing::error!("failed to scan for plugins: {}", e);
-                plugins::Discovery::default()
-            }
-        };
-        for e in &plugins.errors {
-            tracing::warn!(dir = %e.dir.display(), "skipping plugin: {}", e.error);
-        }
-        // Running a plugin with its defaults instead of the config it was
-        // given could quietly change what it does, so this is fatal.
+        // Plugins are reloaded while the server runs, whenever the plugins
+        // directory changes or a plugin's config is changed through the API.
+        let plugins = Arc::new(
+            plugins::runtime::PluginRuntime::start(
+                self.plugins_dir.clone(),
+                pool.clone(),
+                metrics.clone(),
+                script_runner.clone(),
+                self.script_host.clone(),
+                self.cancel_token.clone(),
+            )
+            .with_context(|| "failed to load plugins")?,
+        );
+        if let Err(e) = plugins::runtime::spawn_watcher(plugins.clone(), self.cancel_token.clone())
         {
-            let conn = pool
-                .get()
-                .with_context(|| "failed to get connection to load plugin configs")?;
-            let overrides = crate::db::plugins::all_config_overrides(&conn)
-                .with_context(|| "failed to load plugin configs")?;
-            plugins.apply_config_overrides(overrides);
-        }
-        let plugins = Arc::new(plugins);
-
-        #[cfg(feature = "lua")]
-        tasks::load_script_runner(&plugins, &metrics, &script_runner, &self.script_host);
-        #[cfg(not(feature = "lua"))]
-        {
-            // Without the `lua` feature there is no script host to
-            // dispatch to; it would otherwise read as dead code.
-            let _ = &self.script_host;
+            tracing::warn!(
+                "not watching plugins directory {:?} for changes; edits to plugins \
+                 take effect when a plugin's config changes or the server restarts: {:#}",
+                self.plugins_dir,
+                e
+            );
         }
 
         let num_workers = self.worker_count.unwrap_or_else(tasks::worker_count);
@@ -851,7 +842,7 @@ async fn uds_server(
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
     data_dir: PathBuf,
-    plugins: Arc<plugins::Discovery>,
+    plugins: Arc<plugins::runtime::PluginRuntime>,
     script_runner: ScriptRunnerHandle,
     config: ConfigHandle,
 ) -> Result<()> {

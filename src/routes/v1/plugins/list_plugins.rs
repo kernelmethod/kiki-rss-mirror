@@ -1,4 +1,4 @@
-use crate::plugins::{Plugin, PluginEngine};
+use crate::plugins::{DiscoveryError, Plugin, PluginEngine};
 use crate::server::AppState;
 use axum::{
     extract::State,
@@ -27,8 +27,9 @@ pub struct PluginResponse {
     pub authors: Vec<String>,
     pub license: Option<String>,
     pub homepage: Option<String>,
-    /// The plugin's config, as it was when the server started: the defaults
-    /// from its manifest, with its config overrides applied.
+    /// The config the plugin is running with: the defaults from its manifest,
+    /// with its config overrides applied, as they were when plugins were last
+    /// loaded.
     #[schema(value_type = Object)]
     pub config: serde_json::Map<String, serde_json::Value>,
 }
@@ -62,6 +63,19 @@ pub struct PluginErrorResponse {
     pub error: String,
 }
 
+impl From<&DiscoveryError> for PluginErrorResponse {
+    fn from(e: &DiscoveryError) -> Self {
+        PluginErrorResponse {
+            directory: e
+                .dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            error: e.error.to_string(),
+        }
+    }
+}
+
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 pub struct ListPluginsResponse {
     /// The plugins that were found, in load order.
@@ -74,9 +88,10 @@ pub struct ListPluginsResponse {
 
 /// List plugins
 ///
-/// Return every plugin that was found in the plugins directory when the server started,
-/// along with the directories in it that could not be loaded as plugins and why. Plugins
-/// installed or changed since then take effect, and appear here, after a restart.
+/// Return every plugin that was found in the plugins directory when plugins were last
+/// loaded, along with the directories in it that could not be loaded as plugins and why.
+/// Plugins are reloaded when a file in the plugins directory changes, and when a plugin's
+/// config is changed.
 #[utoipa::path(
     get,
     path = "/v1/plugins",
@@ -88,19 +103,12 @@ pub struct ListPluginsResponse {
 )]
 #[axum::debug_handler]
 pub async fn list_plugins(State(state): State<AppState>) -> Response {
-    let plugins: Vec<PluginResponse> = state.plugins.plugins.iter().map(Into::into).collect();
-    let errors = state
-        .plugins
+    let discovery = state.plugins.current();
+    let plugins: Vec<PluginResponse> = discovery.plugins.iter().map(Into::into).collect();
+    let errors = discovery
         .errors
         .iter()
-        .map(|e| PluginErrorResponse {
-            directory: e
-                .dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            error: e.error.to_string(),
-        })
+        .map(PluginErrorResponse::from)
         .collect();
     Json(ListPluginsResponse {
         count: plugins.len(),
@@ -129,9 +137,6 @@ mod test {
         std::fs::create_dir_all(tc.plugins_dir().join("broken"))?;
         let tc = tc.init_server()?;
         let client = tc.client()?;
-
-        // Plugins installed after the server started are not picked up.
-        tc.install_lua_plugin("too-late", "", serde_json::json!({}))?;
 
         let resp = client.get("http://localhost/v1/plugins").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);

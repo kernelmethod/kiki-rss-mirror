@@ -12,6 +12,9 @@
 //! database, no filesystem (Landlock with an empty ruleset), and no way
 //! to open a socket (seccomp). Its entire view of the world is one
 //! inherited socket pair and whatever the server chooses to send down it.
+//! What plugins ask of the server (`kiki.store`, `kiki.entries`) goes back
+//! up that socket as a [`HostResponse::Call`], and the server decides how
+//! to answer: the child never touches the database itself.
 //!
 //! # Roles
 //!
@@ -38,13 +41,16 @@
 use crate::process::ipc::{
     decode, encode, read_frame, write_frame, HostRequest, HostResponse, MAX_FRAME_BYTES,
 };
-use crate::scripting::{Event, EventPayload, FeedEntry, ScriptRunner, ScriptSource};
+use crate::scripting::{
+    Event, EventPayload, FeedEntry, ScanSummary, ScriptRunner, ScriptServices, ScriptSource,
+    ServiceCall, ServiceReply,
+};
 use anyhow::{Context, Result};
 use std::io;
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::process::Child;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -136,6 +142,9 @@ struct Live {
 /// than each waiting out its own timeout.
 pub struct ScriptHost {
     state: Mutex<Option<Live>>,
+    /// Answers the calls plugins make while a request is served. Calls
+    /// fail until the server sets it with [`Self::set_services`].
+    services: RwLock<Option<Arc<dyn ScriptServices>>>,
 }
 
 impl ScriptHost {
@@ -166,7 +175,14 @@ impl ScriptHost {
                 stream: ours,
                 child,
             })),
+            services: RwLock::new(None),
         })
+    }
+
+    /// Answer the calls plugins make through `kiki.store` and
+    /// `kiki.entries` with `services`.
+    pub fn set_services(&self, services: Arc<dyn ScriptServices>) {
+        *self.services.write().unwrap_or_else(|e| e.into_inner()) = Some(services);
     }
 
     /// Send `request` and wait for the matching response.
@@ -180,7 +196,12 @@ impl ScriptHost {
             None => return Err(HostError::Dead),
         };
 
-        let result = exchange(&mut live.stream, request);
+        let services = self
+            .services
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let result = exchange(&mut live.stream, request, services.as_deref());
         match result {
             Ok(HostResponse::Failed { message }) => Err(HostError::Failed(message)),
             Ok(response) => Ok(response),
@@ -205,7 +226,8 @@ impl ScriptHost {
     }
 
     /// Rebuild the child's VM from `sources`, replacing whatever it was
-    /// running.
+    /// running. If `sources` fail to compile, the child keeps running the
+    /// VM it had.
     ///
     /// Returns the number of scripts the child compiled.
     pub fn reload(&self, sources: Vec<ScriptSource>) -> Result<usize, HostError> {
@@ -238,11 +260,16 @@ impl Drop for ScriptHost {
     }
 }
 
-/// Write one request and read one response.
+/// Write one request and read its response, answering the calls the host
+/// makes with `services` along the way.
 ///
 /// Failures before the first byte goes out are [`HostError::Failed`], not
 /// [`HostError::Io`] — see [`HostError::is_fatal`].
-fn exchange(stream: &mut UnixStream, request: &HostRequest) -> Result<HostResponse, HostError> {
+fn exchange(
+    stream: &mut UnixStream,
+    request: &HostRequest,
+    services: Option<&dyn ScriptServices>,
+) -> Result<HostResponse, HostError> {
     let encoded =
         encode(request).map_err(|e| HostError::Failed(format!("could not encode request: {e}")))?;
     if encoded.len() > MAX_FRAME_BYTES {
@@ -253,8 +280,23 @@ fn exchange(stream: &mut UnixStream, request: &HostRequest) -> Result<HostRespon
         )));
     }
     write_frame(stream, &encoded)?;
-    let frame = read_frame(stream)?;
-    decode(&frame).map_err(|e| HostError::Protocol(format!("decoding response: {e}")))
+    loop {
+        let frame = read_frame(stream)?;
+        let response: HostResponse =
+            decode(&frame).map_err(|e| HostError::Protocol(format!("decoding response: {e}")))?;
+        let HostResponse::Call { plugin, call } = response else {
+            return Ok(response);
+        };
+        let result = match services {
+            Some(services) => services.call(&plugin, call),
+            None => Err("not available: the server is not answering plugin calls".to_string()),
+        };
+        // An answer that cannot be sent would leave the host waiting for
+        // one, so failing to send it is fatal to the channel.
+        let encoded = encode(&HostRequest::CallResult { result })
+            .map_err(|e| HostError::Protocol(format!("encoding a call result: {e}")))?;
+        write_frame(stream, &encoded)?;
+    }
 }
 
 /// A [`ScriptRunner`] that forwards every dispatch to the script host
@@ -296,6 +338,26 @@ impl ScriptRunner for SubprocessScriptRunner {
         let request = HostRequest::Observe { event, payload };
         if let Err(e) = self.host.request(&request) {
             warn!(event = event.name(), error = %e, "script host: observe dispatch failed");
+        }
+    }
+
+    fn dispatch_scan(
+        &self,
+        scan_id: u64,
+        entries: Vec<FeedEntry>,
+    ) -> Result<Option<Vec<Option<FeedEntry>>>> {
+        match self.host.request(&HostRequest::Scan { scan_id, entries })? {
+            HostResponse::Scanned { entries } => Ok(entries),
+            other => anyhow::bail!("script host: expected a Scanned response, got {other:?}"),
+        }
+    }
+
+    fn finish_scan(&self, scan_id: u64, summary: Option<ScanSummary>) {
+        if let Err(e) = self
+            .host
+            .request(&HostRequest::FinishScan { scan_id, summary })
+        {
+            warn!(error = %e, "script host: finishing scan {scan_id} failed");
         }
     }
 }
@@ -340,12 +402,15 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
             .context("failed to install the script host sandbox")?;
     }
 
-    let mut stream = crate::process::take_parent_socket(SUBCOMMAND)?;
+    let stream = Arc::new(Mutex::new(crate::process::take_parent_socket(SUBCOMMAND)?));
+    let services: Arc<dyn ScriptServices> = Arc::new(IpcServices {
+        stream: stream.clone(),
+    });
 
     let mut runner: Option<crate::scripting::lua::LuaScriptRunner> = None;
 
     loop {
-        let frame = match read_frame(&mut stream) {
+        let frame = match read_frame(&mut *stream.lock().unwrap_or_else(|e| e.into_inner())) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 debug!("script host: server closed the channel, exiting");
@@ -358,7 +423,7 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
         };
 
         let response = match decode::<HostRequest>(&frame) {
-            Ok(request) => serve(&mut runner, request),
+            Ok(request) => serve(&mut runner, &services, request),
             Err(e) => HostResponse::Failed {
                 message: format!("undecodable request: {e}"),
             },
@@ -371,9 +436,40 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
                 return Ok(());
             }
         };
-        if let Err(e) = write_frame(&mut stream, &encoded) {
+        if let Err(e) = write_frame(
+            &mut *stream.lock().unwrap_or_else(|e| e.into_inner()),
+            &encoded,
+        ) {
             warn!(error = %e, "script host: write failed, exiting");
             return Ok(());
+        }
+    }
+}
+
+/// Answers plugins' calls in the child by asking the server over the
+/// channel, in the middle of the request being served.
+struct IpcServices {
+    stream: Arc<Mutex<UnixStream>>,
+}
+
+impl ScriptServices for IpcServices {
+    fn call(&self, plugin: &str, call: ServiceCall) -> Result<ServiceReply, String> {
+        let mut stream = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+        let encoded = encode(&HostResponse::Call {
+            plugin: plugin.to_string(),
+            call,
+        })
+        .map_err(|e| format!("could not encode the call: {e}"))?;
+        write_frame(&mut *stream, &encoded)
+            .map_err(|e| format!("could not reach the server: {e}"))?;
+        let frame =
+            read_frame(&mut *stream).map_err(|e| format!("could not reach the server: {e}"))?;
+        match decode::<HostRequest>(&frame) {
+            Ok(HostRequest::CallResult { result }) => result,
+            Ok(other) => Err(format!(
+                "the server sent {other:?} instead of a call result"
+            )),
+            Err(e) => Err(format!("undecodable call result: {e}")),
         }
     }
 }
@@ -381,20 +477,25 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
 /// Handle a single request against the child's current VM.
 fn serve(
     runner: &mut Option<crate::scripting::lua::LuaScriptRunner>,
+    services: &Arc<dyn ScriptServices>,
     request: HostRequest,
 ) -> HostResponse {
     match request {
         HostRequest::Reload { sources } => {
             let count = sources.len();
-            match crate::scripting::lua::LuaScriptRunner::from_sources(&sources) {
+            match crate::scripting::lua::LuaScriptRunner::from_sources_with(
+                &sources,
+                Some(services.clone()),
+            ) {
                 Ok(new_runner) => {
                     *runner = Some(new_runner);
                     HostResponse::Reloaded { loaded: count }
                 }
                 Err(e) => {
-                    // Drop the old VM too: continuing to run superseded
-                    // scripts would be more surprising than running none.
-                    *runner = None;
+                    // Keep the old VM: a broken edit to a plugin should not
+                    // switch off the plugins that were working, just as an
+                    // invalid edit to the config file leaves the last good
+                    // settings in force.
                     HostResponse::Failed {
                         message: format!("{e}"),
                     }
@@ -418,5 +519,26 @@ fn serve(
             }
             HostResponse::Ack
         }
+
+        HostRequest::Scan { scan_id, entries } => match runner.as_ref() {
+            None => HostResponse::Scanned { entries: None },
+            Some(r) => match r.dispatch_scan(scan_id, entries) {
+                Ok(entries) => HostResponse::Scanned { entries },
+                Err(e) => HostResponse::Failed {
+                    message: format!("{e}"),
+                },
+            },
+        },
+
+        HostRequest::FinishScan { scan_id, summary } => {
+            if let Some(r) = runner.as_ref() {
+                r.finish_scan(scan_id, summary);
+            }
+            HostResponse::Ack
+        }
+
+        HostRequest::CallResult { .. } => HostResponse::Failed {
+            message: "a call result arrived with no call outstanding".to_string(),
+        },
     }
 }

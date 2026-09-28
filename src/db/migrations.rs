@@ -37,6 +37,10 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0004_plugin_config",
         sql: include_str!("include/migrations/0004_plugin_config.sql"),
     },
+    Migration {
+        name: "0005_plugin_store",
+        sql: include_str!("include/migrations/0005_plugin_store.sql"),
+    },
 ];
 
 /// The migration that drops the `scripts` table in favour of plugins.
@@ -323,6 +327,28 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("object"))?,
         )?;
 
+        Ok(())
+    }
+
+    /// `0005_plugin_store` adds the table plugins' key-value stores are
+    /// kept in, with the same shape as a freshly-initialized database's.
+    #[test]
+    fn test_plugin_store_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        run_pending_migrations(&mut conn)?;
+
+        let fresh = ConnectionBuilder::default().in_memory().create().build()?;
+        let sql = |conn: &Connection| -> Result<String> {
+            Ok(conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'plugin_store'",
+                [],
+                |row| row.get(0),
+            )?)
+        };
+        assert_eq!(sql(&conn)?, sql(&fresh)?);
+
+        crate::db::plugins::store_set(&conn, "p", "k", Some(&serde_json::json!(1)))?;
         Ok(())
     }
 }

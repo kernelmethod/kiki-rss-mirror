@@ -47,6 +47,16 @@ CREATE TABLE plugins (
     updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+-- Each plugin's key-value store, read and written by its code with
+-- `kiki.store.get` and `kiki.store.set`. `value` is JSON.
+CREATE TABLE plugin_store (
+    plugin      VARCHAR NOT NULL,
+    key         VARCHAR NOT NULL,
+    value       VARCHAR NOT NULL CHECK (json_valid(value)),
+    updated_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (plugin, key)
+);
+
 ---------------------------------------------------------------------------------
 -- Tables for feeds
 ---------------------------------------------------------------------------------
