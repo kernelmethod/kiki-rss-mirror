@@ -45,6 +45,12 @@ impl Kiki {
     /// Spawn `kiki serve` with the given extra flags in a fresh temp
     /// data directory and wait for it to start listening.
     fn spawn(extra_args: &[&str]) -> Self {
+        Self::spawn_with(extra_args, |_| {})
+    }
+
+    /// As [`Self::spawn`], calling `setup` with the data directory once
+    /// it has been initialized and before the server starts.
+    fn spawn_with(extra_args: &[&str], setup: impl FnOnce(&Path)) -> Self {
         let dir = TempDir::with_prefix("kiki-sandbox-test").expect("create tempdir");
 
         let init_status = Command::new(KIKI_BIN)
@@ -55,6 +61,7 @@ impl Kiki {
             .status()
             .expect("spawn kiki init");
         assert!(init_status.success(), "kiki init failed: {init_status:?}");
+        setup(dir.path());
 
         let socket = dir.path().join("kiki.sock");
         let mut cmd = Command::new(KIKI_BIN);
@@ -666,24 +673,35 @@ mod script_isolation {
             .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
     }
 
-    /// Add a script and wait for the reloaded runner to report it loaded.
-    fn install_script(kiki: &mut Kiki, source: &str) {
-        install_script_with_config(kiki, source, serde_json::json!({}));
+    /// Spawn `kiki serve` with a plugin whose entrypoint is `source`
+    /// installed, and wait for the server to report it loaded.
+    fn spawn_with_script(extra_args: &[&str], source: &str) -> Kiki {
+        spawn_with_configured_script(extra_args, source, serde_json::json!({}))
     }
 
-    /// Add a script with a config and wait for the reloaded runner to
-    /// report it loaded.
-    fn install_script_with_config(kiki: &mut Kiki, source: &str, config: serde_json::Value) {
-        let body = serde_json::json!({
+    /// As [`spawn_with_script`], giving the plugin the config `config`.
+    /// Plugins are only discovered when the server starts, so the plugin
+    /// is installed before it is spawned.
+    fn spawn_with_configured_script(
+        extra_args: &[&str],
+        source: &str,
+        config: serde_json::Value,
+    ) -> Kiki {
+        let manifest = serde_json::json!({
+            "name": "test-plugin",
+            "version": "1.0.0",
             "engine": "lua",
-            "text": source,
-            "kind": "user",
             "config": config,
         });
-        kiki.post_json("/v1/scripts/create", &body.to_string())
-            .assert_success();
-        kiki.post_json("/v1/scripts/reload", "").assert_success();
+        let mut kiki = Kiki::spawn_with(extra_args, |home| {
+            let plugin = home.join("plugins").join("test-plugin");
+            std::fs::create_dir_all(&plugin).expect("create plugin directory");
+            std::fs::write(plugin.join("main.lua"), source).expect("write main.lua");
+            std::fs::write(plugin.join("manifest.json"), manifest.to_string())
+                .expect("write manifest.json");
+        });
         kiki.wait_for_scripts_loaded(1, Duration::from_secs(10));
+        kiki
     }
 
     /// Refresh `feed_id` and poll until an entry shows up, returning its
@@ -759,16 +777,14 @@ mod script_isolation {
         kiki.shutdown();
     }
 
-    /// End to end: a script registered through the API transforms a real
+    /// End to end: a script installed as a plugin transforms a real
     /// entry, with the VM in the sandboxed child and the database in the
     /// server. This is the test that fails if anything in the IPC path —
     /// framing, serialisation, the child's sandbox — is wrong.
     #[test]
     fn an_isolated_script_transforms_an_ingested_entry() {
         let (addr, _server) = spawn_local_rss_server();
-        let mut kiki = Kiki::spawn(&[]);
-
-        install_script(&mut kiki, TITLE_STAMPING_SCRIPT);
+        let mut kiki = spawn_with_script(&[], TITLE_STAMPING_SCRIPT);
         assert_eq!(kiki.script_host_pids().len(), 1);
 
         let feed_id = create_local_feed(&mut kiki, addr);
@@ -785,10 +801,8 @@ mod script_isolation {
     #[test]
     fn an_isolated_script_receives_its_config() {
         let (addr, _server) = spawn_local_rss_server();
-        let mut kiki = Kiki::spawn(&[]);
-
-        install_script_with_config(
-            &mut kiki,
+        let mut kiki = spawn_with_configured_script(
+            &[],
             r#"
             local config = ...
             kiki.on("entry.ingest", function(entry)
@@ -813,10 +827,8 @@ mod script_isolation {
     #[test]
     fn an_isolated_script_can_use_regexes() {
         let (addr, _server) = spawn_local_rss_server();
-        let mut kiki = Kiki::spawn(&[]);
-
-        install_script(
-            &mut kiki,
+        let mut kiki = spawn_with_script(
+            &[],
             r#"
             local re = kiki.regex([[^hello from (?P<how>\w+)]], "i")
             kiki.on("entry.ingest", function(entry)
@@ -839,47 +851,19 @@ mod script_isolation {
     #[test]
     fn no_script_isolation_runs_lua_in_the_server_process() {
         let (addr, _server) = spawn_local_rss_server();
-        let mut kiki = Kiki::spawn(&["--no-script-isolation"]);
+        let mut kiki = spawn_with_script(&["--no-script-isolation"], TITLE_STAMPING_SCRIPT);
 
         assert!(
             kiki.script_host_pids().is_empty(),
             "--no-script-isolation must not spawn a script host"
         );
 
-        install_script(&mut kiki, TITLE_STAMPING_SCRIPT);
         let feed_id = create_local_feed(&mut kiki, addr);
         let title = refresh_and_read_title(&mut kiki, feed_id);
         assert!(
             title.starts_with("[scripted] "),
             "in-process script did not transform the entry: {title:?}"
         );
-        kiki.shutdown();
-    }
-
-    /// A reload swaps the child's VM in place rather than respawning it —
-    /// the server cannot spawn anything once its sandbox is up, so a reload
-    /// that needed a new process would silently stop working.
-    #[test]
-    fn reloading_scripts_reuses_the_same_host_process() {
-        let (addr, _server) = spawn_local_rss_server();
-        let mut kiki = Kiki::spawn(&[]);
-
-        install_script(&mut kiki, TITLE_STAMPING_SCRIPT);
-        let before = kiki.script_host_pids();
-
-        kiki.post_json("/v1/scripts/reload", "").assert_success();
-        kiki.wait_for_scripts_loaded(1, Duration::from_secs(10));
-
-        let after = kiki.script_host_pids();
-        assert_eq!(
-            before, after,
-            "a script reload must not respawn the host process"
-        );
-
-        // And the reloaded runner still works.
-        let feed_id = create_local_feed(&mut kiki, addr);
-        let title = refresh_and_read_title(&mut kiki, feed_id);
-        assert!(title.starts_with("[scripted] "), "title was {title:?}");
         kiki.shutdown();
     }
 
@@ -905,10 +889,8 @@ mod script_isolation {
     #[test]
     fn a_failing_script_leaves_the_host_running() {
         let (addr, _server) = spawn_local_rss_server();
-        let mut kiki = Kiki::spawn(&[]);
-
-        install_script(
-            &mut kiki,
+        let mut kiki = spawn_with_script(
+            &[],
             r#"kiki.on("entry.ingest", function(entry) error("boom") end)"#,
         );
         let before = kiki.script_host_pids();

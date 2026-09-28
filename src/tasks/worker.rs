@@ -91,8 +91,7 @@ pub fn worker_count() -> usize {
 
 /// Spawn multiple worker tasks that pull from a shared channel.
 ///
-/// All workers share a single [`ScriptRunnerHandle`]; reloads are handled centrally by
-/// a separate task that listens on `reload_rx` and swaps the runner inside the handle.
+/// All workers share a single [`ScriptRunnerHandle`], installed when the server starts.
 /// They also share one [`Fetcher`], through which every feed refresh
 /// retrieves and parses its feed, and read settings from `config` afresh
 /// for every command, so a settings change applies to the next one.

@@ -36,16 +36,6 @@ INSERT INTO tags (name, kind) VALUES
     ('system:saved', 'system'),
     ('system:hidden', 'system');
 
-CREATE TABLE scripts (
-    id      INTEGER PRIMARY KEY,
-    engine  VARCHAR NOT NULL,
-    text    VARCHAR NOT NULL,
-    kind    VARCHAR NOT NULL,
-    -- JSON object handed to the script's top-level chunk as its argument.
-    config  VARCHAR NOT NULL DEFAULT '{}'
-);
-CREATE INDEX idx_scripts_kind ON scripts(kind);
-
 ---------------------------------------------------------------------------------
 -- Tables for feeds
 ---------------------------------------------------------------------------------
@@ -152,15 +142,6 @@ CREATE TABLE feed_tags (
     FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
 );
 CREATE UNIQUE INDEX idx_feed_tags_unique ON feed_tags(feed_id, tag_id);
-
--- A list of scripts that should run on entries retrieved for a given feed
-CREATE TABLE feed_scripts (
-    feed_id INTEGER NOT NULL,
-    script_id INTEGER NOT NULL,
-
-    FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
-    FOREIGN KEY(script_id) REFERENCES scripts(id) ON DELETE CASCADE
-);
 
 ---------------------------------------------------------------------------------
 -- Tables for entry sources

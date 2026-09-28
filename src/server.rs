@@ -1,7 +1,7 @@
 use crate::{
     config::{self, ConfigHandle, ConfigStore},
     db::migrations,
-    routes,
+    plugins, routes,
     scripting::ScriptRunnerHandle,
     tasks::{self, TaskManagerCommand},
 };
@@ -27,10 +27,6 @@ pub struct SharedAppState {
     /// to worker tasks used to fetch and process feeds.
     pub task_manager_tx: async_channel::Sender<TaskManagerCommand>,
 
-    /// A [`tokio::sync::watch::Sender`] used to signal all workers to reload
-    /// their configuration (e.g. Lua script runners).
-    pub reload_tx: tokio::sync::watch::Sender<()>,
-
     /// A [`r2d2::Pool`] instance that intermediates connections to the
     /// SQLite database.
     pub conn_pool: r2d2::Pool<SqliteConnectionManager>,
@@ -45,6 +41,9 @@ pub struct SharedAppState {
     /// Root directory for on-disk state. Used to locate the cached asset
     /// filesystem under `{data_dir}/assets/`.
     pub data_dir: PathBuf,
+
+    /// The plugins discovered when the server started. See [`crate::plugins`].
+    pub plugins: Arc<plugins::Discovery>,
 
     /// Shared handle to the currently-installed scripting engine. Empty when the `lua`
     /// feature is disabled or when no scripts have been loaded.
@@ -61,6 +60,7 @@ pub struct ServerBuilder<'a> {
     db_path: &'a Path,
     socket_path: Option<PathBuf>,
     config_path: Option<PathBuf>,
+    plugins_dir: Option<PathBuf>,
     autofetch: bool,
     single_threaded: bool,
     worker_count: Option<usize>,
@@ -74,6 +74,7 @@ impl<'a> ServerBuilder<'a> {
             db_path,
             socket_path: None,
             config_path: None,
+            plugins_dir: None,
             autofetch: false,
             single_threaded: false,
             worker_count: None,
@@ -91,6 +92,13 @@ impl<'a> ServerBuilder<'a> {
     /// [`config::CONFIG_FILE_NAME`] in the data directory.
     pub fn config_path(mut self, p: &Path) -> Self {
         self.config_path = Some(p.to_path_buf());
+        self
+    }
+
+    /// Discover plugins in `p` instead of the default,
+    /// [`plugins::PLUGINS_DIR_NAME`] in the data directory.
+    pub fn plugins_dir(mut self, p: &Path) -> Self {
+        self.plugins_dir = Some(p.to_path_buf());
         self
     }
 
@@ -151,9 +159,14 @@ impl<'a> ServerBuilder<'a> {
             .config_path
             .unwrap_or_else(|| data_dir.join(config::CONFIG_FILE_NAME));
 
+        let plugins_dir = self
+            .plugins_dir
+            .unwrap_or_else(|| plugins::plugins_dir(&data_dir));
+
         Server {
             db_path: PathBuf::from(self.db_path),
             config_path,
+            plugins_dir,
             data_dir,
             socket_path,
             autofetch: self.autofetch,
@@ -200,6 +213,9 @@ pub struct Server {
 
     /// Path of the config file holding settings overrides.
     config_path: PathBuf,
+
+    /// Directory plugins are discovered in.
+    plugins_dir: PathBuf,
 
     /// Path of the Unix domain socket the server listens on.
     socket_path: PathBuf,
@@ -330,32 +346,40 @@ impl Server {
         // service workers can send tasks to the feed-fetcher workers.
         let (tx, rx) = async_channel::bounded(1024);
 
-        // Watch channel for broadcasting script-reload signals.
-        let (reload_tx, reload_rx) = tokio::sync::watch::channel(());
-
         // Shared scripting engine handle; workers and HTTP handlers dispatch events
         // through it.
         let script_runner = ScriptRunnerHandle::empty();
 
-        // Build the initial runner and spawn the reloader task (lua feature only).
-        #[cfg(feature = "lua")]
-        {
-            tasks::reload_script_runner(&pool, &metrics, &script_runner, &self.script_host);
-            tokio::spawn(tasks::run_script_reloader(
-                pool.clone(),
-                metrics.clone(),
-                script_runner.clone(),
-                self.script_host.clone(),
-                reload_rx,
-                self.cancel_token.clone(),
-            ));
+        // Plugins live in a directory Kiki creates, so that there is always
+        // somewhere to install one.
+        if let Err(e) = fs::create_dir_all(&self.plugins_dir) {
+            tracing::warn!(
+                "failed to create plugins directory {:?}: {}",
+                self.plugins_dir,
+                e
+            );
         }
+
+        // Plugins are discovered once, here: installing, removing or editing
+        // one takes a restart.
+        let plugins = match plugins::discover(&self.plugins_dir) {
+            Ok(discovery) => discovery,
+            Err(e) => {
+                tracing::error!("failed to scan for plugins: {}", e);
+                plugins::Discovery::default()
+            }
+        };
+        for e in &plugins.errors {
+            tracing::warn!(dir = %e.dir.display(), "skipping plugin: {}", e.error);
+        }
+        let plugins = Arc::new(plugins);
+
+        #[cfg(feature = "lua")]
+        tasks::load_script_runner(&plugins, &metrics, &script_runner, &self.script_host);
         #[cfg(not(feature = "lua"))]
         {
-            // Without the `lua` feature there is nothing to reload and
-            // no script host to dispatch to; both would otherwise read
-            // as dead code.
-            let _ = reload_rx;
+            // Without the `lua` feature there is no script host to
+            // dispatch to; it would otherwise read as dead code.
             let _ = &self.script_host;
         }
 
@@ -448,11 +472,11 @@ impl Server {
         tokio::spawn(uds_server(
             self.socket_path,
             tx.clone(),
-            reload_tx.clone(),
             pool.clone(),
             self.cancel_token.clone(),
             metrics.clone(),
             self.data_dir.clone(),
+            plugins,
             script_runner.clone(),
             config,
         ));
@@ -813,21 +837,21 @@ fn claim_socket_path(socket_path: &Path) -> Result<()> {
 async fn uds_server(
     socket_path: PathBuf,
     tx: async_channel::Sender<TaskManagerCommand>,
-    reload_tx: tokio::sync::watch::Sender<()>,
     pool: r2d2::Pool<SqliteConnectionManager>,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
     data_dir: PathBuf,
+    plugins: Arc<plugins::Discovery>,
     script_runner: ScriptRunnerHandle,
     config: ConfigHandle,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
         task_manager_tx: tx,
-        reload_tx,
         conn_pool: pool,
         cancel_token: cancel_token.clone(),
         metrics: metrics.clone(),
         data_dir,
+        plugins,
         script_runner,
         config,
     });

@@ -107,6 +107,10 @@ impl InitArgs {
             .with_context(|| format!("failed to create database in {:?}", db_path))?;
         restrict_permissions(&db_path, 0o660)?;
 
+        let plugins_dir = crate::plugins::plugins_dir(directory);
+        fs::create_dir_all(&plugins_dir)
+            .with_context(|| format!("unable to create plugins directory {plugins_dir:?}"))?;
+
         println!("Initialized Kiki in {}", directory.display());
 
         Ok(())
@@ -181,6 +185,7 @@ mod test {
         let path = td.path().join("nested").join("home");
         assert!(args().run_in(&path).is_ok());
         assert!(path.join(paths::DB_FILE_NAME).exists());
+        assert!(path.join(crate::plugins::PLUGINS_DIR_NAME).is_dir());
 
         Ok(())
     }

@@ -44,8 +44,6 @@
 //!   timeouts — inside the child, the ways it can actually die are an OOM
 //!   kill, a panic, or a seccomp violation, and refusing to hand a fresh
 //!   VM to whatever caused the last one to die is the safer default.
-//!   Script *reloads* do not need a respawn: the host rebuilds its VM in
-//!   place when the server sends it a new set of sources.
 //! * The **feed fetcher** is a supervisor that `fork`s (allowed, unlike
 //!   `exec`) a replacement worker whenever the last one dies, because
 //!   fetching is Kiki's core job; see [`feed_fetcher`].
