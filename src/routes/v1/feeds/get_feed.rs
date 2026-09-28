@@ -26,6 +26,8 @@ pub struct GetFeedResponse {
     /// Current authentication scheme for this feed. Credentials themselves
     /// are never returned — only the scheme in use.
     pub auth_type: FeedAuthType,
+    /// Number of entries stored for this feed.
+    pub entry_count: i64,
 }
 
 /// Read the `auth_type` column at `idx` and decode it into a [`FeedAuthType`].
@@ -95,7 +97,8 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
     // statement on a blocking thread.
     let task_result = task::spawn_blocking(move || {
         let mut stmt = match conn.prepare(
-            "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at, min_fetch_interval_seconds, auth_type
+            "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at, min_fetch_interval_seconds, auth_type,
+                (SELECT COUNT(*) FROM entries WHERE feed_id = feeds.id)
                 FROM feeds WHERE id = ?1 LIMIT 1",
         ) {
             Ok(s) => s,
@@ -116,6 +119,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
                 }),
                 min_fetch_interval_seconds: row.get(7)?,
                 auth_type,
+                entry_count: row.get(9)?,
             };
             let last_fetch_error = row
                 .get::<usize, Option<String>>(5)?
