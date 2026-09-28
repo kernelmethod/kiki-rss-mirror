@@ -1,6 +1,8 @@
 mod sanitize;
+mod settings;
 
 use crate::cli::serve::ServeArgs;
+use crate::plugins::settings::{Setting, SettingType};
 use crate::routes::v1::entries::entry_assets::ListEntryAssetsResponse;
 use crate::routes::v1::entries::get_entry::GetEntryResponse;
 use crate::routes::v1::entries::{ListEntriesResponse, ListEntriesResponseEntry};
@@ -464,10 +466,12 @@ async fn plugin_page(
 }
 
 /// What a form on a plugin's page asks to do to its config.
-#[derive(Deserialize, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy)]
 enum ConfigAction {
-    /// Override setting `key` with `value`.
+    /// Override setting `key` with the value of the form's fields for it;
+    /// see [`settings::parse_input`].
+    Save,
+    /// Override setting `key` with `value`, written as JSON.
     Set,
     /// Remove the override of setting `key`, restoring its default.
     Reset,
@@ -475,22 +479,25 @@ enum ConfigAction {
     ResetAll,
 }
 
-/// A form submitted from a plugin's page.
-#[derive(Deserialize)]
-struct ConfigForm {
-    action: ConfigAction,
-    /// The setting to change; unused by [`ConfigAction::ResetAll`].
-    #[serde(default)]
-    key: String,
-    /// The setting's new value, as JSON; used only by [`ConfigAction::Set`].
-    #[serde(default)]
-    value: String,
+impl ConfigAction {
+    /// The action named `name` by a form's `action` field.
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "save" => Self::Save,
+            "set" => Self::Set,
+            "reset" => Self::Reset,
+            "reset_all" => Self::ResetAll,
+            _ => return None,
+        })
+    }
 }
 
 /// Change plugin `name`'s config as a form on its page asks, then send the
 /// browser back to the page.
 ///
-/// A value that is not valid JSON, or a config too large for the server to
+/// The form's `action` field says what to do (see [`ConfigAction`]) and its
+/// `key` field names the setting to change. A value that does not match its
+/// setting or is not valid JSON, or a config too large for the server to
 /// save, is reported on the plugin's page, and nothing is changed. Forms
 /// submitted from other sites are refused with `403 Forbidden`; see
 /// [`is_same_origin`].
@@ -498,7 +505,7 @@ async fn update_plugin_config(
     State(api): State<reqwest::Client>,
     UrlPath(name): UrlPath<String>,
     headers: HeaderMap,
-    Form(form): Form<ConfigForm>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
     if !is_same_origin(&headers) {
         return (
@@ -508,40 +515,60 @@ async fn update_plugin_config(
             .into_response();
     }
 
+    let form = settings::FormValues::new(pairs);
+    let key = form.first("key").unwrap_or_default().to_owned();
+    let Some(action) = form.first("action").and_then(ConfigAction::from_name) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "Unknown form action.").into_response();
+    };
+    let invalid = |error: String| {
+        let api = api.clone();
+        let name = name.clone();
+        async move {
+            render_plugin_config_page(&api, &name, StatusCode::UNPROCESSABLE_ENTITY, Some(&error))
+                .await
+        }
+    };
+    if key.is_empty() && !matches!(action, ConfigAction::ResetAll) {
+        return invalid("Give the setting a name.".into()).await;
+    }
+
     let config_url = plugin_api_url(&name, &["config"]);
-    let req = match form.action {
-        ConfigAction::Set => {
-            if form.key.is_empty() {
-                return render_plugin_config_page(
-                    &api,
-                    &name,
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Some("Give the setting a name."),
-                )
-                .await;
-            }
-            let value: Value = match serde_json::from_str(&form.value) {
+    let req = match action {
+        ConfigAction::Save => {
+            let config =
+                match fetch_optional::<PluginConfigResponse>(&api, config_url.clone()).await {
+                    Ok(Some(config)) => config,
+                    Ok(None) => return plugin_not_found(),
+                    Err(e) => return server_unavailable(&e),
+                };
+            let setting = setting_for(&config, &key);
+            let value = match settings::parse_input(&setting, &key, &form) {
                 Ok(value) => value,
                 Err(e) => {
-                    let error = format!(
-                        "The value for {} is not valid JSON ({e}). Strings must be in \
-                         double quotes.",
-                        form.key
-                    );
-                    return render_plugin_config_page(
-                        &api,
-                        &name,
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        Some(&error),
-                    )
+                    return invalid(format!("{} was not saved: {e}.", setting.label())).await;
+                }
+            };
+            let mut changes = Map::new();
+            changes.insert(key, value);
+            api.patch(config_url).json(&changes)
+        }
+        ConfigAction::Set => {
+            let text = form.first("value").unwrap_or_default();
+            let value: Value = match serde_json::from_str(text) {
+                Ok(value) => value,
+                Err(e) => {
+                    return invalid(format!(
+                        "The value for {key} is not valid JSON ({e}). Strings must be in \
+                         double quotes."
+                    ))
                     .await;
                 }
             };
             let mut changes = Map::new();
-            changes.insert(form.key, value);
+            changes.insert(key, value);
             api.patch(config_url).json(&changes)
         }
-        ConfigAction::Reset => api.delete(plugin_api_url(&name, &["config", &form.key])),
+        ConfigAction::Reset => api.delete(plugin_api_url(&name, &["config", &key])),
         ConfigAction::ResetAll => api.delete(config_url),
     };
 
@@ -574,6 +601,16 @@ async fn update_plugin_config(
             }
         }
         StatusCode::NOT_FOUND => plugin_not_found(),
+        StatusCode::UNPROCESSABLE_ENTITY => {
+            let error = resp.text().await.unwrap_or_default();
+            let error = error.trim();
+            invalid(if error.is_empty() {
+                "The config was not saved.".to_owned()
+            } else {
+                format!("The config was not saved. {error}.")
+            })
+            .await
+        }
         StatusCode::PAYLOAD_TOO_LARGE => {
             render_plugin_config_page(
                 &api,
@@ -1264,6 +1301,9 @@ fn render_plugin_details(plugin: &PluginResponse) -> String {
 /// [`render_plugin_details`], then its config, `config`, with a form for
 /// each setting, a form to add one and a form to reset them all. `error`,
 /// if there is one, is shown above the config.
+///
+/// The settings the plugin's manifest describes come first, in the order
+/// it gives them, then the others, by name.
 fn render_plugin_page(
     plugin: &PluginResponse,
     config: &PluginConfigResponse,
@@ -1290,30 +1330,41 @@ fn render_plugin_page(
     html.push_str("<h3>Config</h3>\n");
     // Settings the plugin is running with but that are no longer set are
     // listed too, until the plugins reload without them.
-    let keys: BTreeSet<&String> = config.config.keys().chain(config.active.keys()).collect();
+    let described: Vec<&str> = config.settings.iter().map(|s| s.name.as_str()).collect();
+    let others: BTreeSet<&str> = config
+        .config
+        .keys()
+        .chain(config.active.keys())
+        .map(String::as_str)
+        .filter(|k| !described.contains(k))
+        .collect();
+    let keys: Vec<&str> = described.into_iter().chain(others).collect();
     if keys.is_empty() {
         html.push_str("<p>This plugin has no settings.</p>\n");
-    } else {
-        html.push_str(
-            "<p class=\"meta\">Values are JSON: strings go in double quotes, as in \
-             <code>\"hello\"</code>; numbers, <code>true</code>, <code>false</code>, \
-             <code>null</code>, lists and objects are written as they are.</p>\n\
-             <table class=\"config\">\n",
-        );
-        for key in keys {
-            html.push_str(&render_config_setting(&action, key, config));
-        }
-        html.push_str("</table>\n");
+    }
+    for (i, key) in keys.into_iter().enumerate() {
+        html.push_str(&render_config_setting(&action, key, config, i));
     }
 
-    html.push_str(&format!(
-        "<h3>Add a setting</h3>\n\
-         <form method=\"post\" action=\"{action}\" class=\"config-form\">\
+    let add_form = format!(
+        "<form method=\"post\" action=\"{action}\" class=\"config-form\">\
          <input type=\"hidden\" name=\"action\" value=\"set\">\
          <input type=\"text\" name=\"key\" placeholder=\"name\" aria-label=\"Name\" required>\
          <input type=\"text\" name=\"value\" placeholder=\"value, as JSON\" aria-label=\"Value\" required>\
-         <button type=\"submit\">Add</button></form>\n"
-    ));
+         <button type=\"submit\">Add</button></form>\n\
+         <p class=\"meta\">Values are JSON: strings go in double quotes, as in \
+         <code>\"hello\"</code>; numbers, <code>true</code>, <code>false</code>, \
+         <code>null</code>, lists and objects are written as they are.</p>\n"
+    );
+    if config.settings.is_empty() {
+        html.push_str(&format!("<h3>Add a setting</h3>\n{add_form}"));
+    } else {
+        // Plugins that describe their settings rarely need others.
+        html.push_str(&format!(
+            "<details class=\"add-setting\"><summary>Add a setting the plugin does not \
+             describe</summary>\n{add_form}</details>\n"
+        ));
+    }
     if !config.overrides.is_empty() {
         html.push_str(&format!(
             "<form method=\"post\" action=\"{action}\" class=\"config-form\">\
@@ -1326,29 +1377,95 @@ fn render_plugin_page(
     html
 }
 
-/// Render the row of the config table for setting `key` of `config`: a
-/// form, submitted to `action`, to change its value or restore its
-/// default, and where its value comes from.
-fn render_config_setting(action: &str, key: &str, config: &PluginConfigResponse) -> String {
+/// The setting that describes config key `key` of `config`: the one the
+/// plugin's manifest gives, or else one guessed from the key's default, or
+/// its value if it has no default. See [`guess_setting_type`].
+fn setting_for(config: &PluginConfigResponse, key: &str) -> Setting {
+    if let Some(setting) = config.settings.iter().find(|s| s.name == key) {
+        return setting.clone();
+    }
+    let example = config
+        .defaults
+        .get(key)
+        .or_else(|| config.config.get(key))
+        .or_else(|| config.active.get(key));
+    Setting {
+        name: key.to_owned(),
+        label: None,
+        description: None,
+        required: false,
+        kind: example.map(guess_setting_type).unwrap_or(SettingType::Json),
+    }
+}
+
+/// The type of setting that `example`, a value of it, suggests: booleans,
+/// numbers and strings are edited as such, lists of strings or of integers
+/// one item per line, and anything else as JSON.
+fn guess_setting_type(example: &Value) -> SettingType {
+    let list_of = |items: SettingType| SettingType::List {
+        items: Box::new(items),
+    };
+    match example {
+        Value::Bool(_) => SettingType::Boolean,
+        Value::Number(n) if n.is_i64() => SettingType::Integer {
+            min: None,
+            max: None,
+        },
+        Value::Number(_) => SettingType::Number {
+            min: None,
+            max: None,
+        },
+        Value::String(s) => SettingType::String {
+            multiline: s.contains('\n'),
+        },
+        Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_string) => {
+            list_of(SettingType::String { multiline: false })
+        }
+        Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_i64) => {
+            list_of(SettingType::Integer {
+                min: None,
+                max: None,
+            })
+        }
+        _ => SettingType::Json,
+    }
+}
+
+/// Render the section of the plugin page for setting `key` of `config`,
+/// the `index`th on the page: its label and description, a form, submitted
+/// to `action`, to change its value or restore its default, and where its
+/// value comes from.
+///
+/// The form has fields that fit the setting (see [`setting_for`]), with a
+/// second form to edit the value as JSON; a value that does not fit them is
+/// only shown as JSON.
+fn render_config_setting(
+    action: &str,
+    key: &str,
+    config: &PluginConfigResponse,
+    index: usize,
+) -> String {
+    let setting = setting_for(config, key);
     let default = config.defaults.get(key);
     let overridden = config.overrides.contains_key(key);
     let value = config.config.get(key);
     let active = config.active.get(key);
-    let key_html = escape(key);
-
-    // Lists and objects get room to be written out over several lines.
     let shown = value.or(active);
-    let field = if shown.is_some_and(|v| v.is_array() || v.is_object()) {
-        format!(
-            "<textarea name=\"value\" rows=\"4\" aria-label=\"Value of {key_html}\">{}</textarea>",
-            escape(shown.map(to_json_pretty).unwrap_or_default())
-        )
-    } else {
-        format!(
-            "<input type=\"text\" name=\"value\" value=\"{}\" aria-label=\"Value of {key_html}\">",
-            escape(shown.map(to_json).unwrap_or_default())
-        )
-    };
+    let key_html = escape(key);
+    let id = format!("setting-{index}");
+
+    let mut html = format!("<section class=\"setting\" id=\"{id}\">\n<h4>");
+    if setting.label() != key {
+        html.push_str(&format!("{} ", escape(setting.label())));
+    }
+    html.push_str(&format!("<code>{key_html}</code></h4>\n"));
+    if let Some(description) = setting.description.as_deref() {
+        html.push_str(&format!(
+            "<p class=\"description\">{}</p>\n",
+            escape(description)
+        ));
+    }
+
     let reset = match (overridden, default.is_some()) {
         (true, true) => {
             "<button type=\"submit\" name=\"action\" value=\"reset\">Reset to default</button>"
@@ -1356,16 +1473,69 @@ fn render_config_setting(action: &str, key: &str, config: &PluginConfigResponse)
         (true, false) => "<button type=\"submit\" name=\"action\" value=\"reset\">Remove</button>",
         (false, _) => "",
     };
+    let form = |fields: &str, save: &str| {
+        format!(
+            "<form method=\"post\" action=\"{action}\" class=\"setting-form\">\
+             <input type=\"hidden\" name=\"key\" value=\"{key_html}\">{fields}\
+             <div class=\"buttons\"><button type=\"submit\" name=\"action\" value=\"{save}\">\
+             Save</button>{reset}</div></form>\n"
+        )
+    };
 
-    let mut notes = vec![match (overridden, default) {
-        (true, Some(default)) => format!(
-            "overrides the default, <code>{}</code>",
-            escape(to_json(default))
-        ),
-        (true, None) => "set here; the manifest has no default".to_owned(),
-        (false, Some(_)) => "default".to_owned(),
-        (false, None) => "no longer set".to_owned(),
-    }];
+    // Lists and objects get room to be written out over several lines.
+    let json_field = if shown.is_some_and(|v| v.is_array() || v.is_object()) {
+        format!(
+            "<textarea name=\"value\" rows=\"4\" class=\"json\" aria-label=\"Value of {key_html}, as JSON\">{}</textarea>",
+            escape(shown.map(to_json_pretty).unwrap_or_default())
+        )
+    } else {
+        format!(
+            "<input type=\"text\" name=\"value\" value=\"{}\" class=\"json\" aria-label=\"Value of {key_html}, as JSON\">",
+            escape(shown.map(to_json).unwrap_or_default())
+        )
+    };
+    let typed = match setting.kind {
+        SettingType::Json => None,
+        _ => settings::render_input(&setting, shown, &id),
+    };
+    let mut notes = Vec::new();
+    match typed {
+        Some(fields) => {
+            html.push_str(&form(&fields, "save"));
+            html.push_str(&format!(
+                "<details class=\"as-json\"><summary>Edit as JSON</summary>\n{}</details>\n",
+                form(&json_field, "set")
+            ));
+        }
+        None => {
+            html.push_str(&form(&json_field, "set"));
+            if !matches!(setting.kind, SettingType::Json) {
+                notes.push(
+                    "shown as JSON, since the value does not fit the setting's fields".to_owned(),
+                );
+            }
+        }
+    }
+
+    notes.insert(
+        0,
+        match (overridden, default) {
+            (true, Some(default)) => {
+                let default = to_json(default);
+                if default.len() <= 80 {
+                    format!("overrides the default, <code>{}</code>", escape(default))
+                } else {
+                    "overrides the default".to_owned()
+                }
+            }
+            (true, None) => "set here; the manifest has no default".to_owned(),
+            (false, Some(_)) => "default".to_owned(),
+            (false, None) => "no longer set".to_owned(),
+        },
+    );
+    if value.is_some_and(Value::is_null) {
+        notes.push("set to <code>null</code>, hiding the default".to_owned());
+    }
     if value != active {
         notes.push(match active {
             Some(active) => format!(
@@ -1375,15 +1545,11 @@ fn render_config_setting(action: &str, key: &str, config: &PluginConfigResponse)
             None => "not set in the config the plugin is running with".to_owned(),
         });
     }
-
-    format!(
-        "<tr><th scope=\"row\"><code>{key_html}</code></th><td>\
-         <form method=\"post\" action=\"{action}\" class=\"config-form\">\
-         <input type=\"hidden\" name=\"key\" value=\"{key_html}\">{field}\
-         <button type=\"submit\" name=\"action\" value=\"set\">Save</button>{reset}</form>\
-         <span class=\"meta\">{}</span></td></tr>\n",
+    html.push_str(&format!(
+        "<span class=\"meta\">{}</span>\n</section>\n",
         notes.join(" &middot; ")
-    )
+    ));
+    html
 }
 
 /// `value` as compact JSON.
@@ -2439,6 +2605,23 @@ mod tests {
         );
         assert!(body.contains(r#"name="value" value="1""#), "{body}");
         assert!(body.contains("<textarea name=\"value\""), "{body}");
+        // Settings the manifest does not describe get fields that fit their
+        // defaults, and can be edited as JSON too.
+        assert!(
+            body.contains(r#"<input type="text" name="v" id="setting-1-v" value="hi""#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<input type="number" step="1" name="v" id="setting-0-v" value="1""#),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                r#"<textarea name="v" id="setting-2-v" rows="3" aria-label="tags">a</textarea>"#
+            ),
+            "{body}"
+        );
+        assert!(body.contains("<summary>Edit as JSON</summary>"), "{body}");
         assert!(!body.contains("Reset to default"), "{body}");
         assert!(!body.contains("reset_all"), "{body}");
         assert!(!body.contains(r#"class="notice""#), "{body}");
@@ -2516,6 +2699,326 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(stored_overrides(&tc)?, serde_json::json!({}));
         assert!(!body.contains(r#"class="notice""#), "{body}");
+        Ok(())
+    }
+
+    /// A plugin, `rules`, whose manifest describes its settings: a
+    /// boolean, a choice and a list of objects. The server is running.
+    fn rules_plugin() -> Result<crate::test::TestConfig> {
+        let tc = TestBuilder::default().init_database().build()?;
+        let dir = tc.plugins_dir().join("rules");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("manifest.toml"),
+            r#"
+            name = "rules"
+            version = "1.0.0"
+            engine = "lua"
+
+            [config]
+            on = true
+            mode = "fast"
+            rules = [{ pattern = "a", fields = ["title"] }]
+            toggles = [{ enabled = false }]
+
+            [[settings]]
+            name = "on"
+            type = "boolean"
+            label = "Enabled"
+            description = "Whether to do anything."
+
+            [[settings]]
+            name = "mode"
+            type = "choice"
+            choices = ["fast", "slow"]
+
+            [[settings]]
+            name = "rules"
+            type = "list"
+            label = "Rules"
+            [settings.items]
+            type = "object"
+            [[settings.items.fields]]
+            name = "pattern"
+            type = "string"
+            required = true
+            [[settings.items.fields]]
+            name = "fields"
+            type = "list"
+            items = { type = "choice", choices = ["title", "content"] }
+            [[settings.items.fields]]
+            name = "feeds"
+            type = "list"
+            items = { type = "integer" }
+
+            [[settings]]
+            name = "toggles"
+            type = "list"
+            [settings.items]
+            type = "object"
+            [[settings.items.fields]]
+            name = "enabled"
+            type = "boolean"
+            [[settings.items.fields]]
+            name = "note"
+            type = "string"
+            "#,
+        )?;
+        std::fs::write(dir.join("main.lua"), "")?;
+        tc.init_server()
+    }
+
+    fn stored_rules(tc: &crate::test::TestConfig) -> Result<Value> {
+        Ok(Value::Object(crate::db::plugins::get_config_overrides(
+            &tc.database_conn()?,
+            "rules",
+        )?))
+    }
+
+    /// Settings the manifest describes get fields that fit them, in the
+    /// order the manifest gives.
+    #[tokio::test]
+    async fn described_settings_get_fitting_fields() -> Result<()> {
+        let tc = rules_plugin()?;
+        let (status, body) = get_page(tc.client()?, "/plugins/rules").await?;
+        assert_eq!(status, StatusCode::OK);
+
+        assert!(body.contains("<h4>Enabled <code>on</code></h4>"), "{body}");
+        assert!(body.contains("Whether to do anything."), "{body}");
+        assert!(
+            body.contains(
+                r#"<input type="checkbox" name="v" id="setting-0-v" value="true" checked> Enabled"#
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                r#"<option value="fast" selected>fast</option><option value="slow">slow</option>"#
+            ),
+            "{body}"
+        );
+        assert!(
+            !body.contains("(not set)</option><option value=\"fast\" selected"),
+            "{body}"
+        );
+        // One fieldset per rule, and a blank one to add a rule.
+        assert!(body.contains(r#"name="v#count" value="2""#), "{body}");
+        assert!(
+            body.contains(r#"name="v.0.pattern" id="setting-2-v.0.pattern" value="a""#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"name="v.0.fields" value="title" checked"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"name="v.0.fields" value="content">"#),
+            "{body}"
+        );
+        assert!(body.contains(r#"name="remove" value="v.0""#), "{body}");
+        assert!(
+            body.contains(r#"name="v.1.pattern" id="setting-2-v.1.pattern" value="""#),
+            "{body}"
+        );
+        assert!(body.contains(r#"<legend>Add to Rules</legend>"#), "{body}");
+        assert!(body.find("<code>on</code>") < body.find("<code>mode</code>"));
+        assert!(body.find("<code>mode</code>") < body.find("<code>rules</code>"));
+        assert!(
+            body.contains("Add a setting the plugin does not describe"),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// Saving a described setting reads its value from its fields.
+    #[tokio::test]
+    async fn described_settings_are_saved_from_their_fields() -> Result<()> {
+        let tc = rules_plugin()?;
+        let path = "/plugins/rules/config";
+
+        // An unticked box is false.
+        let (status, body) = post_form(
+            tc.client()?,
+            path,
+            &[("action", "save"), ("key", "on")],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(stored_rules(&tc)?, serde_json::json!({"on": false}));
+
+        let (status, _) = post_form(
+            tc.client()?,
+            path,
+            &[("action", "save"), ("key", "mode"), ("v", "slow")],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+
+        // Edit the first rule, remove it, keep the second, and add a third
+        // from the blank fieldset; a blank one adds nothing.
+        let (status, body) = post_form(
+            tc.client()?,
+            path,
+            &[
+                ("action", "save"),
+                ("key", "rules"),
+                ("v#count", "4"),
+                ("v.0.pattern", "gone"),
+                ("remove", "v.0"),
+                ("v.1.pattern", "b"),
+                ("v.1.fields", "title"),
+                ("v.1.fields", "content"),
+                ("v.1.feeds", "1\r\n\r\n2\r\n"),
+                ("v.2.pattern", "c"),
+                ("v.3.pattern", ""),
+                ("v.3.feeds", ""),
+            ],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            stored_rules(&tc)?,
+            serde_json::json!({
+                "on": false,
+                "mode": "slow",
+                "rules": [
+                    {"pattern": "b", "fields": ["title", "content"], "feeds": [1, 2]},
+                    {"pattern": "c"},
+                ],
+            })
+        );
+        assert!(
+            body.contains(r#"name="v.1.pattern" id="setting-2-v.1.pattern" value="c""#),
+            "{body}"
+        );
+
+        // Removing every item leaves an empty list.
+        let (status, _) = post_form(
+            tc.client()?,
+            path,
+            &[
+                ("action", "save"),
+                ("key", "rules"),
+                ("v#count", "1"),
+                ("v.0.pattern", "b"),
+                ("remove", "v.0"),
+            ],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            stored_rules(&tc)?.get("rules"),
+            Some(&serde_json::json!([]))
+        );
+        Ok(())
+    }
+
+    /// An item already in a list is kept when all its fields are left empty
+    /// or unticked; only the blank fieldset for a new item is dropped.
+    #[tokio::test]
+    async fn existing_items_are_kept_when_left_blank() -> Result<()> {
+        let tc = rules_plugin()?;
+        let (_, body) = get_page(tc.client()?, "/plugins/rules").await?;
+        assert!(body.contains(r#"name="v.0#present" value="1""#), "{body}");
+        assert!(!body.contains(r#"name="v.1#present""#), "{body}");
+
+        // What the browser submits for the page as it is: the item's box is
+        // unticked, and its note and the blank fieldset are empty.
+        let (status, body) = post_form(
+            tc.client()?,
+            "/plugins/rules/config",
+            &[
+                ("action", "save"),
+                ("key", "toggles"),
+                ("v#count", "2"),
+                ("v.0#present", "1"),
+                ("v.0.note", ""),
+                ("v.1.note", ""),
+            ],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            stored_rules(&tc)?,
+            serde_json::json!({"toggles": [{"enabled": false}]})
+        );
+        Ok(())
+    }
+
+    /// Fields that do not hold a value of their setting's type are reported,
+    /// and nothing is saved; so are JSON values the API refuses.
+    #[tokio::test]
+    async fn described_settings_are_checked() -> Result<()> {
+        let tc = rules_plugin()?;
+        let path = "/plugins/rules/config";
+
+        for (form, error) in [
+            (
+                &[("v#count", "1"), ("v.0.fields", "title")][..],
+                "Rules was not saved: rules[0].pattern: is required.",
+            ),
+            (
+                &[("v#count", "1"), ("v.0.pattern", "a"), ("v.0.feeds", "x")],
+                "Rules was not saved: rules[0].feeds[0]: &quot;x&quot; is not a whole number.",
+            ),
+            (
+                &[
+                    ("v#count", "1"),
+                    ("v.0.pattern", "a"),
+                    ("v.0.fields", "url"),
+                ],
+                "Rules was not saved: rules[0].fields[0]: expected one of",
+            ),
+        ] {
+            let mut pairs = vec![("action", "save"), ("key", "rules")];
+            pairs.extend_from_slice(form);
+            let (status, body) = post_form(tc.client()?, path, &pairs, &[]).await?;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(body.contains(error), "{error}: {body}");
+        }
+
+        let (status, body) = post_form(
+            tc.client()?,
+            path,
+            &[("action", "set"), ("key", "mode"), ("value", "\"medium\"")],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            body.contains("The config was not saved. Invalid config: mode: expected one of"),
+            "{body}"
+        );
+        assert_eq!(stored_rules(&tc)?, serde_json::json!({}));
+        Ok(())
+    }
+
+    /// A value that does not fit its setting's fields, set some other way,
+    /// is shown as JSON.
+    #[tokio::test]
+    async fn values_that_do_not_fit_are_shown_as_json() -> Result<()> {
+        let tc = rules_plugin()?;
+        let overrides = serde_json::json!({"rules": [{"pattern": "a", "fields": "title"}]});
+        crate::db::plugins::set_config_overrides(
+            &tc.database_conn()?,
+            "rules",
+            overrides.as_object().unwrap_or(&Map::new()),
+        )?;
+        let (status, body) = get_page(tc.client()?, "/plugins/rules").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains(r#"<div class="items" id="setting-2-v">"#),
+            "{body}"
+        );
+        assert!(
+            body.contains("shown as JSON, since the value does not fit the setting's fields"),
+            "{body}"
+        );
         Ok(())
     }
 

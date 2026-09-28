@@ -19,12 +19,29 @@
     .plugins .description { margin: 0.25rem 0; }
     .plugin .error { padding: 0.5rem; border: 1px solid #c00; color: #900; }
     .plugin .notice { padding: 0.5rem; border: 1px solid #ca0; background: #fff8dd; }
-    .config { width: 100%; border-collapse: collapse; }
-    .config th, .config td { padding: 0.5rem 0.5rem 0.5rem 0; border-bottom: 1px solid #ddd; text-align: left; vertical-align: top; }
-    .config th { width: 1%; white-space: nowrap; }
     .config-form { display: flex; flex-wrap: wrap; gap: 0.25rem; margin: 0.5rem 0; }
     .config-form input[type=text] { flex: 1 1 10rem; font-family: monospace; }
-    .config-form textarea { flex: 1 1 100%; font-family: monospace; }
+    .setting { padding: 0.5rem 0 0.75rem; border-bottom: 1px solid #ddd; }
+    .setting h4 { margin: 0.25rem 0; }
+    .setting h4 code { font-weight: normal; font-size: 0.875rem; color: #666; }
+    .setting .description { margin: 0.25rem 0; }
+    .setting-form { margin: 0.5rem 0; }
+    .setting-form input[type=text], .setting-form input[type=number], .setting-form textarea, .setting-form select { box-sizing: border-box; max-width: 100%; font: inherit; }
+    .setting-form input[type=text], .setting-form textarea { width: 100%; }
+    .setting-form textarea, .setting-form .json { font-family: monospace; }
+    .setting-form .buttons { display: flex; gap: 0.25rem; margin-top: 0.5rem; }
+    .setting-form fieldset { margin: 0.5rem 0; border: 1px solid #ddd; }
+    .setting-form .item.new { border-style: dashed; }
+    .setting-form .field { margin: 0.5rem 0; }
+    .setting-form .field > label { display: block; font-weight: 600; }
+    .setting-form legend { font-weight: 600; }
+    .setting-form .choices { display: flex; flex-wrap: wrap; gap: 0 1rem; border: none; padding: 0; margin: 0; }
+    .setting-form .check { font-weight: normal; }
+    .setting-form .remove { display: block; margin-top: 0.25rem; color: #900; }
+    .hint { display: block; font-size: 0.875rem; color: #666; }
+    .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+    details.as-json, details.add-setting { margin: 0.25rem 0; }
+    details summary { cursor: pointer; color: #666; font-size: 0.875rem; }
     .feed-header h2 { margin-bottom: 0.25rem; }
     .feed-header .description { margin: 0.5rem 0; }
     .meta { display: block; font-size: 0.875rem; color: #666; }

@@ -7,6 +7,7 @@
 //! load with it, they keep running with the config they had.
 
 use crate::db::plugins::{self as db, ConfigOverrides, PluginConfigError};
+use crate::plugins::settings::{check_config, Setting};
 use crate::plugins::{apply_config_overrides, Plugin};
 use crate::server::AppState;
 use axum::{
@@ -48,6 +49,12 @@ pub struct PluginConfigResponse {
     /// could not. The plugins that were running keep running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reload_error: Option<String>,
+    /// Descriptions of the plugin's settings, from its manifest: the type of
+    /// value each holds, and a label and description for it. Keys without
+    /// one may hold any value.
+    #[serde(default)]
+    #[schema(value_type = Vec<Object>)]
+    pub settings: Vec<Setting>,
 }
 
 impl PluginConfigResponse {
@@ -60,8 +67,33 @@ impl PluginConfigResponse {
             overrides,
             config,
             reload_error,
+            settings: plugin.manifest.settings.clone(),
         }
     }
+}
+
+/// Checks the config values `values`, about to be saved as overrides of
+/// plugin `name`, against the plugin's settings, answering `422
+/// Unprocessable Entity` if one does not match.
+///
+/// A plugin that is not loaded is let through, for [`with_plugin`] to
+/// answer.
+fn check_overrides(
+    state: &AppState,
+    name: &str,
+    values: &Map<String, Value>,
+) -> Result<(), Response> {
+    let discovery = state.plugins.current();
+    let Some(plugin) = discovery.plugins.iter().find(|p| p.manifest.name == name) else {
+        return Ok(());
+    };
+    check_config(&plugin.manifest.settings, values).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("Invalid config: {e}"),
+        )
+            .into_response()
+    })
 }
 
 /// Whether a route changes the overrides, and so must reload the plugins.
@@ -185,6 +217,9 @@ pub async fn get_plugin_config(
 /// manifest; an empty object removes every override. A key set to `null` is passed to the
 /// plugin as `nil`, hiding its default.
 ///
+/// Keys described by the plugin's settings must hold values of the setting's type, or be
+/// `null`.
+///
 /// The plugins are reloaded, so that the new config takes effect at once. If they fail to
 /// load with it, the response says why in `reload_error`, and they keep running with the
 /// config they had.
@@ -199,7 +234,7 @@ pub async fn get_plugin_config(
         (status = 200, description = "The plugin's updated config", body = PluginConfigResponse),
         (status = 404, description = "Plugin not found"),
         (status = 413, description = "The overrides are too large"),
-        (status = 422, description = "The request body is not a JSON object"),
+        (status = 422, description = "The request body is not a JSON object, or a value does not match its setting"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "plugins"
@@ -210,6 +245,7 @@ pub async fn put_plugin_config(
     Path(name): Path<String>,
     Json(overrides): Json<Map<String, Value>>,
 ) -> Result<Response, Response> {
+    check_overrides(&state, &name, &overrides)?;
     with_plugin(&state, name, Access::Write, move |conn, name| {
         db::set_config_overrides(conn, name, &overrides)?;
         Ok(overrides)
@@ -225,6 +261,9 @@ pub async fn put_plugin_config(
 /// which is passed to the plugin as `nil`, hiding its default; to restore a key's default,
 /// delete its override instead.
 ///
+/// Keys described by the plugin's settings must hold values of the setting's type, or be
+/// `null`.
+///
 /// The plugins are reloaded, so that the new config takes effect at once. If they fail to
 /// load with it, the response says why in `reload_error`, and they keep running with the
 /// config they had.
@@ -239,7 +278,7 @@ pub async fn put_plugin_config(
         (status = 200, description = "The plugin's updated config", body = PluginConfigResponse),
         (status = 404, description = "Plugin not found"),
         (status = 413, description = "The overrides are too large"),
-        (status = 422, description = "The request body is not a JSON object"),
+        (status = 422, description = "The request body is not a JSON object, or a value does not match its setting"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "plugins"
@@ -250,6 +289,7 @@ pub async fn patch_plugin_config(
     Path(name): Path<String>,
     Json(changes): Json<Map<String, Value>>,
 ) -> Result<Response, Response> {
+    check_overrides(&state, &name, &changes)?;
     with_plugin(&state, name, Access::Write, move |conn, name| {
         db::update_config_overrides(conn, name, |overrides| overrides.extend(changes))
     })
@@ -520,6 +560,47 @@ mod test {
         let resp = client.put(URL).json(&json!([1, 2])).send().await?;
         assert!(resp.status().is_client_error(), "{}", resp.status());
         assert_eq!(stored(&tc)?, json!({}));
+
+        Ok(())
+    }
+
+    /// Values of keys a plugin describes with a setting must match it.
+    #[tokio::test]
+    async fn test_overrides_must_match_settings() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        let dir = tc.plugins_dir().join("hello");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("manifest.toml"),
+            "name = 'hello'\nversion = '1.0.0'\nengine = 'lua'\n\
+             [config]\nn = 1\n\
+             [[settings]]\nname = 'n'\ntype = 'integer'\nmin = 0\n",
+        )?;
+        std::fs::write(dir.join("main.lua"), "")?;
+        let tc = tc.init_server()?;
+        let client = tc.client()?;
+
+        let resp = client.get(URL).send().await?;
+        let body = resp.json::<PluginConfigResponse>().await?;
+        assert_eq!(body.settings.len(), 1);
+        assert_eq!(body.settings[0].name, "n");
+
+        for req in [client.put(URL), client.patch(URL)] {
+            let resp = req.json(&json!({"n": -1})).send().await?;
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(resp.text().await?, "Invalid config: n: must be at least 0");
+        }
+        assert_eq!(stored(&tc)?, json!({}));
+
+        let resp = client
+            .patch(URL)
+            .json(&json!({"n": 5, "other": "x"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = client.patch(URL).json(&json!({"n": null})).send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(stored(&tc)?, json!({"n": null, "other": "x"}));
 
         Ok(())
     }

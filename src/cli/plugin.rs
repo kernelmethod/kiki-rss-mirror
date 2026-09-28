@@ -219,7 +219,9 @@ impl SetArgs {
     fn set(&self, home: &Path, input: &str) -> Result<ConfigOverrides> {
         let changes = toml_to_config(input)
             .with_context(|| format!("failed to parse TOML from {:?}", self.file))?;
-        find_plugin(home, &self.name)?;
+        let plugin = find_plugin(home, &self.name)?;
+        plugins::settings::check_config(&plugin.manifest.settings, &changes)
+            .with_context(|| format!("invalid config for plugin {:?}", self.name))?;
 
         let mut conn = ConnectionBuilder::default()
             .at_path(&database(home))
@@ -380,7 +382,8 @@ mod tests {
     use tempfile::TempDir;
 
     /// A home directory with a database and one plugin, `hello`, whose
-    /// defaults are `a = 1` and `b = [1, 2]`.
+    /// defaults are `a = 1` and `b = [1, 2]`, and whose setting `a` is an
+    /// integer.
     fn home() -> TempDir {
         let home = TempDir::with_prefix("kiki-plugin").unwrap();
         ConnectionBuilder::default()
@@ -394,7 +397,8 @@ mod tests {
         std::fs::write(
             dir.join(plugins::MANIFEST_FILE_NAME),
             "name = 'hello'\nversion = '1.0.0'\nengine = 'lua'\n\
-             description = 'Says hello'\n[config]\na = 1\nb = [1, 2]\n",
+             description = 'Says hello'\n[config]\na = 1\nb = [1, 2]\n\
+             [[settings]]\nname = 'a'\ntype = 'integer'\n",
         )
         .unwrap();
         std::fs::write(dir.join("main.lua"), "").unwrap();
@@ -508,6 +512,13 @@ mod tests {
         let home = home();
         assert!(set(&home, "not toml", false).is_err());
         assert!(set(&home, "a = nan", false).is_err());
+
+        let err = set(&home, "a = 'x'", false).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "invalid config for plugin \"hello\": a: expected an integer"
+        );
+        assert_eq!(get(&home, false, true), "");
 
         let missing = SetArgs {
             name: "missing".into(),

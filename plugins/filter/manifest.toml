@@ -1,12 +1,18 @@
 name = "filter"
-version = "1.1.0"
+version = "2.0.0"
 engine = "lua"
 description = "Hide or tag entries whose fields match, or fail to match, regular expressions"
 license = "MIT"
 homepage = "https://github.com/kernelmethod/kiki-rss"
 
-# The rules are empty by default. Set them with, for example,
-# `kiki plugin config set filter rules.toml`, where rules.toml holds:
+# Entries matching an `exclude` rule are hidden. When an entry's feed has
+# `include` rules, entries matching none of them are hidden too. Entries
+# matching a `tag` rule get its tag. A rule's `feeds` names feeds by id, or
+# by the URL they are fetched from. See main.lua for every setting.
+#
+# The rules are empty by default. Set them in the web UI or with, for
+# example, `kiki plugin config set filter rules.toml`, where rules.toml
+# holds:
 #
 #     [[exclude]]
 #     fields = ["title"]
@@ -23,13 +29,129 @@ homepage = "https://github.com/kernelmethod/kiki-rss"
 #     pattern = '\bzero-day\b'
 #     flags = "i"
 #     tag = "urgent"
-#
-# Entries matching an `exclude` rule are hidden. When an entry's feed has
-# `include` rules, entries matching none of them are hidden too. Entries
-# matching a `tag` rule get its tag. A rule's `feeds` names feeds by id, or
-# by the URL they are fetched from. See main.lua for every setting.
 [config]
 exclude = []
 include = []
 tag = []
 rescan = true
+
+[[settings]]
+name = "exclude"
+type = "list"
+label = "Exclude rules"
+description = "Entries matching any of these rules are hidden."
+
+[settings.items]
+type = "object"
+
+[[settings.items.fields]]
+name = "pattern"
+type = "string"
+required = true
+label = "Pattern"
+description = "A regular expression, in the syntax of kiki.regex."
+
+[[settings.items.fields]]
+name = "flags"
+type = "string"
+label = "Flags"
+description = "kiki.regex flags, such as \"i\" for case-insensitive."
+
+[[settings.items.fields]]
+name = "fields"
+type = "list"
+items = { type = "choice", choices = ["title", "url", "content", "authors", "categories", "guid"] }
+label = "Fields"
+description = "The entry fields to match. None ticked means title and content."
+
+[[settings.items.fields]]
+name = "feeds"
+type = "list"
+items = { type = "feed" }
+label = "Feeds"
+description = "The feeds the rule applies to, each by its id or the URL it is fetched from. Leave empty for every feed."
+
+[[settings]]
+name = "include"
+type = "list"
+label = "Include rules"
+description = "When an entry's feed has include rules, entries matching none of them are hidden."
+
+[settings.items]
+type = "object"
+
+[[settings.items.fields]]
+name = "pattern"
+type = "string"
+required = true
+label = "Pattern"
+description = "A regular expression, in the syntax of kiki.regex."
+
+[[settings.items.fields]]
+name = "flags"
+type = "string"
+label = "Flags"
+description = "kiki.regex flags, such as \"i\" for case-insensitive."
+
+[[settings.items.fields]]
+name = "fields"
+type = "list"
+items = { type = "choice", choices = ["title", "url", "content", "authors", "categories", "guid"] }
+label = "Fields"
+description = "The entry fields to match. None ticked means title and content."
+
+[[settings.items.fields]]
+name = "feeds"
+type = "list"
+items = { type = "feed" }
+label = "Feeds"
+description = "The feeds the rule applies to, each by its id or the URL it is fetched from. Leave empty for every feed."
+
+[[settings]]
+name = "tag"
+type = "list"
+label = "Tag rules"
+description = "Entries matching one of these rules, and not hidden, get its tag."
+
+[settings.items]
+type = "object"
+
+[[settings.items.fields]]
+name = "pattern"
+type = "string"
+required = true
+label = "Pattern"
+description = "A regular expression, in the syntax of kiki.regex."
+
+[[settings.items.fields]]
+name = "tag"
+type = "string"
+required = true
+label = "Tag"
+description = "The tag to add: a user tag, or a system tag such as system:saved."
+
+[[settings.items.fields]]
+name = "flags"
+type = "string"
+label = "Flags"
+description = "kiki.regex flags, such as \"i\" for case-insensitive."
+
+[[settings.items.fields]]
+name = "fields"
+type = "list"
+items = { type = "choice", choices = ["title", "url", "content", "authors", "categories", "guid"] }
+label = "Fields"
+description = "The entry fields to match. None ticked means title and content."
+
+[[settings.items.fields]]
+name = "feeds"
+type = "list"
+items = { type = "feed" }
+label = "Feeds"
+description = "The feeds the rule applies to, each by its id or the URL it is fetched from. Leave empty for every feed."
+
+[[settings]]
+name = "rescan"
+type = "boolean"
+label = "Rescan stored entries"
+description = "Apply the rules to the entries already stored whenever they change."
