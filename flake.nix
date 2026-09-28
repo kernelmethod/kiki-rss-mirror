@@ -22,9 +22,13 @@
               docsFilter = path: _type: builtins.match ".*/src/.*\\.md$" path != null;
               # Web UI pages pulled in via include_str! (e.g. src/cli/web/*.html)
               htmlFilter = path: _type: builtins.match ".*/src/.*\\.html$" path != null;
+              # Bundled plugins, whose tests pull them in via include_str!
+              # (e.g. plugins/filter/main.lua)
+              pluginsFilter = path: _type: builtins.match ".*/plugins(/.*)?" path != null;
               customOrCargo = path: type:
                 (sqlFilter path type) || (xmlFilter path type) || (docsFilter path type)
-                || (htmlFilter path type) || (craneLib.filterCargoSources path type);
+                || (htmlFilter path type) || (pluginsFilter path type)
+                || (craneLib.filterCargoSources path type);
             in
               pkgs.lib.cleanSourceWith {
                 src = ./.;
