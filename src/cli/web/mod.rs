@@ -1291,9 +1291,11 @@ fn render_feeds(resp: &ListFeedsResponse, page: u32) -> String {
                 feed.last_checked.as_deref(),
             );
             html.push_str(&format!(
-                "<li><a href=\"/feeds/{}\">{}</a>{meta}</li>\n",
+                "<li><a href=\"/feeds/{}\">{}</a> <span class=\"entry-count\">({} {})</span>{meta}</li>\n",
                 feed.id,
-                escape(display_feed_title(&feed.title))
+                escape(display_feed_title(&feed.title)),
+                feed.entry_count,
+                if feed.entry_count == 1 { "entry" } else { "entries" }
             ));
         }
         html.push_str("</ol>\n");

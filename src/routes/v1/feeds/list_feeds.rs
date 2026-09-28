@@ -77,7 +77,8 @@ pub async fn list_feeds(
 
         let feeds = conn
             .prepare(
-                "SELECT id, title, url, description, last_checked, min_fetch_interval_seconds, auth_type
+                "SELECT id, title, url, description, last_checked, min_fetch_interval_seconds, auth_type,
+                (SELECT COUNT(*) FROM entries WHERE feed_id = feeds.id)
                 FROM feeds LIMIT ?1 OFFSET ?2",
             )
             .inspect_err(|e| {
@@ -95,6 +96,7 @@ pub async fn list_feeds(
                     }),
                     min_fetch_interval_seconds: row.get(5)?,
                     auth_type,
+                    entry_count: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
