@@ -155,6 +155,8 @@ config as TOML (`--defaults` or `--overrides` for just one part), and
 `kiki plugin config set <name> [FILE]` sets overrides from a TOML document,
 read from `FILE` or standard input, keeping the others unless `--replace` is
 given. `kiki plugin ls` lists the installed plugins.
+In the web UI (`kiki web`), each plugin on the Plugins page links to a page
+that shows its config and has a form to set, reset or add each setting.
 Since overrides live outside the plugin directory, a new version of a plugin
 can be dropped in without losing them. As with any other change to a plugin,
 a new config takes effect when the server restarts.
