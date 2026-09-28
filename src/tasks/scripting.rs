@@ -2,7 +2,7 @@
 use crate::metrics::Metrics;
 use crate::scripting::ScriptRunner;
 #[cfg(feature = "lua")]
-use crate::scripting::ScriptRunnerHandle;
+use crate::scripting::{ScriptRunnerHandle, ScriptSource};
 #[cfg(feature = "lua")]
 use anyhow::Result;
 #[cfg(feature = "lua")]
@@ -60,13 +60,18 @@ pub(super) fn fire_fetch_success(
     }
 }
 
-/// Load all Lua script source texts from the database.
+/// Load every Lua script, with its config, from the database.
 #[cfg(feature = "lua")]
 pub(super) fn load_all_script_sources(
     conn: &r2d2::PooledConnection<SqliteConnectionManager>,
-) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT text FROM scripts ORDER BY id")?;
-    let rows = stmt.query_map([], |row| row.get(0))?;
+) -> Result<Vec<ScriptSource>> {
+    let mut stmt = conn.prepare("SELECT text, config FROM scripts ORDER BY id")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ScriptSource {
+            text: row.get(0)?,
+            config: row.get(1)?,
+        })
+    })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
@@ -159,7 +164,7 @@ pub fn reload_script_runner(
     // No isolated host: compile into a VM in this process.
     let _ = host;
     let count = sources.len() as f64;
-    match crate::scripting::lua::LuaScriptRunner::new(&sources) {
+    match crate::scripting::lua::LuaScriptRunner::from_sources(&sources) {
         Ok(runner) => {
             handle.set(if empty {
                 None

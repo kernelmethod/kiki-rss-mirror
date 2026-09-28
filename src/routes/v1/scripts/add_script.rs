@@ -9,6 +9,11 @@ pub struct AddScriptRequest {
     pub text: String,
     #[serde(default = "default_kind")]
     pub kind: String,
+    /// The script's config, handed to its top-level chunk as its argument. Defaults to an
+    /// empty object.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub config: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_kind() -> String {
@@ -42,13 +47,17 @@ pub async fn add_script(
     })?;
 
     let result = task::spawn_blocking(move || {
-        conn.prepare("INSERT INTO scripts (engine, text, kind) VALUES (?1, ?2, ?3) RETURNING id")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([payload.engine, payload.text, payload.kind], |row| {
-                row.get(0)
-            })
+        let config = serde_json::Value::Object(payload.config).to_string();
+        conn.prepare(
+            "INSERT INTO scripts (engine, text, kind, config) VALUES (?1, ?2, ?3, ?4) RETURNING id",
+        )
+        .inspect_err(|e| {
+            event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+        })?
+        .query_row(
+            [payload.engine, payload.text, payload.kind, config],
+            |row| row.get(0),
+        )
     })
     .await;
 
@@ -96,6 +105,7 @@ mod test {
                 engine: "lua".to_string(),
                 text: "kiki.on(\"entry.ingest\", function(entry) return entry end)".to_string(),
                 kind: "user".to_string(),
+                config: Default::default(),
             })
             .send()
             .await?;
@@ -121,6 +131,7 @@ mod test {
                 engine: "lua".to_string(),
                 text: text.to_string(),
                 kind: "user".to_string(),
+                config: Default::default(),
             })
             .send()
             .await?;
@@ -149,6 +160,7 @@ mod test {
                 engine: "lua".to_string(),
                 text: "kiki.on(\"entry.ingest\", function(entry) return entry end)".to_string(),
                 kind: "system".to_string(),
+                config: Default::default(),
             })
             .send()
             .await?;

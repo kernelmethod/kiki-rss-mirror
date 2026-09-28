@@ -8,7 +8,7 @@ use axum::{
 use tokio::task;
 use tracing::{event, Level};
 
-use super::list_scripts::ScriptResponse;
+use super::list_scripts::{ScriptResponse, SCRIPT_COLUMNS};
 
 /// Get script information
 ///
@@ -38,25 +38,23 @@ pub async fn get_script(State(state): State<AppState>, Path(id): Path<i64>) -> R
 
     let task_result = task::spawn_blocking(move || {
         let query_result = conn
-            .prepare("SELECT id, engine, text, kind FROM scripts WHERE id = ?1 LIMIT 1")
+            .prepare(&format!(
+                "SELECT {SCRIPT_COLUMNS} FROM scripts WHERE id = ?1 LIMIT 1"
+            ))
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
-            .query_row([id], |row| {
-                Ok(ScriptResponse {
-                    id: row.get(0)?,
-                    engine: row.get(1)?,
-                    text: row.get(2)?,
-                    kind: row.get(3)?,
-                })
-            });
-        Ok::<_, rusqlite::Error>(query_result)
+            .query_row([id], ScriptResponse::from_row);
+        match query_result {
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            other => other.map(Some),
+        }
     })
     .await;
 
     match task_result {
-        Ok(Ok(Ok(script))) => (StatusCode::OK, Json(script)).into_response(),
-        Ok(Ok(Err(_))) => (StatusCode::NOT_FOUND, "Script not found").into_response(),
+        Ok(Ok(Some(script))) => (StatusCode::OK, Json(script)).into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "Script not found").into_response(),
         Ok(Err(e)) => {
             event!(Level::ERROR, "error in get_script: {:?}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
@@ -89,6 +87,7 @@ mod test {
                 engine: "lua".to_string(),
                 text: text.to_string(),
                 kind: "user".to_string(),
+                config: Default::default(),
             })
             .send()
             .await?;

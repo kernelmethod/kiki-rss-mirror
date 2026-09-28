@@ -23,9 +23,14 @@
 //!   via [`Lua::set_memory_limit`].
 //!
 //! Timeouts surface as execution errors; for `entry.ingest` handlers the entry passes
-//! through unmodified, for observe handlers the failure is dropped.
+//! through unmodified, for observe handlers the failure is dropped. Regexes compiled through
+//! `kiki.regex` live outside the Lua allocator and have limits of their own; see
+//! the `regex_api` module.
 
-use super::{Event, EventPayload, FeedEntry, ScriptRunner};
+mod config;
+mod regex_api;
+
+use super::{parse_script_config, Event, EventPayload, FeedEntry, ScriptRunner, ScriptSource};
 use mlua::prelude::*;
 use mlua::HookTriggers;
 use mlua::RegistryKey;
@@ -62,6 +67,10 @@ pub enum ScriptError {
         "script returned a value of type {0}; scripts must register handlers via `kiki.on(event, handler)` and must not return a value"
     )]
     InvalidReturnType(String),
+
+    /// A script's config is not a JSON object.
+    #[error(transparent)]
+    InvalidConfig(#[from] super::ScriptConfigError),
 }
 
 impl IntoLua for FeedEntry {
@@ -181,18 +190,30 @@ pub struct LuaScriptRunner {
 }
 
 impl LuaScriptRunner {
-    /// Build a runner from a slice of Lua script source strings.
+    /// Build a runner from a slice of Lua script source strings, each with an empty config.
     ///
-    /// The VM is sandboxed and memory-capped before any script is loaded. Each source may
-    /// either `return` a function (legacy `entry.ingest` shortcut) or register handlers
-    /// directly via `kiki.on`.
+    /// See [`Self::from_sources`].
     ///
     /// # Errors
     ///
-    /// Returns [`ScriptError::ScriptLoadError`] for VM-setup or compile failures, and
-    /// [`ScriptError::InvalidReturnType`] if a chunk returns something other than `nil` or
-    /// a function.
+    /// As for [`Self::from_sources`].
     pub fn new(script_sources: &[String]) -> Result<Self, ScriptError> {
+        let sources: Vec<ScriptSource> = script_sources.iter().map(ScriptSource::new).collect();
+        Self::from_sources(&sources)
+    }
+
+    /// Build a runner from scripts and their configs.
+    ///
+    /// The VM is sandboxed and memory-capped before any script is loaded. Each script's
+    /// top-level chunk is called with its config, converted to a Lua table, as its only
+    /// argument, and registers handlers via `kiki.on`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError::InvalidConfig`] if a config is not a JSON object,
+    /// [`ScriptError::ScriptLoadError`] for VM-setup, compile, or top-level runtime failures,
+    /// and [`ScriptError::InvalidReturnType`] if a chunk returns a value.
+    pub fn from_sources(script_sources: &[ScriptSource]) -> Result<Self, ScriptError> {
         let lua = Lua::new_with(
             LuaStdLib::STRING | LuaStdLib::TABLE | LuaStdLib::MATH | LuaStdLib::OS,
             LuaOptions::default(),
@@ -271,18 +292,23 @@ impl LuaScriptRunner {
                 .map_err(ScriptError::ScriptLoadError)?;
         }
 
+        regex_api::install(&lua, &kiki).map_err(ScriptError::ScriptLoadError)?;
+
         lua.globals()
             .set("kiki", kiki)
             .map_err(ScriptError::ScriptLoadError)?;
 
-        // Load each script. Chunks register handlers via `kiki.on(...)` side effects and
-        // must not return a value — any return (including a function) is treated as an
+        // Load each script, passing it its config. Chunks register handlers via
+        // `kiki.on(...)` side effects and must not return a value — any return (including a function) is treated as an
         // error to catch accidentally-copied legacy scripts at load time rather than
         // silently.
         for source in script_sources {
+            let config = parse_script_config(&source.config)?;
+            let config =
+                config::to_lua_table(&lua, &config).map_err(ScriptError::ScriptLoadError)?;
             let value: LuaValue = lua
-                .load(source.as_str())
-                .eval()
+                .load(source.text.as_str())
+                .call(config)
                 .map_err(ScriptError::ScriptLoadError)?;
             match value {
                 LuaValue::Nil => {}
@@ -461,6 +487,94 @@ mod tests {
             content: Some("<p>Hello</p>".to_string()),
             tags: vec![],
         }
+    }
+
+    #[test]
+    fn config_is_passed_to_the_chunk() {
+        let runner = LuaScriptRunner::from_sources(&[ScriptSource {
+            text: r#"
+                local config = ...
+                kiki.on("entry.ingest", function(entry)
+                    entry.title = config.prefix .. entry.title .. config.suffixes[2]
+                        .. tostring(config.count) .. tostring(config.missing)
+                    return entry
+                end)
+            "#
+            .to_string(),
+            config: r#"{"prefix": "[x] ", "suffixes": ["a", "b"], "count": 3, "missing": null}"#
+                .to_string(),
+        }])
+        .unwrap();
+        let out = runner
+            .dispatch_transform_entry(make_entry())
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.title, "[x] Test Titleb3nil");
+    }
+
+    #[test]
+    fn each_script_gets_its_own_config() {
+        let script = r#"
+            local config = ...
+            kiki.on("entry.ingest", function(entry)
+                entry.title = entry.title .. config.tag
+                return entry
+            end)
+        "#;
+        let runner = LuaScriptRunner::from_sources(&[
+            ScriptSource {
+                text: script.to_string(),
+                config: r#"{"tag": "-1"}"#.to_string(),
+            },
+            ScriptSource {
+                text: script.to_string(),
+                config: r#"{"tag": "-2"}"#.to_string(),
+            },
+        ])
+        .unwrap();
+        let out = runner
+            .dispatch_transform_entry(make_entry())
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.title, "Test Title-1-2");
+    }
+
+    #[test]
+    fn scripts_without_config_get_an_empty_table() {
+        let runner = LuaScriptRunner::new(&[r#"
+            local config = ...
+            assert(type(config) == "table" and next(config) == nil)
+        "#
+        .to_string()])
+        .unwrap();
+        drop(runner);
+    }
+
+    #[test]
+    fn config_that_is_not_an_object_is_rejected() {
+        for config in ["[]", "1", "not json"] {
+            let err = LuaScriptRunner::from_sources(&[ScriptSource {
+                text: String::new(),
+                config: config.to_string(),
+            }])
+            .err()
+            .unwrap();
+            assert!(
+                matches!(err, ScriptError::InvalidConfig(_)),
+                "{config:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_regex_in_config_fails_the_load() {
+        let err = LuaScriptRunner::from_sources(&[ScriptSource {
+            text: "local config = ...; kiki.regex(config.pattern)".to_string(),
+            config: r#"{"pattern": "("}"#.to_string(),
+        }])
+        .err()
+        .unwrap();
+        assert!(matches!(err, ScriptError::ScriptLoadError(_)), "{err}");
     }
 
     #[test]
@@ -744,6 +858,38 @@ mod tests {
         .unwrap();
         let result = runner.dispatch_transform_entry(make_entry()).unwrap();
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn handlers_can_use_regexes_compiled_at_load_time() {
+        let runner = LuaScriptRunner::new(&[r#"
+            local promo = kiki.regex([[\b(sponsored|giveaway)\b]], "i")
+            kiki.on("entry.ingest", function(entry)
+                if promo:is_match(entry.title) then
+                    table.insert(entry.tags, "promo")
+                end
+                return entry
+            end)
+        "#
+        .to_string()])
+        .unwrap();
+
+        let mut entry = make_entry();
+        entry.title = "A Sponsored post".to_string();
+        let result = runner.dispatch_transform_entry(entry).unwrap().unwrap();
+        assert_eq!(result.tags, vec!["promo"]);
+
+        let result = runner
+            .dispatch_transform_entry(make_entry())
+            .unwrap()
+            .unwrap();
+        assert!(result.tags.is_empty());
+    }
+
+    #[test]
+    fn an_invalid_regex_fails_the_script_at_load_time() {
+        let result = LuaScriptRunner::new(&[r#"local re = kiki.regex("(")"#.to_string()]);
+        assert!(matches!(result, Err(ScriptError::ScriptLoadError(_))));
     }
 
     #[test]

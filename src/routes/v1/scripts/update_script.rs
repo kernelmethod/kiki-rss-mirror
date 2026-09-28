@@ -9,13 +9,17 @@ use thiserror::Error;
 use tokio::task;
 use tracing::{event, Level};
 
-use super::list_scripts::ScriptResponse;
+use super::list_scripts::{ScriptResponse, SCRIPT_COLUMNS};
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 pub struct UpdateScriptRequest {
     pub engine: Option<String>,
     pub text: Option<String>,
     pub kind: Option<String>,
+    /// Replaces the script's config, which is handed to its top-level chunk as its
+    /// argument.
+    #[schema(value_type = Option<Object>)]
+    pub config: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Error, Debug)]
@@ -89,6 +93,13 @@ pub async fn update_script(
             params.push(Box::new(kind.clone()));
         }
 
+        if let Some(config) = &payload.config {
+            updates.push("config = ?".to_string());
+            params.push(Box::new(
+                serde_json::Value::Object(config.clone()).to_string(),
+            ));
+        }
+
         if updates.is_empty() {
             return Err(UpdateScriptTaskError::InvalidUpdate);
         }
@@ -102,18 +113,13 @@ pub async fn update_script(
         })?;
 
         let script = conn
-            .prepare("SELECT id, engine, text, kind FROM scripts WHERE id = ?1 LIMIT 1")
+            .prepare(&format!(
+                "SELECT {SCRIPT_COLUMNS} FROM scripts WHERE id = ?1 LIMIT 1"
+            ))
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare select statement: {:?}", e);
             })?
-            .query_row([id], |row| {
-                Ok(ScriptResponse {
-                    id: row.get(0)?,
-                    engine: row.get(1)?,
-                    text: row.get(2)?,
-                    kind: row.get(3)?,
-                })
-            })?;
+            .query_row([id], ScriptResponse::from_row)?;
 
         Ok::<ScriptResponse, UpdateScriptTaskError>(script)
     })
@@ -169,6 +175,7 @@ mod test {
                 engine: "lua".to_string(),
                 text: "kiki.on(\"entry.ingest\", function(entry) return entry end)".to_string(),
                 kind: "user".to_string(),
+                config: Default::default(),
             })
             .send()
             .await?;
@@ -182,6 +189,7 @@ mod test {
                 engine: None,
                 text: Some(new_text.to_string()),
                 kind: None,
+                config: None,
             })
             .send()
             .await?;
@@ -206,6 +214,7 @@ mod test {
                 engine: Some("lua".to_string()),
                 text: None,
                 kind: None,
+                config: None,
             })
             .send()
             .await?;
@@ -226,6 +235,7 @@ mod test {
                 engine: "lua".to_string(),
                 text: "kiki.on(\"entry.ingest\", function(entry) return entry end)".to_string(),
                 kind: "user".to_string(),
+                config: Default::default(),
             })
             .send()
             .await?;
@@ -238,6 +248,7 @@ mod test {
                 engine: None,
                 text: None,
                 kind: None,
+                config: None,
             })
             .send()
             .await?;
@@ -267,6 +278,7 @@ mod test {
                 engine: "lua".to_string(),
                 text: "kiki.on(\"entry.ingest\", function(entry) return entry end)".to_string(),
                 kind: "user".to_string(),
+                config: Default::default(),
             })
             .send()
             .await?;
@@ -300,6 +312,7 @@ mod test {
                 engine: None,
                 text: Some("kiki.on(\"entry.ingest\", function(entry) return nil end)".to_string()),
                 kind: None,
+                config: None,
             })
             .send()
             .await?;
@@ -338,6 +351,67 @@ mod test {
                 "filter script should have prevented entries after reload"
             );
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_script_config() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        let id = client
+            .post("http://localhost/v1/scripts/create")
+            .json(&serde_json::json!({
+                "engine": "lua",
+                "text": "local config = ...",
+                "config": {"rules": [{"field": "title", "pattern": "a"}]},
+            }))
+            .send()
+            .await?
+            .json::<AddScriptResponse>()
+            .await?
+            .id;
+
+        let resp = client
+            .get(format!("http://localhost/v1/scripts/id/{id}"))
+            .send()
+            .await?;
+        let body = resp.json::<ScriptResponse>().await?;
+        assert_eq!(
+            serde_json::Value::Object(body.config),
+            serde_json::json!({"rules": [{"field": "title", "pattern": "a"}]})
+        );
+
+        // Updating another field leaves the config alone.
+        let resp = client
+            .put(format!("http://localhost/v1/scripts/id/{id}"))
+            .json(&serde_json::json!({"text": "local config = ... -- v2"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<ScriptResponse>().await?;
+        assert_eq!(body.config.len(), 1);
+
+        let resp = client
+            .put(format!("http://localhost/v1/scripts/id/{id}"))
+            .json(&serde_json::json!({"config": {"rules": []}}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<ScriptResponse>().await?;
+        assert_eq!(
+            serde_json::Value::Object(body.config),
+            serde_json::json!({"rules": []})
+        );
+
+        // A config must be an object.
+        let resp = client
+            .put(format!("http://localhost/v1/scripts/id/{id}"))
+            .json(&serde_json::json!({"config": ["not", "an", "object"]}))
+            .send()
+            .await?;
+        assert!(resp.status().is_client_error(), "got {}", resp.status());
 
         Ok(())
     }
