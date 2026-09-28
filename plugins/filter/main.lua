@@ -15,11 +15,13 @@
 --
 --   pattern  The regular expression, in the syntax of kiki.regex.
 --   flags    Optional kiki.regex flags, such as "i" for case-insensitive.
---   fields   The entry fields to match: a name or a list of names, from
---            title, url, content, authors, categories and guid. A rule
---            matches if the pattern matches any of them (for authors and
---            categories, any one of the entry's). Defaults to
---            { "title", "content" }.
+--   fields   The entry fields to match: a list of names, from title, url,
+--            content, authors, categories and guid. A rule matches if the
+--            pattern matches any of them (for authors and categories, any
+--            one of the entry's). Defaults to { "title", "content" }. A
+--            single name is accepted in place of a list, but the settings
+--            in manifest.toml, which the web UI and config API go by, only
+--            allow lists.
 --   feeds    Optional list of the feeds the rule applies to, each given
 --            by its id or by the URL it is fetched from. Without it, the
 --            rule applies to every feed.

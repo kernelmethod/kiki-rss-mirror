@@ -26,7 +26,19 @@
 //!
 //! [config]
 //! patterns = ["sponsored"]
+//!
+//! [[settings]]
+//! name = "patterns"
+//! type = "list"
+//! items = { type = "string" }
+//! label = "Patterns"
+//! description = "Hide entries whose title contains one of these."
 //! ```
+//!
+//! The optional `[[settings]]` array describes the settings in `[config]`:
+//! the type of value each holds, and a label and description for it. The
+//! web UI shows a form field that fits each described setting, and configs
+//! that do not match their settings are refused; see [`settings`].
 //!
 //! The config a plugin runs with is these defaults with the plugin's
 //! overrides, kept in the database's `plugins` table (see
@@ -56,6 +68,7 @@
 pub mod defaults;
 pub mod runtime;
 pub mod services;
+pub mod settings;
 
 #[cfg(all(test, feature = "lua"))]
 mod filter_tests;
@@ -214,6 +227,13 @@ pub struct PluginManifest {
     #[serde(default, deserialize_with = "deserialize_config")]
     #[schema(value_type = Object)]
     pub config: serde_json::Map<String, serde_json::Value>,
+
+    /// Descriptions of the settings in the plugin's config, the manifest's
+    /// `[[settings]]` array: the type of value each holds, and how to show
+    /// it to people editing it. See [`settings`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<Object>)]
+    pub settings: Vec<settings::Setting>,
 }
 
 fn default_enabled() -> bool {
@@ -299,8 +319,9 @@ impl PluginManifest {
     /// # Errors
     ///
     /// Returns [`PluginError::InvalidManifest`] if `text` is not a manifest,
-    /// and [`PluginError::InvalidName`], [`PluginError::InvalidVersion`] or
-    /// [`PluginError::InvalidEntrypoint`] if one of its fields is invalid.
+    /// and [`PluginError::InvalidName`], [`PluginError::InvalidVersion`],
+    /// [`PluginError::InvalidEntrypoint`] or [`PluginError::InvalidSettings`]
+    /// if one of its fields is invalid.
     ///
     /// # Examples
     ///
@@ -340,6 +361,7 @@ impl PluginManifest {
         if !is_plain_relative_path(Path::new(entrypoint)) || !entrypoint.ends_with(&extension) {
             return Err(PluginError::InvalidEntrypoint(entrypoint.to_string()));
         }
+        settings::validate_settings(&self.settings, &self.config)?;
         Ok(())
     }
 }
@@ -387,6 +409,11 @@ pub enum PluginError {
          the plugin directory"
     )]
     InvalidEntrypoint(String),
+
+    /// The manifest's `[[settings]]` are not well formed, or a default in
+    /// its `[config]` does not match its setting.
+    #[error("invalid settings: {0}")]
+    InvalidSettings(#[from] settings::InvalidSettings),
 
     /// The entrypoint named by the manifest does not exist.
     #[error("entrypoint {0:?} not found")]
@@ -883,6 +910,7 @@ mod tests {
             homepage: None,
             enabled: true,
             config: Default::default(),
+            settings: vec![],
         }
     }
 

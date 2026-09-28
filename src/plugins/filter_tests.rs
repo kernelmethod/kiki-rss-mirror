@@ -145,6 +145,24 @@ fn exclude_rules_win_over_include_rules() {
     assert!(hidden(&runner, e));
 }
 
+/// The manifest describes the rules, so the web UI can edit them, and the
+/// config API accepts rules written as the plugin documents them.
+#[test]
+fn the_manifest_describes_the_rules() {
+    let manifest = crate::plugins::PluginManifest::parse(MANIFEST).unwrap();
+    let names: Vec<_> = manifest.settings.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["exclude", "include", "rescan"]);
+    let config = json!({
+        "exclude": [{"fields": ["title"], "pattern": "x", "flags": "i"}],
+        "include": [{"pattern": "rust", "feeds": [3]}],
+        "rescan": false,
+    });
+    crate::plugins::settings::check_config(&manifest.settings, config.as_object().unwrap())
+        .unwrap();
+    let runner = filter(config).unwrap();
+    assert!(hidden(&runner, entry(1, "x")));
+}
+
 #[test]
 fn rules_can_name_feeds_by_url() {
     let feeds = Arc::new(Feeds::default());
@@ -287,7 +305,7 @@ async fn stored_entries_are_filtered_when_the_rules_change() -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("manifest.toml"), MANIFEST)?;
     std::fs::write(dir.join("main.lua"), MAIN)?;
-    let overrides = json!({"exclude": [{"fields": "title", "pattern": "sponsored"}]});
+    let overrides = json!({"exclude": [{"fields": ["title"], "pattern": "sponsored"}]});
     crate::db::plugins::set_config_overrides(
         &tc.database_conn()?,
         "filter",
@@ -340,7 +358,7 @@ async fn stored_entries_are_filtered_when_the_rules_change() -> Result<()> {
     // Changing the rules applies them to stored entries.
     let resp = client
         .patch(url)
-        .json(&json!({"exclude": [{"fields": "title", "pattern": "webinar"}]}))
+        .json(&json!({"exclude": [{"fields": ["title"], "pattern": "webinar"}]}))
         .send()
         .await?;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
