@@ -7,8 +7,9 @@
 
 use crate::tasks::assets::resolve_http_url;
 use lol_html::errors::RewritingError;
-use lol_html::html_content::Element;
+use lol_html::html_content::{ContentType, Element};
 use lol_html::{doc_comments, element, HtmlRewriter, Settings};
+use quick_xml::escape::escape;
 use url::Url;
 
 /// Elements that are kept, with their attributes stripped. Every other
@@ -98,9 +99,12 @@ const DROPPED: &[&str] = &[
 /// Elements in an allowlist of formatting elements are kept, but lose all
 /// of their attributes except:
 ///
-/// - `href` on `<a>`, and `src` and `alt` on `<img>`, where the URL is
-///   `http(s)` after resolving it against `base`. A link without such a URL
-///   loses its `href`; an image without one is removed.
+/// - `href` on `<a>`, where the URL is `http(s)` after resolving it
+///   against `base`. A link without such a URL loses its `href`.
+/// - `src` and `alt` on `<img>`. Images are never loaded from where the
+///   feed says they are: `image_src` maps an image's resolved `http(s)` URL
+///   to the URL of a local copy. An image with no local copy is replaced
+///   by a link to it, and one without an `http(s)` URL is removed.
 ///
 /// Elements that carry script, styles or embedded documents are removed
 /// along with their content, as are comments. Any other element is
@@ -114,10 +118,14 @@ const DROPPED: &[&str] = &[
 /// # Examples
 ///
 /// ```ignore
-/// let html = sanitize_html(r#"<p onclick="x()">Hi<script>x()</script></p>"#, None)?;
+/// let html = sanitize_html(r#"<p onclick="x()">Hi<script>x()</script></p>"#, None, |_| None)?;
 /// assert_eq!(html, "<p>Hi</p>");
 /// ```
-pub fn sanitize_html(html: &str, base: Option<&Url>) -> Result<String, RewritingError> {
+pub fn sanitize_html(
+    html: &str,
+    base: Option<&Url>,
+    image_src: impl Fn(&Url) -> Option<String>,
+) -> Result<String, RewritingError> {
     let resolve = |raw: &str| match base {
         Some(base) => resolve_http_url(raw, base),
         None => Url::parse(raw.trim())
@@ -152,11 +160,27 @@ pub fn sanitize_html(html: &str, base: Option<&Url>) -> Result<String, Rewriting
                 }
             }
             "img" => match src.as_deref().and_then(resolve) {
-                Some(url) => {
-                    el.set_attribute("src", url.as_str())?;
-                    el.set_attribute("alt", alt.as_deref().unwrap_or(""))?;
-                    el.set_attribute("loading", "lazy")?;
-                }
+                Some(url) => match image_src(&url) {
+                    Some(local) => {
+                        el.set_attribute("src", &local)?;
+                        el.set_attribute("alt", alt.as_deref().unwrap_or(""))?;
+                        el.set_attribute("loading", "lazy")?;
+                    }
+                    None => {
+                        let label = match alt.as_deref().map(str::trim) {
+                            Some(alt) if !alt.is_empty() => format!("[Image: {alt}]"),
+                            _ => "[Image]".to_owned(),
+                        };
+                        el.replace(
+                            &format!(
+                                "<a href=\"{}\" rel=\"noopener noreferrer nofollow\">{}</a>",
+                                escape(url.as_str()),
+                                escape(&label)
+                            ),
+                            ContentType::Html,
+                        );
+                    }
+                },
                 None => el.remove(),
             },
             _ => {}
@@ -189,7 +213,10 @@ mod tests {
 
     fn sanitize(html: &str) -> String {
         let base = Url::parse("https://example.com/posts/1").unwrap();
-        sanitize_html(html, Some(&base)).unwrap()
+        sanitize_html(html, Some(&base), |url| {
+            (url.as_str() == "https://example.com/posts/pic.png").then(|| "/assets/pic".to_owned())
+        })
+        .unwrap()
     }
 
     #[test]
@@ -249,12 +276,31 @@ mod tests {
         );
     }
 
+    /// Cached images are shown from their local copy.
     #[test]
-    fn images_need_an_http_source() {
+    fn images_are_served_from_the_cache() {
         assert_eq!(
             sanitize("<img src=\"pic.png\" alt=\"A pic\" onerror=\"x()\">"),
-            "<img src=\"https://example.com/posts/pic.png\" alt=\"A pic\" loading=\"lazy\">"
+            "<img src=\"/assets/pic\" alt=\"A pic\" loading=\"lazy\">"
         );
+    }
+
+    /// Images that aren't cached are never loaded from the publisher; they
+    /// become links instead.
+    #[test]
+    fn uncached_images_become_links() {
+        assert_eq!(
+            sanitize("<img src=\"other.png\" alt=\"Other <pic>\">"),
+            "<a href=\"https://example.com/posts/other.png\" rel=\"noopener noreferrer nofollow\">[Image: Other &lt;pic&gt;]</a>"
+        );
+        assert_eq!(
+            sanitize("<img src=\"/other.png\">"),
+            "<a href=\"https://example.com/other.png\" rel=\"noopener noreferrer nofollow\">[Image]</a>"
+        );
+    }
+
+    #[test]
+    fn images_need_an_http_source() {
         assert_eq!(sanitize("<img src=\"data:image/png;base64,AA\">x"), "x");
     }
 
@@ -263,8 +309,8 @@ mod tests {
     #[test]
     fn attribute_values_are_escaped() {
         assert_eq!(
-            sanitize("<img src=\"https://example.com/a.png\" alt='\"><script>x()</script>'>"),
-            "<img src=\"https://example.com/a.png\" alt=\"&quot;><script>x()</script>\" loading=\"lazy\">"
+            sanitize("<img src=\"pic.png\" alt='\"><script>x()</script>'>"),
+            "<img src=\"/assets/pic\" alt=\"&quot;><script>x()</script>\" loading=\"lazy\">"
         );
     }
 
@@ -276,7 +322,7 @@ mod tests {
     #[test]
     fn relative_urls_without_a_base_are_dropped() {
         assert_eq!(
-            sanitize_html("<a href=\"/about\">a</a>", None).unwrap(),
+            sanitize_html("<a href=\"/about\">a</a>", None, |_| None).unwrap(),
             "<a>a</a>"
         );
     }

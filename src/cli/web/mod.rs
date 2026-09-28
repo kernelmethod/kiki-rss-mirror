@@ -1,12 +1,13 @@
 mod sanitize;
 
 use crate::cli::serve::ServeArgs;
+use crate::routes::v1::entries::entry_assets::ListEntryAssetsResponse;
 use crate::routes::v1::entries::get_entry::GetEntryResponse;
 use crate::routes::v1::entries::{ListEntriesResponse, ListEntriesResponseEntry};
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{Path as UrlPath, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
     Router,
@@ -39,9 +40,16 @@ static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
 ///
 /// Pages carry titles and content from feeds. They are escaped or
 /// sanitized, but as a second line of defence the pages may not run any
-/// script, load anything but images, or submit forms.
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src http: https:; \
+/// script, load anything but images from the web UI's own asset cache, or
+/// submit forms.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src 'self'; \
     style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// `Content-Security-Policy` sent with cached assets. They were downloaded
+/// from feeds, and are served from the web UI's origin, so one opened on
+/// its own — an SVG, say — must not be able to run script there either.
+const ASSET_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src 'self'; \
+    style-src 'unsafe-inline'; sandbox";
 
 /// Base URL for requests to the Kiki API. The client sends every request
 /// over the server's Unix socket, so the host is never resolved and only
@@ -173,6 +181,7 @@ async fn serve_ui(
     let app = Router::new()
         .route("/", get(index))
         .route("/entries/{id}", get(entry_page))
+        .route("/assets/{hash}", get(asset))
         .with_state(api);
     axum::serve(listener, app)
         .with_graceful_shutdown(cancel.cancelled_owned())
@@ -276,15 +285,107 @@ async fn entry_page(
         Err(e) => return server_unavailable(&e),
     };
 
-    let feed_title = match entry.feed_id {
-        Some(feed_id) => fetch_feed_titles(&api, [feed_id]).await.remove(&feed_id),
-        None => None,
+    let feed_title = async {
+        match entry.feed_id {
+            Some(feed_id) => fetch_feed_titles(&api, [feed_id]).await.remove(&feed_id),
+            None => None,
+        }
     };
+    let (feed_title, images) = tokio::join!(feed_title, fetch_cached_images(&api, id));
     render_page(
         StatusCode::OK,
         &format!("{} - Kiki", display_title(&entry.title)),
-        &render_entry_page(&entry, feed_title.as_deref(), params.page()),
+        &render_entry_page(&entry, feed_title.as_deref(), &images, params.page()),
     )
+}
+
+/// Serve the cached asset with the blake3 hash `hash`, fetched from the
+/// Kiki API. Entry pages show images from here, so that the browser never
+/// loads anything from the sites the feeds link to.
+async fn asset(
+    State(api): State<reqwest::Client>,
+    UrlPath(hash): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    // Checked here as well as by the API, so that nothing but a hash is
+    // ever put into the API's URL.
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return (StatusCode::NOT_FOUND, "asset not found").into_response();
+    }
+
+    let mut req = api.get(format!("{API_BASE}/v1/assets/{hash}"));
+    if let Some(etag) = headers.get(header::IF_NONE_MATCH) {
+        req = req.header(header::IF_NONE_MATCH, etag);
+    }
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!("failed to reach the Kiki server: {e:#}");
+            return (StatusCode::BAD_GATEWAY, "The Kiki server is unavailable.").into_response();
+        }
+    };
+
+    let status = resp.status();
+    if status == StatusCode::NOT_FOUND {
+        return (StatusCode::NOT_FOUND, "asset not found").into_response();
+    }
+    if status != StatusCode::OK && status != StatusCode::NOT_MODIFIED {
+        tracing::warn!(%status, hash, "failed to fetch cached asset");
+        return (StatusCode::BAD_GATEWAY, "failed to fetch asset").into_response();
+    }
+
+    let mut out = HeaderMap::new();
+    for name in [header::CONTENT_TYPE, header::ETAG, header::CACHE_CONTROL] {
+        if let Some(value) = resp.headers().get(&name) {
+            out.insert(name, value.clone());
+        }
+    }
+    out.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    out.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(ASSET_CONTENT_SECURITY_POLICY),
+    );
+    match resp.bytes().await {
+        Ok(body) => (status, out, body).into_response(),
+        Err(e) => {
+            tracing::warn!(hash, "failed to read cached asset: {e:#}");
+            (StatusCode::BAD_GATEWAY, "failed to fetch asset").into_response()
+        }
+    }
+}
+
+/// Fetch the images cached for entry `id` from the Kiki API, mapping each
+/// image's original URL to the web UI URL that serves the cached copy.
+///
+/// If the list cannot be fetched it is logged and treated as empty, so the
+/// entry is still shown, with links in place of its images.
+async fn fetch_cached_images(api: &reqwest::Client, id: i64) -> HashMap<String, String> {
+    let assets: Result<ListEntryAssetsResponse> = async {
+        Ok(api
+            .get(format!("{API_BASE}/v1/entries/id/{id}/assets"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+    .await;
+
+    match assets {
+        Ok(assets) => assets
+            .assets
+            .into_iter()
+            .filter(|a| a.kind == "inline_img")
+            .map(|a| (a.original_url, format!("/assets/{}", a.blake3)))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(entry_id = id, "failed to fetch cached assets: {e:#}");
+            HashMap::new()
+        }
+    }
 }
 
 /// Fetch page `page` (counting from 1) of `/v1/entries` from the Kiki API.
@@ -411,7 +512,16 @@ fn render_entry(entry: &ListEntriesResponseEntry, feed: Option<&str>, page: u32)
 /// categories, its content from the feed, and links to the entry itself and
 /// to anything else the feed links it to. The page links back to page
 /// `page` of the index.
-fn render_entry_page(entry: &GetEntryResponse, feed: Option<&str>, page: u32) -> String {
+///
+/// Images in the content are shown from the asset cache: `images` maps an
+/// image's original URL to the URL of its cached copy. Images that are not
+/// cached are shown as links instead.
+fn render_entry_page(
+    entry: &GetEntryResponse,
+    feed: Option<&str>,
+    images: &HashMap<String, String>,
+    page: u32,
+) -> String {
     let authors: Vec<&str> = match (&entry.rss, &entry.atom) {
         (Some(rss), _) => rss.author.as_deref().into_iter().collect(),
         (None, Some(atom)) => atom.authors.iter().map(String::as_str).collect(),
@@ -458,7 +568,9 @@ fn render_entry_page(entry: &GetEntryResponse, feed: Option<&str>, page: u32) ->
                 .and_then(|rss| rss.description.as_deref())
         })
         .filter(|c| !c.trim().is_empty());
-    match content.map(|c| sanitize::sanitize_html(c, base.as_ref())) {
+    match content
+        .map(|c| sanitize::sanitize_html(c, base.as_ref(), |url| images.get(url.as_str()).cloned()))
+    {
         Some(Ok(content)) => {
             html.push_str(&format!("<div class=\"content\">\n{content}\n</div>\n"));
         }
@@ -931,6 +1043,84 @@ mod tests {
             body.contains(r#"<a href="/">&larr; Back to entries</a>"#),
             "{body}"
         );
+        Ok(())
+    }
+
+    /// Cached images are shown from the web UI's asset route, which serves
+    /// the bytes from the cache; images that aren't cached become links.
+    #[tokio::test]
+    async fn entry_images_are_served_from_the_asset_cache() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO entries (id, syndication_format, guid, published_at, title, url, content)
+             VALUES (1, 'rss', 'a', 1, 'Pictures', 'http://example.com/posts/a',
+                     '<img src=\"cached.png\" alt=\"Cached\"><img src=\"http://example.com/missing.png\">')",
+            [],
+        )?;
+        let bytes = b"not really a png";
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let path = crate::tasks::assets::asset_path(tc.config_dir(), &hash);
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, bytes)?;
+        let asset_id = crate::db::assets::insert_asset(
+            &conn,
+            &hash,
+            "http://example.com/posts/cached.png",
+            Some("image/png"),
+            bytes.len() as i64,
+            None,
+            None,
+        )?;
+        crate::db::assets::link_entry_asset(&conn, 1, asset_id, "inline_img")?;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
+
+        let resp = reqwest::get(format!("http://{addr}/entries/1")).await?;
+        let csp = resp.headers()[header::CONTENT_SECURITY_POLICY].to_str()?;
+        assert!(csp.contains("img-src 'self';"), "{csp}");
+        let body = resp.text().await?;
+        assert!(
+            body.contains(&format!(
+                r#"<img src="/assets/{hash}" alt="Cached" loading="lazy">"#
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<a href="http://example.com/missing.png" rel="noopener noreferrer nofollow">[Image]</a>"#),
+            "{body}"
+        );
+
+        let resp = reqwest::get(format!("http://{addr}/assets/{hash}")).await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert!(resp.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()?
+            .ends_with("sandbox"));
+        let etag = resp.headers()[header::ETAG].clone();
+        assert_eq!(resp.bytes().await?.as_ref(), bytes);
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/assets/{hash}"))
+            .header(header::IF_NONE_MATCH, etag)
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+
+        for path in [
+            format!("/assets/{}", "0".repeat(64)),
+            "/assets/..%2Fentries".to_owned(),
+        ] {
+            let resp = reqwest::get(format!("http://{addr}{path}")).await?;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+
+        cancel.cancel();
+        task.await??;
         Ok(())
     }
 
