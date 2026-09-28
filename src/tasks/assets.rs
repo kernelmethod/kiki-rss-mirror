@@ -139,7 +139,9 @@ pub fn extract_asset_urls(content: &str, base: &Url) -> Vec<Url> {
     out.into_inner()
 }
 
-fn resolve_http_url(raw: &str, base: &Url) -> Option<Url> {
+/// Resolve `raw` against `base`, returning it only if the result is an
+/// `http(s)` URL.
+pub(crate) fn resolve_http_url(raw: &str, base: &Url) -> Option<Url> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
