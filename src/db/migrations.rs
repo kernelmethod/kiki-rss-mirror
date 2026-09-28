@@ -33,6 +33,10 @@ pub const MIGRATIONS: &[Migration] = &[
         name: PLUGINS_MIGRATION,
         sql: include_str!("include/migrations/0003_plugins.sql"),
     },
+    Migration {
+        name: "0004_plugin_config",
+        sql: include_str!("include/migrations/0004_plugin_config.sql"),
+    },
 ];
 
 /// The migration that drops the `scripts` table in favour of plugins.
@@ -288,6 +292,36 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(remaining, 0);
+
+        Ok(())
+    }
+
+    /// `0004_plugin_config` adds the table plugin config overrides are kept
+    /// in, with the same shape as a freshly-initialized database's.
+    #[test]
+    fn test_plugin_config_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        run_pending_migrations(&mut conn)?;
+
+        let fresh = ConnectionBuilder::default().in_memory().create().build()?;
+        let columns = |conn: &Connection| -> Result<Vec<(String, String)>> {
+            let mut stmt = conn.prepare("SELECT name, type FROM pragma_table_info('plugins')")?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        };
+        assert_eq!(columns(&conn)?, columns(&fresh)?);
+        assert!(!columns(&conn)?.is_empty());
+
+        crate::db::plugins::set_config_overrides(
+            &conn,
+            "p",
+            serde_json::json!({"a": 1})
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("object"))?,
+        )?;
 
         Ok(())
     }

@@ -169,7 +169,7 @@ fn read_overrides(path: &Path) -> Result<Overrides, ConfigError> {
 /// same directory and a `rename(2)`, so readers never see a partial file.
 ///
 /// The replacement keeps the permissions of the file it replaces.
-pub(crate) fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
+fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),

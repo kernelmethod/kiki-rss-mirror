@@ -29,7 +29,6 @@
 mod store;
 pub mod watch;
 
-pub(crate) use store::write_atomically;
 pub use store::{ConfigHandle, ConfigStore};
 
 use serde::{Deserialize, Serialize};

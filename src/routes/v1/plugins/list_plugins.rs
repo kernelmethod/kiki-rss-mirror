@@ -27,8 +27,8 @@ pub struct PluginResponse {
     pub authors: Vec<String>,
     pub license: Option<String>,
     pub homepage: Option<String>,
-    /// The plugin's config: the defaults from its manifest, overridden by its
-    /// `config.json`.
+    /// The plugin's config, as it was when the server started: the defaults
+    /// from its manifest, with its config overrides applied.
     #[schema(value_type = Object)]
     pub config: serde_json::Map<String, serde_json::Value>,
 }
