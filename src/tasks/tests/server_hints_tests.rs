@@ -5,6 +5,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::super::cache::{corrected_max_age, extract_server_hints, parse_http_date};
+use super::super::fetch::hint_source;
+use crate::fetcher::FeedHints;
 use reqwest::header::{HeaderMap, HeaderValue};
 
 /// A fixed "now" for the tests: Sun, 06 Nov 1994 08:49:37 GMT.
@@ -190,4 +192,40 @@ fn test_hints_no_cache_or_no_store_overrides_max_age() {
         let h = headers(&[("cache-control", cc)]);
         assert_eq!(extract_server_hints(&h, NOW).hint_secs, None, "{cc}");
     }
+}
+
+/// The schedule explanation names the header a freshness hint came from,
+/// with any `Age` that shortened it.
+#[test]
+fn test_hint_source_names_headers() {
+    let none = FeedHints::default();
+    let h = headers(&[("cache-control", "public, max-age=0"), ("age", "12")]);
+    assert_eq!(
+        hint_source(&h, Some(0), &none).as_deref(),
+        Some("Cache-Control \"public, max-age=0\", Age \"12\"")
+    );
+
+    let h = headers(&[
+        ("cache-control", "public"),
+        ("expires", "Sun, 06 Nov 1994 08:50:37 GMT"),
+    ]);
+    assert_eq!(
+        hint_source(&h, Some(60), &none).as_deref(),
+        Some("Expires \"Sun, 06 Nov 1994 08:50:37 GMT\"")
+    );
+}
+
+/// Without an HTTP hint, the feed's own refresh hint is named, if any.
+#[test]
+fn test_hint_source_falls_back_to_feed_hints() {
+    let h = headers(&[]);
+    assert_eq!(hint_source(&h, None, &FeedHints::default()), None);
+    let ttl = FeedHints {
+        ttl_secs: Some(3600),
+        ..FeedHints::default()
+    };
+    assert_eq!(
+        hint_source(&h, None, &ttl).as_deref(),
+        Some("the feed's <ttl>/sy:updatePeriod")
+    );
 }

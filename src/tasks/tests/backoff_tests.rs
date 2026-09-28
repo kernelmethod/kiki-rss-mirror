@@ -1,6 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use super::super::backoff::{compute_next_fetch_at, defer_past_skipped, same_origin, FetchOutcome};
+use super::super::backoff::{
+    compute_next_fetch_at, defer_past_skipped, format_duration, plan_next_fetch, same_origin,
+    FetchOutcome, ScheduleClamp, ScheduleReason,
+};
 use super::super::FetchError;
 
 const MIN_CADENCE: u64 = 60;
@@ -349,4 +352,170 @@ fn test_same_origin() {
     assert!(!same_origin(feed, "https://example.com:8443/feed"));
     // Unparseable URLs are never trusted.
     assert!(!same_origin(feed, "not a url"));
+}
+
+/// 2026-09-28T18:39:42Z, a Monday.
+const PLAN_NOW: i64 = 1_790_620_782;
+
+fn plan(outcome: FetchOutcome) -> super::super::backoff::Schedule {
+    plan_next_fetch(
+        outcome,
+        PLAN_NOW,
+        MIN_CADENCE,
+        MAX_BACKOFF,
+        MIN_FETCH_INTERVAL,
+    )
+}
+
+/// A zero freshness hint is raised to the minimum cadence, and the
+/// explanation says so, naming where the hint came from.
+#[test]
+fn test_plan_zero_hint_explains_min_cadence() {
+    let schedule = plan(FetchOutcome::NotModified {
+        server_hint_secs: Some(0),
+    })
+    .with_hint_source(Some("Cache-Control \"public, max-age=0\"".to_string()));
+    assert_eq!(schedule.next_fetch_at, PLAN_NOW + 60);
+    assert_eq!(
+        schedule.reason,
+        ScheduleReason::FreshnessHint {
+            secs: 0,
+            interval_secs: MIN_FETCH_INTERVAL
+        }
+    );
+    assert_eq!(schedule.clamp, Some(ScheduleClamp::MinCadence { secs: 60 }));
+    assert_eq!(
+        schedule.to_string(),
+        "in 1m at 2026-09-28T18:40:42Z (freshness hint of 0s, under the feed's 3h \
+         interval; hint from Cache-Control \"public, max-age=0\", raised to the 1m \
+         minimum polling cadence)"
+    );
+}
+
+/// Without a hint, or with one longer than the interval, the feed's own
+/// interval decides, and a longer hint is mentioned.
+#[test]
+fn test_plan_feed_interval_reasons() {
+    let schedule = plan(success_with_hint(None));
+    assert_eq!(schedule.next_fetch_at, PLAN_NOW + MIN_FETCH_INTERVAL as i64);
+    assert_eq!(
+        schedule.reason,
+        ScheduleReason::FeedInterval {
+            secs: MIN_FETCH_INTERVAL,
+            hint_secs: None
+        }
+    );
+    assert_eq!(schedule.clamp, None);
+    assert_eq!(
+        schedule.to_string(),
+        "in 3h at 2026-09-28T21:39:42Z (feed interval of 3h, no freshness hint)"
+    );
+
+    let schedule = plan(success_with_hint(Some(86_400)))
+        .with_hint_source(Some("the feed's <ttl>/sy:updatePeriod".to_string()));
+    assert_eq!(
+        schedule.reason,
+        ScheduleReason::FeedInterval {
+            secs: MIN_FETCH_INTERVAL,
+            hint_secs: Some(86_400)
+        }
+    );
+    assert_eq!(
+        schedule.to_string(),
+        "in 3h at 2026-09-28T21:39:42Z (feed interval of 3h, freshness hint of 1d; \
+         hint from the feed's <ttl>/sy:updatePeriod)"
+    );
+}
+
+/// The hint source is left out when no hint was used.
+#[test]
+fn test_plan_hint_source_hidden_without_hint() {
+    let schedule = plan(success_with_hint(None)).with_hint_source(Some("x".to_string()));
+    assert!(!schedule.to_string().contains("hint from"));
+}
+
+/// Error outcomes name the rule that picked the retry time.
+#[test]
+fn test_plan_error_reasons() {
+    let schedule = plan(FetchOutcome::TransientErr {
+        retry_after_ts: None,
+        consecutive_failures: 3,
+        stale_if_error_secs: None,
+    });
+    assert_eq!(schedule.next_fetch_at, PLAN_NOW + 240);
+    assert_eq!(
+        schedule.reason,
+        ScheduleReason::Backoff {
+            consecutive_failures: 3
+        }
+    );
+    assert!(schedule
+        .to_string()
+        .ends_with("(backoff after 3 consecutive failures)"));
+
+    let schedule = plan(FetchOutcome::TransientErr {
+        retry_after_ts: Some(PLAN_NOW + 600),
+        consecutive_failures: 1,
+        stale_if_error_secs: None,
+    });
+    assert_eq!(schedule.next_fetch_at, PLAN_NOW + 600);
+    assert_eq!(schedule.reason, ScheduleReason::RetryAfter);
+
+    let schedule = plan(FetchOutcome::TransientErr {
+        retry_after_ts: Some(PLAN_NOW + 6_000),
+        consecutive_failures: 1,
+        stale_if_error_secs: Some(300),
+    });
+    assert_eq!(schedule.next_fetch_at, PLAN_NOW + 300);
+    assert_eq!(schedule.reason, ScheduleReason::StaleIfError { secs: 300 });
+
+    let schedule = plan(FetchOutcome::TransientErr {
+        retry_after_ts: None,
+        consecutive_failures: 30,
+        stale_if_error_secs: None,
+    });
+    assert_eq!(schedule.next_fetch_at, PLAN_NOW + MAX_BACKOFF as i64);
+    assert_eq!(
+        schedule.clamp,
+        Some(ScheduleClamp::MaxBackoff { secs: MAX_BACKOFF })
+    );
+    assert!(schedule
+        .to_string()
+        .ends_with("(backoff after 30 consecutive failures, capped at the 1d maximum backoff)"));
+
+    // A permanent error waits the cap by design; it isn't reported as capped.
+    let schedule = plan(FetchOutcome::PermanentErr);
+    assert_eq!(schedule.reason, ScheduleReason::PermanentError);
+    assert_eq!(schedule.clamp, None);
+    assert!(schedule.to_string().ends_with("(permanent error)"));
+}
+
+/// Deferring out of skipHours is noted only when it moved the time.
+#[test]
+fn test_plan_skip_deferral_noted() {
+    // 21:39 falls in hour 21; skip hours 21 and 22.
+    let skip_hours = (1 << 21) | (1 << 22);
+    let schedule = plan(success_with_hint(None)).defer_past_skipped(skip_hours, 0);
+    assert!(schedule.deferred_for_skip);
+    // 23:00:00Z, the top of the first allowed hour.
+    assert_eq!(schedule.next_fetch_at, PLAN_NOW + 4 * 3600 + 20 * 60 + 18);
+    assert!(schedule
+        .to_string()
+        .contains("deferred past the feed's skipHours/skipDays"));
+
+    let schedule = plan(success_with_hint(None)).defer_past_skipped(1 << 3, 0);
+    assert!(!schedule.deferred_for_skip);
+    assert_eq!(schedule.next_fetch_at, PLAN_NOW + MIN_FETCH_INTERVAL as i64);
+}
+
+#[test]
+fn test_format_duration() {
+    assert_eq!(format_duration(0), "0s");
+    assert_eq!(format_duration(45), "45s");
+    assert_eq!(format_duration(60), "1m");
+    assert_eq!(format_duration(90), "1m 30s");
+    assert_eq!(format_duration(10_800), "3h");
+    assert_eq!(format_duration(7_500), "2h 5m");
+    assert_eq!(format_duration(108_000), "1d 6h");
+    assert_eq!(format_duration(86_430), "1d");
 }
