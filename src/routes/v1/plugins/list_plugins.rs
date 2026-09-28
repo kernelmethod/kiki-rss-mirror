@@ -152,7 +152,7 @@ mod test {
 
         assert_eq!(body.errors.len(), 1);
         assert_eq!(body.errors[0].directory, "broken");
-        assert!(body.errors[0].error.contains("manifest.json"));
+        assert!(body.errors[0].error.contains("manifest.toml"));
 
         Ok(())
     }

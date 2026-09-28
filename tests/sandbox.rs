@@ -693,12 +693,12 @@ mod script_isolation {
             "engine": "lua",
             "config": config,
         });
+        let manifest = toml::to_string(&manifest).expect("serialize manifest.toml");
         let mut kiki = Kiki::spawn_with(extra_args, |home| {
             let plugin = home.join("plugins").join("test-plugin");
             std::fs::create_dir_all(&plugin).expect("create plugin directory");
             std::fs::write(plugin.join("main.lua"), source).expect("write main.lua");
-            std::fs::write(plugin.join("manifest.json"), manifest.to_string())
-                .expect("write manifest.json");
+            std::fs::write(plugin.join("manifest.toml"), manifest).expect("write manifest.toml");
         });
         kiki.wait_for_scripts_loaded(1, Duration::from_secs(10));
         kiki
