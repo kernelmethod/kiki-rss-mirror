@@ -187,6 +187,45 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_list_entries_leaves_out_hidden_entries() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_feeds_and_entries(&tc)?;
+        {
+            let conn = tc.database_conn()?;
+            let hidden = SystemTag::Hidden.id(&conn)?;
+            conn.execute(
+                "INSERT INTO entry_tags (entry_id, tag_id) VALUES (1, ?1)",
+                [hidden],
+            )?;
+        }
+
+        let titles = |r: &list_entries::ListEntriesResponse| -> Vec<String> {
+            r.entries.iter().map(|e| e.title.clone()).collect()
+        };
+
+        let response = client
+            .get("http://localhost/v1/entries")
+            .send()
+            .await?
+            .json::<list_entries::ListEntriesResponse>()
+            .await?;
+        assert_eq!(response.count, 1);
+        assert_eq!(titles(&response), ["Entry 2"]);
+
+        let response = client
+            .get("http://localhost/v1/entries?include_hidden=true")
+            .send()
+            .await?
+            .json::<list_entries::ListEntriesResponse>()
+            .await?;
+        assert_eq!(response.count, 2);
+        assert_eq!(titles(&response), ["Entry 2", "Entry 1"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_list_entries_ordering() -> Result<()> {
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;
