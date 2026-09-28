@@ -724,8 +724,9 @@ mod test {
             )?;
             conn.execute("INSERT INTO tags (name) VALUES (?)", ["technology"])?;
             conn.execute(
-                "INSERT INTO feed_tags (feed_id, tag_id) VALUES (?, ?)",
-                [1i64, 1i64],
+                "INSERT INTO feed_tags (feed_id, tag_id)
+                 SELECT 1, id FROM tags WHERE name = 'technology'",
+                [],
             )?;
         }
 
@@ -1155,7 +1156,7 @@ mod test {
         let resp = client
             .put("http://localhost/v1/feeds/id/1/tags")
             .json(&feed_tags::SetFeedTagsRequest {
-                tag_ids: vec![1, 2],
+                tag_ids: vec![4, 5],
             })
             .send()
             .await?;
@@ -1175,7 +1176,7 @@ mod test {
         // Replace tags
         let resp = client
             .put("http://localhost/v1/feeds/id/1/tags")
-            .json(&feed_tags::SetFeedTagsRequest { tag_ids: vec![3] })
+            .json(&feed_tags::SetFeedTagsRequest { tag_ids: vec![6] })
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1194,6 +1195,17 @@ mod test {
         let resp = client
             .put("http://localhost/v1/feeds/id/1/tags")
             .json(&feed_tags::SetFeedTagsRequest { tag_ids: vec![999] })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // System tags can't be applied to feeds
+        let read_id = crate::db::tags::SystemTag::Read.id(&tc.database_conn()?)?;
+        let resp = client
+            .put("http://localhost/v1/feeds/id/1/tags")
+            .json(&feed_tags::SetFeedTagsRequest {
+                tag_ids: vec![read_id],
+            })
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);

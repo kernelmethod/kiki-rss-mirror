@@ -7,6 +7,7 @@ pub mod assets;
 pub mod log;
 pub mod migrations;
 pub mod retention;
+pub mod tags;
 pub mod task_queue;
 
 enum ConnectionType<'a> {

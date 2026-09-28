@@ -1,3 +1,4 @@
+use crate::db::tags::{is_reserved_tag_name, SYSTEM_TAG_PREFIX};
 use crate::server::AppState;
 use axum::{
     extract::State,
@@ -32,13 +33,15 @@ enum CreateTagTaskError {
 
 /// Create a new tag
 ///
-/// Create a new tag with the given name. Tag names must be unique.
+/// Create a new user tag with the given name. Tag names must be unique, and may not start with
+/// the `system:` prefix, which is reserved for system tags.
 #[utoipa::path(
     post,
     path = "/v1/tags/create",
     request_body = CreateTagRequest,
     responses(
         (status = 201, description = "Tag created successfully", body = CreateTagResponse),
+        (status = 400, description = "Tag name is reserved for system tags"),
         (status = 409, description = "Tag already exists"),
         (status = 500, description = "Internal server error"),
     ),
@@ -49,6 +52,10 @@ pub async fn create_tag(
     State(state): State<AppState>,
     Json(payload): Json<CreateTagRequest>,
 ) -> Result<Response, Response> {
+    if is_reserved_tag_name(&payload.name) {
+        return Err(reserved_name_response());
+    }
+
     let conn = state.conn_pool.get().map_err(|e| {
         event!(Level::ERROR, "failed to get database connection: {:?}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
@@ -56,7 +63,7 @@ pub async fn create_tag(
 
     let result = task::spawn_blocking(move || {
         let result = conn
-            .prepare("INSERT INTO tags (name) VALUES (?1) RETURNING id, name")
+            .prepare("INSERT INTO tags (name, kind) VALUES (?1, 'user') RETURNING id, name")
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
@@ -93,4 +100,14 @@ pub async fn create_tag(
         }
         Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()),
     }
+}
+
+/// The `400 Bad Request` response for a user tag name that is reserved for
+/// system tags.
+pub(super) fn reserved_name_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("Tag names starting with {SYSTEM_TAG_PREFIX:?} are reserved for system tags"),
+    )
+        .into_response()
 }

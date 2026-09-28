@@ -23,6 +23,7 @@
 //! let xml = build_opml(&feeds).unwrap();
 //! assert_eq!(parse_opml(&xml).unwrap(), feeds);
 //! ```
+use crate::db::tags::is_reserved_tag_name;
 use quick_xml::events::{BytesDecl, BytesStart, BytesText, Event};
 use quick_xml::reader::Reader;
 use quick_xml::Writer;
@@ -323,7 +324,10 @@ pub fn export_feeds(conn: &Connection) -> Result<Vec<OpmlFeed>, OpmlError> {
 /// Add feeds to the database in a single transaction.
 ///
 /// Feeds whose URL already exists in the database are skipped and left
-/// untouched. New feeds are created along with any tags they carry. The
+/// untouched. New feeds are created along with any tags they carry, except
+/// for tag names reserved for system tags (see
+/// [`is_reserved_tag_name`](crate::db::tags::is_reserved_tag_name)), which
+/// are ignored. The
 /// caller is responsible for scheduling fetches of the new feeds; a running
 /// server picks them up on its next scheduling pass, since new feeds are
 /// immediately due.
@@ -360,6 +364,9 @@ pub fn import_feeds(conn: &mut Connection, feeds: &[OpmlFeed]) -> Result<ImportS
             summary.imported.push(feed_id);
 
             for tag in &feed.tags {
+                if is_reserved_tag_name(tag) {
+                    continue;
+                }
                 insert_tag_stmt.execute([tag])?;
                 let tag_id: i64 = tag_id_stmt.query_row([tag], |row| row.get(0))?;
                 feed_tag_stmt.execute((feed_id, tag_id))?;

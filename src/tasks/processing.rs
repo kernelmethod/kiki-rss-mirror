@@ -1,3 +1,4 @@
+use crate::db::tags::is_reserved_tag_name;
 use crate::fetcher::{AtomEntry, AtomFeedIngestData, RssEntry};
 use crate::metrics::Metrics;
 use crate::scripting::{FeedEntry, ScriptRunner};
@@ -275,15 +276,24 @@ pub(super) fn enqueue_asset_caching(
 /// Sync the script-provided tags for the entry `entry_id`.
 ///
 /// For each tag name in `tags`:
+/// - skips it, with a warning, if the name is reserved for system tags
 /// - ensures the tag row exists in `tags` (`INSERT OR IGNORE`)
 /// - looks up its `id`
 ///
-/// Then removes any `entry_tags` rows for this entry whose `tag_id` is not in the
-/// script-provided set, and inserts new associations (`INSERT OR IGNORE`).
+/// Then removes any user-tag `entry_tags` rows for this entry whose `tag_id` is
+/// not in the script-provided set, and inserts new associations (`INSERT OR
+/// IGNORE`). System tags (read, saved, ...) on the entry are left untouched.
 fn sync_entry_tags(conn: &Connection, entry_id: i64, tags: &[String]) -> Result<()> {
     // Upsert each tag and collect its id.
     let mut tag_ids: Vec<i64> = Vec::with_capacity(tags.len());
     for name in tags {
+        if is_reserved_tag_name(name) {
+            warn!(
+                "ignoring tag {:?} set by a script on entry {}: names starting with \"system:\" are reserved for system tags",
+                name, entry_id
+            );
+            continue;
+        }
         conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [name])?;
         let id: i64 = conn.query_row(
             "SELECT id FROM tags WHERE name = ?1",
@@ -293,9 +303,14 @@ fn sync_entry_tags(conn: &Connection, entry_id: i64, tags: &[String]) -> Result<
         tag_ids.push(id);
     }
 
-    // Remove stale entry_tags rows (those not in the script-provided set).
+    // Remove stale user-tag entry_tags rows (those not in the script-provided
+    // set).
+    const USER_TAGS: &str = "tag_id IN (SELECT id FROM tags WHERE kind = 'user')";
     if tag_ids.is_empty() {
-        conn.execute("DELETE FROM entry_tags WHERE entry_id = ?1", [entry_id])?;
+        conn.execute(
+            &format!("DELETE FROM entry_tags WHERE entry_id = ?1 AND {USER_TAGS}"),
+            [entry_id],
+        )?;
     } else {
         let placeholders = tag_ids
             .iter()
@@ -304,7 +319,8 @@ fn sync_entry_tags(conn: &Connection, entry_id: i64, tags: &[String]) -> Result<
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "DELETE FROM entry_tags WHERE entry_id = ?1 AND tag_id NOT IN ({placeholders})"
+            "DELETE FROM entry_tags WHERE entry_id = ?1 AND {USER_TAGS} \
+             AND tag_id NOT IN ({placeholders})"
         );
         let params: Vec<rusqlite::types::Value> =
             std::iter::once(rusqlite::types::Value::Integer(entry_id))
@@ -326,4 +342,58 @@ fn sync_entry_tags(conn: &Connection, entry_id: i64, tags: &[String]) -> Result<
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::tags::SystemTag;
+    use crate::db::ConnectionBuilder;
+
+    fn entry_tag_names(conn: &Connection, entry_id: i64) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(
+            "SELECT t.name FROM tags t JOIN entry_tags et ON et.tag_id = t.id
+             WHERE et.entry_id = ?1 ORDER BY t.name",
+        )?;
+        let names = stmt
+            .query_map([entry_id], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(names)
+    }
+
+    /// Script-provided tags replace the entry's user tags, but leave its
+    /// system tags alone, and scripts cannot apply system tags.
+    #[test]
+    fn sync_entry_tags_preserves_system_tags() -> Result<()> {
+        let conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute(
+            "INSERT INTO entries (syndication_format, guid, published_at, title, url)
+             VALUES ('rss', 'g', 0, 't', 'u')",
+            [],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+            [entry_id, SystemTag::Read.id(&conn)?],
+        )?;
+
+        sync_entry_tags(&conn, entry_id, &["a".into(), "b".into()])?;
+        assert_eq!(entry_tag_names(&conn, entry_id)?, ["a", "b", "system:read"]);
+
+        sync_entry_tags(
+            &conn,
+            entry_id,
+            &["b".into(), "system:hidden".into(), "System:new".into()],
+        )?;
+        assert_eq!(entry_tag_names(&conn, entry_id)?, ["b", "system:read"]);
+
+        let reserved: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tags WHERE kind = 'user' AND name LIKE 'system:%'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reserved, 0);
+
+        Ok(())
+    }
 }

@@ -33,10 +33,13 @@ pub fn create_router() -> Router<AppState> {
 #[allow(clippy::indexing_slicing)]
 mod test {
     use super::*;
+    use crate::db::tags::{SystemTag, TagKind};
     use crate::test::{TestBuilder, TestConfig};
     use anyhow::Result;
     use axum::http::StatusCode;
 
+    /// Add user tags "news", "tech", and "science", with IDs 4, 5, and 6
+    /// (after the system tags).
     fn populate_tags(tc: &TestConfig) -> Result<()> {
         let conn = tc.database_conn()?;
         conn.execute("INSERT INTO tags (name) VALUES (?)", ["news"])?;
@@ -90,7 +93,19 @@ mod test {
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;
 
+        // A new database only has the system tags
         let resp = client.get("http://localhost/v1/tags").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = resp.json::<list_tags::ListTagsResponse>().await?;
+        assert_eq!(json.count, SystemTag::ALL.len());
+        let names: Vec<_> = json.tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, SystemTag::ALL.map(SystemTag::name));
+        assert!(json.tags.iter().all(|t| t.kind == TagKind::System));
+
+        let resp = client
+            .get("http://localhost/v1/tags?kind=user")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<list_tags::ListTagsResponse>().await?;
         assert_eq!(json.tags.len(), 0);
@@ -117,12 +132,23 @@ mod test {
         assert_eq!(tag.name, "news");
 
         // List tags
-        let resp = client.get("http://localhost/v1/tags").send().await?;
+        let resp = client
+            .get("http://localhost/v1/tags?kind=user")
+            .send()
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = resp.json::<list_tags::ListTagsResponse>().await?;
         assert_eq!(json.tags.len(), 1);
         assert_eq!(json.count, 1);
         assert_eq!(json.tags[0].name, "news");
+        assert_eq!(json.tags[0].kind, TagKind::User);
+
+        let resp = client
+            .get("http://localhost/v1/tags?kind=system")
+            .send()
+            .await?;
+        let json = resp.json::<list_tags::ListTagsResponse>().await?;
+        assert_eq!(json.count, SystemTag::ALL.len());
 
         Ok(())
     }
@@ -161,11 +187,19 @@ mod test {
 
         populate_tags(&tc)?;
 
+        let resp = client.get("http://localhost/v1/tags/id/4").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let tag = resp.json::<get_tag::GetTagResponse>().await?;
+        assert_eq!(tag.id, 4);
+        assert_eq!(tag.name, "news");
+        assert_eq!(tag.kind, TagKind::User);
+
+        // System tag
         let resp = client.get("http://localhost/v1/tags/id/1").send().await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let tag = resp.json::<get_tag::GetTagResponse>().await?;
-        assert_eq!(tag.id, 1);
-        assert_eq!(tag.name, "news");
+        assert_eq!(tag.name, SystemTag::Read.name());
+        assert_eq!(tag.kind, TagKind::System);
 
         // Non-existent tag
         let resp = client.get("http://localhost/v1/tags/id/999").send().await?;
@@ -183,7 +217,7 @@ mod test {
 
         // Rename tag
         let resp = client
-            .put("http://localhost/v1/tags/id/1")
+            .put("http://localhost/v1/tags/id/4")
             .json(&update_tag::UpdateTagRequest {
                 name: "breaking-news".to_string(),
             })
@@ -191,7 +225,7 @@ mod test {
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let tag = resp.json::<update_tag::UpdateTagResponse>().await?;
-        assert_eq!(tag.id, 1);
+        assert_eq!(tag.id, 4);
         assert_eq!(tag.name, "breaking-news");
 
         // Non-existent tag
@@ -206,7 +240,7 @@ mod test {
 
         // Duplicate name conflict
         let resp = client
-            .put("http://localhost/v1/tags/id/1")
+            .put("http://localhost/v1/tags/id/4")
             .json(&update_tag::UpdateTagRequest {
                 name: "tech".to_string(),
             })
@@ -225,13 +259,13 @@ mod test {
         populate_tags(&tc)?;
 
         let resp = client
-            .delete("http://localhost/v1/tags/id/1")
+            .delete("http://localhost/v1/tags/id/4")
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         // Verify it's gone
-        let resp = client.get("http://localhost/v1/tags/id/1").send().await?;
+        let resp = client.get("http://localhost/v1/tags/id/4").send().await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         // Delete non-existent
@@ -257,16 +291,16 @@ mod test {
             let conn = tc.database_conn()?;
             conn.execute(
                 "INSERT INTO feed_tags (feed_id, tag_id) VALUES (?, ?)",
-                [1, 1],
+                [1, 4],
             )?;
             conn.execute(
                 "INSERT INTO feed_tags (feed_id, tag_id) VALUES (?, ?)",
-                [2, 1],
+                [2, 4],
             )?;
         }
 
         let resp = client
-            .get("http://localhost/v1/tags/id/1/feeds")
+            .get("http://localhost/v1/tags/id/4/feeds")
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -276,7 +310,7 @@ mod test {
 
         // Tag with no feeds
         let resp = client
-            .get("http://localhost/v1/tags/id/3/feeds")
+            .get("http://localhost/v1/tags/id/6/feeds")
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -306,12 +340,12 @@ mod test {
             let conn = tc.database_conn()?;
             conn.execute(
                 "INSERT INTO entry_tags (entry_id, tag_id) VALUES (?, ?)",
-                [1, 2],
+                [1, 5],
             )?;
         }
 
         let resp = client
-            .get("http://localhost/v1/tags/id/2/entries")
+            .get("http://localhost/v1/tags/id/5/entries")
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -319,6 +353,70 @@ mod test {
         assert_eq!(json.count, 1);
         assert_eq!(json.entries.len(), 1);
         assert_eq!(json.entries[0].title, "Entry 1");
+
+        Ok(())
+    }
+
+    /// Names with the reserved `system:` prefix cannot be used for user tags.
+    #[tokio::test]
+    async fn test_reserved_tag_names() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        populate_tags(&tc)?;
+
+        for name in ["system:read", "system:starred", "SYSTEM:x"] {
+            let resp = client
+                .post("http://localhost/v1/tags/create")
+                .json(&create_tag::CreateTagRequest {
+                    name: name.to_string(),
+                })
+                .send()
+                .await?;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{name}");
+
+            let resp = client
+                .put("http://localhost/v1/tags/id/4")
+                .json(&update_tag::UpdateTagRequest {
+                    name: name.to_string(),
+                })
+                .send()
+                .await?;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{name}");
+        }
+
+        Ok(())
+    }
+
+    /// System tags cannot be renamed or deleted.
+    #[tokio::test]
+    async fn test_system_tags_are_immutable() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        let id = SystemTag::Read.id(&tc.database_conn()?)?;
+
+        let resp = client
+            .put(format!("http://localhost/v1/tags/id/{id}"))
+            .json(&update_tag::UpdateTagRequest {
+                name: "renamed".to_string(),
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = client
+            .delete(format!("http://localhost/v1/tags/id/{id}"))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = client
+            .get(format!("http://localhost/v1/tags/id/{id}"))
+            .send()
+            .await?;
+        let tag = resp.json::<get_tag::GetTagResponse>().await?;
+        assert_eq!(tag.name, SystemTag::Read.name());
 
         Ok(())
     }

@@ -18,10 +18,23 @@ CREATE TABLE task_queue (
     last_run_at  INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
+-- Tags come in two kinds:
+--   * 'user'   — created and managed by the user.
+--   * 'system' — built-in tags recording entry metadata (read, saved,
+--                hidden). They are seeded below, cannot be renamed or
+--                deleted, and their names all start with the reserved
+--                prefix 'system:', which user tags may not use.
 CREATE TABLE tags (
     id      INTEGER PRIMARY KEY,
-    name    VARCHAR UNIQUE NOT NULL
+    name    VARCHAR UNIQUE NOT NULL,
+    kind    VARCHAR NOT NULL DEFAULT 'user' CHECK (kind IN ('user', 'system'))
 );
+
+-- Keep in sync with `SystemTag` in src/db/tags.rs.
+INSERT INTO tags (name, kind) VALUES
+    ('system:read', 'system'),
+    ('system:saved', 'system'),
+    ('system:hidden', 'system');
 
 CREATE TABLE scripts (
     id      INTEGER PRIMARY KEY,
@@ -136,6 +149,7 @@ CREATE TABLE feed_tags (
     FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
     FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
 );
+CREATE UNIQUE INDEX idx_feed_tags_unique ON feed_tags(feed_id, tag_id);
 
 -- A list of scripts that should run on entries retrieved for a given feed
 CREATE TABLE feed_scripts (
@@ -205,7 +219,8 @@ CREATE INDEX idx_entry_published_at ON entries(published_at);
 -- Serves per-feed entry listings in newest-first order. SQLite appends the
 -- rowid (entries.id) to every index, so this also covers the id tie-breaker.
 CREATE INDEX idx_entry_feed_published_at ON entries(feed_id, published_at);
-CREATE INDEX idx_entry_tags_entry_id ON entry_tags(entry_id);
+-- Also serves lookups by entry_id.
+CREATE UNIQUE INDEX idx_entry_tags_unique ON entry_tags(entry_id, tag_id);
 CREATE INDEX idx_entry_tags_tag_id ON entry_tags(tag_id);
 
 ---------------------------------------------------------------------------------

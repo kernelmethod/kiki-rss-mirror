@@ -1,3 +1,5 @@
+use super::create_tag::reserved_name_response;
+use crate::db::tags::{is_reserved_tag_name, TagKind};
 use crate::server::AppState;
 use axum::{
     extract::{Path, State},
@@ -19,12 +21,17 @@ pub struct UpdateTagRequest {
 pub struct UpdateTagResponse {
     pub id: i64,
     pub name: String,
+    /// Always `user`, since system tags cannot be renamed.
+    pub kind: TagKind,
 }
 
 #[derive(Error, Debug)]
 enum UpdateTagTaskError {
     #[error("tag not found")]
     TagNotFound,
+
+    #[error("system tags cannot be renamed")]
+    SystemTag,
 
     #[error("tag name already exists")]
     AlreadyExists,
@@ -35,7 +42,8 @@ enum UpdateTagTaskError {
 
 /// Update a tag
 ///
-/// Rename the tag with the provided ID.
+/// Rename the user tag with the provided ID. System tags cannot be renamed, and the new name may
+/// not start with the `system:` prefix.
 #[utoipa::path(
     put,
     path = "/v1/tags/id/{id}",
@@ -45,6 +53,8 @@ enum UpdateTagTaskError {
     request_body = UpdateTagRequest,
     responses(
         (status = 200, description = "Tag updated successfully", body = UpdateTagResponse),
+        (status = 400, description = "Tag name is reserved for system tags"),
+        (status = 403, description = "System tags cannot be renamed"),
         (status = 404, description = "Tag not found"),
         (status = 409, description = "Tag name already exists"),
         (status = 500, description = "Internal server error"),
@@ -57,22 +67,31 @@ pub async fn update_tag(
     Path(id): Path<i64>,
     Json(payload): Json<UpdateTagRequest>,
 ) -> Result<Response, Response> {
+    if is_reserved_tag_name(&payload.name) {
+        return Err(reserved_name_response());
+    }
+
     let conn = state.conn_pool.get().map_err(|e| {
         event!(Level::ERROR, "failed to get database connection: {:?}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
     let result = task::spawn_blocking(move || {
-        // Check if the tag exists
-        let exists: bool = conn
-            .prepare("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)")
+        // Check that the tag exists and is a user tag
+        let kind = conn
+            .prepare("SELECT kind FROM tags WHERE id = ?1")
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
-            .query_row([id], |row| row.get(0))?;
+            .query_row([id], |row| row.get::<_, TagKind>(0));
 
-        if !exists {
-            return Err(UpdateTagTaskError::TagNotFound);
+        match kind {
+            Ok(TagKind::User) => {}
+            Ok(TagKind::System) => return Err(UpdateTagTaskError::SystemTag),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(UpdateTagTaskError::TagNotFound)
+            }
+            Err(e) => return Err(UpdateTagTaskError::Database(e)),
         }
 
         // Update the tag name
@@ -96,6 +115,7 @@ pub async fn update_tag(
         Ok(UpdateTagResponse {
             id,
             name: payload.name,
+            kind: TagKind::User,
         })
     })
     .await
@@ -107,6 +127,9 @@ pub async fn update_tag(
         Ok(Ok(tag)) => Ok(Json(tag).into_response()),
         Ok(Err(UpdateTagTaskError::TagNotFound)) => {
             Err((StatusCode::NOT_FOUND, "Tag not found").into_response())
+        }
+        Ok(Err(UpdateTagTaskError::SystemTag)) => {
+            Err((StatusCode::FORBIDDEN, "System tags cannot be renamed").into_response())
         }
         Ok(Err(UpdateTagTaskError::AlreadyExists)) => {
             Err((StatusCode::CONFLICT, "Tag name already exists").into_response())
