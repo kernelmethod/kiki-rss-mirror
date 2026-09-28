@@ -15,7 +15,7 @@
 //!
 //! | Process | Started by | Filesystem | Network | Sandbox profile |
 //! |---|---|---|---|---|
-//! | server | `kiki serve` | data dir + socket dir (rw), system paths (ro) | outbound (asset caching) + listening | [`SandboxProfile::Server`] |
+//! | server | `kiki serve` | data dir + socket dir + SQLite temp dir (rw), system paths (ro) | outbound (asset caching) + listening | [`SandboxProfile::Server`] |
 //! | feed fetcher | the server, at startup | TLS trust stores (ro) | outbound TCP only; DNS via the server | [`SandboxProfile::FeedFetcher`] |
 //! | script host | the server, at startup | none | none | [`SandboxProfile::ScriptHost`] |
 //!

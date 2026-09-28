@@ -54,6 +54,10 @@ pub struct ServeArgs {
 impl ServeArgs {
     pub fn run(&self) -> Result<()> {
         tracing_subscriber::fmt::init();
+        // Before anything opens the database, so SQLite still accepts it.
+        if let Err(e) = crate::db::log::install() {
+            tracing::warn!("unable to forward SQLite's error log: {e}");
+        }
 
         let env = Env::from_process();
 
@@ -80,6 +84,20 @@ impl ServeArgs {
         // longer create the directory itself.
         let socket_dir = ensure_socket_dir(&socket_path)?;
 
+        // Likewise SQLite's temp directory, which it writes to whenever a
+        // statement journal, sort or index outgrows memory. Left to itself
+        // SQLite would use /var/tmp or /tmp, which the sandbox does not
+        // grant.
+        let temp_dir = ensure_temp_dir(&temp_dir_for(
+            &data_dir.path,
+            std::env::var_os(SQLITE_TMPDIR),
+        ))?;
+        // SQLite reads this whenever it creates a temp file. Nothing else
+        // runs yet — no threads, no children — so nothing can read the
+        // environment while it changes.
+        std::env::set_var(SQLITE_TMPDIR, &temp_dir);
+        tracing::info!(path = %temp_dir.display(), "using SQLite temp directory");
+
         // Spawn the children *before* the sandbox goes up: every profile
         // denies `execve`, so this is the last moment at which the server
         // can start a child process at all.
@@ -88,8 +106,9 @@ impl ServeArgs {
         let script_host = self.spawn_script_host()?;
 
         if !self.no_sandbox {
-            let config = build_sandbox_config(&db_path, socket_dir, self);
+            let config = build_sandbox_config(&db_path, socket_dir, temp_dir.clone(), self);
             sandbox::apply(&config).context("failed to install sandbox")?;
+            check_temp_dir_is_writable(&temp_dir)?;
         } else {
             tracing::warn!(
                 "sandbox disabled via --no-sandbox; process runs with full filesystem \
@@ -232,16 +251,95 @@ fn ensure_socket_dir(socket_path: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// The environment variable SQLite consults first for where to put its
+/// temporary files.
+const SQLITE_TMPDIR: &str = "SQLITE_TMPDIR";
+
+/// The directory SQLite should put its temporary files in: the one named
+/// by `SQLITE_TMPDIR` (passed as `env_value`) if set, and `tmp/` in the
+/// data directory otherwise.
+fn temp_dir_for(data_dir: &Path, env_value: Option<std::ffi::OsString>) -> PathBuf {
+    env_value
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("tmp"))
+}
+
+/// Create SQLite's temp directory `dir` if it does not exist yet, and
+/// return it.
+///
+/// It has to exist before the sandbox goes up, when SQLite first needs
+/// it. As with the socket directory, one Kiki creates is owner-only and
+/// one that exists is left alone. SQLite unlinks each temp file as soon as
+/// it opens it, so nothing accumulates here.
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be created or its permissions
+/// cannot be set.
+fn ensure_temp_dir(dir: &Path) -> Result<PathBuf> {
+    if !dir.exists() {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("unable to create SQLite temp directory {dir:?}"))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!("unable to set permissions on SQLite temp directory {dir:?}")
+        })?;
+    }
+    Ok(dir.to_path_buf())
+}
+
+/// Check that the server can create files in SQLite's temp directory
+/// `dir`, as SQLite will whenever a statement outgrows memory.
+///
+/// Run once the sandbox is up, this turns a sandbox that forbids it into a
+/// startup failure, rather than a statement failing with "unable to open
+/// database file" whenever it first needs a temp file — which may be
+/// hours later, and only for some feeds.
+///
+/// # Errors
+///
+/// Returns an error if a file cannot be created in `dir`.
+fn check_temp_dir_is_writable(dir: &Path) -> Result<()> {
+    let probe = dir.join(format!(".kiki-probe-{}", std::process::id()));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .with_context(|| {
+            format!(
+                "the server cannot create files in SQLite's temp directory {}; \
+                 SQLite needs to for large queries",
+                dir.display()
+            )
+        })?;
+    if let Err(e) = fs::remove_file(&probe) {
+        tracing::warn!("unable to remove {}: {e}", probe.display());
+    }
+    tracing::debug!(path = %dir.display(), "SQLite temp directory is writable");
+    Ok(())
+}
+
 /// Build a [`SandboxConfig`] from the CLI arguments and the paths the
 /// server will use.
 ///
 /// The sandbox needs read-write access to:
 ///   * the directory containing the SQLite database (which also contains
-///     the `assets/` cache tree), and
+///     the `assets/` cache tree),
 ///   * the parent directory of the Unix socket, so the socket file can be
-///     created and unlinked.
-fn build_sandbox_config(db_path: &Path, socket_dir: PathBuf, args: &ServeArgs) -> SandboxConfig {
-    SandboxConfig::server(parent_or_cwd(db_path), socket_dir, args.seccomp_log_only)
+///     created and unlinked, and
+///   * SQLite's temp directory, `temp_dir`.
+fn build_sandbox_config(
+    db_path: &Path,
+    socket_dir: PathBuf,
+    temp_dir: PathBuf,
+    args: &ServeArgs,
+) -> SandboxConfig {
+    SandboxConfig::server(
+        parent_or_cwd(db_path),
+        socket_dir,
+        temp_dir,
+        args.seccomp_log_only,
+    )
 }
 
 /// Return the parent directory of `p`, treating a relative path with no
@@ -320,6 +418,7 @@ mod tests {
         Ok(build_sandbox_config(
             &data_dir.path.join(paths::DB_FILE_NAME),
             socket_dir,
+            temp_dir_for(&data_dir.path, None),
             &args,
         ))
     }
@@ -335,6 +434,7 @@ mod tests {
             SandboxProfile::Server {
                 data_dir,
                 socket_dir,
+                ..
             } => (data_dir, socket_dir),
             _ => panic!("serve must build a Server profile"),
         }
@@ -346,6 +446,46 @@ mod tests {
         let (data_dir, socket_dir) = server_paths(&config);
         assert_eq!(data_dir, &PathBuf::from("/data"));
         assert_eq!(socket_dir, &PathBuf::from("/data"));
+    }
+
+    /// SQLite's temp files go in the data directory unless
+    /// `SQLITE_TMPDIR` says otherwise, and the sandbox grants whichever it
+    /// is.
+    #[test]
+    fn sqlite_temp_dir_defaults_into_the_data_dir() {
+        let data = Path::new("/data");
+        assert_eq!(temp_dir_for(data, None), PathBuf::from("/data/tmp"));
+        assert_eq!(
+            temp_dir_for(data, Some("".into())),
+            PathBuf::from("/data/tmp")
+        );
+        assert_eq!(
+            temp_dir_for(data, Some("/var/tmp/kiki".into())),
+            PathBuf::from("/var/tmp/kiki")
+        );
+
+        match &config_from(&[]).profile {
+            SandboxProfile::Server { temp_dir, .. } => {
+                assert_eq!(temp_dir, &PathBuf::from("/data/tmp"))
+            }
+            _ => panic!("serve must build a Server profile"),
+        }
+    }
+
+    #[test]
+    fn temp_dir_check_passes_for_a_writable_dir_and_leaves_nothing() -> Result<()> {
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
+        check_temp_dir_is_writable(td.path())?;
+        assert_eq!(fs::read_dir(td.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn temp_dir_check_fails_for_a_missing_dir() -> Result<()> {
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
+        let err = check_temp_dir_is_writable(&td.path().join("missing")).unwrap_err();
+        assert!(format!("{err:#}").contains("SQLite's temp directory"));
+        Ok(())
     }
 
     #[test]
