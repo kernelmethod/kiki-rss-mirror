@@ -23,7 +23,11 @@
 //!   via [`Lua::set_memory_limit`].
 //!
 //! Timeouts surface as execution errors; for `entry.ingest` handlers the entry passes
-//! through unmodified, for observe handlers the failure is dropped.
+//! through unmodified, for observe handlers the failure is dropped. Regexes compiled through
+//! `kiki.regex` live outside the Lua allocator and have limits of their own; see
+//! the `regex_api` module.
+
+mod regex_api;
 
 use super::{Event, EventPayload, FeedEntry, ScriptRunner};
 use mlua::prelude::*;
@@ -270,6 +274,8 @@ impl LuaScriptRunner {
             kiki.set("log", log_fn)
                 .map_err(ScriptError::ScriptLoadError)?;
         }
+
+        regex_api::install(&lua, &kiki).map_err(ScriptError::ScriptLoadError)?;
 
         lua.globals()
             .set("kiki", kiki)
@@ -744,6 +750,38 @@ mod tests {
         .unwrap();
         let result = runner.dispatch_transform_entry(make_entry()).unwrap();
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn handlers_can_use_regexes_compiled_at_load_time() {
+        let runner = LuaScriptRunner::new(&[r#"
+            local promo = kiki.regex([[\b(sponsored|giveaway)\b]], "i")
+            kiki.on("entry.ingest", function(entry)
+                if promo:is_match(entry.title) then
+                    table.insert(entry.tags, "promo")
+                end
+                return entry
+            end)
+        "#
+        .to_string()])
+        .unwrap();
+
+        let mut entry = make_entry();
+        entry.title = "A Sponsored post".to_string();
+        let result = runner.dispatch_transform_entry(entry).unwrap().unwrap();
+        assert_eq!(result.tags, vec!["promo"]);
+
+        let result = runner
+            .dispatch_transform_entry(make_entry())
+            .unwrap()
+            .unwrap();
+        assert!(result.tags.is_empty());
+    }
+
+    #[test]
+    fn an_invalid_regex_fails_the_script_at_load_time() {
+        let result = LuaScriptRunner::new(&[r#"local re = kiki.regex("(")"#.to_string()]);
+        assert!(matches!(result, Err(ScriptError::ScriptLoadError(_))));
     }
 
     #[test]

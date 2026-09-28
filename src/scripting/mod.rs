@@ -58,7 +58,7 @@
 //!
 //! Inside the VM: a restricted standard library. Only `string`, `table`, `math`, `os` (with
 //! dangerous functions removed), `tostring`, `tonumber`, `type`, `pairs`, `ipairs`, `select`,
-//! and `unpack` are available, plus the `kiki` table exposing `on` and `log`. Filesystem
+//! and `unpack` are available, plus the `kiki` table exposing `on`, `log`, and `regex`. Filesystem
 //! access, process execution, and module loading are blocked. Scripts run under a
 //! per-invocation time budget and a VM-wide memory limit (see the `lua` sub-module for the
 //! concrete values).

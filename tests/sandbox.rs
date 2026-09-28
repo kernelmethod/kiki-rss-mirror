@@ -773,6 +773,31 @@ mod script_isolation {
         kiki.shutdown();
     }
 
+    /// `kiki.regex` compiles and matches inside the script host, under the
+    /// child's own sandbox, not just in the in-process VM the unit tests use.
+    #[test]
+    fn an_isolated_script_can_use_regexes() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&[]);
+
+        install_script(
+            &mut kiki,
+            r#"
+            local re = kiki.regex([[^hello from (?P<how>\w+)]], "i")
+            kiki.on("entry.ingest", function(entry)
+                local caps = re:captures(entry.title)
+                if caps then entry.title = "[" .. caps.how .. "] " .. entry.title end
+                return entry
+            end)
+            "#,
+        );
+
+        let feed_id = create_local_feed(&mut kiki, addr);
+        let title = refresh_and_read_title(&mut kiki, feed_id);
+        assert_eq!(title, "[a] hello from a sandboxed fetch");
+        kiki.shutdown();
+    }
+
     /// `--no-script-isolation` is the documented escape hatch: no child, and
     /// scripts still work. If this passes while the test above fails, the
     /// problem is in the IPC layer rather than in the scripting engine.

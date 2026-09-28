@@ -14,6 +14,8 @@ that, kiki exposes a single additional global — the `kiki` table:
   `event_name` is emitted.
 - `kiki.log(level, message)` — write `message` to the server log at the given
   level. `level` must be one of `"debug"`, `"info"`, `"warn"`, or `"error"`.
+- `kiki.regex(pattern [, flags])` — compile a regular expression. See
+  [Regular expressions](#regular-expressions) below.
 
 The sandbox removes `require`, `dofile`, `loadfile`, `debug`, `io`, `package`,
 and the destructive `os.*` calls (`execute`, `exit`, `getenv`, `remove`,
@@ -90,6 +92,65 @@ inserted into the `scripts` table). For `entry.ingest`, the output of one
 handler becomes the input to the next — if any handler returns `nil`, the
 entry is dropped immediately and subsequent handlers do not run.
 
+## Regular expressions
+
+Lua's built-in patterns have no alternation (`a|b`) and no case-insensitive
+matching. For anything beyond simple matching, `kiki.regex` compiles a
+pattern with Rust's [`regex`](https://docs.rs/regex) crate:
+
+```lua
+local promo = kiki.regex([[\b(sponsored|giveaway|webinar)\b]], "i")
+
+kiki.on("entry.ingest", function(entry)
+    if promo:is_match(entry.title) then
+        table.insert(entry.tags, "promo")
+    end
+    return entry
+end)
+```
+
+The pattern syntax is the `regex` crate's: it supports character classes,
+alternation, repetition, named groups and inline flags such as `(?i)`, but not
+look-around or backreferences. In exchange, matching always runs in time
+linear in the input, so a hostile feed cannot make a pattern run for ever.
+Long Lua bracket strings (`[[...]]`) avoid having to double every backslash.
+
+`flags` is an optional string of single-letter flags:
+
+| Flag | Meaning |
+|------|---------|
+| `i`  | Case-insensitive matching. |
+| `m`  | `^` and `$` match at the start and end of each line. |
+| `s`  | `.` matches `\n` as well. |
+| `x`  | Ignore whitespace and allow `#` comments in the pattern. |
+| `U`  | Swap the meaning of greedy and lazy repetition. |
+
+An invalid pattern or flag raises an error. Compile regexes at the top of a
+script, as above, so that a mistake fails when the script loads rather than on
+every entry.
+
+A compiled regex has these methods. Positions are 1-based byte offsets, as with
+Lua's `string` functions; `init`, where accepted, is where to start searching
+and may be negative to count from the end.
+
+| Method | Returns |
+|--------|---------|
+| `re:is_match(s)` | `true` if the regex matches anywhere in `s`. |
+| `re:find(s [, init])` | The start and end of the first match, or `nil`. |
+| `re:match(s [, init])` | The text of the first match, or `nil`. |
+| `re:captures(s [, init])` | A table of the first match's groups, or `nil`. `[0]` is the whole match, `[1]`, `[2]`, … are the numbered groups and named groups are also available by name. A group that took no part in the match is `false`. |
+| `re:match_all(s)` | An array of the text of every non-overlapping match. |
+| `re:replace(s, replacement [, limit])` | `s` with matches replaced by `replacement`, in which `$1` or `${name}` expand to a group (write `$$` for a literal `$`). Replaces every match, or only the first `limit`. |
+| `re:split(s [, limit])` | An array of the parts of `s` between matches, splitting into at most `limit` parts if given. |
+
+`re.pattern` and `re.flags` hold the pattern and flags the regex was compiled
+with, and `kiki.regex.escape(s)` returns `s` with every metacharacter escaped,
+for matching it literally. `kiki.regex.new(pattern [, flags])` is the same as
+`kiki.regex(pattern [, flags])`.
+
+Compiling the same pattern with the same flags again returns the regex that is
+already compiled, so building a regex inside a handler is cheap, if less tidy.
+
 ## Resource limits
 
 Every handler call runs under two hard limits:
@@ -100,6 +161,11 @@ Every handler call runs under two hard limits:
   control returns to the VM.
 - **Memory**: 16 MiB across the entire VM. Allocations that would exceed this
   cap fail the handler.
+- **Regexes**: compiled regexes live outside the VM, so the memory cap does not
+  count them. Each is instead limited to 256 KiB of compiled program (plus a
+  matching cache of the same size), and at most 128 distinct regexes may be
+  alive at once; exceeding either raises an error. Regexes a script no longer refers to are freed by Lua's garbage
+  collector.
 
 When a handler errors, times out, or exceeds the memory cap:
 
