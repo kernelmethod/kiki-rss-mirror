@@ -8,35 +8,36 @@ when something interesting happens.
 
 A plugin is a directory inside the `plugins/` directory in Kiki's home (next
 to `kiki.db`; `kiki init` creates it). Every plugin has a manifest,
-`manifest.json`, at its root, and its code alongside:
+`manifest.toml`, at its root, and its code alongside:
 
 ```text
 plugins/
 └── hide-sponsored/
-    ├── manifest.json
+    ├── manifest.toml
     ├── main.lua
     └── lib/
         └── rules.lua
 ```
 
-The manifest declares the plugin's name, its version, and the engine its code
-is written for:
+The manifest is a [TOML](https://toml.io) file declaring the plugin's name,
+its version, and the engine its code is written for:
 
-```json
-{
-  "name": "hide-sponsored",
-  "version": "1.0.0",
-  "engine": "lua",
-  "description": "Hide sponsored posts",
-  "authors": ["Jane Doe <jane@example.com>"],
-  "license": "MIT",
-  "homepage": "https://example.com/hide-sponsored",
-  "entrypoint": "main.lua",
-  "enabled": true,
-  "config": {
-    "rules": [{ "field": "title", "pattern": "\\bsponsored\\b", "flags": "i" }]
-  }
-}
+```toml
+name = "hide-sponsored"
+version = "1.0.0"
+engine = "lua"
+description = "Hide sponsored posts"
+authors = ["Jane Doe <jane@example.com>"]
+license = "MIT"
+homepage = "https://example.com/hide-sponsored"
+entrypoint = "main.lua"
+enabled = true
+
+[config]
+[[config.rules]]
+field = "title"
+pattern = '\bsponsored\b'
+flags = "i"
 ```
 
 | Field         | Required | Meaning |
@@ -47,7 +48,7 @@ is written for:
 | `entrypoint`  | No       | The file that runs when the plugin loads, relative to the plugin directory. Defaults to `main.lua`. |
 | `description`, `authors`, `license`, `homepage` | No | Informational; shown by the API. |
 | `enabled`     | No       | Set to `false` to keep a plugin installed without running it. Defaults to `true`. |
-| `config`      | No       | The plugin's default config; see [Plugin config](#plugin-config). |
+| `config`      | No       | A table holding the plugin's default config; see [Plugin config](#plugin-config). |
 
 Other fields are ignored, so plugins may carry metadata of their own.
 
@@ -138,18 +139,19 @@ at most 1 MiB.
 
 ## Plugin config
 
-Every plugin has a config: a JSON object, handed to the plugin's entrypoint as
-its argument, converted to a Lua table, so a plugin reads it with
-`local config = ...`. The config is the `config` object in the plugin's
-manifest, with the keys of an optional `config.json` file in the plugin
-directory applied over it. Keeping your settings in `config.json` leaves the
+Every plugin has a config, handed to the plugin's entrypoint as its argument,
+converted to a Lua table, so a plugin reads it with `local config = ...`. The
+config is the `[config]` table in the plugin's manifest, with the keys of an
+optional `config.json` file (a JSON object) in the plugin directory applied
+over it. Keeping your settings in `config.json` leaves the
 manifest's defaults untouched, so a new version of a plugin can be dropped in
 without losing them. Each plugin sees only its own config. A plugin with no
 config gets an empty table.
 
-JSON objects become tables keyed by string and arrays become sequences
-indexed from 1. `null` becomes `nil`, so a key set to `null` is absent from
-its table.
+Tables (and JSON objects) become Lua tables keyed by string, and arrays become
+sequences indexed from 1. TOML dates and times become strings in their
+RFC 3339 form, and `inf` and `nan` are not allowed. A `null` in `config.json`
+becomes `nil`, so a key set to `null` is absent from its table.
 
 For example, this script hides entries whose fields match a configured
 regular expression, or whose fields do *not* match one when `invert` is set:

@@ -7,24 +7,25 @@
 //! ```text
 //! plugins/
 //! └── hide-sponsored/
-//!     ├── manifest.json
+//!     ├── manifest.toml
 //!     ├── main.lua
 //!     └── lib/
 //!         └── rules.lua
 //! ```
 //!
 //! The manifest names the plugin, gives its version, and declares the
-//! scripting engine its code is written for:
+//! scripting engine its code is written for. Its `[config]` table holds the
+//! plugin's default config:
 //!
-//! ```json
-//! {
-//!   "name": "hide-sponsored",
-//!   "version": "1.0.0",
-//!   "engine": "lua",
-//!   "entrypoint": "main.lua",
-//!   "description": "Hide sponsored posts",
-//!   "config": { "patterns": ["sponsored"] }
-//! }
+//! ```toml
+//! name = "hide-sponsored"
+//! version = "1.0.0"
+//! engine = "lua"
+//! entrypoint = "main.lua"
+//! description = "Hide sponsored posts"
+//!
+//! [config]
+//! patterns = ["sponsored"]
 //! ```
 //!
 //! See [`PluginManifest`] for every field. [`discover`] scans the plugins
@@ -48,7 +49,7 @@ use thiserror::Error;
 pub const PLUGINS_DIR_NAME: &str = "plugins";
 
 /// Name of the manifest file at the root of every plugin directory.
-pub const MANIFEST_FILE_NAME: &str = "manifest.json";
+pub const MANIFEST_FILE_NAME: &str = "manifest.toml";
 
 /// Name of the optional file, at the root of a plugin directory, that
 /// overrides the default config given in the plugin's manifest.
@@ -180,16 +181,84 @@ pub struct PluginManifest {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
-    /// The plugin's default config, handed to its entrypoint as its
-    /// argument. Keys in the plugin's [`CONFIG_FILE_NAME`], if it has one,
-    /// override these.
-    #[serde(default)]
+    /// The plugin's default config, the manifest's `[config]` table, handed
+    /// to its entrypoint as its argument. Keys in the plugin's
+    /// [`CONFIG_FILE_NAME`], if it has one, override these.
+    ///
+    /// The table is held as JSON, the form configs take everywhere else; see
+    /// [`toml_to_json`] for how TOML values are converted.
+    #[serde(default, deserialize_with = "deserialize_config")]
     #[schema(value_type = Object)]
     pub config: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_enabled() -> bool {
     true
+}
+
+/// Reads a manifest's `[config]` table, converting it to JSON.
+fn deserialize_config<'de, D>(
+    deserializer: D,
+) -> Result<serde_json::Map<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let table = toml::Table::deserialize(deserializer)?;
+    match toml_to_json(&toml::Value::Table(table)) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        Ok(_) => Err(serde::de::Error::custom("config must be a table")),
+        Err(e) => Err(serde::de::Error::custom(e)),
+    }
+}
+
+/// Error returned when a TOML value has no JSON equivalent.
+#[derive(Debug, Error)]
+#[error("config value {0} is not a finite number")]
+pub struct NonFiniteFloat(pub f64);
+
+/// Converts a TOML value into the equivalent JSON value.
+///
+/// Tables become objects, arrays become arrays, and strings, integers,
+/// floats and booleans map across unchanged. Dates and times, which JSON
+/// lacks, become strings in their TOML (RFC 3339) form.
+///
+/// # Errors
+///
+/// Returns [`NonFiniteFloat`] for `inf` and `nan`, which JSON cannot
+/// represent.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::plugins::toml_to_json;
+///
+/// let value: toml::Value = toml::from_str("n = 1\nat = 2024-01-02").unwrap();
+/// assert_eq!(
+///     toml_to_json(&value).unwrap(),
+///     serde_json::json!({"n": 1, "at": "2024-01-02"}),
+/// );
+/// assert!(toml_to_json(&toml::Value::Float(f64::NAN)).is_err());
+/// ```
+pub fn toml_to_json(value: &toml::Value) -> Result<serde_json::Value, NonFiniteFloat> {
+    use serde_json::Value as Json;
+    Ok(match value {
+        toml::Value::String(s) => Json::String(s.clone()),
+        toml::Value::Integer(i) => Json::from(*i),
+        toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(Json::Number)
+            .ok_or(NonFiniteFloat(*f))?,
+        toml::Value::Boolean(b) => Json::Bool(*b),
+        toml::Value::Datetime(d) => Json::String(d.to_string()),
+        toml::Value::Array(items) => {
+            Json::Array(items.iter().map(toml_to_json).collect::<Result<_, _>>()?)
+        }
+        toml::Value::Table(table) => Json::Object(
+            table
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), toml_to_json(v)?)))
+                .collect::<Result<_, _>>()?,
+        ),
+    })
 }
 
 impl PluginManifest {
@@ -214,17 +283,23 @@ impl PluginManifest {
     /// ```
     /// use kiki_rss::plugins::{PluginEngine, PluginManifest};
     ///
-    /// let manifest = PluginManifest::parse(
-    ///     r#"{"name": "hello", "version": "0.1.0", "engine": "lua"}"#,
-    /// ).unwrap();
+    /// let manifest = PluginManifest::parse(r#"
+    ///     name = "hello"
+    ///     version = "0.1.0"
+    ///     engine = "lua"
+    ///
+    ///     [config]
+    ///     greeting = "hi"
+    /// "#).unwrap();
     /// assert_eq!(manifest.engine, PluginEngine::Lua);
     /// assert_eq!(manifest.entrypoint(), "main.lua");
     /// assert!(manifest.enabled);
+    /// assert_eq!(manifest.config["greeting"], "hi");
     ///
-    /// assert!(PluginManifest::parse(r#"{"name": "Hello!", "version": "1", "engine": "lua"}"#).is_err());
+    /// assert!(PluginManifest::parse(r#"name = "Hello!""#).is_err());
     /// ```
     pub fn parse(text: &str) -> Result<Self, PluginError> {
-        let manifest: Self = serde_json::from_str(text).map_err(PluginError::InvalidManifest)?;
+        let manifest: Self = toml::from_str(text).map_err(PluginError::InvalidManifest)?;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -266,9 +341,9 @@ pub enum PluginError {
     #[error("no {MANIFEST_FILE_NAME} found")]
     MissingManifest,
 
-    /// The manifest is not valid JSON, or is missing a required field.
+    /// The manifest is not valid TOML, or is missing a required field.
     #[error("invalid {MANIFEST_FILE_NAME}: {0}")]
-    InvalidManifest(#[source] serde_json::Error),
+    InvalidManifest(#[source] toml::de::Error),
 
     /// The plugin's name is not allowed.
     #[error(
@@ -580,8 +655,8 @@ pub struct Discovery {
 /// let plugin = dir.path().join("hello");
 /// std::fs::create_dir(&plugin).unwrap();
 /// std::fs::write(
-///     plugin.join("manifest.json"),
-///     r#"{"name": "hello", "version": "1.0.0", "engine": "lua"}"#,
+///     plugin.join("manifest.toml"),
+///     "name = 'hello'\nversion = '1.0.0'\nengine = 'lua'\n",
 /// ).unwrap();
 /// std::fs::write(plugin.join("main.lua"), "kiki.log('info', 'hello')").unwrap();
 ///
@@ -673,6 +748,9 @@ pub fn load_sources(discovery: &Discovery, engine: PluginEngine) -> Vec<ScriptSo
 /// Installs a plugin into `plugins_dir`, in a directory named after it:
 /// writes its manifest and its entrypoint, containing `text`.
 ///
+/// The manifest's config must be representable in TOML, so it may not
+/// contain `null`.
+///
 /// This is a convenience for tests; plugins are
 /// normally installed by copying their directory into the plugins directory.
 ///
@@ -693,8 +771,8 @@ pub fn install(
         .with_context(|| format!("unable to create {}", plugins_dir.display()))?;
     std::fs::create_dir(&dir).with_context(|| format!("unable to create {}", dir.display()))?;
 
-    let manifest_json = serde_json::to_string_pretty(manifest)?;
-    std::fs::write(dir.join(MANIFEST_FILE_NAME), manifest_json + "\n")
+    let manifest_toml = toml::to_string_pretty(manifest)?;
+    std::fs::write(dir.join(MANIFEST_FILE_NAME), manifest_toml)
         .with_context(|| format!("unable to write the manifest in {}", dir.display()))?;
     std::fs::write(dir.join(manifest.entrypoint()), text)
         .with_context(|| format!("unable to write the entrypoint in {}", dir.display()))?;
@@ -730,11 +808,12 @@ mod tests {
     #[test]
     fn manifest_requires_name_version_and_engine() {
         for text in [
-            r#"{"version": "1.0.0", "engine": "lua"}"#,
-            r#"{"name": "a", "engine": "lua"}"#,
-            r#"{"name": "a", "version": "1.0.0"}"#,
-            r#"{"name": "a", "version": "1.0.0", "engine": "python"}"#,
-            "not json",
+            "version = '1.0.0'\nengine = 'lua'",
+            "name = 'a'\nengine = 'lua'",
+            "name = 'a'\nversion = '1.0.0'",
+            "name = 'a'\nversion = '1.0.0'\nengine = 'python'",
+            "name = 'a'\nversion = '1.0.0'\nengine = 'lua'\nconfig = 1",
+            "not toml",
         ] {
             assert!(
                 matches!(
@@ -749,12 +828,12 @@ mod tests {
     #[test]
     fn manifest_validates_names() {
         for name in ["hello", "hello-world", "hello_world", "2fa", "a"] {
-            let text = format!(r#"{{"name": "{name}", "version": "1.0.0", "engine": "lua"}}"#);
+            let text = format!("name = '{name}'\nversion = '1.0.0'\nengine = 'lua'");
             assert!(PluginManifest::parse(&text).is_ok(), "{name}");
         }
         let long = "a".repeat(MAX_NAME_LEN + 1);
         for name in ["", "Hello", "-a", "_a", "a b", "a/b", "..", long.as_str()] {
-            let text = format!(r#"{{"name": "{name}", "version": "1.0.0", "engine": "lua"}}"#);
+            let text = format!("name = '{name}'\nversion = '1.0.0'\nengine = 'lua'");
             assert!(
                 matches!(
                     PluginManifest::parse(&text),
@@ -774,11 +853,11 @@ mod tests {
             "1.0.0-alpha.1",
             "1.0.0+build.5",
         ] {
-            let text = format!(r#"{{"name": "a", "version": "{version}", "engine": "lua"}}"#);
+            let text = format!("name = 'a'\nversion = '{version}'\nengine = 'lua'");
             assert!(PluginManifest::parse(&text).is_ok(), "{version}");
         }
         for version in ["", "1", "1.0", "v1.0.0", "01.0.0", "1.0.0.0", "1.0.0-"] {
-            let text = format!(r#"{{"name": "a", "version": "{version}", "engine": "lua"}}"#);
+            let text = format!("name = 'a'\nversion = '{version}'\nengine = 'lua'");
             assert!(
                 matches!(
                     PluginManifest::parse(&text),
@@ -799,7 +878,7 @@ mod tests {
             "",
         ] {
             let text = format!(
-                r#"{{"name": "a", "version": "1.0.0", "engine": "lua", "entrypoint": "{entrypoint}"}}"#
+                "name = 'a'\nversion = '1.0.0'\nengine = 'lua'\nentrypoint = '{entrypoint}'"
             );
             assert!(
                 matches!(
@@ -809,8 +888,7 @@ mod tests {
                 "{entrypoint}"
             );
         }
-        let text =
-            r#"{"name": "a", "version": "1.0.0", "engine": "lua", "entrypoint": "src/init.lua"}"#;
+        let text = "name = 'a'\nversion = '1.0.0'\nengine = 'lua'\nentrypoint = 'src/init.lua'";
         assert_eq!(
             PluginManifest::parse(text).unwrap().entrypoint(),
             "src/init.lua"
@@ -818,8 +896,58 @@ mod tests {
     }
 
     #[test]
+    fn manifest_config_is_converted_to_json() {
+        let text = r#"
+            name = "a"
+            version = "1.0.0"
+            engine = "lua"
+
+            [config]
+            count = 3
+            ratio = 0.5
+            on = true
+            since = 2024-01-02T03:04:05Z
+            patterns = ["x", "y"]
+
+            [[config.rules]]
+            field = "title"
+            pattern = '\bsponsored\b'
+        "#;
+        let manifest = PluginManifest::parse(text).unwrap();
+        assert_eq!(
+            serde_json::Value::Object(manifest.config),
+            serde_json::json!({
+                "count": 3,
+                "ratio": 0.5,
+                "on": true,
+                "since": "2024-01-02T03:04:05Z",
+                "patterns": ["x", "y"],
+                "rules": [{"field": "title", "pattern": "\\bsponsored\\b"}],
+            })
+        );
+
+        let text = "name = 'a'\nversion = '1.0.0'\nengine = 'lua'\n[config]\nx = nan";
+        assert!(matches!(
+            PluginManifest::parse(text),
+            Err(PluginError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn install_round_trips_the_manifest() {
+        let td = TempDir::new().unwrap();
+        let mut m = manifest("a");
+        m.description = Some("A plugin".to_string());
+        m.config = serde_json::from_str(r#"{"x": 1, "nested": {"y": [1, 2]}, "z": "s"}"#).unwrap();
+        install(td.path(), &m, "").unwrap();
+
+        let plugin = Plugin::load(&td.path().join("a")).unwrap();
+        assert_eq!(plugin.manifest, m);
+    }
+
+    #[test]
     fn manifest_ignores_unknown_fields() {
-        let text = r#"{"name": "a", "version": "1.0.0", "engine": "lua", "keywords": ["x"]}"#;
+        let text = "name = 'a'\nversion = '1.0.0'\nengine = 'lua'\nkeywords = ['x']";
         assert!(PluginManifest::parse(text).is_ok());
     }
 
@@ -837,7 +965,7 @@ mod tests {
         for (dir, name) in [("20-b", "b"), ("10-c", "c"), ("30-a", "a")] {
             write(
                 &td.path().join(dir).join(MANIFEST_FILE_NAME),
-                &serde_json::to_string(&manifest(name)).unwrap(),
+                &toml::to_string(&manifest(name)).unwrap(),
             );
             write(&td.path().join(dir).join("main.lua"), "");
         }
@@ -863,13 +991,13 @@ mod tests {
         // No entrypoint.
         write(
             &td.path().join("no-main").join(MANIFEST_FILE_NAME),
-            &serde_json::to_string(&manifest("no-main")).unwrap(),
+            &toml::to_string(&manifest("no-main")).unwrap(),
         );
         // Duplicate name.
         for dir in ["a1", "a2"] {
             write(
                 &td.path().join(dir).join(MANIFEST_FILE_NAME),
-                &serde_json::to_string(&manifest("a")).unwrap(),
+                &toml::to_string(&manifest("a")).unwrap(),
             );
             write(&td.path().join(dir).join("main.lua"), "");
         }
