@@ -39,8 +39,11 @@ pub struct PluginConfigResponse {
     pub active: Map<String, Value>,
     /// Whether `config` differs from `active`: the plugin is not yet running
     /// with its config, because the plugins could not be reloaded with it.
-    /// Fixing the config, or the plugin, and reloading applies it.
-    pub restart_required: bool,
+    /// Fixing the config, or the plugin, applies it. Called `restart_required`
+    /// before plugins reloaded while the server runs; that name is still
+    /// accepted when reading a response.
+    #[serde(alias = "restart_required")]
+    pub reload_failed: bool,
     /// Why the plugins could not be reloaded with the new config, if they
     /// could not. The plugins that were running keep running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,7 +55,7 @@ impl PluginConfigResponse {
         let config = apply_config_overrides(&plugin.manifest.config, overrides.clone());
         PluginConfigResponse {
             defaults: plugin.manifest.config.clone(),
-            restart_required: config != plugin.config,
+            reload_failed: config != plugin.config,
             active: plugin.config.clone(),
             overrides,
             config,
@@ -365,7 +368,7 @@ mod test {
         assert_eq!(Value::Object(body.overrides), json!({}));
         assert_eq!(Value::Object(body.config), json!({"a": 1, "b": 2}));
         assert_eq!(Value::Object(body.active), json!({"a": 1, "b": 2}));
-        assert!(!body.restart_required);
+        assert!(!body.reload_failed);
 
         Ok(())
     }
@@ -386,7 +389,7 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<PluginConfigResponse>().await?;
         assert_eq!(Value::Object(body.active), json!({"a": 1, "b": 3}));
-        assert!(!body.restart_required);
+        assert!(!body.reload_failed);
 
         // The plugin list shows the config in effect too.
         let resp = client
@@ -421,7 +424,7 @@ mod test {
         let body = resp.json::<PluginConfigResponse>().await?;
         assert_eq!(Value::Object(body.config), json!({"a": 1, "fail": true}));
         assert_eq!(Value::Object(body.active), json!({"a": 1}));
-        assert!(body.restart_required);
+        assert!(body.reload_failed);
         assert!(
             body.reload_error
                 .as_deref()
@@ -436,7 +439,7 @@ mod test {
         let resp = client.put(URL).json(&json!({"a": 2})).send().await?;
         let body = resp.json::<PluginConfigResponse>().await?;
         assert_eq!(Value::Object(body.active), json!({"a": 2}));
-        assert!(!body.restart_required);
+        assert!(!body.reload_failed);
         assert!(body.reload_error.is_none());
 
         Ok(())
@@ -494,7 +497,7 @@ mod test {
             Value::Object(body.active),
             json!({"a": 1, "b": 3, "c": [1, 2]})
         );
-        assert!(!body.restart_required);
+        assert!(!body.reload_failed);
         assert!(body.reload_error.is_none());
         assert_eq!(stored(&tc)?, json!({"b": 3, "c": [1, 2]}));
 
@@ -557,7 +560,7 @@ mod test {
             Value::Object(body.config),
             json!({"a": 10, "b": {"x": 1}, "c": null})
         );
-        assert!(!body.restart_required);
+        assert!(!body.reload_failed);
 
         // Nested objects are replaced, not merged.
         let resp = client
@@ -585,7 +588,7 @@ mod test {
         let body = resp.json::<PluginConfigResponse>().await?;
         assert_eq!(Value::Object(body.overrides), json!({}));
         assert_eq!(Value::Object(body.config), json!({"a": 1, "b": 2}));
-        assert!(!body.restart_required);
+        assert!(!body.reload_failed);
         assert_eq!(stored(&tc)?, json!({}));
 
         // Deleting again is harmless.

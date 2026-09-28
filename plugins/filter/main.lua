@@ -150,6 +150,9 @@ local function filter(entry)
     local reason = reason_to_hide(entry)
     if reason then
         kiki.log("debug", string.format("filter: hiding %q: %s", entry.guid, reason))
+        -- An earlier plugin may have hidden the entry already. (Entries
+        -- passed to a scan always arrive with `tags` empty, so this only
+        -- matters on ingest.)
         for _, tag in ipairs(entry.tags) do
             if tag == HIDDEN then
                 return entry
@@ -183,6 +186,10 @@ end
 -- rules last applied are kept in the plugin's store, so that restarting
 -- the server, or reloading plugins for some other reason, does not rescan:
 -- that would hide again any entry the user unhid.
+--
+-- The rules are only recorded as applied once the scan has gone through
+-- every entry. A scan cut short, by a reload or the server stopping, runs
+-- again from the start on the next load.
 kiki.on("plugin.load", function()
     if config.rescan == false then
         return
@@ -191,9 +198,15 @@ kiki.on("plugin.load", function()
     if deep_equal(kiki.store.get("rules"), rules) then
         return
     end
-    if #exclude > 0 or #include > 0 then
-        kiki.log("info", "filter: rules changed; applying them to stored entries")
-        kiki.entries.scan(filter)
+    if #exclude == 0 and #include == 0 then
+        kiki.store.set("rules", rules)
+        return
     end
-    kiki.store.set("rules", rules)
+    kiki.log("info", "filter: rules changed; applying them to stored entries")
+    kiki.entries.scan(filter, function(summary)
+        kiki.log("info", string.format(
+            "filter: applied the rules to %d stored entries, hiding %d",
+            summary.scanned, summary.updated))
+        kiki.store.set("rules", rules)
+    end)
 end)

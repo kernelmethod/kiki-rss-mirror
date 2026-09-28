@@ -1279,7 +1279,7 @@ fn render_plugin_page(
     if let Some(error) = error {
         html.push_str(&format!("<p class=\"error\">{}</p>\n", escape(error)));
     }
-    if config.restart_required {
+    if config.reload_failed {
         html.push_str(
             "<p class=\"notice\">The plugin is not running with this config: the plugins \
              failed to load with it, so they keep running with the config they had. The \

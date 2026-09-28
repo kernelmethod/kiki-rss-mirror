@@ -377,8 +377,8 @@ impl Server {
         if let Err(e) = plugins::runtime::spawn_watcher(plugins.clone(), self.cancel_token.clone())
         {
             tracing::warn!(
-                "not watching plugins directory {:?} for changes; reload plugins with \
-                 `kiki plugin reload`: {:#}",
+                "not watching plugins directory {:?} for changes; edits to plugins \
+                 take effect when a plugin's config changes or the server restarts: {:#}",
                 self.plugins_dir,
                 e
             );

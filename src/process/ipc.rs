@@ -26,7 +26,9 @@
 //! than as a silently desynchronised stream. The feed fetcher's protocol is
 //! multiplexed instead; see [`crate::process::feed_fetcher`].
 
-use crate::scripting::{Event, EventPayload, FeedEntry, ScriptSource, ServiceCall, ServiceReply};
+use crate::scripting::{
+    Event, EventPayload, FeedEntry, ScanSummary, ScriptSource, ServiceCall, ServiceReply,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -61,8 +63,13 @@ pub enum HostRequest {
         entries: Vec<FeedEntry>,
     },
 
-    /// Forget the scan `scan_id`. Answered with [`HostResponse::Ack`].
-    FinishScan { scan_id: u64 },
+    /// Forget the scan `scan_id`, first calling its `on_done` callback
+    /// with `summary` if the scan completed. Answered with
+    /// [`HostResponse::Ack`].
+    FinishScan {
+        scan_id: u64,
+        summary: Option<ScanSummary>,
+    },
 
     /// The server's answer to a [`HostResponse::Call`].
     CallResult {
@@ -83,8 +90,8 @@ pub enum HostResponse {
     /// An observe event was dispatched.
     Ack,
 
-    /// What the scan handler returned for each entry, or `None` if the
-    /// host has no such scan.
+    /// What the scan handler returned for each entry it handled (a
+    /// prefix of those sent), or `None` if the host has no such scan.
     Scanned {
         entries: Option<Vec<Option<FeedEntry>>>,
     },

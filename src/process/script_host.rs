@@ -42,8 +42,8 @@ use crate::process::ipc::{
     decode, encode, read_frame, write_frame, HostRequest, HostResponse, MAX_FRAME_BYTES,
 };
 use crate::scripting::{
-    Event, EventPayload, FeedEntry, ScriptRunner, ScriptServices, ScriptSource, ServiceCall,
-    ServiceReply,
+    Event, EventPayload, FeedEntry, ScanSummary, ScriptRunner, ScriptServices, ScriptSource,
+    ServiceCall, ServiceReply,
 };
 use anyhow::{Context, Result};
 use std::io;
@@ -352,8 +352,11 @@ impl ScriptRunner for SubprocessScriptRunner {
         }
     }
 
-    fn finish_scan(&self, scan_id: u64) {
-        if let Err(e) = self.host.request(&HostRequest::FinishScan { scan_id }) {
+    fn finish_scan(&self, scan_id: u64, summary: Option<ScanSummary>) {
+        if let Err(e) = self
+            .host
+            .request(&HostRequest::FinishScan { scan_id, summary })
+        {
             warn!(error = %e, "script host: finishing scan {scan_id} failed");
         }
     }
@@ -527,9 +530,9 @@ fn serve(
             },
         },
 
-        HostRequest::FinishScan { scan_id } => {
+        HostRequest::FinishScan { scan_id, summary } => {
             if let Some(r) = runner.as_ref() {
-                r.finish_scan(scan_id);
+                r.finish_scan(scan_id, summary);
             }
             HostResponse::Ack
         }

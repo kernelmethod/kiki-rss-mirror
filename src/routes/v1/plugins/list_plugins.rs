@@ -90,8 +90,8 @@ pub struct ListPluginsResponse {
 ///
 /// Return every plugin that was found in the plugins directory when plugins were last
 /// loaded, along with the directories in it that could not be loaded as plugins and why.
-/// Plugins are reloaded when the plugins directory changes, when a plugin's config is
-/// changed, and on `POST /v1/plugins/reload`.
+/// Plugins are reloaded when a file in the plugins directory changes, and when a plugin's
+/// config is changed.
 #[utoipa::path(
     get,
     path = "/v1/plugins",

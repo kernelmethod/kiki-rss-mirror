@@ -311,6 +311,15 @@ pub struct ScanOptions {
     pub include_hidden: bool,
 }
 
+/// How a scan went, handed to its `on_done` callback when it finishes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanSummary {
+    /// How many entries were passed to the scan's handler.
+    pub scanned: u64,
+    /// How many of them gained a system tag the handler added.
+    pub updated: u64,
+}
+
 /// A request from a plugin to the server, made through the `kiki` Lua API.
 ///
 /// Plugins may run in a sandboxed process with no database access (see
@@ -387,11 +396,14 @@ pub trait ScriptRunner: Send + Sync {
     /// observe events are fire-and-forget.
     fn dispatch_observe(&self, event: Event, payload: EventPayload);
 
-    /// Pass each of `entries` to the handler of the scan `scan_id`, started by a plugin
+    /// Pass `entries`, in order, to the handler of the scan `scan_id`, started by a plugin
     /// with [`ServiceCall::StartScan`].
     ///
-    /// Returns, for each entry, what the handler returned: the entry, possibly modified, or
-    /// `None` if the handler returned `nil` or failed. Returns `Ok(None)` if the runner has
+    /// Returns, for each entry handled, what the handler returned: the entry, possibly
+    /// modified, or `None` if the handler returned `nil` or failed. So that a scan never
+    /// holds up other events for long, the runner may stop after handling only some of
+    /// `entries` (but at least one); the results then cover that prefix, and the caller
+    /// passes the rest again. Returns `Ok(None)` if the runner has
     /// no scan `scan_id`, because the scan was finished or the plugins were reloaded since
     /// it started; the scan should then stop.
     ///
@@ -404,9 +416,11 @@ pub trait ScriptRunner: Send + Sync {
         entries: Vec<FeedEntry>,
     ) -> anyhow::Result<Option<Vec<Option<FeedEntry>>>>;
 
-    /// Forget the scan `scan_id`, releasing its handler. Scans the runner does not know are
+    /// Forget the scan `scan_id`, releasing its handler. When `summary` is given, the scan
+    /// went through every entry it was asked to, and the scan's `on_done` callback, if it
+    /// has one, is called with the summary first. Scans the runner does not know are
     /// ignored.
-    fn finish_scan(&self, scan_id: u64);
+    fn finish_scan(&self, scan_id: u64, summary: Option<ScanSummary>);
 }
 
 /// Shared access to the currently-installed [`ScriptRunner`].

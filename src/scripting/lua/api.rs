@@ -12,9 +12,77 @@ use mlua::RegistryKey;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-/// The handlers of the scans plugins have started, keyed by scan id.
-pub(super) type Scans = Arc<Mutex<HashMap<u64, RegistryKey>>>;
+/// The callbacks of a scan a plugin started.
+pub(super) struct ScanCallbacks {
+    /// Called with each entry.
+    pub handler: RegistryKey,
+    /// Called once the scan has gone through every entry, if the plugin gave one.
+    pub on_done: Option<RegistryKey>,
+}
+
+/// The scans plugins have started, keyed by scan id.
+pub(super) type Scans = Arc<Mutex<HashMap<u64, ScanCallbacks>>>;
+
+/// How much of the time a handler spends waiting on the server, in calls to `kiki.store`
+/// and `kiki.entries`, does not count against its time budget. Past this, waiting counts
+/// as usual, so a handler cannot run for ever by calling the server in a loop.
+pub const MAX_CALL_ALLOWANCE: Duration = Duration::from_secs(1);
+
+/// The time budget of the handler call in progress, if any.
+///
+/// The budget is wall-clock time, but time spent waiting on the server in a service call
+/// is given back, up to [`MAX_CALL_ALLOWANCE`] per handler call: how long the database or
+/// the channel to the server takes is out of the handler's hands.
+#[derive(Default)]
+pub(super) struct Budget {
+    state: Mutex<Option<BudgetState>>,
+}
+
+struct BudgetState {
+    deadline: Instant,
+    allowance: Duration,
+}
+
+impl Budget {
+    /// Starts a budget of `limit` for a handler call.
+    pub fn start(&self, limit: Duration) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Some(BudgetState {
+            deadline: Instant::now() + limit,
+            allowance: MAX_CALL_ALLOWANCE,
+        });
+    }
+
+    /// Ends the handler call's budget.
+    pub fn stop(&self) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Whether the handler call has used up its budget.
+    pub fn expired(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|s| Instant::now() >= s.deadline)
+    }
+
+    /// Gives back `waited`, time spent waiting on the server, as far as the allowance
+    /// goes.
+    fn give_back(&self, waited: Duration) {
+        if let Some(s) = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            let credit = waited.min(s.allowance);
+            s.allowance -= credit;
+            s.deadline += credit;
+        }
+    }
+}
 
 /// What the per-plugin API functions share with the runner.
 #[derive(Clone)]
@@ -23,6 +91,8 @@ pub(super) struct ApiContext {
     /// the functions then raise an error.
     pub services: Option<Arc<dyn ScriptServices>>,
     pub scans: Scans,
+    /// The budget of the handler call in progress.
+    pub budget: Arc<Budget>,
     /// Set while plugins' top-level chunks run, when scans cannot start yet: the runner
     /// they would be dispatched to is not installed until every plugin has loaded.
     pub loading: Arc<AtomicBool>,
@@ -33,9 +103,18 @@ impl ApiContext {
         let services = self.services.as_ref().ok_or_else(|| {
             LuaError::RuntimeError(format!("kiki.{name}: not available in this runner"))
         })?;
-        services
-            .call(plugin, call)
-            .map_err(|e| LuaError::RuntimeError(format!("kiki.{name}: {e}")))
+        // The timeout hook only runs every so many instructions, and a loop
+        // of calls runs few of them while taking a long time, so the budget
+        // is checked here too.
+        if self.budget.expired() {
+            return Err(LuaError::RuntimeError(format!(
+                "kiki.{name}: the handler has used up its time budget"
+            )));
+        }
+        let start = Instant::now();
+        let result = services.call(plugin, call);
+        self.budget.give_back(start.elapsed());
+        result.map_err(|e| LuaError::RuntimeError(format!("kiki.{name}: {e}")))
     }
 }
 
@@ -123,7 +202,7 @@ fn entries_table(lua: &Lua, plugin: &str, ctx: &ApiContext) -> LuaResult<LuaTabl
     entries.set(
         "scan",
         lua.create_function(move |lua, args: LuaMultiValue| {
-            let (options, handler) = scan_args(args)?;
+            let (options, handler, on_done) = scan_args(args)?;
             if c.loading.load(Ordering::SeqCst) {
                 return Err(LuaError::RuntimeError(
                     "kiki.entries.scan: scans cannot start while plugins are loading; \
@@ -137,11 +216,14 @@ fn entries_table(lua: &Lua, plugin: &str, ctx: &ApiContext) -> LuaResult<LuaTabl
             };
             // The scan cannot reach the handler before it is registered: its batches are
             // dispatched through this runner, which is busy until this handler returns.
-            let key = lua.create_registry_value(handler)?;
+            let callbacks = ScanCallbacks {
+                handler: lua.create_registry_value(handler)?,
+                on_done: on_done.map(|f| lua.create_registry_value(f)).transpose()?,
+            };
             c.scans
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(id, key);
+                .insert(id, callbacks);
             Ok(id)
         })?,
     )?;
@@ -149,15 +231,27 @@ fn entries_table(lua: &Lua, plugin: &str, ctx: &ApiContext) -> LuaResult<LuaTabl
     Ok(entries)
 }
 
-/// Parses the arguments of `kiki.entries.scan([options,] handler)`.
-fn scan_args(args: LuaMultiValue) -> LuaResult<(ScanOptions, LuaFunction)> {
+/// Parses the arguments of `kiki.entries.scan([options,] handler [, on_done])`.
+fn scan_args(args: LuaMultiValue) -> LuaResult<(ScanOptions, LuaFunction, Option<LuaFunction>)> {
     let err = |m: &str| LuaError::RuntimeError(format!("kiki.entries.scan: {m}"));
-    let mut args = args.into_iter();
-    let (options, handler) = match (args.next(), args.next()) {
-        (Some(LuaValue::Function(f)), None) => (None, f),
-        (Some(LuaValue::Nil), Some(LuaValue::Function(f))) => (None, f),
-        (Some(LuaValue::Table(t)), Some(LuaValue::Function(f))) => (Some(t), f),
-        _ => return Err(err("expected ([options,] handler)")),
+    let mut args: Vec<LuaValue> = args.into_iter().collect();
+    // Trailing nils are as good as absent.
+    while matches!(args.last(), Some(LuaValue::Nil)) {
+        args.pop();
+    }
+    let options = match args.first() {
+        Some(LuaValue::Table(t)) => Some(t.clone()),
+        Some(LuaValue::Nil) => None,
+        Some(LuaValue::Function(_)) => {
+            args.insert(0, LuaValue::Nil);
+            None
+        }
+        _ => return Err(err("expected ([options,] handler [, on_done])")),
+    };
+    let (handler, on_done) = match args.get(1..).unwrap_or_default() {
+        [LuaValue::Function(h)] => (h.clone(), None),
+        [LuaValue::Function(h), LuaValue::Function(d)] => (h.clone(), Some(d.clone())),
+        _ => return Err(err("expected ([options,] handler [, on_done])")),
     };
     let mut parsed = ScanOptions::default();
     if let Some(options) = options {
@@ -184,5 +278,5 @@ fn scan_args(args: LuaMultiValue) -> LuaResult<(ScanOptions, LuaFunction)> {
             }
         }
     }
-    Ok((parsed, handler))
+    Ok((parsed, handler, on_done))
 }

@@ -6,8 +6,9 @@
 //! plugins:
 //!
 //! - when a file in the plugins directory changes (see [`spawn_watcher`]),
-//! - when a plugin's config overrides are changed through the API, and
-//! - when asked to, with `POST /v1/plugins/reload` or `kiki plugin reload`.
+//!   and
+//! - when a plugin's config overrides are changed through the API, which
+//!   `kiki plugin config set` also uses when the server is running.
 //!
 //! A reload whose plugins fail to compile changes nothing: the plugins that
 //! were running keep running, just as an invalid edit to the config file
@@ -74,7 +75,7 @@ pub struct ReloadOutcome {
 /// documentation](self).
 pub struct PluginRuntime {
     dir: PathBuf,
-    discovery: Arc<ArcSwap<Discovery>>,
+    discovery: ArcSwap<Discovery>,
     /// The sources the script runner was last built from, to tell whether a
     /// reload changes anything. `None` until plugins first load.
     sources: Mutex<Option<Vec<ScriptSource>>>,
@@ -107,10 +108,9 @@ impl PluginRuntime {
         script_host: crate::process::ScriptHostHandle,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Self, ReloadError> {
-        let discovery = Arc::new(ArcSwap::from_pointee(Discovery::default()));
+        let discovery = ArcSwap::from_pointee(Discovery::default());
         let services = Arc::new(ServerServices::new(
             pool.clone(),
-            discovery.clone(),
             script_runner.clone(),
             cancel,
         ));
@@ -174,23 +174,27 @@ impl PluginRuntime {
         let sources = super::load_sources(&discovery, super::PluginEngine::Lua);
         let loaded = sources.len();
         let changed = last_sources.as_ref() != Some(&sources);
-        // Swapped in before the plugins load, since the calls they make
-        // while loading are only answered for plugins that are loaded.
         let discovery = Arc::new(discovery);
-        let previous = self.discovery.swap(discovery.clone());
         if changed {
+            // Set before the plugins load, since the calls they make while
+            // loading are only answered for plugins that are loaded.
+            let names = sources.iter().map(|s| s.name.clone()).collect();
+            let previous = self.services.set_loaded(names);
             if let Err(e) = self.load(&discovery) {
-                // Put back the plugins that keep running, so that what the
-                // API reports as running is what is running. With nothing
-                // loaded before, as when the server starts, list the ones
-                // that were found, although they are not running.
-                if last_sources.is_some() {
-                    self.discovery.store(previous);
+                // The plugins that were running keep running, and keep
+                // being reported, so that what the API reports as running
+                // is what is running. With nothing loaded before, as when
+                // the server starts, list the ones that were found,
+                // although they are not running.
+                self.services.set_loaded((*previous).clone());
+                if last_sources.is_none() {
+                    self.discovery.store(discovery);
                 }
                 return Err(e);
             }
             *last_sources = Some(sources);
         }
+        self.discovery.store(discovery);
         Ok(ReloadOutcome { loaded, changed })
     }
 

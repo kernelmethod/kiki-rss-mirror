@@ -32,9 +32,10 @@ mod config;
 mod regex_api;
 
 use super::{
-    parse_script_config, Event, EventPayload, FeedEntry, ScriptRunner, ScriptServices, ScriptSource,
+    parse_script_config, Event, EventPayload, FeedEntry, ScanSummary, ScriptRunner, ScriptServices,
+    ScriptSource,
 };
-use api::ApiContext;
+use api::{ApiContext, Budget};
 use mlua::prelude::*;
 use mlua::HookTriggers;
 use mlua::RegistryKey;
@@ -48,6 +49,12 @@ use tracing::warn;
 
 /// Per-handler execution time budget.
 pub const SCRIPT_TIMEOUT_MS: u64 = 100;
+
+/// How long one [`ScriptRunner::dispatch_scan`] call may keep the VM busy before handing
+/// back the entries it has not reached, so that events queued behind a scan are not held up
+/// for long. Checked between entries, so a dispatch runs at most this plus one handler's
+/// budget.
+pub const SCAN_SLICE: Duration = Duration::from_millis(50);
 
 /// Frequency (in Lua VM instructions) at which the timeout hook fires.
 const HOOK_EVERY_N: u32 = 1000;
@@ -214,6 +221,9 @@ pub struct LuaScriptRunner {
     handlers: Arc<Mutex<HashMap<Event, Vec<RegistryKey>>>>,
     // The handlers of the scans plugins have started with `kiki.entries.scan`.
     scans: api::Scans,
+    // The time budget of the handler call in progress, which service calls give time back
+    // to.
+    budget: Arc<Budget>,
 }
 
 impl LuaScriptRunner {
@@ -347,6 +357,7 @@ impl LuaScriptRunner {
         let ctx = ApiContext {
             services,
             scans: Arc::new(Mutex::new(HashMap::new())),
+            budget: Arc::new(Budget::default()),
             loading: Arc::new(AtomicBool::new(true)),
         };
         for source in script_sources {
@@ -358,6 +369,7 @@ impl LuaScriptRunner {
             lua: Mutex::new(lua),
             handlers,
             scans: ctx.scans,
+            budget: ctx.budget,
         })
     }
 
@@ -469,17 +481,21 @@ fn plugin_env(lua: &Lua, source: &ScriptSource, ctx: &ApiContext) -> LuaResult<L
     Ok(env)
 }
 
-/// Invoke `handler(payload)` with the timeout hook installed for the duration of the call.
+/// Invoke `handler(payload)` with the timeout hook installed for the duration of the call,
+/// and `budget` running. Time the handler spends waiting on the server is given back to it
+/// (see [`Budget`]).
 fn call_with_timeout<R: FromLua>(
     lua: &Lua,
+    budget: &Arc<Budget>,
     handler: &LuaFunction,
     payload: LuaValue,
 ) -> LuaResult<R> {
-    let deadline = Instant::now() + Duration::from_millis(SCRIPT_TIMEOUT_MS);
+    budget.start(Duration::from_millis(SCRIPT_TIMEOUT_MS));
+    let hook_budget = budget.clone();
     lua.set_hook(
         HookTriggers::new().every_nth_instruction(HOOK_EVERY_N),
         move |_lua, _debug| {
-            if Instant::now() >= deadline {
+            if hook_budget.expired() {
                 Err(LuaError::RuntimeError(format!(
                     "script exceeded {SCRIPT_TIMEOUT_MS}ms time budget"
                 )))
@@ -490,6 +506,7 @@ fn call_with_timeout<R: FromLua>(
     );
     let result = handler.call::<R>(payload);
     lua.remove_hook();
+    budget.stop();
     result
 }
 
@@ -518,7 +535,7 @@ impl ScriptRunner for LuaScriptRunner {
                 }
             };
 
-            match call_with_timeout::<LuaValue>(&lua, handler, lua_entry) {
+            match call_with_timeout::<LuaValue>(&lua, &self.budget, handler, lua_entry) {
                 Ok(LuaValue::Nil) => return Ok(None),
                 Ok(LuaValue::Table(t)) => match FeedEntry::from_lua(LuaValue::Table(t), &lua) {
                     Ok(mut modified) => {
@@ -574,7 +591,8 @@ impl ScriptRunner for LuaScriptRunner {
                 }
             };
 
-            if let Err(e) = call_with_timeout::<LuaValue>(&lua, handler, lua_payload) {
+            if let Err(e) = call_with_timeout::<LuaValue>(&lua, &self.budget, handler, lua_payload)
+            {
                 warn!(
                     event = event.name(),
                     error = %e,
@@ -597,15 +615,25 @@ impl ScriptRunner for LuaScriptRunner {
         let handler: LuaFunction = {
             let scans = self.scans.lock().unwrap_or_else(|e| e.into_inner());
             match scans.get(&scan_id) {
-                Some(key) => lua.registry_value(key)?,
+                Some(callbacks) => lua.registry_value(&callbacks.handler)?,
                 None => return Ok(None),
             }
         };
 
+        let start = Instant::now();
         let mut results = Vec::with_capacity(entries.len());
         for entry in entries {
+            // At least one entry is always handled, so the scan makes progress.
+            if !results.is_empty() && start.elapsed() >= SCAN_SLICE {
+                break;
+            }
             let lua_entry = entry.clone().into_lua(&lua)?;
-            let result = match call_with_timeout::<LuaValue>(&lua, &handler, lua_entry) {
+            let result = match call_with_timeout::<LuaValue>(
+                &lua,
+                &self.budget,
+                &handler,
+                lua_entry,
+            ) {
                 Ok(LuaValue::Nil) => None,
                 Ok(LuaValue::Table(t)) => match FeedEntry::from_lua(LuaValue::Table(t), &lua) {
                     Ok(mut modified) => {
@@ -634,18 +662,33 @@ impl ScriptRunner for LuaScriptRunner {
         Ok(Some(results))
     }
 
-    fn finish_scan(&self, scan_id: u64) {
-        let key = self
+    fn finish_scan(&self, scan_id: u64, summary: Option<ScanSummary>) {
+        let callbacks = self
             .scans
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&scan_id);
-        if let Some(key) = key {
-            let lua = self
-                .lua
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _ = lua.remove_registry_value(key);
+        let Some(callbacks) = callbacks else {
+            return;
+        };
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let (Some(summary), Some(on_done)) = (summary, &callbacks.on_done) {
+            let result = lua.registry_value::<LuaFunction>(on_done).and_then(|f| {
+                let t = lua.create_table()?;
+                t.set("scanned", summary.scanned)?;
+                t.set("updated", summary.updated)?;
+                call_with_timeout::<LuaValue>(&lua, &self.budget, &f, LuaValue::Table(t))
+            });
+            if let Err(e) = result {
+                warn!(error = %e, "scan on_done callback failed");
+            }
+        }
+        let _ = lua.remove_registry_value(callbacks.handler);
+        if let Some(on_done) = callbacks.on_done {
+            let _ = lua.remove_registry_value(on_done);
         }
     }
 }
@@ -1194,5 +1237,104 @@ mod tests {
         .unwrap();
         let result = runner.dispatch_transform_entry(make_entry()).unwrap();
         assert!(result.is_some());
+    }
+
+    /// Answers every scan request with scan 7, and makes every store read
+    /// take `delay`.
+    struct SlowServices {
+        delay: Duration,
+    }
+
+    impl ScriptServices for SlowServices {
+        fn call(
+            &self,
+            _plugin: &str,
+            call: crate::scripting::ServiceCall,
+        ) -> Result<crate::scripting::ServiceReply, String> {
+            use crate::scripting::{ServiceCall, ServiceReply};
+            match call {
+                ServiceCall::StartScan { .. } => Ok(ServiceReply::ScanStarted(7)),
+                ServiceCall::StoreGet { .. } => {
+                    std::thread::sleep(self.delay);
+                    Ok(ServiceReply::Value(None))
+                }
+                other => Err(format!("unexpected {other:?}")),
+            }
+        }
+    }
+
+    /// A runner whose plugin, on `plugin.load`, starts scan 7 with `handler`.
+    fn scanning_runner(handler: &str, delay: Duration) -> LuaScriptRunner {
+        let text =
+            format!(r#"kiki.on("plugin.load", function() kiki.entries.scan({handler}) end)"#);
+        let runner = LuaScriptRunner::from_sources_with(
+            &[ScriptSource::new(text)],
+            Some(Arc::new(SlowServices { delay })),
+        )
+        .unwrap();
+        runner.dispatch_observe(Event::PluginLoad, EventPayload::PluginLoad);
+        runner
+    }
+
+    #[test]
+    fn scan_dispatches_are_time_sliced() {
+        // Each entry takes about 20ms, so a 50ms slice ends well before 10.
+        let runner = scanning_runner(
+            r#"function(entry)
+                local start = os.clock()
+                while os.clock() - start < 0.02 do end
+                return entry
+            end"#,
+            Duration::ZERO,
+        );
+        let entries = vec![make_entry(); 10];
+        let results = runner.dispatch_scan(7, entries).unwrap().unwrap();
+        assert!(
+            !results.is_empty() && results.len() < 10,
+            "handled {} entries",
+            results.len()
+        );
+        assert!(runner
+            .dispatch_scan(8, vec![make_entry()])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn time_spent_waiting_on_the_server_is_not_counted() {
+        // A store read takes longer than the whole budget, but the handler
+        // still finishes.
+        let runner = scanning_runner(
+            r#"function(entry)
+                kiki.store.get("k")
+                entry.title = "done"
+                return entry
+            end"#,
+            Duration::from_millis(3 * SCRIPT_TIMEOUT_MS),
+        );
+        let results = runner
+            .dispatch_scan(7, vec![make_entry()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(results.first().unwrap().as_ref().unwrap().title, "done");
+    }
+
+    #[test]
+    fn waiting_on_the_server_only_goes_so_far() {
+        // Past the allowance, waiting counts again, so calling the server in
+        // a loop cannot keep a handler running for ever.
+        let runner = scanning_runner(
+            r#"function(entry)
+                while true do kiki.store.get("k") end
+            end"#,
+            Duration::from_millis(50),
+        );
+        let start = Instant::now();
+        let results = runner
+            .dispatch_scan(7, vec![make_entry()])
+            .unwrap()
+            .unwrap();
+        assert!(results.first().unwrap().is_none());
+        assert!(start.elapsed() < api::MAX_CALL_ALLOWANCE * 3);
     }
 }

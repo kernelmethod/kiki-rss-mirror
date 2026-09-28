@@ -17,16 +17,16 @@
 //! were running belong to the plugins that were unloaded, and the server
 //! shutting down ends them too.
 
-use super::Discovery;
 use crate::db::plugins::{store_get, store_set};
 use crate::db::tags::{is_reserved_tag_name, SystemTag};
 use crate::scripting::{
-    FeedEntry, ScanOptions, ScriptRunnerHandle, ScriptServices, ServiceCall, ServiceReply,
+    FeedEntry, ScanOptions, ScanSummary, ScriptRunnerHandle, ScriptServices, ServiceCall,
+    ServiceReply,
 };
 use arc_swap::ArcSwap;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -37,20 +37,26 @@ use tracing::{debug, info, warn};
 /// up behind a long scan.
 const READ_BATCH: usize = 200;
 
-/// How many entries a scan hands to the plugin per dispatch. Every entry
-/// gets the handler's full time budget, so this keeps one dispatch well
-/// inside the script host's IPC timeout.
+/// Most entries a scan hands to the plugin per dispatch. The runner hands
+/// back the ones it did not reach once a dispatch has taken
+/// [`SCAN_SLICE`](crate::scripting::lua::SCAN_SLICE), so events queued
+/// behind a scan wait for one slice at most, not a whole batch.
 const DISPATCH_BATCH: usize = 25;
 
 /// Longest user tag name a plugin may set.
 const MAX_TAG_NAME_BYTES: usize = 255;
+
+/// Most user tags there may be for a plugin to create another. Plugins can
+/// tag entries with existing user tags past this, but not add new ones.
+pub const MAX_USER_TAGS: i64 = 10_000;
 
 type Pool = r2d2::Pool<SqliteConnectionManager>;
 
 /// Answers the calls plugins make. See the [module documentation](self).
 pub struct ServerServices {
     pool: Pool,
-    discovery: Arc<ArcSwap<Discovery>>,
+    /// The names of the plugins loaded into the script runner.
+    loaded: ArcSwap<HashSet<String>>,
     scans: Arc<ScanState>,
 }
 
@@ -65,14 +71,10 @@ struct ScanState {
 }
 
 impl ServerServices {
-    /// Answers calls from the plugins in `discovery`, dispatching scans to
-    /// the runner in `runner`. Scans stop when `cancel` fires.
-    pub fn new(
-        pool: Pool,
-        discovery: Arc<ArcSwap<Discovery>>,
-        runner: ScriptRunnerHandle,
-        cancel: CancellationToken,
-    ) -> Self {
+    /// Answers calls from plugins, dispatching scans to the runner in
+    /// `runner`. Scans stop when `cancel` fires. No calls are answered
+    /// until [`Self::set_loaded`] names the plugins that are loaded.
+    pub fn new(pool: Pool, runner: ScriptRunnerHandle, cancel: CancellationToken) -> Self {
         Self {
             scans: Arc::new(ScanState {
                 pool: pool.clone(),
@@ -82,8 +84,15 @@ impl ServerServices {
                 running: Mutex::new(HashMap::new()),
             }),
             pool,
-            discovery,
+            loaded: ArcSwap::from_pointee(HashSet::new()),
         }
+    }
+
+    /// Answers calls only from the plugins named in `names`, the plugins
+    /// being loaded into the script runner, and returns the names it
+    /// answered calls from before.
+    pub fn set_loaded(&self, names: HashSet<String>) -> Arc<HashSet<String>> {
+        self.loaded.swap(Arc::new(names))
     }
 
     fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, String> {
@@ -97,13 +106,7 @@ impl ScriptServices for ServerServices {
     fn call(&self, plugin: &str, call: ServiceCall) -> Result<ServiceReply, String> {
         // The name comes from the script host, which is not trusted to
         // make it up: only loaded plugins get stores and scans.
-        if !self
-            .discovery
-            .load()
-            .plugins
-            .iter()
-            .any(|p| p.manifest.name == plugin)
-        {
+        if !self.loaded.load().contains(plugin) {
             return Err(format!("no plugin named {plugin:?} is loaded"));
         }
 
@@ -172,8 +175,7 @@ fn set_entry_tag(
             ));
         }
         if present {
-            conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [tag])
-                .map_err(db)?;
+            create_user_tag(conn, tag)?;
         }
         conn.query_row("SELECT id FROM tags WHERE name = ?1", [tag], |row| {
             row.get(0)
@@ -192,6 +194,32 @@ fn set_entry_tag(
         "DELETE FROM entry_tags WHERE entry_id = ?1 AND tag_id = ?2"
     };
     Ok(conn.execute(sql, [entry_id, tag_id]).map_err(db)? > 0)
+}
+
+/// Creates the user tag named `tag`, unless it exists already.
+///
+/// # Errors
+///
+/// Returns an error if the tag does not exist and there are already
+/// [`MAX_USER_TAGS`] user tags.
+fn create_user_tag(conn: &Connection, tag: &str) -> Result<(), String> {
+    let db = |e: rusqlite::Error| format!("database error: {e}");
+    let (exists, count): (bool, i64) = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tags WHERE name = ?1),
+                    (SELECT COUNT(*) FROM tags WHERE kind = 'user')",
+            [tag],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(db)?;
+    if !exists && count >= MAX_USER_TAGS {
+        return Err(format!(
+            "there are already {MAX_USER_TAGS} user tags, so plugins cannot create more"
+        ));
+    }
+    conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [tag])
+        .map_err(db)?;
+    Ok(())
 }
 
 impl ScanState {
@@ -225,25 +253,35 @@ impl ScanState {
         id
     }
 
-    /// Runs the scan `id` to the end, then forgets it.
+    /// Runs the scan `id` to the end, then forgets it, calling its
+    /// `on_done` callback if it went through every entry.
     fn run(&self, plugin: &str, id: u64, options: &ScanOptions, cancel: &CancellationToken) {
-        let mut totals = (0, 0);
+        let mut summary = ScanSummary::default();
         let result = scan(&self.pool, &self.runner, id, options, cancel, |s, u| {
-            totals.0 += s;
-            totals.1 += u;
+            summary.scanned += s;
+            summary.updated += u;
         });
-        match result {
-            Ok(()) if cancel.is_cancelled() => debug!(plugin, "scan {id} cancelled"),
-            Ok(()) => info!(
-                plugin,
-                scanned = totals.0,
-                updated = totals.1,
-                "scan {id} of stored entries finished"
-            ),
-            Err(e) => warn!(plugin, "scan {id} of stored entries failed: {e:#}"),
-        }
+        let completed = match result {
+            Ok(true) => {
+                info!(
+                    plugin,
+                    scanned = summary.scanned,
+                    updated = summary.updated,
+                    "scan {id} of stored entries finished"
+                );
+                true
+            }
+            Ok(false) => {
+                debug!(plugin, "scan {id} ended before it finished");
+                false
+            }
+            Err(e) => {
+                warn!(plugin, "scan {id} of stored entries failed: {e:#}");
+                false
+            }
+        };
         if let Some(runner) = self.runner.current() {
-            runner.finish_scan(id);
+            runner.finish_scan(id, completed.then_some(summary));
         }
         self.finished(plugin, id);
     }
@@ -261,8 +299,9 @@ impl ScanState {
 
 /// Runs the scan `scan_id` over the entries `options` describes, calling
 /// `progress` with the number of entries scanned and updated after each
-/// batch. Stops early, without error, when `cancel` fires or the runner no
-/// longer knows the scan.
+/// batch. Returns whether it went through every entry: it stops early,
+/// without error, when `cancel` fires or the runner no longer knows the
+/// scan.
 ///
 /// # Errors
 ///
@@ -276,30 +315,49 @@ pub(crate) fn scan(
     options: &ScanOptions,
     cancel: &CancellationToken,
     mut progress: impl FnMut(u64, u64),
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let hidden = SystemTag::Hidden.id(&*pool.get()?)?;
     let mut after_id = 0;
-    while !cancel.is_cancelled() {
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(false);
+        }
         let batch = load_batch(&*pool.get()?, options, hidden, after_id)?;
         let Some((last_id, _)) = batch.last() else {
-            return Ok(());
+            return Ok(true);
         };
         after_id = *last_id;
-        let scanned = batch.len() as u64;
 
+        let mut scanned = 0;
         let mut to_tag: Vec<(i64, Vec<SystemTag>)> = Vec::new();
-        let mut entries = batch.into_iter().map(|(_, e)| e).peekable();
-        while entries.peek().is_some() {
+        let mut pending: std::collections::VecDeque<FeedEntry> =
+            batch.into_iter().map(|(_, e)| e).collect();
+        let mut stopped = false;
+        while !pending.is_empty() {
             // Read the runner for each dispatch: after a reload, the scan
             // belongs to a runner that is gone, and the new one says so.
             let Some(runner) = runner.current() else {
-                return Ok(());
+                stopped = true;
+                break;
             };
-            let chunk: Vec<FeedEntry> = entries.by_ref().take(DISPATCH_BATCH).collect();
+            let take = pending.len().min(DISPATCH_BATCH);
+            let chunk: Vec<FeedEntry> = pending.drain(..take).collect();
             let ids: Vec<i64> = chunk.iter().filter_map(|e| e.id).collect();
-            let Some(results) = runner.dispatch_scan(scan_id, chunk)? else {
-                return Ok(());
+            let Some(results) = runner.dispatch_scan(scan_id, chunk.clone())? else {
+                stopped = true;
+                break;
             };
+            anyhow::ensure!(
+                !results.is_empty() && results.len() <= ids.len(),
+                "the runner handled {} of {} entries",
+                results.len(),
+                ids.len()
+            );
+            // Put back the entries the runner did not reach.
+            for entry in chunk.into_iter().skip(results.len()).rev() {
+                pending.push_front(entry);
+            }
+            scanned += results.len() as u64;
             for (entry_id, result) in ids.into_iter().zip(results) {
                 let tags = result.map(|e| system_tags(&e.tags)).unwrap_or_default();
                 if !tags.is_empty() {
@@ -307,18 +365,23 @@ pub(crate) fn scan(
                 }
             }
             if cancel.is_cancelled() {
+                stopped = true;
                 break;
             }
         }
 
+        // Whatever the handler already returned is applied, even if the
+        // scan stops here.
         let updated = if to_tag.is_empty() {
             0
         } else {
             apply_system_tags(&mut *pool.get()?, &to_tag)?
         };
         progress(scanned, updated);
+        if stopped {
+            return Ok(false);
+        }
     }
-    Ok(())
 }
 
 /// The known system tags in `tags`.
@@ -507,25 +570,13 @@ mod tests {
 
     impl Harness {
         fn new(pool: Pool, text: &str) -> Self {
-            let mut discovery = Discovery::default();
-            let dir = tempfile::tempdir().unwrap();
-            let manifest = crate::plugins::PluginManifest::parse(
-                "name = 'p'\nversion = '1.0.0'\nengine = 'lua'",
-            )
-            .unwrap();
-            let plugin_dir = crate::plugins::install(dir.path(), &manifest, text).unwrap();
-            discovery
-                .plugins
-                .push(crate::plugins::Plugin::load(&plugin_dir).unwrap());
-            std::mem::forget(dir);
-
             let runner = ScriptRunnerHandle::empty();
             let services = Arc::new(ServerServices::new(
                 pool.clone(),
-                Arc::new(ArcSwap::from_pointee(discovery)),
                 runner.clone(),
                 CancellationToken::new(),
             ));
+            services.set_loaded(HashSet::from(["p".to_string()]));
             let mut source = ScriptSource::new(text);
             source.name = "p".to_string();
             let lua = LuaScriptRunner::from_sources_with(
@@ -786,12 +837,10 @@ mod tests {
     #[test]
     fn scans_cannot_start_while_plugins_load() {
         let pool = pool();
-        let services: Arc<dyn ScriptServices> = Arc::new(ServerServices::new(
-            pool,
-            Arc::new(ArcSwap::from_pointee(Discovery::default())),
-            ScriptRunnerHandle::empty(),
-            CancellationToken::new(),
-        ));
+        let services =
+            ServerServices::new(pool, ScriptRunnerHandle::empty(), CancellationToken::new());
+        services.set_loaded(HashSet::from([ScriptSource::new("").name]));
+        let services: Arc<dyn ScriptServices> = Arc::new(services);
         let err = LuaScriptRunner::from_sources_with(
             &[ScriptSource::new("kiki.entries.scan(function() end)")],
             Some(services),
@@ -799,5 +848,84 @@ mod tests {
         .err()
         .unwrap();
         assert!(err.to_string().contains("plugin.load"), "{err}");
+    }
+
+    /// A scan's `on_done` callback runs once it has gone through every
+    /// entry, with a summary; a scan replaced by another never calls it.
+    #[test]
+    fn on_done_runs_only_when_a_scan_completes() {
+        let pool = pool();
+        let conn = pool.get().unwrap();
+        let feed = insert_feed(&conn);
+        for i in 0..(READ_BATCH + 3) {
+            insert_entry(&conn, feed, "rss", &format!("spam-{i}"));
+        }
+
+        let h = Harness::new(
+            pool.clone(),
+            r#"
+            local function hide(entry)
+                table.insert(entry.tags, "system:hidden")
+                return entry
+            end
+            kiki.on("plugin.load", function()
+                -- Replaced at once by the second scan, so never done.
+                kiki.entries.scan(hide, function() kiki.store.set("first", true) end)
+                kiki.entries.scan(hide, function(summary)
+                    kiki.store.set("summary", summary)
+                end)
+            end)
+            "#,
+        );
+        h.load();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store_get(&conn, "p", "summary").unwrap().is_none() {
+            assert!(Instant::now() < deadline, "on_done never ran");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        h.wait_for_scans();
+        let total = (READ_BATCH + 3) as u64;
+        assert_eq!(
+            store_get(&conn, "p", "summary").unwrap(),
+            Some(serde_json::json!({"scanned": total, "updated": total}))
+        );
+        assert_eq!(store_get(&conn, "p", "first").unwrap(), None);
+    }
+
+    #[test]
+    fn plugins_cannot_create_tags_past_the_limit() {
+        let pool = pool();
+        let mut conn = pool.get().unwrap();
+        let feed = insert_feed(&conn);
+        let entry = insert_entry(&conn, feed, "rss", "e");
+        {
+            let tx = conn.transaction().unwrap();
+            let existing: i64 = tx
+                .query_row("SELECT COUNT(*) FROM tags WHERE kind = 'user'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            for i in existing..MAX_USER_TAGS {
+                tx.execute("INSERT INTO tags (name) VALUES (?1)", [format!("t{i}")])
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let err = set_entry_tag(&conn, entry, "one-too-many", true).unwrap_err();
+        assert!(err.contains("cannot create more"), "{err}");
+        // Existing tags can still be used.
+        assert!(set_entry_tag(&conn, entry, "t1", true).unwrap());
+    }
+
+    #[test]
+    fn plugins_that_are_not_loaded_are_refused() {
+        let h = Harness::new(pool(), "");
+        let previous = h.services.set_loaded(HashSet::new());
+        assert!(previous.contains("p"));
+        let err = h
+            .services
+            .call("p", ServiceCall::StoreGet { key: "k".into() })
+            .unwrap_err();
+        assert!(err.contains("no plugin"), "{err}");
     }
 }

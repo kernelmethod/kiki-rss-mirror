@@ -313,16 +313,27 @@ its config changed:
 - `kiki.entries.tag(id, name)` adds the tag `name` to the stored entry with id
   `id`, creating the tag if it is a new user tag, and returns whether the
   entry did not already have it. `name` may be a system tag, such as
-  `system:hidden`.
+  `system:hidden`. Plugins cannot create new user tags once there are 10,000
+  user tags; they can still use the ones that exist.
 - `kiki.entries.untag(id, name)` removes the tag, returning whether the entry
-  had it.
-- `kiki.entries.scan([options,] handler)` starts a scan: in the background,
-  every stored entry that `options` selects is passed to `handler`, oldest
-  first, as an entry table with its `id` set and `tags` empty. As with a new
-  entry, the system tags the handler adds to `tags` are applied to the entry;
-  nothing else it changes is kept, and returning `nil` leaves the entry as it
-  is. To change anything else, the handler calls `kiki.entries.tag` or
-  `untag`. Returns the scan's id.
+  had it. System tags can be removed too, so a plugin can mark as unread,
+  unsave or unhide entries the user marked; use this with care.
+- `kiki.entries.scan([options,] handler [, on_done])` starts a scan: in the
+  background, every stored entry that `options` selects is passed to
+  `handler`, oldest first, as an entry table with its `id` set and `tags`
+  empty. As with a new entry, the system tags the handler adds to `tags` are
+  applied to the entry; nothing else it changes is kept, and returning `nil`
+  leaves the entry as it is. To change anything else, the handler calls
+  `kiki.entries.tag` or `untag`. Once the scan has gone through every entry,
+  `on_done`, if given, is called with a table holding `scanned`, how many
+  entries the handler saw, and `updated`, how many gained a system tag. It is
+  not called for a scan that ends early. Returns the scan's id.
+
+User tags added with `kiki.entries.tag` last only until an `entry.ingest`
+handler next sets the entry's user tags: when an entry is fetched again and a
+handler returns any user tag for it, its user tags are replaced with the ones
+returned, as they would be for tags added by hand. Tags that must last are best
+set by the same plugin, on ingest as well as on stored entries.
 
 `options` is a table with any of:
 
@@ -333,17 +344,22 @@ its config changed:
 | `include_hidden` | Also scan entries tagged `system:hidden`, which are skipped by default. |
 
 Each call of the handler has the usual [time budget](#resource-limits), so a
-scan can visit any number of entries; it runs alongside feed refreshes rather
-than holding them up. A plugin runs one scan at a time: starting another
-cancels the first. Reloading the plugins ends every scan, and so does
-stopping the server; a scan is not resumed afterwards.
+scan can visit any number of entries. Scans and feed refreshes take turns
+with the plugins: entries are handed to a scan a few at a time, and after
+about 50 ms of handling, any events a refresh has queued up go first. A scan
+therefore slows refreshes down by a little, rather than holding them up for
+long. A plugin runs one scan at a time: starting another cancels the first.
+Reloading the plugins ends every scan, and so does stopping the server; a scan
+is not resumed afterwards, and its `on_done` is not called.
 
 Scans cannot start while plugins are loading, from the top-level chunk:
 start them from a `plugin.load` handler. Since `plugin.load` fires on every
 reload, including those for other plugins' changes, keep track in
-`kiki.store` of what a scan has already applied. This plugin hides stored
-entries matching a configured pattern, but only when the pattern changes, so
-that entries the user has since unhidden stay unhidden:
+`kiki.store` of what a scan has already applied, and record it from `on_done`,
+once the scan has finished: a scan that was cut short then runs again on the
+next load. This plugin hides stored entries matching a configured pattern, but
+only when the pattern changes, so that entries the user has since unhidden
+stay unhidden:
 
 ```lua
 local config = ...
@@ -360,14 +376,16 @@ kiki.on("entry.ingest", hide)
 
 kiki.on("plugin.load", function()
     if kiki.store.get("pattern") ~= config.pattern then
-        kiki.entries.scan(hide)
-        kiki.store.set("pattern", config.pattern)
+        kiki.entries.scan(hide, function()
+            kiki.store.set("pattern", config.pattern)
+        end)
     end
 end)
 ```
 
 Calls to `kiki.store` and `kiki.entries` go to the server, which answers them
-from the database, and count against the handler's time budget.
+from the database. Time a handler spends waiting on them does not count
+against its [time budget](#resource-limits), up to a second per handler call.
 
 ## Regular expressions
 
@@ -435,7 +453,9 @@ Every handler call runs under two hard limits:
 - **Time**: 100 ms per invocation. Enforced by a Lua debug hook that fires
   every 1000 VM instructions. Scripts stuck in long-running C-level calls
   (e.g. pathological `string.gsub` patterns) can exceed this slightly before
-  control returns to the VM.
+  control returns to the VM. Time spent waiting on the server in calls to
+  `kiki.store` and `kiki.entries` is not counted, up to one second per
+  invocation; past that, waiting counts like anything else.
 - **Memory**: 16 MiB across the entire VM. Allocations that would exceed this
   cap fail the handler.
 - **Regexes**: compiled regexes live outside the VM, so the memory cap does not
