@@ -163,6 +163,19 @@ fn the_manifest_describes_the_rules() {
     assert!(hidden(&runner, entry(1, "x")));
 }
 
+/// An empty `fields` list, which the manifest's settings allow, matches
+/// the default fields, as the manifest says.
+#[test]
+fn an_empty_fields_list_means_the_default_fields() {
+    let config = json!({"exclude": [{"pattern": "body", "fields": []}]});
+    let manifest = crate::plugins::PluginManifest::parse(MANIFEST).unwrap();
+    crate::plugins::settings::check_config(&manifest.settings, config.as_object().unwrap())
+        .unwrap();
+    let runner = filter(config).unwrap();
+    // The entry's content is "<p>body</p>".
+    assert!(hidden(&runner, entry(1, "title")));
+}
+
 #[test]
 fn rules_can_name_feeds_by_url() {
     let feeds = Arc::new(Feeds::default());

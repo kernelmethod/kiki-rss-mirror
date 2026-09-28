@@ -44,6 +44,9 @@
 //! true` must be present in every object. Object field names are made of
 //! letters, digits, `_` and `-`.
 //!
+//! Options Kiki does not know, such as a misspelt `mni = 1`, are ignored,
+//! so check the spelling of an option that seems to have no effect.
+//!
 //! Settings are optional: config keys without one are shown as JSON, and
 //! a setting's default, if it has one, is its value in `[config]`, which
 //! must be of the setting's type. A top-level setting may still be
@@ -72,7 +75,8 @@ pub struct Setting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    /// For a field of an object, whether every object must have it.
+    /// For a field of an object, whether every object must have it. Not
+    /// allowed on top-level settings.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub required: bool,
 
@@ -394,6 +398,12 @@ fn validate_fields(
                 "field names may only hold ASCII letters, digits, '_' and '-'",
             ));
         }
+        if !nested && field.required {
+            return Err(bad(
+                "only fields of an object can be required; top-level settings \
+                 take their default from [config]",
+            ));
+        }
         if !names.insert(field.name.as_str()) {
             return Err(bad("is described twice"));
         }
@@ -607,6 +617,11 @@ mod tests {
             (
                 "[[settings]]\nname = 'a'\ntype = 'choice'\nchoices = []",
                 "a: a choice must have at least one choice",
+            ),
+            (
+                "[[settings]]\nname = 'a'\ntype = 'json'\nrequired = true",
+                "a: only fields of an object can be required; top-level settings take \
+                 their default from [config]",
             ),
             (
                 "[[settings]]\nname = 'a'\ntype = 'integer'\nmin = 2\nmax = 1",

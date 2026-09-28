@@ -2719,6 +2719,7 @@ mod tests {
             on = true
             mode = "fast"
             rules = [{ pattern = "a", fields = ["title"] }]
+            toggles = [{ enabled = false }]
 
             [[settings]]
             name = "on"
@@ -2749,6 +2750,18 @@ mod tests {
             name = "feeds"
             type = "list"
             items = { type = "integer" }
+
+            [[settings]]
+            name = "toggles"
+            type = "list"
+            [settings.items]
+            type = "object"
+            [[settings.items.fields]]
+            name = "enabled"
+            type = "boolean"
+            [[settings.items.fields]]
+            name = "note"
+            type = "string"
             "#,
         )?;
         std::fs::write(dir.join("main.lua"), "")?;
@@ -2904,6 +2917,39 @@ mod tests {
         Ok(())
     }
 
+    /// An item already in a list is kept when all its fields are left empty
+    /// or unticked; only the blank fieldset for a new item is dropped.
+    #[tokio::test]
+    async fn existing_items_are_kept_when_left_blank() -> Result<()> {
+        let tc = rules_plugin()?;
+        let (_, body) = get_page(tc.client()?, "/plugins/rules").await?;
+        assert!(body.contains(r#"name="v.0#present" value="1""#), "{body}");
+        assert!(!body.contains(r#"name="v.1#present""#), "{body}");
+
+        // What the browser submits for the page as it is: the item's box is
+        // unticked, and its note and the blank fieldset are empty.
+        let (status, body) = post_form(
+            tc.client()?,
+            "/plugins/rules/config",
+            &[
+                ("action", "save"),
+                ("key", "toggles"),
+                ("v#count", "2"),
+                ("v.0#present", "1"),
+                ("v.0.note", ""),
+                ("v.1.note", ""),
+            ],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            stored_rules(&tc)?,
+            serde_json::json!({"toggles": [{"enabled": false}]})
+        );
+        Ok(())
+    }
+
     /// Fields that do not hold a value of their setting's type are reported,
     /// and nothing is saved; so are JSON values the API refuses.
     #[tokio::test]
@@ -2965,7 +3011,10 @@ mod tests {
         )?;
         let (status, body) = get_page(tc.client()?, "/plugins/rules").await?;
         assert_eq!(status, StatusCode::OK);
-        assert!(!body.contains(r#"name="v#count""#), "{body}");
+        assert!(
+            !body.contains(r#"<div class="items" id="setting-2-v">"#),
+            "{body}"
+        );
         assert!(
             body.contains("shown as JSON, since the value does not fit the setting's fields"),
             "{body}"

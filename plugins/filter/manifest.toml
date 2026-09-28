@@ -1,5 +1,5 @@
 name = "filter"
-version = "1.2.0"
+version = "2.0.0"
 engine = "lua"
 description = "Hide or tag entries whose fields match, or fail to match, regular expressions"
 license = "MIT"

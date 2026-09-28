@@ -11,8 +11,10 @@
 //! `v.2.pattern` a field of the third object in a list. Object field names
 //! hold no `.` or `#` (see [`crate::plugins::settings`]), so these names
 //! never clash. A list of objects is shown as one fieldset per item, with a
-//! box to tick to remove it, and a blank one to fill in to add an item;
-//! `v#count` says how many fieldsets were shown.
+//! box to tick to remove it, and a blank one to fill in to add an item.
+//! `v#count` says how many fieldsets were shown, and `v.2#present` marks
+//! the fieldsets of items already in the list, which are kept even if all
+//! their fields are left empty.
 
 use crate::plugins::settings::{InvalidValue, Setting, SettingType, ValuePath};
 use quick_xml::escape::escape;
@@ -84,12 +86,10 @@ fn fits(kind: &SettingType, value: &Value) -> bool {
             list.iter()
                 .all(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
         }
-        // Each item is shown on its own; a blank one would be dropped.
         (SettingType::List { items }, Value::Array(list)) => match &**items {
-            SettingType::Object { fields } => list.iter().all(|item| {
-                item.as_object()
-                    .is_some_and(|o| !o.values().all(Value::is_null) && fits_object(fields, o))
-            }),
+            SettingType::Object { fields } => list
+                .iter()
+                .all(|item| item.as_object().is_some_and(|o| fits_object(fields, o))),
             _ => true,
         },
         (SettingType::Object { fields }, Value::Object(o)) => fits_object(fields, o),
@@ -240,9 +240,10 @@ fn render_list(items: &SettingType, field: &Field, value: Option<&Value>, label:
             for (i, item) in list.iter().enumerate() {
                 let item_field = field.child(&i.to_string(), false);
                 html.push_str(&format!(
-                    "<fieldset class=\"item\"><legend>{} {}</legend>{}\
+                    "<fieldset class=\"item\"><legend>{} {}</legend>\
+                     <input type=\"hidden\" name=\"{3}#present\" value=\"1\">{}\
                      <label class=\"check remove\"><input type=\"checkbox\" name=\"{REMOVE_FIELD}\" \
-                     value=\"{}\"> Remove</label></fieldset>",
+                     value=\"{3}\"> Remove</label></fieldset>",
                     escape(label),
                     i + 1,
                     render_widget(items, &item_field, Some(item), label),
@@ -396,7 +397,7 @@ pub fn parse_input(setting: &Setting, key: &str, form: &FormValues) -> Result<Va
             SettingType::String { .. } => Value::String(String::new()),
             kind => empty(kind, &path)?.ok_or_else(|| InvalidValue {
                 path: path.clone(),
-                message: "enter a value".into(),
+                message: "enter a value, or reset the setting to its default".into(),
             })?,
         },
     };
@@ -430,7 +431,7 @@ fn parse(
             .then_some(Value::Bool(true)),
         SettingType::Choice { .. } => Some(text).filter(|s| !s.is_empty()).map(Value::from),
         SettingType::List { items } => parse_list(items, name, path, form)?,
-        SettingType::Object { fields } => parse_object(fields, name, path, form)?,
+        SettingType::Object { fields } => parse_object(fields, name, path, form, false)?,
         SettingType::Json => parse_json(text).map_err(bad)?,
     })
 }
@@ -512,7 +513,13 @@ fn parse_list(
                     continue;
                 }
                 let item_path = path.index(list.len());
-                list.extend(parse_object(fields, &item_name, &item_path, form)?);
+                // Items that were already in the list are kept even if all
+                // their fields are left empty or unticked; only the blank
+                // fieldset for a new item is dropped when left blank.
+                let existing = form.first(&format!("{item_name}#present")).is_some();
+                list.extend(parse_object(
+                    fields, &item_name, &item_path, form, existing,
+                )?);
             }
         }
         _ => {
@@ -527,11 +534,14 @@ fn parse_list(
     Ok((!list.is_empty()).then_some(Value::Array(list)))
 }
 
+/// Reads an object with `fields` from the fields at form path `name`.
+/// Returns `None` if every field was left empty, unless `keep` is set.
 fn parse_object(
     fields: &[Setting],
     name: &str,
     path: &ValuePath,
     form: &FormValues,
+    keep: bool,
 ) -> Result<Option<Value>, InvalidValue> {
     let mut parsed = Vec::with_capacity(fields.len());
     for field in fields {
@@ -543,7 +553,7 @@ fn parse_object(
         )?;
         parsed.push(value);
     }
-    if parsed.iter().all(Option::is_none) {
+    if !keep && parsed.iter().all(Option::is_none) {
         return Ok(None);
     }
     fill_object(fields, parsed, path).map(Some)

@@ -51,7 +51,10 @@ flags = "i"
 | `config`      | No       | A table holding the plugin's default config; see [Plugin config](#plugin-config). |
 | `settings`    | No       | An array describing the keys of `config`: their types, labels and descriptions; see [Describing settings](#describing-settings). |
 
-Other fields are ignored, so plugins may carry metadata of their own.
+Other fields are ignored, so plugins may carry metadata of their own. Kiki
+may give meaning to new fields in later versions, as it did to `settings`,
+so a plugin's own metadata is best kept under a name unlikely to clash, such
+as a table named after the plugin.
 
 To install a plugin, copy its directory into `plugins/`; to remove one, delete
 its directory. A running server watches the plugins directory and reloads its
@@ -229,10 +232,17 @@ items = { type = "choice", choices = ["title", "content"] }
 
 Every setting has a `name` (the config key, or the object field) and may have
 a `label` and a `description`. A field of an object may be `required`; the
-others may be left out. Objects may not hold fields they do not describe, and
+others may be left out. Top-level settings may not be `required`: they take
+their default from `[config]`, and can be reset to it. Options Kiki does not
+know are ignored, so a misspelt option (`mni = 1`) silently has no effect. Objects may not hold fields they do not describe, and
 field names are made of ASCII letters, digits, `_` and `-`. A manifest whose
 settings are malformed, or whose `[config]` defaults do not match them, is
 invalid.
+
+Values are checked when they are saved, not when plugins load. Overrides
+saved before a plugin described or tightened a setting keep running as they
+are; the web UI shows ones that no longer match as JSON, and saving that key
+again must give a value that matches.
 
 Tables (and JSON objects) become Lua tables keyed by string, and arrays become
 sequences indexed from 1. TOML dates and times become strings in their

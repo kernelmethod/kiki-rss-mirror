@@ -18,10 +18,10 @@
 --   fields   The entry fields to match: a list of names, from title, url,
 --            content, authors, categories and guid. A rule matches if the
 --            pattern matches any of them (for authors and categories, any
---            one of the entry's). Defaults to { "title", "content" }. A
---            single name is accepted in place of a list, but the settings
---            in manifest.toml, which the web UI and config API go by, only
---            allow lists.
+--            one of the entry's). Missing or empty, it is { "title",
+--            "content" }. A single name is accepted in place of a list,
+--            but the settings in manifest.toml, which the web UI and
+--            config API go by, only allow lists.
 --   feeds    Optional list of the feeds the rule applies to, each given
 --            by its id or by the URL it is fetched from. Without it, the
 --            rule applies to every feed.
@@ -78,12 +78,14 @@ local function compile_rule(where, rule)
         fail(where, "'pattern' must be a string")
     end
 
-    local fields = rule.fields or DEFAULT_FIELDS
-    if type(fields) == "string" then
+    local fields = rule.fields
+    if fields == nil or (type(fields) == "table" and #fields == 0) then
+        fields = DEFAULT_FIELDS
+    elseif type(fields) == "string" then
         fields = { fields }
     end
     if type(fields) ~= "table" or #fields == 0 then
-        fail(where, "'fields' must be a field name or a non-empty list of them")
+        fail(where, "'fields' must be a field name or a list of them")
     end
     local readers = {}
     for _, name in ipairs(fields) do
