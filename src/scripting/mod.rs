@@ -35,10 +35,13 @@
 //! | `title`             | string            | Yes     |
 //! | `url`               | string or nil     | Yes     |
 //! | `content`           | string or nil     | Yes     |
+//! | `authors`           | array of strings  | No      |
+//! | `categories`        | array of strings  | No      |
 //! | `tags`              | array of strings  | Yes     |
 //!
-//! `feed_id`, `syndication_format`, and `guid` are identity fields. They are present for
-//! scripts to read, but any modifications are ignored when converting back to [`FeedEntry`].
+//! `feed_id`, `syndication_format`, and `guid` are identity fields, and `authors` and
+//! `categories` describe the entry as the feed published it. They are present for scripts to
+//! read, but any modifications are ignored when converting back to [`FeedEntry`].
 //!
 //! # Handler chaining and return values
 //!
@@ -184,6 +187,9 @@ pub fn parse_script_config(
 /// layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedEntry {
+    /// ID of the stored entry, for entries handed to a scan (see [`ServiceCall::StartScan`]).
+    /// `None` for entries being ingested, which are not stored yet. Read-only for scripts.
+    pub id: Option<i64>,
     /// ID of the feed this entry belongs to.
     pub feed_id: i64,
     /// Syndication format: `"rss"` or `"atom"`.
@@ -198,6 +204,12 @@ pub struct FeedEntry {
     pub url: Option<String>,
     /// Entry body/description (HTML), if present.
     pub content: Option<String>,
+    /// Names of the entry's authors: an RSS item's `<author>`, or an Atom entry's
+    /// `<author>` names. Read-only for scripts.
+    pub authors: Vec<String>,
+    /// The entry's categories: an RSS item's `<category>` values, or an Atom entry's
+    /// `<category>` terms. Read-only for scripts.
+    pub categories: Vec<String>,
     /// Tag names to attach to this entry. Scripts can add or remove tags; duplicates are
     /// deduplicated on the Rust side. Starts empty when the entry is first extracted.
     ///
@@ -223,6 +235,9 @@ pub enum Event {
     FeedAdded,
     /// Fires when a feed is removed via the HTTP API.
     FeedRemoved,
+    /// Fires once plugins have loaded: when the server starts, and whenever plugins are
+    /// reloaded because a plugin or its config changed.
+    PluginLoad,
 }
 
 impl Event {
@@ -235,6 +250,7 @@ impl Event {
             Self::FetchError => "fetch.error",
             Self::FeedAdded => "feed.added",
             Self::FeedRemoved => "feed.removed",
+            Self::PluginLoad => "plugin.load",
         }
     }
 
@@ -247,6 +263,7 @@ impl Event {
             "fetch.error" => Some(Self::FetchError),
             "feed.added" => Some(Self::FeedAdded),
             "feed.removed" => Some(Self::FeedRemoved),
+            "plugin.load" => Some(Self::PluginLoad),
             _ => None,
         }
     }
@@ -279,6 +296,71 @@ pub enum EventPayload {
     },
     /// Used for [`Event::FeedAdded`] and [`Event::FeedRemoved`].
     Feed { id: i64, url: String, title: String },
+    /// Used for [`Event::PluginLoad`]. Handlers are called with no argument.
+    PluginLoad,
+}
+
+/// Which stored entries a scan visits. See [`ServiceCall::StartScan`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanOptions {
+    /// Only visit the entries of this feed.
+    pub feed_id: Option<i64>,
+    /// Only visit entries published at or after this Unix timestamp.
+    pub since: Option<i64>,
+    /// Also visit entries tagged `system:hidden`, which are skipped by default.
+    pub include_hidden: bool,
+}
+
+/// A request from a plugin to the server, made through the `kiki` Lua API.
+///
+/// Plugins may run in a sandboxed process with no database access (see
+/// [`crate::process::script_host`]), so everything they ask of the server goes through
+/// [`ScriptServices`], which the server answers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ServiceCall {
+    /// Read the value stored under `key` in the plugin's store. Answered with
+    /// [`ServiceReply::Value`].
+    StoreGet { key: String },
+    /// Store `value`, as JSON text, under `key` in the plugin's store, or remove the key
+    /// when `value` is `None`. Answered with [`ServiceReply::Done`].
+    StoreSet { key: String, value: Option<String> },
+    /// Add the tag named `tag` to the stored entry `entry_id`, or remove it when `present`
+    /// is false. Answered with [`ServiceReply::Changed`].
+    SetEntryTag {
+        entry_id: i64,
+        tag: String,
+        present: bool,
+    },
+    /// Start visiting the stored entries described by `options` in the background, handing
+    /// them to the plugin in batches with [`ScriptRunner::dispatch_scan`]. Answered with
+    /// [`ServiceReply::ScanStarted`], carrying the scan's id.
+    StartScan { options: ScanOptions },
+}
+
+/// The server's answer to a [`ServiceCall`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceReply {
+    /// A stored value, as JSON text, or `None` if there is none.
+    Value(Option<String>),
+    /// Whether the call changed anything.
+    Changed(bool),
+    /// A scan started, with this id.
+    ScanStarted(u64),
+    /// The call succeeded and has nothing to report.
+    Done,
+}
+
+/// Answers the [`ServiceCall`]s plugins make.
+pub trait ScriptServices: Send + Sync {
+    /// Answer `call`, made by the plugin named `plugin`.
+    ///
+    /// Called while the plugin's handler is running, so implementations must not dispatch
+    /// events to scripts themselves: the script runner is busy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message, raised as a Lua error in the calling plugin, if the call fails.
+    fn call(&self, plugin: &str, call: ServiceCall) -> Result<ServiceReply, String>;
 }
 
 /// Dispatches server events to user-supplied scripts.
@@ -304,6 +386,27 @@ pub trait ScriptRunner: Send + Sync {
     /// Errors inside individual handlers are logged but do not surface to the caller —
     /// observe events are fire-and-forget.
     fn dispatch_observe(&self, event: Event, payload: EventPayload);
+
+    /// Pass each of `entries` to the handler of the scan `scan_id`, started by a plugin
+    /// with [`ServiceCall::StartScan`].
+    ///
+    /// Returns, for each entry, what the handler returned: the entry, possibly modified, or
+    /// `None` if the handler returned `nil` or failed. Returns `Ok(None)` if the runner has
+    /// no scan `scan_id`, because the scan was finished or the plugins were reloaded since
+    /// it started; the scan should then stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entries could not be dispatched at all.
+    fn dispatch_scan(
+        &self,
+        scan_id: u64,
+        entries: Vec<FeedEntry>,
+    ) -> anyhow::Result<Option<Vec<Option<FeedEntry>>>>;
+
+    /// Forget the scan `scan_id`, releasing its handler. Scans the runner does not know are
+    /// ignored.
+    fn finish_scan(&self, scan_id: u64);
 }
 
 /// Shared access to the currently-installed [`ScriptRunner`].

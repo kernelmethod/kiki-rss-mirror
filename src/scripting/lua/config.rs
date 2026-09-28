@@ -1,4 +1,5 @@
-//! Converts a script's config from JSON into the Lua table its top-level chunk receives.
+//! Converts a script's config from JSON into the Lua table its top-level chunk receives, and
+//! Lua values into JSON for a plugin's store.
 //!
 //! JSON objects become tables keyed by string, and arrays become sequences indexed from 1.
 //! Integers that fit in an `i64` become Lua integers and other numbers become floats.
@@ -25,7 +26,7 @@ pub(super) fn to_lua_table(lua: &Lua, config: &Map<String, Value>) -> LuaResult<
     Ok(table)
 }
 
-fn to_lua_value(lua: &Lua, value: &Value) -> LuaResult<LuaValue> {
+pub(super) fn to_lua_value(lua: &Lua, value: &Value) -> LuaResult<LuaValue> {
     Ok(match value {
         Value::Null => LuaValue::Nil,
         Value::Bool(b) => LuaValue::Boolean(*b),
@@ -43,4 +44,113 @@ fn to_lua_value(lua: &Lua, value: &Value) -> LuaResult<LuaValue> {
         }
         Value::Object(map) => LuaValue::Table(to_lua_table(lua, map)?),
     })
+}
+
+/// How deeply nested a Lua table may be to be converted to JSON.
+const MAX_DEPTH: usize = 32;
+
+/// Converts a Lua value into JSON, for keeping in a plugin's store.
+///
+/// `nil` becomes `null`, booleans, numbers and strings map across, and tables become
+/// arrays if their keys are exactly `1..n`, and objects otherwise. An empty table becomes
+/// an empty array.
+///
+/// # Errors
+///
+/// Returns an error for values with no JSON equivalent: functions and other userdata,
+/// strings that are not UTF-8, `inf` and `nan`, tables with keys that are neither strings
+/// nor a sequence, and tables nested more than 32 deep (which includes cyclic ones).
+pub(super) fn from_lua_value(value: &LuaValue) -> LuaResult<Value> {
+    from_lua_value_at(value, 0)
+}
+
+fn from_lua_value_at(value: &LuaValue, depth: usize) -> LuaResult<Value> {
+    let err = |message: &str| LuaError::RuntimeError(message.to_string());
+    Ok(match value {
+        LuaValue::Nil => Value::Null,
+        LuaValue::Boolean(b) => Value::Bool(*b),
+        LuaValue::Integer(i) => Value::from(*i),
+        LuaValue::Number(n) => serde_json::Number::from_f64(*n)
+            .map(Value::Number)
+            .ok_or_else(|| err("cannot store a number that is not finite"))?,
+        LuaValue::String(s) => Value::String(
+            s.to_str()
+                .map_err(|_| err("cannot store a string that is not UTF-8"))?
+                .to_string(),
+        ),
+        LuaValue::Table(t) => {
+            if depth >= MAX_DEPTH {
+                return Err(err("cannot store tables nested more than 32 deep"));
+            }
+            let len = t.raw_len();
+            let count = t.clone().pairs::<LuaValue, LuaValue>().count();
+            if count == len {
+                let mut items = Vec::with_capacity(len);
+                for i in 1..=len {
+                    items.push(from_lua_value_at(&t.raw_get::<LuaValue>(i)?, depth + 1)?);
+                }
+                Value::Array(items)
+            } else {
+                let mut map = Map::new();
+                for pair in t.clone().pairs::<LuaValue, LuaValue>() {
+                    let (k, v) = pair?;
+                    let LuaValue::String(k) = k else {
+                        return Err(err(
+                            "cannot store a table whose keys are neither strings nor 1..n",
+                        ));
+                    };
+                    let k = k
+                        .to_str()
+                        .map_err(|_| err("cannot store a key that is not UTF-8"))?
+                        .to_string();
+                    map.insert(k, from_lua_value_at(&v, depth + 1)?);
+                }
+                Value::Object(map)
+            }
+        }
+        other => {
+            return Err(LuaError::RuntimeError(format!(
+                "cannot store a value of type {}",
+                other.type_name()
+            )))
+        }
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn lua_values_round_trip_through_json() {
+        let lua = Lua::new();
+        for value in [
+            json!(null),
+            json!(true),
+            json!(3),
+            json!(0.5),
+            json!("s"),
+            json!([1, "a", [true]]),
+            json!({"a": {"b": [1, 2]}}),
+        ] {
+            let back = from_lua_value(&to_lua_value(&lua, &value).unwrap()).unwrap();
+            assert_eq!(back, value);
+        }
+    }
+
+    #[test]
+    fn values_without_json_equivalents_are_rejected() {
+        let lua = Lua::new();
+        for code in [
+            "return function() end",
+            "return 1/0",
+            "return {[true] = 1}",
+            "local t = {}; t.t = t; return t",
+        ] {
+            let value: LuaValue = lua.load(code).eval().unwrap();
+            assert!(from_lua_value(&value).is_err(), "{code}");
+        }
+    }
 }

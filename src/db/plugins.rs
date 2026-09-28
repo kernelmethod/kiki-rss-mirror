@@ -1,5 +1,5 @@
-//! Per-plugin state kept in the database: currently, each plugin's config
-//! overrides.
+//! Per-plugin state kept in the database: each plugin's config overrides,
+//! and its key-value store.
 //!
 //! Plugins themselves live on disk (see [`crate::plugins`]); the `plugins`
 //! table holds only what Kiki changes about them, keyed by plugin name. A
@@ -174,6 +174,119 @@ where
     Ok(overrides)
 }
 
+/// Longest key, in bytes, a plugin's store accepts.
+pub const MAX_STORE_KEY_BYTES: usize = 256;
+
+/// Largest value, serialized as JSON, a plugin's store accepts.
+pub const MAX_STORE_VALUE_BYTES: usize = 64 * 1024;
+
+/// Most keys one plugin's store may hold.
+pub const MAX_STORE_KEYS: usize = 1024;
+
+/// Errors raised while reading or writing a plugin's store.
+#[derive(Debug, Error)]
+pub enum PluginStoreError {
+    /// The key is empty or longer than [`MAX_STORE_KEY_BYTES`].
+    #[error("store keys must be between 1 and {MAX_STORE_KEY_BYTES} bytes long")]
+    InvalidKey,
+
+    /// The value is larger than [`MAX_STORE_VALUE_BYTES`].
+    #[error("store values must be at most {MAX_STORE_VALUE_BYTES} bytes as JSON")]
+    ValueTooLarge,
+
+    /// The store already holds [`MAX_STORE_KEYS`] keys.
+    #[error("a plugin's store may hold at most {MAX_STORE_KEYS} keys")]
+    Full,
+
+    /// A stored value is not valid JSON.
+    #[error("the stored value is invalid: {0}")]
+    Corrupt(#[from] serde_json::Error),
+
+    /// A database operation failed.
+    #[error(transparent)]
+    Database(#[from] rusqlite::Error),
+}
+
+/// Returns the value stored under `key` by the plugin named `plugin`, if
+/// there is one.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be queried or the stored value
+/// is not valid JSON.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::db::{plugins, ConnectionBuilder};
+/// use serde_json::json;
+///
+/// let conn = ConnectionBuilder::default().in_memory().create().build().unwrap();
+/// assert_eq!(plugins::store_get(&conn, "p", "k").unwrap(), None);
+/// plugins::store_set(&conn, "p", "k", Some(&json!({"n": 1}))).unwrap();
+/// assert_eq!(plugins::store_get(&conn, "p", "k").unwrap(), Some(json!({"n": 1})));
+/// plugins::store_set(&conn, "p", "k", None).unwrap();
+/// assert_eq!(plugins::store_get(&conn, "p", "k").unwrap(), None);
+/// ```
+pub fn store_get(
+    conn: &Connection,
+    plugin: &str,
+    key: &str,
+) -> Result<Option<Value>, PluginStoreError> {
+    let text: Option<String> = conn
+        .query_row(
+            "SELECT value FROM plugin_store WHERE plugin = ?1 AND key = ?2",
+            [plugin, key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(text.map(|t| serde_json::from_str(&t)).transpose()?)
+}
+
+/// Stores `value` under `key` for the plugin named `plugin`, or removes the
+/// key when `value` is `None`.
+///
+/// # Errors
+///
+/// Returns an error if the key or value is too large, if the plugin's
+/// store is full, or if the database cannot be written.
+pub fn store_set(
+    conn: &Connection,
+    plugin: &str,
+    key: &str,
+    value: Option<&Value>,
+) -> Result<(), PluginStoreError> {
+    if key.is_empty() || key.len() > MAX_STORE_KEY_BYTES {
+        return Err(PluginStoreError::InvalidKey);
+    }
+    let Some(value) = value else {
+        conn.execute(
+            "DELETE FROM plugin_store WHERE plugin = ?1 AND key = ?2",
+            [plugin, key],
+        )?;
+        return Ok(());
+    };
+    let text = value.to_string();
+    if text.len() > MAX_STORE_VALUE_BYTES {
+        return Err(PluginStoreError::ValueTooLarge);
+    }
+    let (keys, exists): (i64, bool) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(key = ?2), 0) > 0 FROM plugin_store WHERE plugin = ?1",
+        [plugin, key],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if !exists && keys as usize >= MAX_STORE_KEYS {
+        return Err(PluginStoreError::Full);
+    }
+    conn.execute(
+        "INSERT INTO plugin_store (plugin, key, value) VALUES (?1, ?2, ?3)
+         ON CONFLICT(plugin, key) DO UPDATE
+         SET value = excluded.value, updated_at = unixepoch()",
+        [plugin, key, &text],
+    )?;
+    Ok(())
+}
+
 fn parse(name: &str, text: &str) -> Result<ConfigOverrides, PluginConfigError> {
     serde_json::from_str(text).map_err(|source| PluginConfigError::Corrupt {
         name: name.to_string(),
@@ -274,5 +387,38 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn stores_are_kept_per_plugin() {
+        let conn = conn();
+        store_set(&conn, "p", "k", Some(&json!("a"))).unwrap();
+        store_set(&conn, "q", "k", Some(&json!("b"))).unwrap();
+        store_set(&conn, "p", "k", Some(&json!("c"))).unwrap();
+        assert_eq!(store_get(&conn, "p", "k").unwrap(), Some(json!("c")));
+        assert_eq!(store_get(&conn, "q", "k").unwrap(), Some(json!("b")));
+    }
+
+    #[test]
+    fn stores_are_bounded() {
+        let conn = conn();
+        assert!(matches!(
+            store_set(&conn, "p", "", Some(&json!(1))),
+            Err(PluginStoreError::InvalidKey)
+        ));
+        let big = json!("x".repeat(MAX_STORE_VALUE_BYTES));
+        assert!(matches!(
+            store_set(&conn, "p", "k", Some(&big)),
+            Err(PluginStoreError::ValueTooLarge)
+        ));
+        for i in 0..MAX_STORE_KEYS {
+            store_set(&conn, "p", &i.to_string(), Some(&json!(i))).unwrap();
+        }
+        assert!(matches!(
+            store_set(&conn, "p", "one-more", Some(&json!(1))),
+            Err(PluginStoreError::Full)
+        ));
+        // Overwriting a key that exists is still allowed.
+        store_set(&conn, "p", "0", Some(&json!("new"))).unwrap();
     }
 }

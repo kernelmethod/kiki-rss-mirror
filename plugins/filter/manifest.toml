@@ -1,0 +1,27 @@
+name = "filter"
+version = "1.0.0"
+engine = "lua"
+description = "Hide entries whose fields match, or fail to match, regular expressions"
+license = "MIT"
+homepage = "https://github.com/kernelmethod/kiki-rss"
+
+# The rules are empty by default. Set them with, for example,
+# `kiki plugin config set filter rules.toml`, where rules.toml holds:
+#
+#     [[exclude]]
+#     fields = ["title"]
+#     pattern = '\b(sponsored|webinar)\b'
+#     flags = "i"
+#
+#     [[include]]
+#     fields = ["categories"]
+#     pattern = "rust"
+#     feeds = [3]
+#
+# Entries matching an `exclude` rule are hidden. When an entry's feed has
+# `include` rules, entries matching none of them are hidden too. See
+# main.lua for every setting.
+[config]
+exclude = []
+include = []
+rescan = true

@@ -910,4 +910,101 @@ mod script_isolation {
         kiki.assert_still_running();
         kiki.shutdown();
     }
+
+    /// Plugins in the sandboxed host can reach the server through the
+    /// `kiki` API: their store, tagging entries, and scans of stored
+    /// entries, started from `plugin.load`. Editing the plugin reloads it,
+    /// which runs `plugin.load` again.
+    #[test]
+    fn plugins_in_the_host_can_scan_and_tag_stored_entries() {
+        const SCRIPT: &str = r#"
+            local pattern = "spam"
+            kiki.on("plugin.load", function()
+                kiki.store.set("loads", (kiki.store.get("loads") or 0) + 1)
+                kiki.entries.scan(function(entry)
+                    if entry.title:find(pattern) then
+                        table.insert(entry.tags, "system:hidden")
+                    end
+                    if entry.title:find("tagme") then
+                        kiki.entries.tag(entry.id, "tagged")
+                    end
+                    return entry
+                end)
+            end)
+        "#;
+        let manifest = "name = 'scanner'\nversion = '1.0.0'\nengine = 'lua'\n";
+        let mut kiki = Kiki::spawn_with(&[], |home| {
+            let conn = rusqlite::Connection::open(home.join("kiki.db")).expect("open db");
+            conn.execute("INSERT INTO feeds (title) VALUES ('f')", [])
+                .expect("insert feed");
+            let feed = conn.last_insert_rowid();
+            for title in ["ham", "spam", "tagme"] {
+                conn.execute(
+                    "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+                     VALUES (?1, 'rss', ?2, 0, ?2, 'u')",
+                    rusqlite::params![feed, title],
+                )
+                .expect("insert entry");
+            }
+            let plugin = home.join("plugins").join("scanner");
+            std::fs::create_dir_all(&plugin).expect("create plugin directory");
+            std::fs::write(plugin.join("manifest.toml"), manifest).expect("write manifest");
+            std::fs::write(plugin.join("main.lua"), SCRIPT).expect("write main.lua");
+        });
+        assert_eq!(kiki.script_host_pids().len(), 1);
+
+        let home = kiki._dir.path().to_path_buf();
+        let tags_of = |title: &str| -> Vec<String> {
+            let conn = rusqlite::Connection::open(home.join("kiki.db")).expect("open db");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT t.name FROM entries e
+                     JOIN entry_tags et ON et.entry_id = e.id
+                     JOIN tags t ON t.id = et.tag_id
+                     WHERE e.title = ?1 ORDER BY t.name",
+                )
+                .expect("prepare");
+            stmt.query_map([title], |row| row.get(0))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("rows")
+        };
+        let wait_for = |what: &str, cond: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !cond() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        wait_for("spam to be hidden", &|| {
+            tags_of("spam") == ["system:hidden"]
+        });
+        wait_for("tagme to be tagged", &|| tags_of("tagme") == ["tagged"]);
+        assert!(tags_of("ham").is_empty());
+        let loads = || -> String {
+            let conn = rusqlite::Connection::open(home.join("kiki.db")).expect("open db");
+            conn.query_row(
+                "SELECT value FROM plugin_store WHERE plugin = 'scanner' AND key = 'loads'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_default()
+        };
+        assert_eq!(loads(), "1");
+
+        // Editing the plugin reloads it, through the plugins directory
+        // watcher, and its new scan hides ham too.
+        std::fs::write(
+            home.join("plugins").join("scanner").join("main.lua"),
+            SCRIPT.replace(r#"local pattern = "spam""#, r#"local pattern = "ham""#),
+        )
+        .expect("rewrite main.lua");
+        wait_for("ham to be hidden", &|| tags_of("ham") == ["system:hidden"]);
+        assert_eq!(loads(), "2");
+
+        assert_eq!(kiki.script_host_pids().len(), 1);
+        kiki.assert_still_running();
+        kiki.shutdown();
+    }
 }

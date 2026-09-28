@@ -17,12 +17,16 @@
 //! The script host protocol is strictly request/response — every request
 //! written by the server is answered by exactly one response from the
 //! script host, including for observe-only events whose result is
-//! discarded. Keeping the two sides in lockstep means a dropped or
-//! malformed frame shows up immediately as an error rather than as a
-//! silently desynchronised stream. The feed fetcher's protocol is
+//! discarded. While it works on a request, the script host may ask the
+//! server for something on a plugin's behalf with [`HostResponse::Call`];
+//! the server answers with [`HostRequest::CallResult`] and goes back to
+//! waiting for the response, so calls nest inside a request without the
+//! two sides ever getting out of step. Keeping them in lockstep means a
+//! dropped or malformed frame shows up immediately as an error rather
+//! than as a silently desynchronised stream. The feed fetcher's protocol is
 //! multiplexed instead; see [`crate::process::feed_fetcher`].
 
-use crate::scripting::{Event, EventPayload, FeedEntry, ScriptSource};
+use crate::scripting::{Event, EventPayload, FeedEntry, ScriptSource, ServiceCall, ServiceReply};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -41,7 +45,7 @@ pub enum HostRequest {
     /// Discard the current VM, if any, and build a new one from
     /// `sources`, each script with its config.
     ///
-    /// Sent once, when the server starts and has discovered its plugins.
+    /// Sent when the server starts, and whenever plugins are reloaded.
     Reload { sources: Vec<ScriptSource> },
 
     /// Run `entry` through the `entry.ingest` handler chain.
@@ -50,6 +54,20 @@ pub enum HostRequest {
     /// Fire an observe-only event. The response carries no data, but is
     /// still awaited to keep the stream in lockstep.
     Observe { event: Event, payload: EventPayload },
+
+    /// Pass `entries` to the handler of the scan `scan_id`.
+    Scan {
+        scan_id: u64,
+        entries: Vec<FeedEntry>,
+    },
+
+    /// Forget the scan `scan_id`. Answered with [`HostResponse::Ack`].
+    FinishScan { scan_id: u64 },
+
+    /// The server's answer to a [`HostResponse::Call`].
+    CallResult {
+        result: Result<ServiceReply, String>,
+    },
 }
 
 /// A message from the script host back to the server.
@@ -64,6 +82,17 @@ pub enum HostResponse {
 
     /// An observe event was dispatched.
     Ack,
+
+    /// What the scan handler returned for each entry, or `None` if the
+    /// host has no such scan.
+    Scanned {
+        entries: Option<Vec<Option<FeedEntry>>>,
+    },
+
+    /// Not a response: a plugin asks the server for something while the
+    /// request is being served. The server answers with
+    /// [`HostRequest::CallResult`] and keeps waiting for the response.
+    Call { plugin: String, call: ServiceCall },
 
     /// The request could not be served. The server treats this as a
     /// script-level failure, not a dead host: for `entry.ingest` the
@@ -358,6 +387,7 @@ mod tests {
     #[test]
     fn requests_and_responses_survive_a_round_trip() {
         let entry = FeedEntry {
+            id: None,
             feed_id: 7,
             syndication_format: "rss".to_string(),
             guid: "urn:kiki:1".to_string(),
@@ -365,6 +395,8 @@ mod tests {
             title: "title".to_string(),
             url: Some("https://example.com/1".to_string()),
             content: Some("<p>body</p>".to_string()),
+            authors: vec!["Ada".to_string()],
+            categories: vec!["news".to_string()],
             tags: vec!["a".to_string(), "b".to_string()],
         };
 

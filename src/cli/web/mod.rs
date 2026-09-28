@@ -545,13 +545,33 @@ async fn update_plugin_config(
         ConfigAction::ResetAll => api.delete(config_url),
     };
 
-    let status = match req.send().await {
-        Ok(resp) => resp.status(),
+    let resp = match req.send().await {
+        Ok(resp) => resp,
         Err(e) => return server_unavailable(&e.into()),
     };
-    match status {
+    match resp.status() {
         StatusCode::OK => {
-            Redirect::to(&format!("/plugins/{}", encode_path_segment(&name))).into_response()
+            let reload_error = resp
+                .json::<PluginConfigResponse>()
+                .await
+                .ok()
+                .and_then(|c| c.reload_error);
+            match reload_error {
+                None => Redirect::to(&format!("/plugins/{}", encode_path_segment(&name)))
+                    .into_response(),
+                Some(e) => {
+                    let error = format!(
+                        "The config was saved, but the plugins failed to load with it: {e}"
+                    );
+                    render_plugin_config_page(
+                        &api,
+                        &name,
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Some(&error),
+                    )
+                    .await
+                }
+            }
         }
         StatusCode::NOT_FOUND => plugin_not_found(),
         StatusCode::PAYLOAD_TOO_LARGE => {
@@ -1176,7 +1196,8 @@ fn render_plugins(resp: &ListPluginsResponse) -> String {
     }
 
     html.push_str(
-        "<p class=\"meta\">Plugins installed or changed take effect after the server restarts.</p>\n",
+        "<p class=\"meta\">Plugins are reloaded whenever the plugins directory or a \
+         plugin's config changes.</p>\n",
     );
     html
 }
@@ -1260,14 +1281,15 @@ fn render_plugin_page(
     }
     if config.restart_required {
         html.push_str(
-            "<p class=\"notice\">The config has changed since the server started. \
-             Restart the server for the plugin to use it.</p>\n",
+            "<p class=\"notice\">The plugin is not running with this config: the plugins \
+             failed to load with it, so they keep running with the config they had. The \
+             server log says why.</p>\n",
         );
     }
 
     html.push_str("<h3>Config</h3>\n");
     // Settings the plugin is running with but that are no longer set are
-    // listed too, until a restart drops them.
+    // listed too, until the plugins reload without them.
     let keys: BTreeSet<&String> = config.config.keys().chain(config.active.keys()).collect();
     if keys.is_empty() {
         html.push_str("<p>This plugin has no settings.</p>\n");
@@ -1299,7 +1321,7 @@ fn render_plugin_page(
              Reset every setting to its default</button></form>\n"
         ));
     }
-    html.push_str("<p class=\"meta\">Changes take effect after the server restarts.</p>\n");
+    html.push_str("<p class=\"meta\">Changes take effect at once.</p>\n");
     html.push_str("</article>\n<p><a href=\"/plugins\">&larr; Back to plugins</a></p>\n");
     html
 }
@@ -1347,10 +1369,10 @@ fn render_config_setting(action: &str, key: &str, config: &PluginConfigResponse)
     if value != active {
         notes.push(match active {
             Some(active) => format!(
-                "running with <code>{}</code> until the server restarts",
+                "running with <code>{}</code>, since the plugins failed to load with this value",
                 escape(to_json(active))
             ),
-            None => "not set when the server started".to_owned(),
+            None => "not set in the config the plugin is running with".to_owned(),
         });
     }
 
@@ -2423,8 +2445,8 @@ mod tests {
         Ok(())
     }
 
-    /// Saving a setting overrides it, and the page then says so and that
-    /// the server must restart; resetting it restores the default.
+    /// Saving a setting overrides it, and the page then says so; resetting
+    /// it restores the default.
     #[tokio::test]
     async fn settings_can_be_changed_from_the_plugin_page() -> Result<()> {
         let tc = hello_plugin()?;
@@ -2452,11 +2474,9 @@ mod tests {
             body.contains("overrides the default, <code>&quot;hi&quot;</code>"),
             "{body}"
         );
-        assert!(
-            body.contains("running with <code>&quot;hi&quot;</code> until the server restarts"),
-            "{body}"
-        );
-        assert!(body.contains(r#"class="notice""#), "{body}");
+        // The plugins reloaded, so the plugin runs with the new value.
+        assert!(!body.contains("running with"), "{body}");
+        assert!(!body.contains(r#"class="notice""#), "{body}");
         assert!(body.contains("Reset to default"), "{body}");
 
         // Settings the manifest has no default for can be added, too.
@@ -2530,6 +2550,32 @@ mod tests {
         assert!(body.contains("Give the setting a name."), "{body}");
 
         assert_eq!(stored_overrides(&tc)?, serde_json::json!({}));
+        Ok(())
+    }
+
+    /// A setting the plugin fails to load with is saved, and the page says
+    /// the plugin keeps running with its old config.
+    #[tokio::test]
+    async fn settings_that_fail_to_load_are_reported() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        tc.install_lua_plugin(
+            "hello",
+            "local config = ...\nif config.fail then error('refusing to load') end",
+            serde_json::json!({}),
+        )?;
+        let tc = tc.init_server()?;
+
+        let (status, body) = post_form(
+            tc.client()?,
+            "/plugins/hello/config",
+            &[("action", "set"), ("key", "fail"), ("value", "true")],
+            &[],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("refusing to load"), "{body}");
+        assert!(body.contains(r#"class="notice""#), "{body}");
+        assert_eq!(stored_overrides(&tc)?, serde_json::json!({"fail": true}));
         Ok(())
     }
 

@@ -27,15 +27,20 @@
 //! `kiki.regex` live outside the Lua allocator and have limits of their own; see
 //! the `regex_api` module.
 
+mod api;
 mod config;
 mod regex_api;
 
-use super::{parse_script_config, Event, EventPayload, FeedEntry, ScriptRunner, ScriptSource};
+use super::{
+    parse_script_config, Event, EventPayload, FeedEntry, ScriptRunner, ScriptServices, ScriptSource,
+};
+use api::ApiContext;
 use mlua::prelude::*;
 use mlua::HookTriggers;
 use mlua::RegistryKey;
 use mlua::VmState;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -76,6 +81,7 @@ pub enum ScriptError {
 impl IntoLua for FeedEntry {
     fn into_lua(self, lua: &Lua) -> LuaResult<LuaValue> {
         let table = lua.create_table()?;
+        table.set("id", self.id)?;
         table.set("feed_id", self.feed_id)?;
         table.set("syndication_format", self.syndication_format)?;
         table.set("guid", self.guid)?;
@@ -83,6 +89,8 @@ impl IntoLua for FeedEntry {
         table.set("title", self.title)?;
         table.set("url", self.url)?;
         table.set("content", self.content)?;
+        table.set("authors", lua.create_sequence_from(self.authors)?)?;
+        table.set("categories", lua.create_sequence_from(self.categories)?)?;
 
         let tags = lua.create_table()?;
         for (i, tag) in self.tags.iter().enumerate() {
@@ -123,6 +131,8 @@ impl FromLua for FeedEntry {
         }
 
         Ok(FeedEntry {
+            // Read-only: restored from the entry the handler was given.
+            id: None,
             feed_id,
             syndication_format,
             guid,
@@ -130,6 +140,9 @@ impl FromLua for FeedEntry {
             title,
             url,
             content,
+            // Read-only: restored from the entry the handler was given.
+            authors: Vec::new(),
+            categories: Vec::new(),
             tags,
         })
     }
@@ -174,7 +187,19 @@ fn payload_to_lua(lua: &Lua, payload: EventPayload) -> LuaResult<LuaValue> {
             t.set("title", title)?;
             Ok(LuaValue::Table(t))
         }
+        EventPayload::PluginLoad => Ok(LuaValue::Nil),
     }
+}
+
+/// Copies the fields scripts may not change from `original` onto `modified`, the entry a
+/// handler returned.
+fn restore_read_only(modified: &mut FeedEntry, original: &FeedEntry) {
+    modified.id = original.id;
+    modified.feed_id = original.feed_id;
+    modified.syndication_format = original.syndication_format.clone();
+    modified.guid = original.guid.clone();
+    modified.authors = original.authors.clone();
+    modified.categories = original.categories.clone();
 }
 
 /// Runs user-supplied Lua handlers in response to server events.
@@ -187,6 +212,8 @@ pub struct LuaScriptRunner {
     lua: Mutex<Lua>,
     // Populated at load time by the `kiki.on` closure; read-only thereafter.
     handlers: Arc<Mutex<HashMap<Event, Vec<RegistryKey>>>>,
+    // The handlers of the scans plugins have started with `kiki.entries.scan`.
+    scans: api::Scans,
 }
 
 impl LuaScriptRunner {
@@ -214,6 +241,21 @@ impl LuaScriptRunner {
     /// [`ScriptError::ScriptLoadError`] for VM-setup, compile, or top-level runtime failures,
     /// and [`ScriptError::InvalidReturnType`] if a chunk returns a value.
     pub fn from_sources(script_sources: &[ScriptSource]) -> Result<Self, ScriptError> {
+        Self::from_sources_with(script_sources, None)
+    }
+
+    /// Build a runner from scripts and their configs, answering the calls they make
+    /// through `kiki.store` and `kiki.entries` with `services`.
+    ///
+    /// See [`Self::from_sources`]; without `services`, those calls raise an error.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::from_sources`].
+    pub fn from_sources_with(
+        script_sources: &[ScriptSource],
+        services: Option<Arc<dyn ScriptServices>>,
+    ) -> Result<Self, ScriptError> {
         let lua = Lua::new_with(
             LuaStdLib::STRING | LuaStdLib::TABLE | LuaStdLib::MATH | LuaStdLib::OS,
             LuaOptions::default(),
@@ -302,13 +344,20 @@ impl LuaScriptRunner {
         // `kiki.on(...)` side effects and must not return a value — any return (including a
         // function) is treated as an error to catch accidentally-copied legacy scripts at
         // load time rather than silently.
+        let ctx = ApiContext {
+            services,
+            scans: Arc::new(Mutex::new(HashMap::new())),
+            loading: Arc::new(AtomicBool::new(true)),
+        };
         for source in script_sources {
-            load_plugin(&lua, source)?;
+            load_plugin(&lua, source, &ctx)?;
         }
+        ctx.loading.store(false, Ordering::SeqCst);
 
         Ok(Self {
             lua: Mutex::new(lua),
             handlers,
+            scans: ctx.scans,
         })
     }
 
@@ -341,10 +390,10 @@ impl LuaScriptRunner {
 ///
 /// Each plugin runs in an environment of its own, so the globals one plugin defines are
 /// not seen by the others, and its `require` loads only its own modules.
-fn load_plugin(lua: &Lua, source: &ScriptSource) -> Result<(), ScriptError> {
+fn load_plugin(lua: &Lua, source: &ScriptSource, ctx: &ApiContext) -> Result<(), ScriptError> {
     let config = parse_script_config(&source.config)?;
     let config = config::to_lua_table(lua, &config).map_err(ScriptError::ScriptLoadError)?;
-    let env = plugin_env(lua, source).map_err(ScriptError::ScriptLoadError)?;
+    let env = plugin_env(lua, source, ctx).map_err(ScriptError::ScriptLoadError)?;
     let value: LuaValue = lua
         .load(source.text.as_str())
         .set_name(format!("@{}", source.name))
@@ -360,16 +409,18 @@ fn load_plugin(lua: &Lua, source: &ScriptSource) -> Result<(), ScriptError> {
 }
 
 /// Build the environment a plugin's code runs in: a table that falls back to the VM's
-/// globals, with a `require` that loads the plugin's own modules.
+/// globals, with a `require` that loads the plugin's own modules and a `kiki` table whose
+/// `store` and `entries` act for the plugin.
 ///
 /// `require(name)` runs the module named `name` the first time it is called, in the same
 /// environment, and returns what the module returned (or `true` if it returned nothing).
 /// Later calls return the same value without running the module again.
-fn plugin_env(lua: &Lua, source: &ScriptSource) -> LuaResult<LuaTable> {
+fn plugin_env(lua: &Lua, source: &ScriptSource, ctx: &ApiContext) -> LuaResult<LuaTable> {
     let env = lua.create_table()?;
     let meta = lua.create_table()?;
     meta.set("__index", lua.globals())?;
     env.set_metatable(Some(meta));
+    env.raw_set("kiki", api::plugin_kiki_table(lua, &source.name, ctx)?)?;
 
     let plugin = source.name.clone();
     let modules: HashMap<String, String> = source
@@ -454,10 +505,8 @@ impl ScriptRunner for LuaScriptRunner {
             return Ok(Some(entry));
         }
 
-        // Preserve identity fields so scripts cannot corrupt them.
-        let feed_id = entry.feed_id;
-        let syndication_format = entry.syndication_format.clone();
-        let guid = entry.guid.clone();
+        // Keep the identity and read-only fields so scripts cannot corrupt them.
+        let original = entry.clone();
 
         let mut current = entry;
         for handler in &handlers {
@@ -473,9 +522,7 @@ impl ScriptRunner for LuaScriptRunner {
                 Ok(LuaValue::Nil) => return Ok(None),
                 Ok(LuaValue::Table(t)) => match FeedEntry::from_lua(LuaValue::Table(t), &lua) {
                     Ok(mut modified) => {
-                        modified.feed_id = feed_id;
-                        modified.syndication_format = syndication_format.clone();
-                        modified.guid = guid.clone();
+                        restore_read_only(&mut modified, &original);
                         current = modified;
                     }
                     Err(e) => {
@@ -536,6 +583,71 @@ impl ScriptRunner for LuaScriptRunner {
             }
         }
     }
+
+    fn dispatch_scan(
+        &self,
+        scan_id: u64,
+        entries: Vec<FeedEntry>,
+    ) -> anyhow::Result<Option<Vec<Option<FeedEntry>>>> {
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let handler: LuaFunction = {
+            let scans = self.scans.lock().unwrap_or_else(|e| e.into_inner());
+            match scans.get(&scan_id) {
+                Some(key) => lua.registry_value(key)?,
+                None => return Ok(None),
+            }
+        };
+
+        let mut results = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let lua_entry = entry.clone().into_lua(&lua)?;
+            let result = match call_with_timeout::<LuaValue>(&lua, &handler, lua_entry) {
+                Ok(LuaValue::Nil) => None,
+                Ok(LuaValue::Table(t)) => match FeedEntry::from_lua(LuaValue::Table(t), &lua) {
+                    Ok(mut modified) => {
+                        restore_read_only(&mut modified, &entry);
+                        Some(modified)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "scan handler returned an invalid entry; skipping it");
+                        None
+                    }
+                },
+                Ok(other) => {
+                    warn!(
+                        return_type = other.type_name(),
+                        "scan handler returned invalid type; skipping the entry"
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!(error = %e, "scan handler execution error; skipping the entry");
+                    None
+                }
+            };
+            results.push(result);
+        }
+        Ok(Some(results))
+    }
+
+    fn finish_scan(&self, scan_id: u64) {
+        let key = self
+            .scans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&scan_id);
+        if let Some(key) = key {
+            let lua = self
+                .lua
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = lua.remove_registry_value(key);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -545,6 +657,7 @@ mod tests {
 
     fn make_entry() -> FeedEntry {
         FeedEntry {
+            id: None,
             feed_id: 1,
             syndication_format: "rss".to_string(),
             guid: "test-guid".to_string(),
@@ -552,6 +665,8 @@ mod tests {
             title: "Test Title".to_string(),
             url: Some("https://example.com".to_string()),
             content: Some("<p>Hello</p>".to_string()),
+            authors: vec!["Ada".to_string()],
+            categories: vec!["news".to_string()],
             tags: vec![],
         }
     }

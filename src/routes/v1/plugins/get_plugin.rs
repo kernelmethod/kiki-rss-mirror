@@ -10,8 +10,8 @@ use super::list_plugins::PluginResponse;
 
 /// Get plugin information
 ///
-/// Retrieve the manifest and config of a plugin, by its name, as they were when the
-/// server started.
+/// Retrieve the manifest and config of a plugin, by its name, as they were when plugins
+/// were last loaded.
 #[utoipa::path(
     get,
     path = "/v1/plugins/name/{name}",
@@ -29,6 +29,7 @@ use super::list_plugins::PluginResponse;
 pub async fn get_plugin(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     match state
         .plugins
+        .current()
         .plugins
         .iter()
         .find(|p| p.manifest.name == name)
