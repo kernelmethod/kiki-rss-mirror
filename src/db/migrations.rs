@@ -20,7 +20,16 @@ pub struct Migration {
 /// When adding a new migration:
 /// 1. Create the SQL file in `src/db/include/migrations/`
 /// 2. Append an entry to this array
-pub const MIGRATIONS: &[Migration] = &[];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_system_tags",
+        sql: include_str!("include/migrations/0001_system_tags.sql"),
+    },
+    Migration {
+        name: "0002_unique_tag_links",
+        sql: include_str!("include/migrations/0002_unique_tag_links.sql"),
+    },
+];
 
 /// SQL to create the migrations table. Safe to run on databases that already
 /// have it (uses `IF NOT EXISTS`).
@@ -144,6 +153,85 @@ mod tests {
             count, 0,
             "no migrations should be applied on fresh database"
         );
+        Ok(())
+    }
+
+    /// The tag-related parts of the schema before any migrations.
+    const LEGACY_TAG_SCHEMA: &str = "
+        CREATE TABLE tags (
+            id      INTEGER PRIMARY KEY,
+            name    VARCHAR UNIQUE NOT NULL
+        );
+        CREATE TABLE feed_tags (feed_id INTEGER NOT NULL, tag_id INTEGER NOT NULL);
+        CREATE TABLE entry_tags (entry_id INTEGER NOT NULL, tag_id INTEGER NOT NULL);
+        CREATE INDEX idx_entry_tags_entry_id ON entry_tags(entry_id);
+        CREATE INDEX idx_entry_tags_tag_id ON entry_tags(tag_id);
+    ";
+
+    /// `0001_system_tags` adds the tag kind to a database created before
+    /// system tags existed, renaming any user tags that used the now-reserved
+    /// `system:` prefix.
+    #[test]
+    fn test_system_tags_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_TAG_SCHEMA)?;
+        conn.execute_batch(
+            "INSERT INTO tags (name) VALUES ('news'), ('system:read'), ('System:Other');",
+        )?;
+
+        let count = run_pending_migrations(&mut conn)?;
+        assert_eq!(count, MIGRATIONS.len());
+
+        let mut stmt = conn.prepare("SELECT name, kind FROM tags ORDER BY id")?;
+        let tags = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected = [
+            ("news", "user"),
+            ("user:system:read", "user"),
+            ("user:System:Other", "user"),
+            ("system:read", "system"),
+            ("system:saved", "system"),
+            ("system:hidden", "system"),
+        ]
+        .map(|(n, k)| (n.to_string(), k.to_string()));
+        assert_eq!(tags, expected);
+
+        Ok(())
+    }
+
+    /// `0002_unique_tag_links` removes duplicate tag links and prevents new
+    /// ones.
+    #[test]
+    fn test_unique_tag_links_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_TAG_SCHEMA)?;
+        conn.execute_batch(
+            "INSERT INTO entry_tags VALUES (1, 1), (1, 1), (1, 2), (2, 1), (1, 1);
+             INSERT INTO feed_tags VALUES (1, 1), (1, 1), (2, 1);",
+        )?;
+
+        run_pending_migrations(&mut conn)?;
+
+        let links = |table: &str| -> Result<Vec<(i64, i64)>> {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2"))?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        };
+        assert_eq!(links("entry_tags")?, [(1, 1), (1, 2), (2, 1)]);
+        assert_eq!(links("feed_tags")?, [(1, 1), (2, 1)]);
+
+        assert!(conn
+            .execute("INSERT INTO entry_tags VALUES (1, 2)", [])
+            .is_err());
+        assert!(conn
+            .execute("INSERT INTO feed_tags VALUES (2, 1)", [])
+            .is_err());
+
         Ok(())
     }
 }

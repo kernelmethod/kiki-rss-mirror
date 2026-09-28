@@ -73,6 +73,11 @@ following fields:
 | `content`           | string (HTML) or `nil` | Yes |
 | `tags`              | array of strings  | Yes     |
 
+`tags` holds the entry's user tags. Tag names starting with `system:` are
+reserved for system tags (such as `system:read`); scripts cannot set them, and
+any such names are ignored with a warning. An entry's system tags are never
+affected by scripts.
+
 `feed_id`, `syndication_format`, and `guid` are identity fields. Handlers may
 read them, but any modifications are discarded when the entry is converted back
 out of Lua.

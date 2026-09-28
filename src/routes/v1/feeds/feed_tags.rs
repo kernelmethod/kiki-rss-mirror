@@ -11,6 +11,7 @@ use thiserror::Error;
 use tokio::task;
 use tracing::{event, Level};
 
+use crate::db::tags::TagKind;
 use crate::routes::v1::tags::list_tags::TagResponse;
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
@@ -30,6 +31,9 @@ enum FeedTagsTaskError {
 
     #[error("tag not found: {0}")]
     TagNotFound(i64),
+
+    #[error("tag {0} is a system tag")]
+    SystemTag(i64),
 
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
@@ -77,19 +81,15 @@ pub async fn get_feed_tags(
 
         let tags = conn
             .prepare(
-                "SELECT t.id, t.name FROM tags t
+                "SELECT t.id, t.name, t.kind FROM tags t
                  INNER JOIN feed_tags ft ON ft.tag_id = t.id
-                 WHERE ft.feed_id = ?1",
+                 WHERE ft.feed_id = ?1
+                 ORDER BY t.id",
             )
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
-            .query_map([id], |row| {
-                Ok(TagResponse {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                })
-            })?
+            .query_map([id], TagResponse::from_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok::<GetFeedTagsResponse, FeedTagsTaskError>(GetFeedTagsResponse { tags })
@@ -117,6 +117,7 @@ pub async fn get_feed_tags(
 /// currently applied to that feed.
 ///
 /// Tags applied at a feed level are automatically applied to all entries retrieved from that feed.
+/// Only user tags can be applied to feeds.
 #[utoipa::path(
     put,
     path = "/v1/feeds/id/{id}/tags",
@@ -126,7 +127,7 @@ pub async fn get_feed_tags(
     request_body = SetFeedTagsRequest,
     responses(
         (status = 200, description = "Tags updated for the feed", body = GetFeedTagsResponse),
-        (status = 400, description = "One or more tag IDs not found"),
+        (status = 400, description = "One or more tag IDs not found, or are system tags"),
         (status = 404, description = "Feed not found"),
         (status = 500, description = "Internal server error"),
     ),
@@ -162,17 +163,22 @@ pub async fn set_feed_tags(
             return Err(FeedTagsTaskError::FeedNotFound);
         }
 
-        // Validate all tag IDs exist
+        // Validate all tag IDs exist and are user tags
         for &tag_id in &payload.tag_ids {
-            let tag_exists: bool = tx
-                .prepare("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)")
+            let kind = tx
+                .prepare("SELECT kind FROM tags WHERE id = ?1")
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
                 })?
-                .query_row([tag_id], |row| row.get(0))?;
+                .query_row([tag_id], |row| row.get::<_, TagKind>(0));
 
-            if !tag_exists {
-                return Err(FeedTagsTaskError::TagNotFound(tag_id));
+            match kind {
+                Ok(TagKind::User) => {}
+                Ok(TagKind::System) => return Err(FeedTagsTaskError::SystemTag(tag_id)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    return Err(FeedTagsTaskError::TagNotFound(tag_id))
+                }
+                Err(e) => return Err(e.into()),
             }
         }
 
@@ -199,19 +205,15 @@ pub async fn set_feed_tags(
         // Return the updated tags
         let tags = tx
             .prepare(
-                "SELECT t.id, t.name FROM tags t
+                "SELECT t.id, t.name, t.kind FROM tags t
                  INNER JOIN feed_tags ft ON ft.tag_id = t.id
-                 WHERE ft.feed_id = ?1",
+                 WHERE ft.feed_id = ?1
+                 ORDER BY t.id",
             )
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
-            .query_map([id], |row| {
-                Ok(TagResponse {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                })
-            })?
+            .query_map([id], TagResponse::from_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
         tx.commit().inspect_err(|e| {
@@ -233,6 +235,14 @@ pub async fn set_feed_tags(
         Ok(Err(FeedTagsTaskError::TagNotFound(tag_id))) => Err((
             StatusCode::BAD_REQUEST,
             format!("Tag not found: {}", tag_id),
+        )
+            .into_response()),
+        Ok(Err(FeedTagsTaskError::SystemTag(tag_id))) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Tag {} is a system tag and cannot be applied to feeds",
+                tag_id
+            ),
         )
             .into_response()),
         Ok(Err(_)) => {

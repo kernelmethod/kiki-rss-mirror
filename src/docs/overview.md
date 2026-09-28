@@ -14,7 +14,14 @@ out of scope for this project:
   intended to provide common backend infrastructure for RSS readers.
 * Favorite entries and entry read status. All per-entry user metadata is
   mediated through the use of tags, which Kiki clients can use to implement
-  features like this.
+  features like this. Kiki distinguishes two kinds of tag:
+  * **User tags** are created, renamed, and deleted by the user (or by
+    scripts and OPML imports).
+  * **System tags** are built in and record common entry metadata:
+    `system:read`, `system:saved`, and `system:hidden`. They cannot be renamed
+    or deleted, and are applied to entries with
+    `PUT`/`DELETE /v1/entries/id/{id}/system-tags/{name}`. The `system:`
+    prefix is reserved, so user tags cannot start with it.
 
 The following is currently out-of-scope, although these features may be
 reconsidered some day:
