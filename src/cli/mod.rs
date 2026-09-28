@@ -2,6 +2,7 @@ pub mod init;
 pub mod migrate;
 pub mod opml;
 pub mod paths;
+pub mod plugin;
 pub mod serve;
 
 #[cfg(feature = "api-docs")]

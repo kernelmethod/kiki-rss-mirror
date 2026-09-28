@@ -29,6 +29,9 @@ pub enum Commands {
     /// Import or export feeds as OPML
     Opml(cli::opml::OpmlArgs),
 
+    /// List plugins and read or change their config
+    Plugin(cli::plugin::PluginArgs),
+
     /// Generate a static HTML page for the API documentation
     #[cfg(feature = "api-docs")]
     Docs(cli::docs::DocsArgs),
@@ -63,6 +66,7 @@ impl Commands {
             Commands::Migrate(args) => args.run(),
             Commands::Serve(args) => args.run(),
             Commands::Opml(args) => args.run(),
+            Commands::Plugin(args) => args.run(),
             #[cfg(feature = "api-docs")]
             Commands::Docs(args) => args.run(),
             #[cfg(feature = "systemd")]
