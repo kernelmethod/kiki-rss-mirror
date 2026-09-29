@@ -1,3 +1,4 @@
+use crate::routes::v1::entries::list_entries::NOT_HIDDEN;
 use crate::routes::v1::feeds::get_feed::{self, read_auth_type_column};
 use crate::server::AppState;
 use axum::{
@@ -76,11 +77,11 @@ pub async fn list_feeds(
             .query_row([], |count| count.get(0))?;
 
         let feeds = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT id, title, url, description, last_checked, min_fetch_interval_seconds, auth_type,
-                (SELECT COUNT(*) FROM entries WHERE feed_id = feeds.id)
-                FROM feeds LIMIT ?1 OFFSET ?2",
-            )
+                (SELECT COUNT(*) FROM entries e WHERE e.feed_id = feeds.id AND {NOT_HIDDEN})
+                FROM feeds LIMIT ?1 OFFSET ?2"
+            ))
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
