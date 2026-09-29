@@ -216,6 +216,10 @@ pub struct FeedEntry {
     /// System tag names (such as `system:hidden`) are applied only when the entry is first
     /// stored, and never removed; see `sync_entry_tags` in [`crate::tasks`].
     pub tags: Vec<String>,
+    /// Whether the images and enclosure the entry links to are downloaded into the
+    /// asset cache. `true` unless a script sets it to `false`; has no effect when the
+    /// asset cache is disabled.
+    pub cache_assets: bool,
 }
 
 /// The set of server events that scripts may subscribe to via `kiki.on(name, handler)`.

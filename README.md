@@ -158,6 +158,14 @@ kiki plugin config get strip-tracking --defaults > strip-tracking.toml
 kiki plugin config set strip-tracking strip-tracking.toml
 ```
 
+To keep Kiki from downloading any images or enclosures for some feeds, so
+that the sites serving them never hear from it, list the feeds, by id or by
+URL, in `skip_assets`:
+
+```bash
+echo 'skip_assets = [3, "https://example.com/feed.xml"]' | kiki plugin config set strip-tracking
+```
+
 See [`plugins/strip-tracking/main.lua`](plugins/strip-tracking/main.lua) for the details.
 
 ## Where Kiki keeps its files

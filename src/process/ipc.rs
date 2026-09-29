@@ -405,6 +405,7 @@ mod tests {
             authors: vec!["Ada".to_string()],
             categories: vec!["news".to_string()],
             tags: vec!["a".to_string(), "b".to_string()],
+            cache_assets: true,
         };
 
         let req = HostRequest::TransformEntry {

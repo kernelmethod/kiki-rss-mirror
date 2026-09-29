@@ -42,6 +42,7 @@ fn entry(feed_id: i64, title: &str) -> FeedEntry {
         authors: vec![],
         categories: vec![],
         tags: vec![],
+        cache_assets: true,
     }
 }
 

@@ -3,8 +3,13 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use crate::scripting::lua::LuaScriptRunner;
-use crate::scripting::{FeedEntry, ScriptRunner, ScriptSource};
+use crate::scripting::{
+    Event, EventPayload, FeedEntry, FeedInfo, ScriptRunner, ScriptServices, ScriptSource,
+    ServiceCall, ServiceReply,
+};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 const MANIFEST: &str = include_str!("../../plugins/strip-tracking/manifest.toml");
 const MAIN: &str = include_str!("../../plugins/strip-tracking/main.lua");
@@ -36,6 +41,7 @@ fn entry(url: Option<&str>, content: Option<&str>) -> FeedEntry {
         authors: vec![],
         categories: vec![],
         tags: vec![],
+        cache_assets: true,
     }
 }
 
@@ -58,7 +64,10 @@ fn the_manifest_is_valid() {
     let manifest = crate::plugins::PluginManifest::parse(MANIFEST).unwrap();
     assert_eq!(manifest.name, "strip-tracking");
     let names: Vec<_> = manifest.settings.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["params", "content", "pixels", "trackers"]);
+    assert_eq!(
+        names,
+        ["params", "content", "pixels", "trackers", "skip_assets"]
+    );
     crate::plugins::settings::check_config(&manifest.settings, &manifest.config).unwrap();
 }
 
@@ -308,6 +317,109 @@ fn bad_trackers_fail_to_load() {
         json!({"trackers": ["a*.example"]}),
         json!({"trackers": ["example.com/a b"]}),
         json!({"trackers": [3]}),
+    ] {
+        let err = plugin(config.clone()).err().unwrap().to_string();
+        assert!(err.contains("strip-tracking: "), "{config}: {err}");
+    }
+}
+
+/// Whether `runner` lets Kiki cache the assets of an entry from feed
+/// `feed_id`.
+fn caches_assets(runner: &LuaScriptRunner, feed_id: i64) -> bool {
+    let mut e = entry(None, Some("<img src=\"https://example.com/photo.jpg\">"));
+    e.feed_id = feed_id;
+    let e = ingest(runner, e);
+    assert_eq!(
+        e.content.as_deref(),
+        Some("<img src=\"https://example.com/photo.jpg\">")
+    );
+    e.cache_assets
+}
+
+#[test]
+fn assets_are_cached_by_default() {
+    let runner = default_plugin();
+    assert!(caches_assets(&runner, 1));
+}
+
+#[test]
+fn assets_are_not_cached_for_feeds_given_by_id() {
+    let runner = plugin(json!({"skip_assets": [2, 3]})).unwrap();
+    assert!(caches_assets(&runner, 1));
+    assert!(!caches_assets(&runner, 2));
+    assert!(!caches_assets(&runner, 3));
+}
+
+/// Answers `kiki.feeds.get` for feed `n` in 1..=3 with the URL
+/// `https://example.com/feed{n}`, counting the lookups.
+#[derive(Default)]
+struct Feeds {
+    lookups: AtomicUsize,
+}
+
+impl ScriptServices for Feeds {
+    fn call(&self, _plugin: &str, call: ServiceCall) -> Result<ServiceReply, String> {
+        match call {
+            ServiceCall::GetFeed { feed_id } => {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                Ok(ServiceReply::Feed((1..=3).contains(&feed_id).then(|| {
+                    FeedInfo {
+                        id: feed_id,
+                        url: Some(format!("https://example.com/feed{feed_id}")),
+                        title: "f".to_string(),
+                    }
+                })))
+            }
+            other => Err(format!("unexpected {other:?}")),
+        }
+    }
+}
+
+#[test]
+fn assets_are_not_cached_for_feeds_given_by_url() {
+    let feeds = Arc::new(Feeds::default());
+    let mut source = ScriptSource::new(MAIN);
+    source.name = "strip-tracking".to_string();
+    source.config = json!({"skip_assets": ["https://example.com/feed2", 3]}).to_string();
+    let runner = LuaScriptRunner::from_sources_with(
+        &[source],
+        Some(feeds.clone() as Arc<dyn ScriptServices>),
+    )
+    .unwrap();
+    let lookups = || feeds.lookups.load(Ordering::SeqCst);
+
+    assert!(caches_assets(&runner, 1));
+    assert!(!caches_assets(&runner, 2));
+    assert!(!caches_assets(&runner, 3));
+    assert!(caches_assets(&runner, 4));
+    // Feed 3 is listed by id, so needs no lookup; the others are looked up
+    // once each.
+    assert_eq!(lookups(), 3);
+    assert!(!caches_assets(&runner, 2));
+    assert!(caches_assets(&runner, 1));
+    assert_eq!(lookups(), 3);
+
+    // A fetch may have moved the feed to a new URL, so it is looked up again.
+    runner.dispatch_observe(
+        Event::FetchSuccess,
+        EventPayload::FetchSuccess {
+            feed_id: 2,
+            status: 200,
+            url: "https://example.com/feed2".to_string(),
+            content_length: None,
+        },
+    );
+    assert!(!caches_assets(&runner, 2));
+    assert_eq!(lookups(), 4);
+}
+
+#[test]
+fn bad_skip_assets_fail_to_load() {
+    for config in [
+        json!({"skip_assets": 3}),
+        json!({"skip_assets": [""]}),
+        json!({"skip_assets": [1.5]}),
+        json!({"skip_assets": [true]}),
     ] {
         let err = plugin(config.clone()).err().unwrap().to_string();
         assert!(err.contains("strip-tracking: "), "{config}: {err}");

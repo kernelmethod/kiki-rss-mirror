@@ -1,5 +1,6 @@
 -- Strip tracking parameters, such as utm_source or fbclid, from the URLs
--- in new entries, and tracking pixels from their content.
+-- in new entries, and tracking pixels from their content, and keep Kiki
+-- from downloading any images at all for the feeds that ask for it.
 --
 -- Config:
 --
@@ -21,6 +22,12 @@
 --            removes images from https://medium.com/_/stat?event=... but
 --            not other images from medium.com. Host names are matched
 --            ignoring case, paths as they are written.
+--   skip_assets
+--            A list of feeds, each given by its id or by the URL it is
+--            fetched from, whose entries' images and enclosures are never
+--            downloaded into Kiki's asset cache, so that the sites they
+--            are served from never hear from Kiki. The entries are stored
+--            as they are; only the downloads are skipped. Empty by default.
 --
 -- The parameters are removed from an entry's query string, and from its
 -- fragment when that is written like one (`#xtor=RSS-1`). Every other part
@@ -312,6 +319,54 @@ local function remove_pixels(html)
     return table.concat(out)
 end
 
+-- The feeds in `skip_assets`: a set of feed ids, and a set of feed URLs.
+local skip_ids, skip_urls = {}, {}
+
+local skip_list = config.skip_assets or {}
+if type(skip_list) ~= "table" then
+    fail("'skip_assets' must be a list of feed ids or URLs")
+end
+for i, feed in ipairs(skip_list) do
+    if type(feed) == "string" and feed ~= "" then
+        skip_urls[feed] = true
+    else
+        local id = type(feed) == "number" and math.tointeger(feed)
+        if not id then
+            fail(string.format("skip_assets[%d] must be a feed id or URL", i))
+        end
+        skip_ids[id] = true
+    end
+end
+
+-- Whether feed `feed_id` is in `skip_assets`, by id or by URL, looked up
+-- once per feed.
+local skips = {}
+
+local function skips_assets(feed_id)
+    if skip_ids[feed_id] then
+        return true
+    end
+    if next(skip_urls) == nil then
+        return false
+    end
+    local skip = skips[feed_id]
+    if skip == nil then
+        local feed = kiki.feeds.get(feed_id)
+        skip = feed ~= nil and feed.url ~= nil and skip_urls[feed.url] == true
+        skips[feed_id] = skip
+    end
+    return skip
+end
+
+-- A feed's URL changes when it is permanently redirected, and a removed
+-- feed's id may be given to a new feed.
+kiki.on("fetch.success", function(fetch)
+    skips[fetch.feed_id] = nil
+end)
+kiki.on("feed.removed", function(feed)
+    skips[feed.id] = nil
+end)
+
 kiki.on("entry.ingest", function(entry)
     if entry.url ~= nil then
         entry.url = clean_url(entry.url)
@@ -321,6 +376,9 @@ kiki.on("entry.ingest", function(entry)
     end
     if entry.content ~= nil and config.content ~= false then
         entry.content = clean_content(entry.content)
+    end
+    if skips_assets(entry.feed_id) then
+        entry.cache_assets = false
     end
     return entry
 end)

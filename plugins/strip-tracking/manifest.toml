@@ -1,7 +1,7 @@
 name = "strip-tracking"
-version = "1.1.0"
+version = "1.2.0"
 engine = "lua"
-description = "Strip tracking parameters, such as utm_source, from the URLs in new entries, and tracking pixels from their content"
+description = "Strip tracking parameters, such as utm_source, from the URLs in new entries, and tracking pixels from their content, and skip downloading images for chosen feeds"
 license = "MIT"
 homepage = "https://github.com/kernelmethod/kiki-rss"
 
@@ -10,8 +10,9 @@ homepage = "https://github.com/kernelmethod/kiki-rss"
 # in its content. A name ending in `*` removes every parameter starting
 # with the rest of it. Names are matched ignoring case. Unless `pixels` is
 # false, it also removes tracking pixels from each new entry's content:
-# images declared 1x1 or smaller, and images from the `trackers`. See
-# main.lua for the details.
+# images declared 1x1 or smaller, and images from the `trackers`. For the
+# feeds in `skip_assets`, it keeps Kiki from downloading entries' images
+# and enclosures at all. See main.lua for the details.
 #
 # To strip more parameters, add them to the list, for example with
 # `kiki plugin config get strip-tracking --defaults`, editing its output and
@@ -82,6 +83,7 @@ trackers = [
     "*.scorecardresearch.com",      # Comscore
     "counter.theconversation.com",  # The Conversation's republishing counter
 ]
+skip_assets = []
 
 [[settings]]
 name = "params"
@@ -108,3 +110,10 @@ type = "list"
 items = { type = "string" }
 label = "Trackers"
 description = "Image sources whose images are removed from content: a host name (starting with *. to match its subdomains too), optionally followed by the start of a path, such as medium.com/_/stat."
+
+[[settings]]
+name = "skip_assets"
+type = "list"
+items = { type = "feed" }
+label = "Feeds not to download images for"
+description = "Kiki never downloads the images and enclosures of these feeds' entries into its asset cache, each feed given by its id or the URL it is fetched from."

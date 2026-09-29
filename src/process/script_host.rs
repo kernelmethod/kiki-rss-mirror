@@ -615,6 +615,7 @@ mod tests {
             authors: Vec::new(),
             categories: Vec::new(),
             tags: Vec::new(),
+            cache_assets: true,
         }
     }
 

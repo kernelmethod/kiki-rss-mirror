@@ -104,6 +104,7 @@ impl IntoLua for FeedEntry {
             tags.set(i + 1, tag.as_str())?;
         }
         table.set("tags", tags)?;
+        table.set("cache_assets", self.cache_assets)?;
 
         Ok(LuaValue::Table(table))
     }
@@ -131,6 +132,20 @@ impl FromLua for FeedEntry {
         let url: Option<String> = table.get("url")?;
         let content: Option<String> = table.get("content")?;
 
+        // `nil` keeps the default, so a handler that clears the field (or
+        // builds a new table) does not opt out.
+        let cache_assets = match table.get::<LuaValue>("cache_assets")? {
+            LuaValue::Nil | LuaValue::Boolean(true) => true,
+            LuaValue::Boolean(false) => false,
+            other => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: other.type_name(),
+                    to: "FeedEntry".to_string(),
+                    message: Some("cache_assets must be a boolean".to_string()),
+                })
+            }
+        };
+
         let tags_table: LuaTable = table.get("tags")?;
         let mut tags = Vec::new();
         for pair in tags_table.sequence_values::<String>() {
@@ -151,6 +166,7 @@ impl FromLua for FeedEntry {
             authors: Vec::new(),
             categories: Vec::new(),
             tags,
+            cache_assets,
         })
     }
 }
@@ -711,7 +727,32 @@ mod tests {
             authors: vec!["Ada".to_string()],
             categories: vec!["news".to_string()],
             tags: vec![],
+            cache_assets: true,
         }
+    }
+
+    #[test]
+    fn scripts_can_turn_off_asset_caching() {
+        let run = |body: &str| {
+            let runner = LuaScriptRunner::new(&[format!(
+                r#"kiki.on("entry.ingest", function(entry) {body} return entry end)"#
+            )])
+            .unwrap();
+            runner.dispatch_transform_entry(make_entry())
+        };
+        let cache_assets = |body: &str| run(body).unwrap().unwrap().cache_assets;
+        assert!(cache_assets("assert(entry.cache_assets == true)"));
+        assert!(!cache_assets("entry.cache_assets = false"));
+        assert!(cache_assets("entry.cache_assets = nil"));
+        assert!(cache_assets(
+            "entry.cache_assets = false; entry.cache_assets = true"
+        ));
+        // Anything but a boolean is refused, discarding the handler's changes.
+        let out = run(r#"entry.title = "changed"; entry.cache_assets = 0"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.title, "Test Title");
+        assert!(out.cache_assets);
     }
 
     #[test]

@@ -381,3 +381,56 @@ async fn integration_configured_regex_filter_hides_entries() -> Result<()> {
 
     Ok(())
 }
+
+/// Only the entries a script leaves `cache_assets` on for have their
+/// assets queued for caching; the others are stored all the same.
+#[tokio::test]
+async fn integration_scripts_can_skip_asset_caching() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let (feed_id, client, pool) = setup_feed_with_script(
+        &tc,
+        r#"kiki.on("entry.ingest", function(entry)
+            entry.cache_assets = #entry.title % 2 == 0
+            return entry
+        end)"#,
+    )
+    .await?;
+
+    let runner = {
+        let sources = load_lua_sources(&crate::plugins::discover(&tc.plugins_dir())?);
+        crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
+    };
+    let (tx, rx) = async_channel::unbounded();
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        Some(&runner as &dyn ScriptRunner),
+        &super::test_metrics(),
+        &tx,
+    )
+    .await?;
+
+    let mut queued = Vec::new();
+    while let Ok(command) = rx.try_recv() {
+        if let TaskManagerCommand::CacheEntryAssets { entry_id } = command {
+            queued.push(entry_id);
+        }
+    }
+    queued.sort_unstable();
+
+    let conn = tc.database_conn()?;
+    let mut stmt = conn.prepare("SELECT id, title FROM entries WHERE feed_id = ?1 ORDER BY id")?;
+    let entries: Vec<(i64, String)> = stmt
+        .query_map([feed_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let expected: Vec<i64> = entries
+        .iter()
+        .filter(|(_, title)| title.len() % 2 == 0)
+        .map(|(id, _)| *id)
+        .collect();
+    assert!(entries.len() > expected.len(), "every entry was cached");
+    assert!(!expected.is_empty(), "no entry was cached");
+    assert_eq!(queued, expected);
+    Ok(())
+}
