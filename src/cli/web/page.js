@@ -70,3 +70,12 @@ function setSaved(button, saved) {
     tags.prepend(tag);
   }
 }
+
+// Filter menus: ticking or unticking a filter's checkbox loads the list with
+// the filter changed, from the URL the page gives in its `data-href`.
+document.addEventListener("change", (event) => {
+  const toggle = event.target.closest("input.filter-toggle");
+  if (toggle) {
+    window.location.href = toggle.dataset.href;
+  }
+});

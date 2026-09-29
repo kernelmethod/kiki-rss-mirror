@@ -48,7 +48,7 @@ static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// The script every page runs, inlined into [`PAGE_HTML`]. It powers the
-/// save buttons shown with each entry.
+/// save buttons shown with each entry, and the filter menus on lists of entries.
 const PAGE_JS: &str = include_str!("page.js");
 
 /// The `script-src` directive that lets pages run [`PAGE_JS`] and nothing
@@ -248,6 +248,9 @@ struct PageParams {
     /// On an entry page, the feed whose page to link back to, rather than
     /// the index.
     feed: Option<i64>,
+    /// Also list entries tagged `system:read`, which are left out by
+    /// default; on an entry page, whether the list it links back to does.
+    show_read: Option<bool>,
 }
 
 impl PageParams {
@@ -260,7 +263,12 @@ impl PageParams {
         Listing {
             feed: self.feed,
             page: self.page(),
+            show_read: self.show_read(),
         }
+    }
+
+    fn show_read(&self) -> bool {
+        self.show_read.unwrap_or(false)
     }
 }
 
@@ -272,6 +280,8 @@ struct Listing {
     feed: Option<i64>,
     /// The page of the list, counting from 1.
     page: u32,
+    /// Whether entries tagged `system:read` are listed.
+    show_read: bool,
 }
 
 impl Listing {
@@ -283,13 +293,34 @@ impl Listing {
         }
     }
 
-    /// The URL of this page of the list.
+    /// The URL of this page of the list, escaped for use in an attribute.
     fn href(&self) -> String {
-        if self.page > 1 {
-            format!("{}?page={}", self.path(), self.page)
-        } else {
-            self.path()
+        let page = (self.page > 1).then_some(self.page as usize);
+        self.list_href(page, self.show_read)
+    }
+
+    /// The URL of page `page` of the list, escaped for use in an attribute.
+    fn page_href(&self, page: usize) -> String {
+        self.list_href(Some(page), self.show_read)
+    }
+
+    /// The URL of the first page of the list with read entries shown or
+    /// not, the other way from this one, escaped for use in an attribute.
+    fn toggle_read_href(&self) -> String {
+        self.list_href(None, !self.show_read)
+    }
+
+    /// The URL of page `page` of the list, or of its first page if `None`,
+    /// listing read entries if `show_read`, escaped for use in an attribute.
+    fn list_href(&self, page: Option<usize>, show_read: bool) -> String {
+        let mut query = Vec::new();
+        if let Some(page) = page {
+            query.push(format!("page={page}"));
         }
+        if show_read {
+            query.push("show_read=true".to_owned());
+        }
+        with_query(self.path(), &query)
     }
 
     /// The URL of entry `id`'s page, linking back to this page of the list,
@@ -302,11 +333,20 @@ impl Listing {
         if self.page > 1 {
             query.push(format!("page={}", self.page));
         }
-        if query.is_empty() {
-            format!("/entries/{id}")
-        } else {
-            format!("/entries/{id}?{}", query.join("&amp;"))
+        if self.show_read {
+            query.push("show_read=true".to_owned());
         }
+        with_query(format!("/entries/{id}"), &query)
+    }
+}
+
+/// `path` with the query parameters `query` (already encoded) appended,
+/// escaped for use in an attribute.
+fn with_query(path: String, query: &[String]) -> String {
+    if query.is_empty() {
+        path
+    } else {
+        format!("{path}?{}", query.join("&amp;"))
     }
 }
 
@@ -363,16 +403,19 @@ fn server_unavailable(e: &anyhow::Error) -> Response {
 
 /// Render the index page: the total number of entries, and one page of
 /// them, newest first, each with the feed it came from, and links to the
-/// neighbouring pages.
+/// neighbouring pages. Read entries are left out unless the `show_read`
+/// query parameter is true.
 async fn index(State(api): State<reqwest::Client>, Query(params): Query<PageParams>) -> Response {
-    let page = params.page();
-    match fetch_entries(&api, page).await {
+    let listing = Listing {
+        feed: None,
+        ..params.listing()
+    };
+    match fetch_entries(&api, listing.page, listing.show_read).await {
         Ok(entries) => {
             let (feeds, tags) = tokio::join!(
                 fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)),
                 fetch_entry_tags(&api, entries.entries.iter().map(|e| e.id)),
             );
-            let listing = Listing { feed: None, page };
             render_page(
                 StatusCode::OK,
                 "Kiki",
@@ -504,7 +547,8 @@ async fn feeds_page(
 }
 
 /// Render the page for feed `id`: what the feed says about itself, and one
-/// page of the entries retrieved from it, newest first.
+/// page of the entries retrieved from it, newest first. Read entries are
+/// left out unless the `show_read` query parameter is true.
 async fn feed_page(
     State(api): State<reqwest::Client>,
     UrlPath(id): UrlPath<i64>,
@@ -512,7 +556,7 @@ async fn feed_page(
 ) -> Response {
     let listing = Listing {
         feed: Some(id),
-        page: params.page(),
+        ..params.listing()
     };
     let not_found = || {
         render_page(
@@ -524,7 +568,7 @@ async fn feed_page(
 
     let (feed, entries) = tokio::join!(
         fetch_feed(&api, id),
-        fetch_feed_entries(&api, id, listing.page)
+        fetch_feed_entries(&api, id, listing.page, listing.show_read)
     );
     let feed = match feed {
         Ok(Some(feed)) => feed,
@@ -902,12 +946,18 @@ async fn fetch_cached_assets(api: &reqwest::Client, id: i64) -> HashMap<String, 
     }
 }
 
-/// Fetch page `page` (counting from 1) of `/v1/entries` from the Kiki API.
-async fn fetch_entries(api: &reqwest::Client, page: u32) -> Result<ListEntriesResponse> {
+/// Fetch page `page` (counting from 1) of `/v1/entries` from the Kiki API,
+/// leaving out read entries unless `show_read`.
+async fn fetch_entries(
+    api: &reqwest::Client,
+    page: u32,
+    show_read: bool,
+) -> Result<ListEntriesResponse> {
     let offset = u64::from(page - 1) * u64::from(PAGE_SIZE);
     Ok(api
         .get(format!(
-            "{API_BASE}/v1/entries?offset={offset}&limit={PAGE_SIZE}"
+            "{API_BASE}/v1/entries?offset={offset}&limit={PAGE_SIZE}&exclude_read={}",
+            !show_read
         ))
         .send()
         .await?
@@ -955,16 +1005,19 @@ async fn fetch_feed(api: &reqwest::Client, id: i64) -> Result<Option<Feed>> {
 }
 
 /// Fetch page `page` (counting from 1) of the entries of feed `id` from the
-/// Kiki API, or `None` if there is no such feed.
+/// Kiki API, leaving out read entries unless `show_read`, or `None` if there
+/// is no such feed.
 async fn fetch_feed_entries(
     api: &reqwest::Client,
     id: i64,
     page: u32,
+    show_read: bool,
 ) -> Result<Option<FeedEntriesResponse>> {
     let offset = u64::from(page - 1) * u64::from(PAGE_SIZE);
     let resp = api
         .get(format!(
-            "{API_BASE}/v1/feeds/id/{id}/entries?offset={offset}&limit={PAGE_SIZE}"
+            "{API_BASE}/v1/feeds/id/{id}/entries?offset={offset}&limit={PAGE_SIZE}&exclude_read={}",
+            !show_read
         ))
         .send()
         .await?;
@@ -1118,7 +1171,8 @@ async fn fetch_entry_tags(
 }
 
 /// Render the entry count (`count`, of all the entries in the list), the
-/// entries on this page of `listing`, and the page links. `feeds` maps feed
+/// filter menu, the entries on this page of `listing`, and the page links.
+/// `feeds` maps feed
 /// IDs to the titles of the feeds; entries from feeds not in it are shown
 /// without their feed. `tags` maps entry IDs to the entries' tags; entries
 /// not in it are shown without tags.
@@ -1129,17 +1183,18 @@ fn render_entries(
     tags: &HashMap<i64, Vec<TagResponse>>,
     listing: Listing,
 ) -> String {
+    let unread = if listing.show_read { "" } else { "unread " };
     let mut html = format!(
-        "<p class=\"count\">{} {}</p>\n",
-        count,
-        if count == 1 { "entry" } else { "entries" }
+        "<div class=\"list-header\">\n<p class=\"count\">{count} {unread}{}</p>\n{}</div>\n",
+        if count == 1 { "entry" } else { "entries" },
+        render_filter(listing),
     );
 
     if entries.is_empty() {
-        html.push_str(if count == 0 {
-            "<p>No entries yet.</p>\n"
-        } else {
-            "<p>No entries on this page.</p>\n"
+        html.push_str(match (count, listing.show_read) {
+            (0, true) => "<p>No entries yet.</p>\n",
+            (0, false) => "<p>No unread entries.</p>\n",
+            _ => "<p>No entries on this page.</p>\n",
         });
     } else {
         html.push_str("<ol class=\"entries\">\n");
@@ -1161,10 +1216,27 @@ fn render_entries(
     html.push_str(&render_pagination(
         count,
         listing.page,
-        &listing.path(),
+        |page| listing.page_href(page),
         ("&larr; Newer", "Older &rarr;"),
     ));
     html
+}
+
+/// Render the filter menu for a list of entries: a checkbox that shows read
+/// entries, or hides them again. Ticking it reloads the first page of
+/// `listing` with the other setting; the script in `page.js` follows the
+/// checkbox's `data-href`, so that the page needs no form, and the page's
+/// `Content-Security-Policy` can go on forbidding them.
+fn render_filter(listing: Listing) -> String {
+    let href = listing.toggle_read_href();
+    format!(
+        "<details class=\"filter\">\n<summary>Filter</summary>\n<div class=\"menu\">\n\
+         <label><input type=\"checkbox\" class=\"filter-toggle\" data-href=\"{href}\"{}> Show read entries</label>\n\
+         <noscript><a href=\"{href}\">{}</a></noscript>\n\
+         </div>\n</details>\n",
+        if listing.show_read { " checked" } else { "" },
+        if listing.show_read { "Hide read entries" } else { "Show read entries" },
+    )
 }
 
 /// Render a single entry in a list: its title, linked to the entry's page,
@@ -1418,7 +1490,7 @@ fn render_feeds(resp: &ListFeedsResponse, page: u32) -> String {
     html.push_str(&render_pagination(
         resp.count,
         page,
-        "/feeds",
+        |page| format!("/feeds?page={page}"),
         ("&larr; Previous", "Next &rarr;"),
     ));
     html
@@ -1937,9 +2009,15 @@ fn safe_link(url: &str) -> Option<&str> {
 }
 
 /// Render the "page X of Y" line for page `page` of a list of `count`
-/// items at `path`, with links to the pages before and after it, labelled
-/// with `labels`.
-fn render_pagination(count: usize, page: u32, path: &str, labels: (&str, &str)) -> String {
+/// items, with links to the pages before and after it, labelled with
+/// `labels`. `href` gives the URL of a page of the list, escaped for use in
+/// an attribute.
+fn render_pagination(
+    count: usize,
+    page: u32,
+    href: impl Fn(usize) -> String,
+    labels: (&str, &str),
+) -> String {
     let (prev_label, next_label) = labels;
     let pages = count.div_ceil(PAGE_SIZE as usize).max(1);
     let page_usize = page as usize;
@@ -1950,14 +2028,15 @@ fn render_pagination(count: usize, page: u32, path: &str, labels: (&str, &str)) 
         // (equally empty) page before it.
         let prev = page_usize.min(pages + 1) - 1;
         links.push(format!(
-            "<a href=\"{path}?page={prev}\" rel=\"prev\">{prev_label}</a>"
+            "<a href=\"{}\" rel=\"prev\">{prev_label}</a>",
+            href(prev)
         ));
     }
     links.push(format!("Page {page} of {pages}"));
     if page_usize < pages {
         links.push(format!(
-            "<a href=\"{path}?page={}\" rel=\"next\">{next_label}</a>",
-            page_usize + 1
+            "<a href=\"{}\" rel=\"next\">{next_label}</a>",
+            href(page_usize + 1)
         ));
     }
     format!(
@@ -2122,8 +2201,8 @@ mod tests {
         let (status, body) = get_index(tc.client()?).await?;
 
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("0 entries"), "{body}");
-        assert!(body.contains("No entries yet."), "{body}");
+        assert!(body.contains("0 unread entries"), "{body}");
+        assert!(body.contains("No unread entries."), "{body}");
         assert!(body.contains("Page 1 of 1"), "{body}");
         assert!(!body.contains("{{content}}"), "{body}");
         Ok(())
@@ -2153,7 +2232,7 @@ mod tests {
 
         let (status, body) = get_index(tc.client()?).await?;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("30 entries"), "{body}");
+        assert!(body.contains("30 unread entries"), "{body}");
         assert!(body.contains("Page 1 of 2"), "{body}");
         assert!(body.contains(r#"href="/?page=2""#), "{body}");
         assert!(!body.contains(r#"rel="prev""#), "{body}");
@@ -2179,7 +2258,7 @@ mod tests {
 
         let (status, body) = get_index(tc.client()?).await?;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("2 entries"), "{body}");
+        assert!(body.contains("2 unread entries"), "{body}");
         assert_eq!(listed_titles(&body), ["Entry 3", "Entry 1"]);
 
         // Its own page still shows it, tagged hidden.
@@ -2187,6 +2266,79 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(
             body.contains(r#"<li class="tag system" title="system:hidden">hidden</li>"#),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// Read entries are left out of the index, unless the filter menu's
+    /// checkbox asks for them.
+    #[tokio::test]
+    async fn the_index_page_hides_read_entries_by_default() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 3)?;
+        tag_entry(&tc, 2, "system:read")?;
+
+        let (status, body) = get_index(tc.client()?).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("2 unread entries"), "{body}");
+        assert_eq!(listed_titles(&body), ["Entry 3", "Entry 1"]);
+        assert!(
+            body.contains(
+                r#"<input type="checkbox" class="filter-toggle" data-href="/?show_read=true"> Show read entries</label>"#
+            ),
+            "{body}"
+        );
+
+        let (status, body) = get_page(tc.client()?, "/?show_read=true").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("3 entries"), "{body}");
+        assert_eq!(listed_titles(&body), ["Entry 3", "Entry 2", "Entry 1"]);
+        // Unticking the checkbox hides them again.
+        assert!(
+            body.contains(
+                r#"<input type="checkbox" class="filter-toggle" data-href="/" checked> Show read entries</label>"#
+            ),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// With read entries shown, the page links, entry links, and the links
+    /// back from entry pages keep showing them.
+    #[tokio::test]
+    async fn showing_read_entries_carries_through_links() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 30)?;
+        for id in 1..=30 {
+            tag_entry(&tc, id, "system:read")?;
+        }
+
+        let (_, body) = get_index(tc.client()?).await?;
+        assert!(body.contains("No unread entries."), "{body}");
+
+        let (_, body) = get_page(tc.client()?, "/?show_read=true").await?;
+        assert!(body.contains("Page 1 of 2"), "{body}");
+        assert!(
+            body.contains(r#"href="/?page=2&amp;show_read=true" rel="next""#),
+            "{body}"
+        );
+
+        let (_, body) = get_page(tc.client()?, "/?page=2&show_read=true").await?;
+        assert!(
+            body.contains(r#"href="/?page=1&amp;show_read=true" rel="prev""#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"href="/entries/5?page=2&amp;show_read=true""#),
+            "{body}"
+        );
+        // The checkbox goes back to the first page of unread entries.
+        assert!(body.contains(r#"data-href="/" checked"#), "{body}");
+
+        let (_, body) = get_page(tc.client()?, "/entries/5?page=2&show_read=true").await?;
+        assert!(
+            body.contains(r#"<a href="/?page=2&amp;show_read=true">"#),
             "{body}"
         );
         Ok(())
@@ -2290,7 +2442,8 @@ mod tests {
         tag_entry(&tc, 1, "system:read")?;
         tag_entry(&tc, 1, "system:saved")?;
 
-        let (status, body) = get_index(tc.client()?).await?;
+        // Entry 1 is read, so only shows when read entries are.
+        let (status, body) = get_page(tc.client()?, "/?show_read=true").await?;
         assert_eq!(status, StatusCode::OK);
         assert!(
             body.contains(
@@ -2945,7 +3098,7 @@ mod tests {
         );
         assert!(body.contains("<h2>Feed &lt;One&gt;</h2>"), "{body}");
         assert!(body.contains("About &lt;b&gt;one&lt;/b&gt;"), "{body}");
-        assert!(body.contains("15 entries"), "{body}");
+        assert!(body.contains("15 unread entries"), "{body}");
         let expected: Vec<_> = (1..=15).rev().map(|i| format!("Entry {}", i * 2)).collect();
         assert_eq!(listed_titles(&body), expected);
         // Every entry is from this feed, so none is labelled with it.
@@ -2960,6 +3113,37 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(
             body.contains(r#"<a href="/feeds/1">&larr; Back to feed</a>"#),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// A feed's page leaves out its read entries too, unless asked for them.
+    #[tokio::test]
+    async fn the_feed_page_hides_read_entries_by_default() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (id, title, url) VALUES (1, 'Feed', 'http://example.com/1.xml')",
+            [],
+        )?;
+        insert_entries(&tc, 3)?;
+        conn.execute("UPDATE entries SET feed_id = 1", [])?;
+        tag_entry(&tc, 3, "system:read")?;
+
+        let (_, body) = get_page(tc.client()?, "/feeds/1").await?;
+        assert!(body.contains("2 unread entries"), "{body}");
+        assert_eq!(listed_titles(&body), ["Entry 2", "Entry 1"]);
+        assert!(
+            body.contains(r#"data-href="/feeds/1?show_read=true""#),
+            "{body}"
+        );
+
+        let (_, body) = get_page(tc.client()?, "/feeds/1?show_read=true").await?;
+        assert!(body.contains("3 entries"), "{body}");
+        assert_eq!(listed_titles(&body), ["Entry 3", "Entry 2", "Entry 1"]);
+        assert!(
+            body.contains(r#"href="/entries/3?feed=1&amp;show_read=true""#),
             "{body}"
         );
         Ok(())

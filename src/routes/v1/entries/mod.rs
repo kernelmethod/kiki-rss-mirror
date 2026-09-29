@@ -226,6 +226,47 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_list_entries_can_leave_out_read_entries() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_feeds_and_entries(&tc)?;
+        {
+            let conn = tc.database_conn()?;
+            let read = SystemTag::Read.id(&conn)?;
+            conn.execute(
+                "INSERT INTO entry_tags (entry_id, tag_id) VALUES (2, ?1)",
+                [read],
+            )?;
+        }
+
+        let titles = |r: &list_entries::ListEntriesResponse| -> Vec<String> {
+            r.entries.iter().map(|e| e.title.clone()).collect()
+        };
+
+        for query in ["", "?exclude_read=false"] {
+            let response = client
+                .get(format!("http://localhost/v1/entries{query}"))
+                .send()
+                .await?
+                .json::<list_entries::ListEntriesResponse>()
+                .await?;
+            assert_eq!(response.count, 2, "{query}");
+            assert_eq!(titles(&response), ["Entry 2", "Entry 1"], "{query}");
+        }
+
+        let response = client
+            .get("http://localhost/v1/entries?exclude_read=true")
+            .send()
+            .await?
+            .json::<list_entries::ListEntriesResponse>()
+            .await?;
+        assert_eq!(response.count, 1);
+        assert_eq!(titles(&response), ["Entry 1"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_list_entries_ordering() -> Result<()> {
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;

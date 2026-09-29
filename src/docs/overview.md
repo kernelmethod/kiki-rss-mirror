@@ -23,7 +23,9 @@ out of scope for this project:
     `PUT`/`DELETE /v1/entries/id/{id}/system-tags/{name}`. The `system:`
     prefix is reserved, so user tags cannot start with it. Entries tagged
     `system:hidden` are left out of entry lists unless asked for with
-    `include_hidden=true`.
+    `include_hidden=true`. Entries tagged `system:read` are listed unless
+    left out with `exclude_read=true`; the web UI (`kiki web`) leaves them
+    out by default, and its "Filter" menu has a checkbox to show them.
 
 The following is currently out-of-scope, although these features may be
 reconsidered some day:
