@@ -19,7 +19,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 /// A zstd-compressed tarball of the plugins installed by default: currently
-/// only `filter`.
+/// `filter` and `strip-tracking`.
 ///
 /// Each plugin's directory is stored under its own name at the root of the
 /// archive, and holds only regular files.
@@ -270,10 +270,16 @@ fn replace_plugin(plugins_dir: &Path, name: &str, files: &[&BundledFile]) -> Res
 ///
 /// let dir = tempfile::TempDir::new().unwrap();
 /// let outcomes = sync_default_plugins(dir.path()).unwrap();
-/// assert_eq!(outcomes, [("filter".to_string(), SyncOutcome::Installed)]);
+/// assert_eq!(
+///     outcomes,
+///     [
+///         ("filter".to_string(), SyncOutcome::Installed),
+///         ("strip-tracking".to_string(), SyncOutcome::Installed),
+///     ]
+/// );
 /// // Syncing again finds them up to date.
 /// let outcomes = sync_default_plugins(dir.path()).unwrap();
-/// assert_eq!(outcomes, [("filter".to_string(), SyncOutcome::UpToDate)]);
+/// assert!(outcomes.iter().all(|(_, o)| *o == SyncOutcome::UpToDate));
 /// ```
 ///
 /// # Errors
@@ -344,28 +350,38 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn the_filter_plugin_is_bundled() {
+    fn the_default_plugins_are_bundled() {
         let files = bundled_files().unwrap();
         let paths: Vec<_> = files.iter().map(|f| f.path.as_path()).collect();
         assert_eq!(
             paths,
             [
                 Path::new("filter/main.lua"),
-                Path::new("filter/manifest.toml")
+                Path::new("filter/manifest.toml"),
+                Path::new("strip-tracking/main.lua"),
+                Path::new("strip-tracking/manifest.toml"),
             ]
         );
-        assert!(files.iter().all(|f| f.plugin == "filter"));
+        let plugins: Vec<_> = files.iter().map(|f| f.plugin.as_str()).collect();
+        assert_eq!(
+            plugins,
+            ["filter", "filter", "strip-tracking", "strip-tracking"]
+        );
         assert_eq!(
             files[0].contents,
             include_bytes!("../../plugins/filter/main.lua")
+        );
+        assert_eq!(
+            files[2].contents,
+            include_bytes!("../../plugins/strip-tracking/main.lua")
         );
     }
 
     /// Syncs `dir`, returning the outcome for `filter`.
     fn sync_filter(dir: &Path) -> SyncOutcome {
         let outcomes = sync_default_plugins(dir).unwrap();
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].0, "filter");
+        let names: Vec<_> = outcomes.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["filter", "strip-tracking"]);
         outcomes[0].1
     }
 
@@ -395,7 +411,7 @@ mod tests {
             .inspect(|(_, outcome)| assert_eq!(*outcome, SyncOutcome::Installed))
             .map(|(name, _)| name.as_str())
             .collect();
-        assert_eq!(installed, ["filter"]);
+        assert_eq!(installed, ["filter", "strip-tracking"]);
 
         let discovery = discover(&plugins_dir).unwrap();
         assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
@@ -437,7 +453,7 @@ mod tests {
             .collect();
         let mut entries = entries;
         entries.sort();
-        assert_eq!(entries, [RECORD_FILE_NAME, "filter"]);
+        assert_eq!(entries, [RECORD_FILE_NAME, "filter", "strip-tracking"]);
     }
 
     #[test]
@@ -460,7 +476,7 @@ mod tests {
         assert_eq!(sync_filter(td.path()), SyncOutcome::Modified);
         assert_eq!(std::fs::read_to_string(&main).unwrap(), "-- edited");
         assert!(!td.path().join("filter").join("manifest.toml").exists());
-        assert!(read_record(td.path()).unwrap().is_empty());
+        assert!(!read_record(td.path()).unwrap().contains_key("filter"));
     }
 
     /// A copy of the bundled plugin made by hand, before Kiki recorded what

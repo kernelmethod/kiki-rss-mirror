@@ -109,6 +109,25 @@ Whenever its rules change, the filter also applies them to the entries already
 downloaded. It never unhides entries. See
 [`plugins/filter/main.lua`](plugins/filter/main.lua) for every setting.
 
+### Stripping tracking parameters
+
+Kiki also ships a `strip-tracking` plugin, in
+[`plugins/strip-tracking`](plugins/strip-tracking), installed by default like
+`filter`. It removes tracking parameters, such as `utm_source`, `fbclid` and
+`gclid`, from the query strings (and query-like fragments, such as
+`#xtor=RSS-1`) of new entries' URLs, and of the links in their content. It only
+cleans entries as they are downloaded, not the ones already stored. To strip
+other parameters, or to leave entries' content alone:
+
+```bash
+kiki plugin config get strip-tracking --defaults > strip-tracking.toml
+# edit strip-tracking.toml: add names to `params` ("prefix_*" matches a prefix),
+# or set `content = false`
+kiki plugin config set strip-tracking strip-tracking.toml
+```
+
+See [`plugins/strip-tracking/main.lua`](plugins/strip-tracking/main.lua) for the details.
+
 ## Where Kiki keeps its files
 
 | | Default |
@@ -163,6 +182,31 @@ the file on every change. Changes made to the file directly are picked up
 by the running server; an invalid edit is logged and ignored. While the
 file is invalid, every settings update through the API fails with
 `409 Conflict` rather than overwriting it, so fix or remove it first.
+
+#### Proxy
+
+To send feed fetches and asset downloads through an HTTP(S) proxy, set it
+in `kiki.toml`:
+
+```toml
+[proxy]
+url = "http://user:password@proxy.example:3128"
+no_proxy = "localhost, .internal.example, 10.0.0.0/8"   # optional
+```
+
+or with environment variables, which take precedence over the file:
+
+| | Overrides |
+| --- | --- |
+| `$KIKI_PROXY` | `proxy.url` |
+| `$KIKI_NO_PROXY` | `proxy.no_proxy` |
+
+`no_proxy` is a comma-separated list of hosts to reach directly: domains
+(which include their subdomains), IP addresses, CIDR ranges, or `*`. When
+no proxy URL is set either way, Kiki honors the conventional
+`$HTTPS_PROXY`, `$HTTP_PROXY`, `$ALL_PROXY` and `$NO_PROXY` instead.
+Changes to the file take effect without a restart; an invalid
+`$KIKI_PROXY` stops `kiki serve` at startup.
 
 Kiki serves over a Unix socket and nothing else — it does not listen on
 TCP. A socket is reachable only by processes that can reach its path, which

@@ -1,4 +1,7 @@
+use crate::db::favicons::favicon_hash_sql;
 use crate::http::FeedAuthType;
+use crate::routes::v1::assets::read_asset_url_column;
+use crate::routes::v1::entries::list_entries::NOT_HIDDEN;
 use crate::routes::v1::feeds::format_data::{
     load_atom_feed_data, load_rss_feed_data, AtomFeedData, RssFeedData,
 };
@@ -26,8 +29,15 @@ pub struct GetFeedResponse {
     /// Current authentication scheme for this feed. Credentials themselves
     /// are never returned — only the scheme in use.
     pub auth_type: FeedAuthType,
-    /// Number of entries stored for this feed.
+    /// Number of entries stored for this feed, not counting hidden ones.
     pub entry_count: i64,
+    /// The website the feed belongs to, as the feed itself gives it.
+    #[serde(default)]
+    pub site_url: Option<String>,
+    /// Relative Kiki URL that serves the favicon of the website the feed
+    /// belongs to, or `null` if it has not been cached.
+    #[serde(default)]
+    pub favicon_url: Option<String>,
 }
 
 /// Read the `auth_type` column at `idx` and decode it into a [`FeedAuthType`].
@@ -96,11 +106,13 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
     // The rusqlite interface is synchronous so we must run the INSERT
     // statement on a blocking thread.
     let task_result = task::spawn_blocking(move || {
-        let mut stmt = match conn.prepare(
+        let mut stmt = match conn.prepare(&format!(
             "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at, min_fetch_interval_seconds, auth_type,
-                (SELECT COUNT(*) FROM entries WHERE feed_id = feeds.id)
+                (SELECT COUNT(*) FROM entries e WHERE e.feed_id = feeds.id AND {NOT_HIDDEN}),
+                site_url, {}
                 FROM feeds WHERE id = ?1 LIMIT 1",
-        ) {
+            favicon_hash_sql("feeds.id")
+        )) {
             Ok(s) => s,
             Err(e) => {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
@@ -120,6 +132,8 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
                 min_fetch_interval_seconds: row.get(7)?,
                 auth_type,
                 entry_count: row.get(9)?,
+                site_url: row.get(10)?,
+                favicon_url: read_asset_url_column(row, 11)?,
             };
             let last_fetch_error = row
                 .get::<usize, Option<String>>(5)?

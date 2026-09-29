@@ -105,10 +105,11 @@ pub async fn feed_entries(
         let entries = conn
             .prepare(&format!(
                 "SELECT id, feed_id, source_id, syndication_format,
-                        guid, published_at, title, url, content
+                        guid, published_at, title, url, content, {}
                  FROM entries e WHERE feed_id = ?1 AND {}
                  ORDER BY published_at DESC, id DESC
                  LIMIT ?2 OFFSET ?3",
+                crate::db::favicons::favicon_hash_sql("e.feed_id"),
                 not_hidden_unless(4)
             ))
             .inspect_err(|e| {
@@ -128,6 +129,7 @@ pub async fn feed_entries(
                         title: row.get(6)?,
                         url: row.get(7)?,
                         content: row.get(8)?,
+                        feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
                     })
                 },
             )?

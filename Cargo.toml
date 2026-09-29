@@ -67,6 +67,8 @@ tar = { version = "0.4", default-features = false, optional = true }
 zstd = { version = "0.14", default-features = false, optional = true }
 arc-swap = "1"
 notify = "8"
+sha2 = "0.10"
+base64 = "0.22"
 
 [build-dependencies]
 tar = { version = "0.4", default-features = false, optional = true }

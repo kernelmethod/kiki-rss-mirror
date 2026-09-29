@@ -300,7 +300,10 @@ source, and `kiki init` installs it by default (unless Kiki was built without
 the `default-plugins` feature, or `--no-default-plugins` is passed); see its
 `main.lua` for the settings it takes. `kiki init --check` installs it into an
 existing home directory too, and updates it when a new release of Kiki bundles
-a new version, unless its files have been edited.
+a new version, unless its files have been edited. It also installs
+`plugins/strip-tracking`, which uses `entry.ingest` to remove tracking
+parameters such as `utm_source` from entries' URLs and the links in their
+content.
 
 ## Events
 

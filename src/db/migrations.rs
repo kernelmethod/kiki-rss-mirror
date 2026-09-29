@@ -41,6 +41,10 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0005_plugin_store",
         sql: include_str!("include/migrations/0005_plugin_store.sql"),
     },
+    Migration {
+        name: "0006_feed_favicons",
+        sql: include_str!("include/migrations/0006_feed_favicons.sql"),
+    },
 ];
 
 /// The migration that drops the `scripts` table in favour of plugins.
@@ -174,6 +178,11 @@ mod tests {
     /// The parts of the schema that migrations touch, as they were before
     /// any migrations.
     const LEGACY_SCHEMA: &str = "
+        CREATE TABLE feeds (
+            id      INTEGER PRIMARY KEY,
+            title   VARCHAR NOT NULL,
+            url     VARCHAR
+        );
         CREATE TABLE scripts (
             id      INTEGER PRIMARY KEY,
             engine  VARCHAR NOT NULL,
@@ -349,6 +358,34 @@ mod tests {
         assert_eq!(sql(&conn)?, sql(&fresh)?);
 
         crate::db::plugins::store_set(&conn, "p", "k", Some(&serde_json::json!(1)))?;
+        Ok(())
+    }
+
+    /// `0006_feed_favicons` adds `feeds.site_url` and the table favicons
+    /// are recorded in, with the same shape as a freshly-initialized
+    /// database's.
+    #[test]
+    fn test_feed_favicons_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        conn.execute_batch("INSERT INTO feeds (title, url) VALUES ('f', 'http://x/');")?;
+        run_pending_migrations(&mut conn)?;
+
+        let fresh = ConnectionBuilder::default().in_memory().create().build()?;
+        let sql = |conn: &Connection, name: &str| -> Result<String> {
+            Ok(conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )?)
+        };
+        for name in ["feed_favicons", "idx_feed_favicons_asset"] {
+            assert_eq!(sql(&conn, name)?, sql(&fresh, name)?);
+        }
+
+        let site_url: Option<String> =
+            conn.query_row("SELECT site_url FROM feeds", [], |row| row.get(0))?;
+        assert_eq!(site_url, None);
         Ok(())
     }
 }

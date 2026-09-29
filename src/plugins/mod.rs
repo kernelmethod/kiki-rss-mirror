@@ -72,6 +72,8 @@ pub mod settings;
 
 #[cfg(all(test, feature = "lua"))]
 mod filter_tests;
+#[cfg(all(test, feature = "lua"))]
+mod strip_tracking_tests;
 
 use crate::scripting::{ScriptModule, ScriptSource};
 use serde::{Deserialize, Serialize};

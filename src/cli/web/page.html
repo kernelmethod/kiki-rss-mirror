@@ -45,6 +45,7 @@
     .feed-header h2 { margin-bottom: 0.25rem; }
     .feed-header .description { margin: 0.5rem 0; }
     .meta { display: block; font-size: 0.875rem; color: #666; }
+    .favicon { width: 1em; height: 1em; margin-right: 0.3em; vertical-align: -0.125em; }
     .pagination { margin: 1rem 0; text-align: center; }
     .entry h2 { margin-bottom: 0.25rem; }
     .entry .content { margin: 1rem 0; overflow-wrap: break-word; }
@@ -54,11 +55,20 @@
     .tags .tag { padding: 0 0.4rem; border: 1px solid #bbb; border-radius: 0.75rem; font-size: 0.75rem; color: #444; }
     .tags .tag.system { border-style: dashed; color: #666; background: #f4f4f4; }
     .entry .links { margin: 1rem 0; padding-top: 0.5rem; border-top: 1px solid #ddd; }
+    .title-row { display: flex; align-items: baseline; gap: 0.5rem; }
+    .save { padding: 0 0.25rem; border: none; background: none; color: #888; font-size: 1rem; line-height: 1; vertical-align: -0.125em; cursor: pointer; }
+    .save:hover, .save:focus-visible { color: #444; }
+    .save:disabled { cursor: progress; opacity: 0.5; }
+    .save svg { width: 1em; height: 1em; }
+    .save path { fill: none; stroke: currentColor; stroke-width: 2; stroke-linejoin: round; }
+    .save[aria-pressed=true] { color: #b8860b; }
+    .save[aria-pressed=true] path { fill: currentColor; }
   </style>
 </head>
 <body>
   <h1><a href="/">Kiki</a> <small class="version">v{{version}}</small></h1>
   <nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a><a href="/plugins">Plugins</a></nav>
   {{content}}
+  <script>{{script}}</script>
 </body>
 </html>

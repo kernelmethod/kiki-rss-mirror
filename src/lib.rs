@@ -7,6 +7,10 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::indexing_slicing)]
+// Tests build their own reqwest clients to talk to local test servers;
+// everything else must go through `fetcher::ProxiedClient` (see
+// `clippy.toml`).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod config;
 pub mod db;

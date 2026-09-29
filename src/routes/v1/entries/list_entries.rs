@@ -1,3 +1,5 @@
+use crate::db::favicons::favicon_hash_sql;
+use crate::routes::v1::assets::read_asset_url_column;
 use crate::server::AppState;
 use axum::{
     extract::{Query, State},
@@ -22,14 +24,16 @@ pub struct ListEntriesQueryParams {
 }
 
 /// An SQL condition that holds when the entry aliased `e` is not tagged
-/// `system:hidden`, or when query parameter number `param` is true.
-pub(crate) fn not_hidden_unless(param: usize) -> String {
-    format!(
-        "(?{param} OR NOT EXISTS (
+/// `system:hidden`.
+pub(crate) const NOT_HIDDEN: &str = "NOT EXISTS (
             SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
             WHERE et.entry_id = e.id AND t.kind = 'system' AND t.name = 'system:hidden'
-        ))"
-    )
+        )";
+
+/// An SQL condition that holds when the entry aliased `e` is not tagged
+/// `system:hidden`, or when query parameter number `param` is true.
+pub(crate) fn not_hidden_unless(param: usize) -> String {
+    format!("(?{param} OR {NOT_HIDDEN})")
 }
 
 #[derive(Deserialize, Serialize)]
@@ -50,6 +54,10 @@ pub struct ListEntriesResponseEntry {
     pub title: String,
     pub url: String,
     pub content: Option<String>,
+    /// Relative Kiki URL that serves the favicon of the website the
+    /// entry's feed belongs to, or `null` if it has not been cached.
+    #[serde(default)]
+    pub feed_favicon_url: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
@@ -114,11 +122,12 @@ pub async fn list_entries(
         let entries = conn
             .prepare(&format!(
                 "SELECT id, feed_id, source_id, syndication_format,
-                    guid, published_at, title, url, content
+                    guid, published_at, title, url, content, {}
                 FROM entries e
                 WHERE {}
                 ORDER BY published_at DESC, id DESC
                 LIMIT ?1 OFFSET ?2",
+                favicon_hash_sql("e.feed_id"),
                 not_hidden_unless(3)
             ))
             .inspect_err(|e| {
@@ -136,6 +145,7 @@ pub async fn list_entries(
                     title: row.get(6)?,
                     url: row.get(7)?,
                     content: row.get(8)?,
+                    feed_favicon_url: read_asset_url_column(row, 9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()

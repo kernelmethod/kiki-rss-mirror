@@ -6,6 +6,7 @@ mod auth_tests;
 mod backoff_tests;
 mod cache_control_parse;
 mod cache_tests;
+mod favicon_tests;
 mod feed_hints_tests;
 mod fetch_error_tests;
 mod format_data_tests;
