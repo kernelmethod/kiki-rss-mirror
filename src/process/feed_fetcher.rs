@@ -1129,6 +1129,23 @@ mod tests {
         assert!(matches!(reply, FetchReply::Body(_)), "got {reply:?}");
     }
 
+    /// A SOCKS5 proxy works from the worker too, with the proxy's own
+    /// hostname resolved by the server and the feed's by the proxy.
+    #[tokio::test]
+    async fn fetches_go_through_a_socks5_proxy_in_the_spec() {
+        use crate::config::ProxySettings;
+        use crate::fetcher::tests::{proxied_spec, start_socks_proxy};
+
+        let addr = start_socks_proxy().await;
+        let host = host_with_in_thread_worker();
+        let proxy = ProxySettings {
+            url: Some(format!("socks5h://localhost:{}", addr.port())),
+            no_proxy: None,
+        };
+        let reply = host.fetch(proxied_spec(proxy)).await.unwrap();
+        assert!(matches!(reply, FetchReply::Body(_)), "got {reply:?}");
+    }
+
     /// When the far end goes away, outstanding and later requests fail
     /// promptly instead of waiting out their deadlines.
     #[tokio::test]

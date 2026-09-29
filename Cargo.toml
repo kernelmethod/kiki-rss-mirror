@@ -42,7 +42,7 @@ clap = { version = "4.5", features = ["cargo", "derive"], optional = true }
 quick-xml = { version = "0.37", features = ["serialize", "escape-html"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.27"
-reqwest = { version = "0.13", default-features = false, features = ["json", "gzip", "deflate", "brotli", "zstd", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "gzip", "deflate", "brotli", "zstd", "rustls", "socks"] }
 rss = "2.0"
 rusqlite = { version = "0.34", features = ["bundled", "functions", "trace"] }
 serde = { version = "1.0", features = ["serde_derive"] }

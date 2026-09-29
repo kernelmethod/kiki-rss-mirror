@@ -654,6 +654,57 @@ pub(crate) mod tests {
         addr
     }
 
+    /// Start a stand-in SOCKS5 proxy that serves [`RSS`] over HTTP on any
+    /// connection it is asked to make to `feed.invalid` by name, so a fetch
+    /// of it succeeds only if it went through the proxy, and the proxy did
+    /// the host name lookup.
+    pub(crate) async fn start_socks_proxy() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve(mut s: tokio::net::TcpStream) -> std::io::Result<()> {
+            // Greeting: version, and the authentication methods offered.
+            let mut head = [0u8; 2];
+            s.read_exact(&mut head).await?;
+            let mut methods = vec![0u8; usize::from(head[1])];
+            s.read_exact(&mut methods).await?;
+            s.write_all(&[5, 0]).await?;
+
+            // Request: only a CONNECT to a host name (address type 3).
+            let mut req = [0u8; 5];
+            s.read_exact(&mut req).await?;
+            assert_eq!(req[..4], [5, 1, 0, 3], "not a CONNECT by host name");
+            let mut name = vec![0u8; usize::from(req[4])];
+            s.read_exact(&mut name).await?;
+            let mut port = [0u8; 2];
+            s.read_exact(&mut port).await?;
+            assert_eq!(name, b"feed.invalid");
+            s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+
+            // The HTTP request, up to its blank line, then the feed.
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                s.read_exact(&mut byte).await?;
+                request.extend_from_slice(&byte);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{RSS}",
+                RSS.len()
+            );
+            s.write_all(response.as_bytes()).await
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(serve(stream));
+            }
+        });
+        addr
+    }
+
     pub(crate) fn proxied_spec(proxy: ProxySettings) -> FetchSpec {
         FetchSpec {
             feed_id: 1,
@@ -685,6 +736,28 @@ pub(crate) mod tests {
             ..proxy
         };
         let reply = fetch_with(&clients, &proxied_spec(bypassed)).await;
+        assert!(matches!(reply, FetchReply::Network { .. }), "got {reply:?}");
+    }
+
+    /// A `socks5h` proxy is handed host names to look up itself, so a
+    /// host that does not resolve here is still reached; with `socks5`,
+    /// the name is looked up locally, and fails.
+    #[tokio::test]
+    async fn fetches_go_through_a_socks5_proxy() {
+        let addr = start_socks_proxy().await;
+        let clients = ProxiedClient::new(client_builder).unwrap();
+        let proxy = ProxySettings {
+            url: Some(format!("socks5h://{addr}")),
+            no_proxy: None,
+        };
+        let reply = fetch_with(&clients, &proxied_spec(proxy)).await;
+        assert!(matches!(reply, FetchReply::Body(_)), "got {reply:?}");
+
+        let local_dns = ProxySettings {
+            url: Some(format!("socks5://{addr}")),
+            no_proxy: None,
+        };
+        let reply = fetch_with(&clients, &proxied_spec(local_dns)).await;
         assert!(matches!(reply, FetchReply::Network { .. }), "got {reply:?}");
     }
 

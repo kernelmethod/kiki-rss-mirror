@@ -21,7 +21,7 @@
 //! max_age_days = 30
 //!
 //! [proxy]
-//! url = "http://proxy.example:3128"
+//! url = "http://proxy.example:3128"   # or "socks5h://127.0.0.1:9050" for Tor
 //! no_proxy = "localhost, .internal.example"
 //! ```
 //!
@@ -161,8 +161,16 @@ pub struct RetentionSettings {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxySettings {
-    /// URL of the proxy all outbound requests go through, `http://` or
-    /// `https://`, optionally with `user:password@` credentials.
+    /// URL of the proxy all outbound requests go through, optionally with
+    /// `user:password@` credentials. The scheme picks the kind of proxy:
+    ///
+    /// * `http://` or `https://`: an HTTP proxy.
+    /// * `socks5h://`: a SOCKS5 proxy that also looks up host names, so
+    ///   no DNS query for a feed or asset leaves this machine. Use this one
+    ///   for Tor (`socks5h://127.0.0.1:9050`).
+    /// * `socks5://`: a SOCKS5 proxy, with host names looked up locally.
+    ///   The lookups go out directly, so they reveal which hosts Kiki
+    ///   fetches from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 
@@ -214,7 +222,8 @@ impl ProxySettings {
     /// # Errors
     ///
     /// Returns [`ConfigError::Invalid`] if the URL does not parse, has a
-    /// scheme other than `http` or `https`, or has no host. The message
+    /// scheme other than those listed on [`url`](Self::url), or has no
+    /// host. The message
     /// never repeats the URL, which may hold credentials.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let Some(raw) = &self.url else {
@@ -225,9 +234,9 @@ impl ProxySettings {
             Ok(url) => url,
             Err(e) => return invalid(format!("is not a valid URL: {e}")),
         };
-        if !matches!(url.scheme(), "http" | "https") {
+        if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h") {
             return invalid(format!(
-                "must use the http or https scheme, not {:?}",
+                "must use the http, https, socks5 or socks5h scheme, not {:?}",
                 url.scheme()
             ));
         }
@@ -543,11 +552,25 @@ mod tests {
     }
 
     #[test]
+    fn socks5_proxies_are_accepted() {
+        for url in [
+            "socks5://127.0.0.1:1080",
+            "socks5h://127.0.0.1:9050",
+            "socks5h://user:pw@proxy.example:1080",
+        ] {
+            let mut o = Overrides::default();
+            o.set("proxy", "url", url).unwrap();
+            let s = o.resolve().unwrap();
+            assert_eq!(s.proxy.url.as_deref(), Some(url));
+        }
+    }
+
+    #[test]
     fn invalid_proxy_urls_are_rejected_without_echoing_them() {
         for url in [
             "not a url",
-            "socks5://secret@proxy.example:1080",
-            "ftp://proxy.example",
+            "socks4://secret@proxy.example:1080",
+            "ftp://secret@proxy.example",
             "http://",
         ] {
             let mut o = Overrides::default();
