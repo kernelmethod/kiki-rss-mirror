@@ -5,14 +5,15 @@ use crate::cli::serve::ServeArgs;
 use crate::db::tags::{SystemTag, TagKind, SYSTEM_TAG_PREFIX};
 use crate::plugins::settings::{Setting, SettingType};
 use crate::routes::v1::entries::entry_assets::ListEntryAssetsResponse;
-use crate::routes::v1::entries::entry_tags::{BulkSystemTagRequest, GetEntryTagsResponse};
+use crate::routes::v1::entries::entry_tags::GetEntryTagsResponse;
 use crate::routes::v1::entries::get_entry::GetEntryResponse;
 use crate::routes::v1::entries::search_entries::SearchEntriesResponse;
 use crate::routes::v1::entries::ListEntriesResponseEntry;
 use crate::routes::v1::feeds::list_feeds::ListFeedsResponse;
 use crate::routes::v1::plugins::list_plugins::{ListPluginsResponse, PluginResponse};
 use crate::routes::v1::plugins::plugin_config::PluginConfigResponse;
-use crate::routes::v1::tags::list_tags::TagResponse;
+use crate::routes::v1::tags::list_tags::{ListTagsResponse, TagResponse};
+use crate::routes::v1::tags::tag_entries::AddTagEntriesRequest;
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{Form, Path as UrlPath, Query, State},
@@ -543,7 +544,7 @@ struct MarkReadParams {
 
 /// Mark every entry as read, or only those from the feed given in
 /// `params`, by giving them the `system:read` tag in one request to the
-/// Kiki API. Called by the "Mark all as read" buttons' script, which
+/// Kiki API, once [`fetch_system_tag_id`] has looked up the tag. Called by the "Mark all as read" buttons' script, which
 /// reloads the page afterwards.
 ///
 /// Responds with `204 No Content` once it is done, `502 Bad Gateway` if
@@ -562,30 +563,50 @@ async fn mark_entries_read(
             .into_response();
     }
 
-    let request = BulkSystemTagRequest {
-        up_to_id: None,
-        feed_id: params.feed,
-    };
-    let resp = api
-        .put(format!("{API_BASE}/v1/entries/system-tags/read"))
-        .json(&request)
-        .send()
-        .await;
-    match resp.map(|resp| resp.status()) {
-        Ok(StatusCode::OK) => StatusCode::NO_CONTENT.into_response(),
-        Ok(status) => {
-            tracing::warn!(%status, feed_id = params.feed, "failed to mark entries as read");
+    let result = async {
+        let tag_id = fetch_system_tag_id(&api, SystemTag::Read).await?;
+        let request = AddTagEntriesRequest {
+            up_to_id: None,
+            feed_id: params.feed,
+        };
+        api.post(format!("{API_BASE}/v1/tags/id/{tag_id}/entries"))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?;
+        anyhow::Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::warn!(
+                feed_id = params.feed,
+                "failed to mark entries as read: {e:#}"
+            );
             (
                 StatusCode::BAD_GATEWAY,
                 "The entries could not be marked as read.",
             )
                 .into_response()
         }
-        Err(e) => {
-            tracing::warn!("failed to reach the Kiki server: {e:#}");
-            (StatusCode::BAD_GATEWAY, "The Kiki server is unavailable.").into_response()
-        }
     }
+}
+
+/// Look up the ID of the system tag `tag` through the Kiki API.
+async fn fetch_system_tag_id(api: &reqwest::Client, tag: SystemTag) -> Result<i64> {
+    let tags: ListTagsResponse = api
+        .get(format!("{API_BASE}/v1/tags?kind=system"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    tags.tags
+        .into_iter()
+        .find(|t| t.name == tag.name())
+        .map(|t| t.id)
+        .ok_or_else(|| anyhow!("the Kiki server has no {tag} tag"))
 }
 
 /// Render the list of feeds: the total number of feeds, and one page of

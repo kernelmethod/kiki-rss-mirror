@@ -10,7 +10,7 @@ use create_tag::create_tag;
 use delete_tag::delete_tag;
 use get_tag::get_tag;
 use list_tags::list_tags;
-use tag_entries::tag_entries;
+use tag_entries::{add_tag_entries, tag_entries};
 use tag_feeds::tag_feeds;
 use update_tag::update_tag;
 
@@ -26,7 +26,7 @@ pub fn create_router() -> Router<AppState> {
         .route("/create", post(create_tag))
         .route("/id/{id}", get(get_tag).put(update_tag).delete(delete_tag))
         .route("/id/{id}/feeds", get(tag_feeds))
-        .route("/id/{id}/entries", get(tag_entries))
+        .route("/id/{id}/entries", get(tag_entries).post(add_tag_entries))
 }
 
 #[cfg(test)]
@@ -353,6 +353,70 @@ mod test {
         assert_eq!(json.count, 1);
         assert_eq!(json.entries.len(), 1);
         assert_eq!(json.entries[0].title, "Entry 1");
+
+        Ok(())
+    }
+
+    /// `POST /id/{id}/entries` tags many entries at once, with user tags and
+    /// system tags alike, narrowed down by `up_to_id` and `feed_id`, and
+    /// skips entries that already have the tag.
+    #[tokio::test]
+    async fn test_add_tag_entries() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        populate_tags(&tc)?;
+        populate_feeds_and_entries(&tc)?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (1, 'rss', 'guid-3', 1700000002, 'Entry 3', 'http://example.com/3')",
+            [],
+        )?;
+
+        let tagged_entries = |tag_id: i64| -> Result<Vec<i64>> {
+            let mut stmt = conn
+                .prepare("SELECT entry_id FROM entry_tags WHERE tag_id = ?1 ORDER BY entry_id")?;
+            let ids = stmt
+                .query_map([tag_id], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(ids)
+        };
+        let add = |tag_id: i64, body: serde_json::Value| {
+            client
+                .post(format!("http://localhost/v1/tags/id/{tag_id}/entries"))
+                .json(&body)
+                .send()
+        };
+        let tagged = |resp: reqwest::Response| async move {
+            assert_eq!(resp.status(), StatusCode::OK);
+            Ok::<_, anyhow::Error>(
+                resp.json::<tag_entries::AddTagEntriesResponse>()
+                    .await?
+                    .tagged,
+            )
+        };
+
+        // A user tag, on entries from feed 1 up to entry 2: just entry 1
+        let resp = add(5, serde_json::json!({"feed_id": 1, "up_to_id": 2})).await?;
+        assert_eq!(tagged(resp).await?, 1);
+        assert_eq!(tagged_entries(5)?, [1]);
+
+        // Up to entry 2, from any feed: entry 1 already has the tag
+        let resp = add(5, serde_json::json!({"up_to_id": 2})).await?;
+        assert_eq!(tagged(resp).await?, 1);
+        assert_eq!(tagged_entries(5)?, [1, 2]);
+
+        // A system tag, on every entry
+        let read = SystemTag::Read.id(&conn)?;
+        let resp = add(read, serde_json::json!({})).await?;
+        assert_eq!(tagged(resp).await?, 3);
+        assert_eq!(tagged_entries(read)?, [1, 2, 3]);
+        assert_eq!(tagged_entries(5)?, [1, 2]);
+
+        // Unknown tag
+        let resp = add(999, serde_json::json!({})).await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         Ok(())
     }

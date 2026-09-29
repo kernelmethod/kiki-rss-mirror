@@ -10,10 +10,7 @@ pub mod search_entries;
 use cleanup::cleanup;
 use delete_entry::delete_entry;
 use entry_assets::list_entry_assets;
-use entry_tags::{
-    add_entries_system_tag, add_entry_system_tag, get_entry_tags, remove_entry_system_tag,
-    set_entry_tags,
-};
+use entry_tags::{add_entry_system_tag, get_entry_tags, remove_entry_system_tag, set_entry_tags};
 use get_entry::get_entry;
 #[allow(unused_imports)]
 pub use list_entries::{list_entries, ListEntriesResponse, ListEntriesResponseEntry};
@@ -30,7 +27,6 @@ pub fn create_router() -> Router<AppState> {
         .route("/", get(list_entries))
         .route("/cleanup", post(cleanup))
         .route("/search", post(search_entries))
-        .route("/system-tags/{name}", put(add_entries_system_tag))
         .route("/id/{id}", get(get_entry).delete(delete_entry))
         .route("/id/{id}/tags", get(get_entry_tags).put(set_entry_tags))
         .route(
@@ -589,67 +585,6 @@ mod test {
         let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
         assert_eq!(body.count, 1);
         assert_eq!(body.entries[0].entry.title, "Entry 2");
-
-        Ok(())
-    }
-
-    /// `PUT /system-tags/{name}` tags many entries at once, narrowed down by
-    /// `up_to_id` and `feed_id`, and skips entries that already have the tag.
-    #[tokio::test]
-    async fn test_bulk_system_tags() -> Result<()> {
-        let tc = TestBuilder::all().build()?;
-        let client = tc.client()?;
-
-        populate_feeds_and_entries(&tc)?;
-        let conn = tc.database_conn()?;
-        conn.execute(
-            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
-             VALUES (1, 'rss', 'guid-3', 1700000002, 'Entry 3', 'http://example.com/3')",
-            [],
-        )?;
-
-        let read_entries = |conn: &rusqlite::Connection| -> Result<Vec<i64>> {
-            let read = SystemTag::Read.id(conn)?;
-            let mut stmt = conn
-                .prepare("SELECT entry_id FROM entry_tags WHERE tag_id = ?1 ORDER BY entry_id")?;
-            let ids = stmt
-                .query_map([read], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            Ok(ids)
-        };
-        let mark_read = |body: serde_json::Value| {
-            client
-                .put("http://localhost/v1/entries/system-tags/read")
-                .json(&body)
-                .send()
-        };
-
-        // Only entries from feed 1 up to entry 2: just entry 1
-        let resp = mark_read(serde_json::json!({"feed_id": 1, "up_to_id": 2})).await?;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = resp.json::<entry_tags::BulkSystemTagResponse>().await?;
-        assert_eq!(json.tagged, 1);
-        assert_eq!(read_entries(&conn)?, [1]);
-
-        // Up to entry 2, from any feed: entry 1 is already read
-        let resp = mark_read(serde_json::json!({"up_to_id": 2})).await?;
-        let json = resp.json::<entry_tags::BulkSystemTagResponse>().await?;
-        assert_eq!(json.tagged, 1);
-        assert_eq!(read_entries(&conn)?, [1, 2]);
-
-        // Everything
-        let resp = mark_read(serde_json::json!({})).await?;
-        let json = resp.json::<entry_tags::BulkSystemTagResponse>().await?;
-        assert_eq!(json.tagged, 1);
-        assert_eq!(read_entries(&conn)?, [1, 2, 3]);
-
-        // Unknown system tag
-        let resp = client
-            .put("http://localhost/v1/entries/system-tags/starred")
-            .json(&serde_json::json!({}))
-            .send()
-            .await?;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         Ok(())
     }

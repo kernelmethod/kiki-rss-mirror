@@ -145,3 +145,94 @@ pub async fn tag_entries(
         Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()),
     }
 }
+
+#[derive(Debug, Default, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct AddTagEntriesRequest {
+    /// Only tag entries with an ID no greater than this, e.g. the newest entry the user has
+    /// seen, so that entries fetched since are left alone.
+    #[serde(default)]
+    pub up_to_id: Option<i64>,
+    /// Only tag entries from this feed.
+    #[serde(default)]
+    pub feed_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct AddTagEntriesResponse {
+    /// Number of entries that did not have the tag before, and now do.
+    pub tagged: usize,
+}
+
+/// Add a tag to many entries
+///
+/// Apply a tag to every entry matching the request, in one go. Works for both user tags and
+/// system tags, e.g. `system:read` to mark entries as read. An empty request body (`{}`) tags
+/// every entry; `up_to_id` and `feed_id` narrow it down. Entries that already have the tag are
+/// left as they are.
+#[utoipa::path(
+    post,
+    path = "/v1/tags/id/{id}/entries",
+    params(
+        ("id" = i64, Path, description = "Tag ID"),
+    ),
+    request_body = AddTagEntriesRequest,
+    responses(
+        (status = 200, description = "Entries tagged", body = AddTagEntriesResponse),
+        (status = 404, description = "Tag not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "tags"
+)]
+#[axum::debug_handler]
+pub async fn add_tag_entries(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<AddTagEntriesRequest>,
+) -> Result<Response, Response> {
+    let conn = state.conn_pool.get().map_err(|e| {
+        event!(Level::ERROR, "failed to get database connection: {:?}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?;
+
+    let result = task::spawn_blocking(move || {
+        let exists: bool = conn
+            .prepare("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)")
+            .inspect_err(|e| {
+                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+            })?
+            .query_row([id], |row| row.get(0))?;
+
+        if !exists {
+            return Err(TagEntriesTaskError::TagNotFound);
+        }
+
+        let tagged = conn
+            .prepare(
+                "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id)
+                 SELECT id, ?1 FROM entries
+                 WHERE (?2 IS NULL OR id <= ?2) AND (?3 IS NULL OR feed_id = ?3)",
+            )
+            .inspect_err(|e| {
+                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+            })?
+            .execute(rusqlite::params![id, request.up_to_id, request.feed_id])?;
+
+        Ok::<AddTagEntriesResponse, TagEntriesTaskError>(AddTagEntriesResponse { tagged })
+    })
+    .await
+    .inspect_err(|e| {
+        event!(Level::ERROR, "task error in add_tag_entries: {:?}", e);
+    });
+
+    match result {
+        Ok(Ok(response)) => Ok(Json(response).into_response()),
+        Ok(Err(TagEntriesTaskError::TagNotFound)) => {
+            Err((StatusCode::NOT_FOUND, "Tag not found").into_response())
+        }
+        Ok(Err(e)) => {
+            event!(Level::ERROR, "error in add_tag_entries: {:?}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
+        }
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()),
+    }
+}
