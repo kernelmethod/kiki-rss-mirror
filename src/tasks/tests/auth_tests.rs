@@ -8,11 +8,11 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use std::sync::{Arc, Mutex};
 
-fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
     let manager = SqliteConnectionManager::file(path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager)?)
+    Ok(r2d2::Pool::new(manager.into())?)
 }
 
 /// Insert a feed pointing at the test feed server with the given auth
@@ -21,7 +21,7 @@ fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManage
 async fn setup_feed_with_auth(
     tc: &crate::test::TestConfig,
     auth: &FeedAuth,
-) -> Result<(i64, reqwest::Client, r2d2::Pool<SqliteConnectionManager>)> {
+) -> Result<(i64, reqwest::Client, crate::db::Pool)> {
     let conn = tc.database_conn()?;
     conn.execute(
         "INSERT INTO feeds

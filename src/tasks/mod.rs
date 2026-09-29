@@ -34,7 +34,7 @@ pub(crate) use favicons::cache_feed_favicon;
 pub(crate) async fn refresh_feed(
     client: &reqwest::Client,
     feed_id: i64,
-    pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    pool: crate::db::Pool,
     script_runner: Option<&dyn crate::scripting::ScriptRunner>,
     metrics: &crate::metrics::Metrics,
     task_tx: &async_channel::Sender<TaskManagerCommand>,
@@ -57,7 +57,7 @@ pub(crate) async fn refresh_feed(
 pub(crate) async fn refresh_feed_with_settings(
     client: &reqwest::Client,
     feed_id: i64,
-    pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    pool: crate::db::Pool,
     settings: &crate::config::Settings,
     script_runner: Option<&dyn crate::scripting::ScriptRunner>,
     metrics: &crate::metrics::Metrics,

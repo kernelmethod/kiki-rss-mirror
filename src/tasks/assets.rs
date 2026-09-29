@@ -266,7 +266,7 @@ pub fn unlink_asset_file(data_dir: &Path, blake3: &str) {
 /// shouldn't block the rest of the entry. Errors are logged at WARN.
 pub async fn cache_asset(
     client: &reqwest::Client,
-    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    pool: &crate::db::Pool,
     data_dir: &Path,
     max_cache_bytes: i64,
     asset_url: &Url,
@@ -302,7 +302,7 @@ pub async fn cache_asset(
 /// filesystem errors, and errors from `link`, are returned.
 pub async fn store_asset<F>(
     client: &reqwest::Client,
-    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    pool: &crate::db::Pool,
     data_dir: &Path,
     max_cache_bytes: i64,
     asset_url: &Url,

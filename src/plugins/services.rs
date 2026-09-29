@@ -24,7 +24,6 @@ use crate::scripting::{
     ServiceReply,
 };
 use arc_swap::ArcSwap;
-use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,7 +49,7 @@ const MAX_TAG_NAME_BYTES: usize = 255;
 /// tag entries with existing user tags past this, but not add new ones.
 pub const MAX_USER_TAGS: i64 = 10_000;
 
-type Pool = r2d2::Pool<SqliteConnectionManager>;
+type Pool = crate::db::Pool;
 
 /// Answers the calls plugins make. See the [module documentation](self).
 pub struct ServerServices {
@@ -95,7 +94,7 @@ impl ServerServices {
         self.loaded.swap(Arc::new(names))
     }
 
-    fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, String> {
+    fn conn(&self) -> Result<crate::db::PooledConnection, String> {
         self.pool
             .get()
             .map_err(|e| format!("database unavailable: {e}"))
@@ -538,6 +537,7 @@ mod tests {
     use super::*;
     use crate::scripting::lua::LuaScriptRunner;
     use crate::scripting::{Event, EventPayload, ScriptRunner, ScriptSource};
+    use r2d2_sqlite::SqliteConnectionManager;
     use rusqlite::params;
     use std::time::{Duration, Instant};
 
@@ -552,7 +552,7 @@ mod tests {
             .build()
             .unwrap();
         std::mem::forget(td);
-        r2d2::Pool::new(SqliteConnectionManager::file(path)).unwrap()
+        r2d2::Pool::new(SqliteConnectionManager::file(path).into()).unwrap()
     }
 
     fn insert_feed(conn: &Connection) -> i64 {

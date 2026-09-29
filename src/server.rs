@@ -29,7 +29,7 @@ pub struct SharedAppState {
 
     /// A [`r2d2::Pool`] instance that intermediates connections to the
     /// SQLite database.
-    pub conn_pool: r2d2::Pool<SqliteConnectionManager>,
+    pub conn_pool: crate::db::Pool,
 
     /// A [`CancellationToken`] that can be used to trigger a graceful
     /// server shutdown.
@@ -310,7 +310,7 @@ impl Server {
             });
         let pool = r2d2::Pool::builder()
             .event_handler(Box::new(crate::metrics::PoolMetrics(metrics.clone())))
-            .build(manager)
+            .build(crate::db::ConnectionManager::new(manager).with_metrics(metrics.clone()))
             .with_context(|| {
                 format!(
                     "Unable to open connection pool to database at {:?}",
@@ -531,7 +531,7 @@ impl Server {
 /// and the CPU and memory used by kiki's processes.
 async fn metrics_sampler_loop(
     task_manager_tx: async_channel::Sender<TaskManagerCommand>,
-    pool: r2d2::Pool<SqliteConnectionManager>,
+    pool: crate::db::Pool,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
 ) {
@@ -607,7 +607,7 @@ async fn metrics_sampler_loop(
 
 async fn check_feeds_loop(
     task_manager_tx: async_channel::Sender<TaskManagerCommand>,
-    pool: r2d2::Pool<SqliteConnectionManager>,
+    pool: crate::db::Pool,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
@@ -685,7 +685,7 @@ fn compute_initial_delay(period: Duration, last_run_at: i64, now: i64) -> Durati
 #[allow(clippy::too_many_arguments)]
 async fn periodic_command_loop(
     task_manager_tx: async_channel::Sender<TaskManagerCommand>,
-    pool: r2d2::Pool<SqliteConnectionManager>,
+    pool: crate::db::Pool,
     cancel_token: CancellationToken,
     period: Duration,
     cmd: TaskManagerCommand,
@@ -737,7 +737,7 @@ async fn periodic_command_loop(
 
 fn check_feeds(
     task_manager_tx: &async_channel::Sender<TaskManagerCommand>,
-    pool: &r2d2::Pool<SqliteConnectionManager>,
+    pool: &crate::db::Pool,
     metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
     debug!("Sending RefreshFeed commands for all feeds");
@@ -880,7 +880,7 @@ fn claim_socket_path(socket_path: &Path) -> Result<()> {
 async fn uds_server(
     socket_path: PathBuf,
     tx: async_channel::Sender<TaskManagerCommand>,
-    pool: r2d2::Pool<SqliteConnectionManager>,
+    pool: crate::db::Pool,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
     data_dir: PathBuf,
@@ -940,11 +940,11 @@ mod test {
     use rusqlite::OpenFlags;
     use std::path::Path;
 
-    fn make_pool(path: &Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
+    fn make_pool(path: &Path) -> Result<crate::db::Pool> {
         let manager = SqliteConnectionManager::file(path)
             .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-        Ok(r2d2::Pool::new(manager)?)
+        Ok(r2d2::Pool::new(manager.into())?)
     }
 
     /// Nothing at the path means nothing to clean up.

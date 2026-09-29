@@ -1,4 +1,5 @@
 use crate::config::Settings;
+use crate::db::{Pool, PooledConnection};
 use crate::fetcher::{
     FeedHints, FetchReply, FetchSpec, FetchedBody, Fetcher, ParseOutcome, ParsedFeed,
 };
@@ -21,8 +22,6 @@ use crate::tasks::processing::{
 use crate::tasks::scripting::{fire_fetch_error, fire_fetch_success};
 use anyhow::Result;
 use chrono::Utc;
-use r2d2::{Pool, PooledConnection};
-use r2d2_sqlite::SqliteConnectionManager;
 use reqwest::header::HeaderMap;
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -48,10 +47,7 @@ struct FeedFetchRow {
     feed_hints: FeedHints,
 }
 
-fn load_feed_fetch_row(
-    conn: &PooledConnection<SqliteConnectionManager>,
-    feed_id: i64,
-) -> Result<FeedFetchRow> {
+fn load_feed_fetch_row(conn: &PooledConnection, feed_id: i64) -> Result<FeedFetchRow> {
     let row = conn.query_row(
         "SELECT
             url,
@@ -170,7 +166,7 @@ pub(super) fn hint_source(
 pub(crate) async fn refresh_feed(
     fetcher: &Fetcher,
     feed_id: i64,
-    pool: Pool<SqliteConnectionManager>,
+    pool: Pool,
     settings: &Settings,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
@@ -377,7 +373,7 @@ fn favicon_is_due(conn: &rusqlite::Connection, feed_id: i64) -> bool {
 
 /// Everything the outcome of one refresh is recorded against.
 struct Recorder<'a> {
-    pool: &'a Pool<SqliteConnectionManager>,
+    pool: &'a Pool,
     feed_id: i64,
     /// The feed as named in the logs; see [`feed_label`].
     label: String,
@@ -859,7 +855,7 @@ fn schedule_success(
 fn retrieve_file_feed(
     feed_url: &str,
     feed_id: i64,
-    pool: Pool<SqliteConnectionManager>,
+    pool: Pool,
     cfg: SchedulerConfig,
 ) -> Result<(Vec<u8>, Schedule)> {
     let conn = pool.get()?;

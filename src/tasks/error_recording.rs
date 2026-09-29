@@ -1,9 +1,8 @@
+use crate::db::PooledConnection;
 use crate::metrics::Metrics;
 use crate::tasks::backoff::{plan_next_fetch, FetchOutcome, Schedule};
 use crate::tasks::error::FetchError;
 use chrono::Utc;
-use r2d2::PooledConnection;
-use r2d2_sqlite::SqliteConnectionManager;
 use tracing::error;
 
 /// Record a fetch error for a feed in the database and reschedule the next
@@ -20,7 +19,7 @@ use tracing::error;
 /// error could not be recorded (which is logged here).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn set_feed_error_with_schedule(
-    conn: &PooledConnection<SqliteConnectionManager>,
+    conn: &PooledConnection,
     feed_id: i64,
     fetch_error: &FetchError,
     retry_after_ts: Option<i64>,
@@ -119,7 +118,7 @@ pub(super) fn set_feed_error_with_schedule(
 /// from `settings`, and returns the same as
 /// [`set_feed_error_with_schedule`].
 pub(super) fn set_feed_error(
-    conn: &PooledConnection<SqliteConnectionManager>,
+    conn: &PooledConnection,
     feed_id: i64,
     fetch_error: &FetchError,
     settings: &crate::config::FeedFetchSettings,
@@ -151,7 +150,7 @@ pub(super) fn set_feed_error(
 
 /// Clear any previously recorded fetch error for a feed and reset the failure
 /// streak counter.
-pub(super) fn clear_feed_error(conn: &PooledConnection<SqliteConnectionManager>, feed_id: i64) {
+pub(super) fn clear_feed_error(conn: &PooledConnection, feed_id: i64) {
     if let Err(e) = conn.execute(
         "UPDATE feeds SET
             last_fetch_error = NULL,

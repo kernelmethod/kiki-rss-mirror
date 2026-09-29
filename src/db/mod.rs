@@ -9,9 +9,12 @@ pub mod log;
 pub mod migrations;
 pub mod plugins;
 pub mod profile;
+mod pool;
 pub mod retention;
 pub mod tags;
 pub mod task_queue;
+
+pub use pool::{ConnectionManager, Pool, PooledConnection};
 
 enum ConnectionType<'a> {
     DefaultConnection,

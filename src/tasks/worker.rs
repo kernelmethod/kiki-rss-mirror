@@ -1,4 +1,5 @@
 use crate::config::ConfigHandle;
+use crate::db::Pool;
 use crate::fetcher::{Fetcher, ProxiedClient};
 use crate::metrics::Metrics;
 use crate::scripting::{ScriptRunner, ScriptRunnerHandle};
@@ -11,8 +12,6 @@ use crate::tasks::favicons::cache_feed_favicon;
 use crate::tasks::fetch::refresh_feed;
 use crate::tasks::maintenance::run_maintenance;
 use anyhow::{Context, Result};
-use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -70,7 +69,7 @@ fn in_progress_len(set: &InProgressSet) -> f64 {
 struct Worker {
     rx: async_channel::Receiver<TaskManagerCommand>,
     tx: async_channel::Sender<TaskManagerCommand>,
-    pool: Pool<SqliteConnectionManager>,
+    pool: Pool,
     token: CancellationToken,
     refresh_in_progress: InProgressSet,
     cleanup_in_progress: InProgressSet,
@@ -107,7 +106,7 @@ pub fn worker_count() -> usize {
 pub fn spawn_workers(
     rx: async_channel::Receiver<TaskManagerCommand>,
     tx: async_channel::Sender<TaskManagerCommand>,
-    pool: Pool<SqliteConnectionManager>,
+    pool: Pool,
     token: CancellationToken,
     num_workers: usize,
     metrics: Arc<Metrics>,

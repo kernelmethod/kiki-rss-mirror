@@ -1,12 +1,11 @@
 use crate::db::tags::{is_reserved_tag_name, SystemTag};
+use crate::db::PooledConnection;
 use crate::fetcher::{AtomEntry, AtomFeedIngestData, RssEntry};
 use crate::metrics::Metrics;
 use crate::scripting::{FeedEntry, ScriptRunner};
 use crate::tasks::command::TaskManagerCommand;
 use crate::tasks::parsing::{insert_atom_entry_data, insert_rss_entry_data, upsert_atom_feed_data};
 use anyhow::Result;
-use r2d2::PooledConnection;
-use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, TransactionBehavior};
 use std::time::Instant;
 use tracing::{debug, warn};
@@ -57,7 +56,7 @@ pub(super) fn process_atom_feed(
     site_url: Option<&str>,
     feed_data: AtomFeedIngestData,
     entries: Vec<AtomEntry>,
-    mut conn: PooledConnection<SqliteConnectionManager>,
+    mut conn: PooledConnection,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
 ) -> Result<StoredEntries> {
@@ -117,7 +116,7 @@ pub(super) fn process_rss_feed(
     feed_id: i64,
     site_url: Option<&str>,
     entries: Vec<RssEntry>,
-    mut conn: PooledConnection<SqliteConnectionManager>,
+    mut conn: PooledConnection,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
 ) -> Result<StoredEntries> {

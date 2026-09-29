@@ -343,6 +343,40 @@ mod imp {
                 ),
             );
 
+            r.describe_counter(
+                KeyName::from_const_str("kiki_db_page_cache_hits_total"),
+                None,
+                SharedString::const_str(
+                    "Total database page reads served from SQLite's page cache, without reading the database file or WAL.",
+                ),
+            );
+            r.describe_counter(
+                KeyName::from_const_str("kiki_db_page_reads_total"),
+                None,
+                SharedString::const_str(
+                    "Total database pages read from the database file or WAL (page cache misses).",
+                ),
+            );
+            r.describe_counter(
+                KeyName::from_const_str("kiki_db_read_bytes_total"),
+                None,
+                SharedString::const_str(
+                    "Total bytes of database pages read from the database file or WAL.",
+                ),
+            );
+            r.describe_counter(
+                KeyName::from_const_str("kiki_db_page_writes_total"),
+                None,
+                SharedString::const_str(
+                    "Total database pages written to the WAL. Checkpoints copying pages from the WAL into the database file are not counted.",
+                ),
+            );
+            r.describe_counter(
+                KeyName::from_const_str("kiki_db_write_bytes_total"),
+                None,
+                SharedString::const_str("Total bytes of database pages written to the WAL."),
+            );
+
             r.describe_histogram(
                 KeyName::from_const_str("kiki_retention_cleanup_duration_seconds"),
                 None,
@@ -728,6 +762,32 @@ mod imp {
                 .set(resident_bytes);
         }
 
+        /// Record page I/O done by a database connection: `cache_hits`
+        /// pages read from SQLite's page cache, `page_reads` pages read from
+        /// disk, and `page_writes` pages written, each `page_size` bytes.
+        pub fn record_db_io(
+            &self,
+            cache_hits: u64,
+            page_reads: u64,
+            page_writes: u64,
+            page_size: u64,
+        ) {
+            for (name, value) in [
+                ("kiki_db_page_cache_hits_total", cache_hits),
+                ("kiki_db_page_reads_total", page_reads),
+                ("kiki_db_read_bytes_total", page_reads * page_size),
+                ("kiki_db_page_writes_total", page_writes),
+                ("kiki_db_write_bytes_total", page_writes * page_size),
+            ] {
+                if value > 0 {
+                    let key = Key::from_static_name(name);
+                    self.recorder
+                        .register_counter(&key, &METADATA)
+                        .increment(value);
+                }
+            }
+        }
+
         // ----- Retention -----
 
         pub fn record_retention_cleanup(
@@ -938,6 +998,16 @@ mod stub {
             _process: &'static str,
             _cpu_seconds: f64,
             _resident_bytes: f64,
+        ) {
+        }
+
+        #[inline]
+        pub fn record_db_io(
+            &self,
+            _cache_hits: u64,
+            _page_reads: u64,
+            _page_writes: u64,
+            _page_size: u64,
         ) {
         }
 

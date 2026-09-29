@@ -8,18 +8,18 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use std::sync::{Arc, Mutex};
 
-fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
     let manager = SqliteConnectionManager::file(path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager)?)
+    Ok(r2d2::Pool::new(manager.into())?)
 }
 
 /// Insert a feed pointing at the test feed server's RSS URL and return
 /// the feed id, an HTTP client, and a connection pool.
 async fn setup_feed_for_cache_test(
     tc: &crate::test::TestConfig,
-) -> Result<(i64, reqwest::Client, r2d2::Pool<SqliteConnectionManager>)> {
+) -> Result<(i64, reqwest::Client, crate::db::Pool)> {
     let conn = tc.database_conn()?;
     conn.execute(
         "INSERT INTO feeds (title, url) VALUES ('cache test feed', ?1)",
@@ -1520,7 +1520,7 @@ async fn fetch_and_reset(
     tc: &crate::test::TestConfig,
     client: &reqwest::Client,
     feed_id: i64,
-    pool: &r2d2::Pool<SqliteConnectionManager>,
+    pool: &crate::db::Pool,
 ) -> Result<()> {
     refresh_feed(
         client,
@@ -1732,7 +1732,7 @@ async fn test_304_without_freshness_keeps_stored_expires() -> Result<()> {
 async fn refresh_once(
     client: &reqwest::Client,
     feed_id: i64,
-    pool: &r2d2::Pool<SqliteConnectionManager>,
+    pool: &crate::db::Pool,
 ) -> Result<()> {
     refresh_feed(
         client,
