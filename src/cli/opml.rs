@@ -25,7 +25,8 @@ enum OpmlCommand {
     /// Import feeds from an OPML file
     ///
     /// Folders in the OPML file become tags on the feeds inside them. Feeds
-    /// whose URL is already in the database are skipped.
+    /// whose URL is already in the database are skipped, except that they
+    /// gain the tags of the folders they're in, keeping the tags they have.
     Import(ImportArgs),
 
     /// Export all feeds as OPML
@@ -65,9 +66,10 @@ impl OpmlArgs {
             OpmlCommand::Import(args) => {
                 let summary = args.import(&database, &config_path)?;
                 println!(
-                    "Imported {} feed(s); skipped {} already present.",
+                    "Imported {} feed(s); skipped {} already present, adding tags to {} of them.",
                     summary.imported.len(),
-                    summary.skipped
+                    summary.skipped,
+                    summary.retagged
                 );
                 Ok(())
             }
@@ -188,6 +190,7 @@ mod tests {
         let summary = import.import(&database, &config_path)?;
         assert!(summary.imported.is_empty());
         assert_eq!(summary.skipped, 2);
+        assert_eq!(summary.retagged, 0);
 
         let output = dir.path().join("out.opml");
         ExportArgs {

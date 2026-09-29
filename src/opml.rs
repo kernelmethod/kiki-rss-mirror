@@ -71,6 +71,8 @@ pub struct ImportSummary {
     /// Number of feeds skipped because a feed with the same URL already
     /// existed in the database.
     pub skipped: usize,
+    /// Number of the skipped feeds that were given tags they didn't have.
+    pub retagged: usize,
 }
 
 /// Parse an OPML document into the feeds it lists.
@@ -323,14 +325,15 @@ pub fn export_feeds(conn: &Connection) -> Result<Vec<OpmlFeed>, OpmlError> {
 
 /// Add feeds to the database in a single transaction.
 ///
-/// Feeds whose URL already exists in the database are skipped and left
-/// untouched. New feeds are given `fetch_interval_seconds` as their
+/// New feeds are given `fetch_interval_seconds` as their
 /// `min_fetch_interval_seconds` (normally
 /// [`FeedFetchSettings::default_fetch_interval_seconds`](crate::config::FeedFetchSettings::default_fetch_interval_seconds))
-/// and are created along with any tags they carry, except
-/// for tag names reserved for system tags (see
-/// [`is_reserved_tag_name`](crate::db::tags::is_reserved_tag_name)), which
-/// are ignored. The
+/// and are created along with any tags they carry. Feeds whose URL already
+/// exists in the database are skipped, except that they are given the tags
+/// they carry in `feeds`, keeping the tags they have; nothing else about
+/// them changes. Tag names reserved for system tags (see
+/// [`is_reserved_tag_name`](crate::db::tags::is_reserved_tag_name)) are
+/// ignored. The
 /// caller is responsible for scheduling fetches of the new feeds; a running
 /// server picks them up on its next scheduling pass, since new feeds are
 /// immediately due.
@@ -338,7 +341,7 @@ pub fn export_feeds(conn: &Connection) -> Result<Vec<OpmlFeed>, OpmlError> {
 /// # Errors
 ///
 /// Returns [`OpmlError::Database`] if a query fails, in which case no feeds
-/// are imported.
+/// are imported or tagged.
 pub fn import_feeds(
     conn: &mut Connection,
     feeds: &[OpmlFeed],
@@ -348,7 +351,7 @@ pub fn import_feeds(
     let mut summary = ImportSummary::default();
 
     {
-        let mut exists_stmt = tx.prepare("SELECT 1 FROM feeds WHERE url = ?1 LIMIT 1")?;
+        let mut exists_stmt = tx.prepare("SELECT id FROM feeds WHERE url = ?1 LIMIT 1")?;
         let mut insert_feed_stmt = tx.prepare(
             "INSERT INTO feeds (title, url, min_fetch_interval_seconds)
              VALUES (?1, ?2, ?3) RETURNING id",
@@ -359,28 +362,35 @@ pub fn import_feeds(
             tx.prepare("INSERT OR IGNORE INTO feed_tags (feed_id, tag_id) VALUES (?1, ?2)")?;
 
         for feed in feeds {
-            let exists = exists_stmt
-                .query_row([&feed.url], |_| Ok(()))
-                .optional()?
-                .is_some();
-            if exists {
-                summary.skipped += 1;
-                continue;
-            }
+            let existing: Option<i64> = exists_stmt
+                .query_row([&feed.url], |row| row.get(0))
+                .optional()?;
+            let feed_id = match existing {
+                Some(feed_id) => {
+                    summary.skipped += 1;
+                    feed_id
+                }
+                None => {
+                    let feed_id: i64 = insert_feed_stmt
+                        .query_row((&feed.title, &feed.url, fetch_interval_seconds), |row| {
+                            row.get(0)
+                        })?;
+                    summary.imported.push(feed_id);
+                    feed_id
+                }
+            };
 
-            let feed_id: i64 = insert_feed_stmt
-                .query_row((&feed.title, &feed.url, fetch_interval_seconds), |row| {
-                    row.get(0)
-                })?;
-            summary.imported.push(feed_id);
-
+            let mut tagged = false;
             for tag in &feed.tags {
                 if is_reserved_tag_name(tag) {
                     continue;
                 }
                 insert_tag_stmt.execute([tag])?;
                 let tag_id: i64 = tag_id_stmt.query_row([tag], |row| row.get(0))?;
-                feed_tag_stmt.execute((feed_id, tag_id))?;
+                tagged |= feed_tag_stmt.execute((feed_id, tag_id))? > 0;
+            }
+            if existing.is_some() && tagged {
+                summary.retagged += 1;
             }
         }
     }
@@ -513,12 +523,80 @@ mod tests {
         let summary = import_feeds(&mut conn, &feeds, 600).unwrap();
         assert!(summary.imported.is_empty());
         assert_eq!(summary.skipped, 2);
+        assert_eq!(summary.retagged, 0);
 
         assert_eq!(
             export_feeds(&conn).unwrap(),
             vec![
                 feed("A", "http://example.com/a", &[]),
                 feed("B", "http://example.com/b", &["tech"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_import_tags_existing_feeds() {
+        let mut conn = ConnectionBuilder::default()
+            .in_memory()
+            .create()
+            .build()
+            .unwrap();
+
+        import_feeds(
+            &mut conn,
+            &[
+                feed("A", "http://example.com/a", &["old"]),
+                feed("B", "http://example.com/b", &[]),
+                feed("C", "http://example.com/c", &["news"]),
+            ],
+            600,
+        )
+        .unwrap();
+        let before: Vec<(i64, String)> = conn
+            .prepare("SELECT id, title FROM feeds ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        // Moved to other folders, renamed, and a new feed: the existing
+        // feeds gain the new tags, keeping their old ones and their titles.
+        let summary = import_feeds(
+            &mut conn,
+            &[
+                feed(
+                    "A renamed",
+                    "http://example.com/a",
+                    &["news", "system:saved"],
+                ),
+                feed("B", "http://example.com/b", &["papers", "news"]),
+                feed("C", "http://example.com/c", &["news"]),
+                feed("D", "http://example.com/d", &["news"]),
+            ],
+            600,
+        )
+        .unwrap();
+        assert_eq!(summary.imported.len(), 1);
+        assert_eq!(summary.skipped, 3);
+        assert_eq!(summary.retagged, 2);
+
+        let after: Vec<(i64, String)> = conn
+            .prepare("SELECT id, title FROM feeds WHERE url != 'http://example.com/d' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(after, before);
+
+        assert_eq!(
+            export_feeds(&conn).unwrap(),
+            vec![
+                feed("A", "http://example.com/a", &["news", "old"]),
+                feed("B", "http://example.com/b", &["news", "papers"]),
+                feed("C", "http://example.com/c", &["news"]),
+                feed("D", "http://example.com/d", &["news"]),
             ]
         );
     }

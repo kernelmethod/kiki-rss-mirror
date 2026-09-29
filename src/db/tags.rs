@@ -191,4 +191,27 @@ mod tests {
         assert_eq!(count, SystemTag::ALL.len());
         Ok(())
     }
+
+    /// System tags cannot be deleted, even with SQL run directly against
+    /// the database, while user tags can.
+    #[test]
+    fn system_tags_cannot_be_deleted() -> Result<()> {
+        let conn = ConnectionBuilder::default().in_memory().create().build()?;
+        for tag in SystemTag::ALL {
+            let id = tag.id(&conn)?;
+            let result = conn.execute("DELETE FROM tags WHERE id = ?1", [id]);
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("system tags cannot be deleted")),
+                "deleting {tag}: {result:?}"
+            );
+            tag.id(&conn)?;
+        }
+        assert!(conn.execute("DELETE FROM tags", []).is_err());
+
+        conn.execute("INSERT INTO tags (name) VALUES ('news')", [])?;
+        assert_eq!(conn.execute("DELETE FROM tags WHERE kind = 'user'", [])?, 1);
+        Ok(())
+    }
 }

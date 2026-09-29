@@ -19,7 +19,9 @@ pub struct ImportOpmlResponse {
 /// Import feeds from OPML
 ///
 /// Import feeds from [OPML](https://en.wikipedia.org/wiki/OPML) format to start retrieving content
-/// from that feed. Feeds whose URL already exists are skipped.
+/// from that feed. Folders in the OPML become tags on the feeds inside them. Feeds whose URL
+/// already exists are skipped, except that they gain the tags of the folders they're in, keeping
+/// the tags they have.
 #[utoipa::path(
     post,
     path = "/v1/feeds/import",

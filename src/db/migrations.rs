@@ -45,6 +45,10 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0006_feed_favicons",
         sql: include_str!("include/migrations/0006_feed_favicons.sql"),
     },
+    Migration {
+        name: "0007_protect_system_tags",
+        sql: include_str!("include/migrations/0007_protect_system_tags.sql"),
+    },
 ];
 
 /// The migration that drops the `scripts` table in favour of plugins.
@@ -386,6 +390,33 @@ mod tests {
         let site_url: Option<String> =
             conn.query_row("SELECT site_url FROM feeds", [], |row| row.get(0))?;
         assert_eq!(site_url, None);
+        Ok(())
+    }
+
+    /// `0007_protect_system_tags` adds the trigger that stops system tags
+    /// from being deleted, with the same shape as a freshly-initialized
+    /// database's.
+    #[test]
+    fn test_protect_system_tags_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        conn.execute_batch("INSERT INTO tags (name) VALUES ('news');")?;
+        run_pending_migrations(&mut conn)?;
+
+        let fresh = ConnectionBuilder::default().in_memory().create().build()?;
+        let sql = |conn: &Connection| -> Result<String> {
+            Ok(conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'protect_system_tags'",
+                [],
+                |row| row.get(0),
+            )?)
+        };
+        assert_eq!(sql(&conn)?, sql(&fresh)?);
+
+        assert!(conn
+            .execute("DELETE FROM tags WHERE name = 'system:read'", [])
+            .is_err());
+        assert_eq!(conn.execute("DELETE FROM tags WHERE name = 'news'", [])?, 1);
         Ok(())
     }
 }

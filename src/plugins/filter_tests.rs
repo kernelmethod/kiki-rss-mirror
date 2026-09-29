@@ -151,11 +151,10 @@ fn exclude_rules_win_over_include_rules() {
 fn the_manifest_describes_the_rules() {
     let manifest = crate::plugins::PluginManifest::parse(MANIFEST).unwrap();
     let names: Vec<_> = manifest.settings.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["exclude", "include", "tag", "rescan"]);
+    assert_eq!(names, ["exclude", "include", "rescan"]);
     let config = json!({
         "exclude": [{"fields": ["title"], "pattern": "x", "flags": "i"}],
         "include": [{"pattern": "rust", "feeds": [3, "https://example.com/feed.xml"]}],
-        "tag": [{"pattern": "zero-day", "tag": "urgent", "feeds": ["https://example.com/a"]}],
         "rescan": false,
     });
     crate::plugins::settings::check_config(&manifest.settings, config.as_object().unwrap())
@@ -226,34 +225,25 @@ fn rules_without_feed_urls_look_up_no_feeds() {
     assert_eq!(feeds.lookups.load(Ordering::SeqCst), 0);
 }
 
+/// Tagging is left to the auto-tag plugin: `tag` rules, which versions
+/// before 3.0.0 took, are ignored rather than failing the plugin.
 #[test]
-fn tag_rules_tag_matching_entries() {
-    let feeds = Arc::new(Feeds::default());
-    let runner = filter_with_feeds(
-        json!({
-            "exclude": [{"fields": "title", "pattern": "webinar"}],
-            "tag": [
-                {"fields": "title", "pattern": r"zero-day|in the wild", "flags": "i", "tag": "urgent"},
-                {"fields": "title", "pattern": "rust", "tag": "system:saved",
-                 "feeds": ["https://example.com/feed2"]},
-            ],
-        }),
-        &feeds,
-    );
-    assert_eq!(tags(&runner, entry(1, "Zero-Day in Chrome")), ["urgent"]);
-    assert!(tags(&runner, entry(1, "quiet news")).is_empty());
-    // Every matching rule adds its tag.
-    assert_eq!(
-        tags(&runner, entry(2, "rust exploited in the wild")),
-        ["urgent", "system:saved"]
-    );
-    assert!(tags(&runner, entry(1, "rust")).is_empty());
-    // Hidden entries are not tagged.
+fn tag_rules_are_ignored() {
+    let runner = filter(json!({
+        "exclude": [{"fields": "title", "pattern": "webinar"}],
+        "tag": [
+            {"fields": "title", "pattern": "zero-day", "tag": "urgent"},
+            // Not even checked.
+            {"pattern": "("},
+        ],
+    }))
+    .unwrap();
+    assert!(tags(&runner, entry(1, "zero-day in Chrome")).is_empty());
     assert_eq!(
         tags(&runner, entry(1, "zero-day webinar")),
         ["system:hidden"]
     );
-    // A tag already there is not added twice.
+    // Tags already there are kept.
     let mut e = entry(1, "zero-day");
     e.tags = vec!["urgent".into()];
     assert_eq!(tags(&runner, e), ["urgent"]);
@@ -281,8 +271,6 @@ fn bad_rules_fail_to_load() {
             json!({"include": [{"pattern": "x", "feeds": [1.5]}]}),
             "feed ids or URLs",
         ),
-        (json!({"tag": [{"pattern": "x"}]}), "'tag'"),
-        (json!({"tag": [{"pattern": "x", "tag": ""}]}), "tag[1]"),
         (
             json!({"exclude": [{"pattern": "x", "flags": "z"}]}),
             "exclude[1]",
@@ -383,73 +371,43 @@ async fn stored_entries_are_filtered_when_the_rules_change() -> Result<()> {
     Ok(())
 }
 
-/// End to end, through a server: tag rules naming a feed by URL tag the
-/// stored entries of that feed.
+/// End to end, through a server: rules recorded by a version before 3.0.0,
+/// with tag rules, compare equal to the same rules without them, so
+/// upgrading does not rescan and hide again the entries unhid by hand.
 #[tokio::test]
-async fn stored_entries_are_tagged_by_feed_url() -> Result<()> {
+async fn dropped_tag_rules_do_not_rescan() -> Result<()> {
     let tc = TestBuilder::default().init_database().build()?;
-    let ids: Vec<i64> = {
+    let exclude = json!([{"fields": ["title"], "pattern": "sponsored"}]);
+    let tag = json!([{"fields": ["title"], "pattern": "zero-day", "tag": "urgent"}]);
+    let id = {
         let conn = tc.database_conn()?;
-        let mut ids = Vec::new();
-        for (url, title) in [
-            ("https://example.com/a", "zero-day in foo"),
-            ("https://example.com/a", "release notes"),
-            ("https://example.com/b", "zero-day in bar"),
-        ] {
-            conn.execute(
-                "INSERT OR IGNORE INTO feeds (title, url) VALUES (?1, ?1)",
-                [url],
-            )?;
-            let feed: i64 =
-                conn.query_row("SELECT id FROM feeds WHERE url = ?1", [url], |r| r.get(0))?;
-            conn.execute(
-                "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
-                 VALUES (?1, 'rss', ?2, 0, ?2, 'u')",
-                rusqlite::params![feed, title],
-            )?;
-            ids.push(conn.last_insert_rowid());
-        }
-        ids
+        conn.execute("INSERT INTO feeds (title) VALUES ('f')", [])?;
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (?1, 'rss', 'g', 0, 'sponsored zero-day', 'u')",
+            [conn.last_insert_rowid()],
+        )?;
+        let id = conn.last_insert_rowid();
+        // Left over from version 2: the overrides, and the rules it applied.
+        let overrides = json!({"exclude": exclude, "tag": tag});
+        crate::db::plugins::set_config_overrides(&conn, "filter", overrides.as_object().unwrap())?;
+        let recorded = json!({"exclude": exclude, "include": [], "tag": tag});
+        crate::db::plugins::store_set(&conn, "filter", "rules", Some(&recorded))?;
+        id
     };
     let dir = tc.plugins_dir().join("filter");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("manifest.toml"), MANIFEST)?;
     std::fs::write(dir.join("main.lua"), MAIN)?;
-    let overrides = json!({"tag": [{
-        "fields": "title",
-        "pattern": "zero-day",
-        "tag": "urgent",
-        "feeds": ["https://example.com/a"],
-    }]});
-    crate::db::plugins::set_config_overrides(
-        &tc.database_conn()?,
-        "filter",
-        overrides.as_object().unwrap(),
-    )?;
 
-    let db = tc.database_path();
-    let is_urgent = |id: i64| -> Result<bool> {
-        let conn = crate::db::ConnectionBuilder::default()
-            .at_path(&db)
-            .read_write()
-            .build()?;
-        Ok(conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
-             WHERE et.entry_id = ?1 AND t.name = 'urgent')",
-            [id],
-            |row| row.get(0),
-        )?)
-    };
-
-    let _tc = tc.init_server()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !is_urgent(ids[0])? {
-        anyhow::ensure!(Instant::now() < deadline, "entry was never tagged");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    // The scan has tagged the first entry; give it time to reach the rest.
+    let tc = tc.init_server()?;
+    // A scan, had one started, would have finished long since.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(!is_urgent(ids[1])?);
-    assert!(!is_urgent(ids[2])?);
+    let tagged: i64 = tc.database_conn()?.query_row(
+        "SELECT COUNT(*) FROM entry_tags WHERE entry_id = ?1",
+        [id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(tagged, 0);
     Ok(())
 }

@@ -106,3 +106,30 @@ document.addEventListener("click", async (event) => {
     button.disabled = false;
   }
 });
+
+// "Delete tag" buttons: clicking one, once confirmed, deletes the button's
+// tag and goes back to the list of tags.
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("button.delete-tag");
+  if (!button || button.disabled) {
+    return;
+  }
+  const name = button.dataset.name;
+  if (!confirm(`Delete the tag "${name}"? It will be removed from every entry and feed.`)) {
+    return;
+  }
+  button.disabled = true;
+  try {
+    const resp = await fetch(`/tags/${encodeURIComponent(button.dataset.tag)}`, {
+      method: "DELETE",
+    });
+    if (!resp.ok) {
+      throw new Error(`${resp.status} ${resp.statusText}`);
+    }
+    location.href = "/tags";
+  } catch (e) {
+    console.error("failed to delete tag:", e);
+    button.title = "Could not delete this tag";
+    button.disabled = false;
+  }
+});
