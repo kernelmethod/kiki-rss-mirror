@@ -338,14 +338,14 @@ pub(crate) async fn refresh_feed(
             metrics,
         )?,
     };
-    enqueue_asset_caching(task_tx, metrics, &inserted);
+    enqueue_asset_caching(task_tx, metrics, &inserted.cache_assets);
     queue_favicon_if_due(settings, &conn, task_tx, metrics, feed_id);
     clear_feed_error(&conn, feed_id);
     debug!(
         "{} refreshed with {} entries, {} new; next fetch {}",
         rec.label,
         entry_count,
-        inserted.len(),
+        inserted.ids.len(),
         schedule
     );
     rec.outcome("success");

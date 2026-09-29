@@ -1,7 +1,8 @@
 use crate::config::ConfigHandle;
-use crate::fetcher::{client_builder, Fetcher, ProxiedClient};
+use crate::fetcher::{Fetcher, ProxiedClient};
 use crate::metrics::Metrics;
 use crate::scripting::{ScriptRunner, ScriptRunnerHandle};
+use crate::tasks::assets::{asset_client_builder, AssetTimeouts};
 use crate::tasks::command::TaskManagerCommand;
 use crate::tasks::entry_assets::cache_entry_assets;
 use crate::tasks::error::FetchError;
@@ -115,7 +116,7 @@ pub fn spawn_workers(
     script_runner: ScriptRunnerHandle,
     fetcher: Fetcher,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
-    let asset_client = ProxiedClient::new(client_builder)
+    let asset_client = ProxiedClient::new(|| asset_client_builder(AssetTimeouts::DEFAULT))
         .context("failed to build the HTTP client for asset caching")?;
 
     let worker = Worker {

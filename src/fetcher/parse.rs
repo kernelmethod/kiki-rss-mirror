@@ -229,6 +229,7 @@ fn atom_entry_to_parts(feed_id: i64, entry: atom_syndication::Entry) -> AtomEntr
         authors: data.authors.clone(),
         categories: data.categories.iter().map(|c| c.term.clone()).collect(),
         tags: vec![],
+        cache_assets: true,
     };
     AtomEntry { entry, data }
 }
@@ -295,6 +296,7 @@ fn rss_item_to_parts(feed_id: i64, item: rss::Item) -> RssEntry {
         authors: data.author.iter().cloned().collect(),
         categories: data.categories.iter().map(|c| c.name.clone()).collect(),
         tags: vec![],
+        cache_assets: true,
     };
     RssEntry { entry, data }
 }
