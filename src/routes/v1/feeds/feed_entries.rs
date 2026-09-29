@@ -1,4 +1,4 @@
-use crate::routes::v1::entries::list_entries::{not_hidden_unless, not_read_if};
+use crate::routes::v1::entries::list_entries::not_hidden_unless;
 use crate::routes::v1::entries::ListEntriesResponseEntry;
 use crate::server::AppState;
 use axum::{
@@ -26,9 +26,6 @@ pub struct FeedEntriesQueryParams {
     /// Also list entries tagged `system:hidden`, which are left out by
     /// default (default: false).
     pub include_hidden: Option<bool>,
-    /// Leave out entries tagged `system:read`, which are listed by default
-    /// (default: false).
-    pub exclude_read: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
@@ -53,8 +50,7 @@ enum FeedEntriesTaskError {
 /// List all of the entries belonging to a specific feed, newest first. Entries
 /// with the same publication time are ordered by descending ID. Entries tagged
 /// `system:hidden` are left out, and not counted, unless `include_hidden` is
-/// true. Entries tagged `system:read` are left out, and not counted, when
-/// `exclude_read` is true.
+/// true.
 #[utoipa::path(
     get,
     path = "/v1/feeds/id/{id}/entries",
@@ -82,7 +78,6 @@ pub async fn feed_entries(
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let include_hidden = params.include_hidden.unwrap_or(false);
-    let exclude_read = params.exclude_read.unwrap_or(false);
 
     let result = task::spawn_blocking(move || {
         // Check if feed exists
@@ -99,33 +94,29 @@ pub async fn feed_entries(
 
         let count: usize = conn
             .prepare(&format!(
-                "SELECT COUNT(*) FROM entries e WHERE feed_id = ?1 AND {} AND {}",
-                not_hidden_unless(2),
-                not_read_if(3)
+                "SELECT COUNT(*) FROM entries e WHERE feed_id = ?1 AND {}",
+                not_hidden_unless(2)
             ))
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
-            .query_row(rusqlite::params![id, include_hidden, exclude_read], |row| {
-                row.get(0)
-            })?;
+            .query_row(rusqlite::params![id, include_hidden], |row| row.get(0))?;
 
         let entries = conn
             .prepare(&format!(
                 "SELECT id, feed_id, source_id, syndication_format,
                         guid, published_at, title, url, content, {}
-                 FROM entries e WHERE feed_id = ?1 AND {} AND {}
+                 FROM entries e WHERE feed_id = ?1 AND {}
                  ORDER BY published_at DESC, id DESC
                  LIMIT ?2 OFFSET ?3",
                 crate::db::favicons::favicon_hash_sql("e.feed_id"),
-                not_hidden_unless(4),
-                not_read_if(5)
+                not_hidden_unless(4)
             ))
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
             .query_map(
-                rusqlite::params![id, limit, offset, include_hidden, exclude_read],
+                rusqlite::params![id, limit, offset, include_hidden],
                 |row| {
                     Ok(ListEntriesResponseEntry {
                         id: row.get(0)?,
@@ -288,40 +279,6 @@ mod test {
             .await?;
         assert_eq!(body.count, 3);
         assert_eq!(ids(&body), HashSet::from([first, second, third]));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_feed_entries_can_leave_out_read_entries() -> Result<()> {
-        let tc = TestBuilder::all().build()?;
-        let client = tc.client()?;
-        let feed_id = insert_feed(&tc, "reading")?;
-        let [first, second, third]: [i64; 3] = insert_entries(&tc, feed_id, 3)?
-            .try_into()
-            .map_err(|ids| anyhow::anyhow!("expected 3 entries, got {ids:?}"))?;
-        {
-            let conn = tc.database_conn()?;
-            let read = crate::db::tags::SystemTag::Read.id(&conn)?;
-            conn.execute(
-                "INSERT INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
-                [first, read],
-            )?;
-        }
-
-        let body = get_entries(&client, feed_id, "")
-            .await?
-            .json::<FeedEntriesResponse>()
-            .await?;
-        assert_eq!(body.count, 3);
-        assert_eq!(ids(&body), HashSet::from([first, second, third]));
-
-        let body = get_entries(&client, feed_id, "?exclude_read=true")
-            .await?
-            .json::<FeedEntriesResponse>()
-            .await?;
-        assert_eq!(body.count, 2);
-        assert_eq!(ids(&body), HashSet::from([second, third]));
 
         Ok(())
     }

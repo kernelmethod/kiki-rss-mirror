@@ -226,47 +226,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_list_entries_can_leave_out_read_entries() -> Result<()> {
-        let tc = TestBuilder::all().build()?;
-        let client = tc.client()?;
-        populate_feeds_and_entries(&tc)?;
-        {
-            let conn = tc.database_conn()?;
-            let read = SystemTag::Read.id(&conn)?;
-            conn.execute(
-                "INSERT INTO entry_tags (entry_id, tag_id) VALUES (2, ?1)",
-                [read],
-            )?;
-        }
-
-        let titles = |r: &list_entries::ListEntriesResponse| -> Vec<String> {
-            r.entries.iter().map(|e| e.title.clone()).collect()
-        };
-
-        for query in ["", "?exclude_read=false"] {
-            let response = client
-                .get(format!("http://localhost/v1/entries{query}"))
-                .send()
-                .await?
-                .json::<list_entries::ListEntriesResponse>()
-                .await?;
-            assert_eq!(response.count, 2, "{query}");
-            assert_eq!(titles(&response), ["Entry 2", "Entry 1"], "{query}");
-        }
-
-        let response = client
-            .get("http://localhost/v1/entries?exclude_read=true")
-            .send()
-            .await?
-            .json::<list_entries::ListEntriesResponse>()
-            .await?;
-        assert_eq!(response.count, 1);
-        assert_eq!(titles(&response), ["Entry 1"]);
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_list_entries_ordering() -> Result<()> {
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;
@@ -948,6 +907,71 @@ mod test {
         assert!(titles.contains(&"Science Discovery"));
         assert!(titles.contains(&"Sports Update"));
         assert!(!titles.contains(&"Tech Review"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_feed_id() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+        {
+            let conn = tc.database_conn()?;
+            conn.execute(
+                "INSERT INTO feeds (id, title, url, syndication_format)
+                 VALUES (2, 'Other Feed', 'http://example.com/other', 'rss')",
+                [],
+            )?;
+            conn.execute("UPDATE entries SET feed_id = 2 WHERE id IN (2, 4)", [])?;
+        }
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"feed_id": 2}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 2);
+        let titles: Vec<&str> = body
+            .entries
+            .iter()
+            .map(|e| e.entry.title.as_str())
+            .collect();
+        assert_eq!(titles, ["Sports Update", "Science Discovery"]);
+
+        // It combines with the other filters.
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"feed_id": 1, "tags": {"not": "news"}}))
+            .send()
+            .await?;
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].entry.title, "Tech Review");
+
+        Ok(())
+    }
+
+    /// Entries published at the same time come out in descending ID order,
+    /// so that paging through them neither skips nor repeats any.
+    #[tokio::test]
+    async fn test_search_orders_ties_by_id() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+        tc.database_conn()?
+            .execute("UPDATE entries SET published_at = 1700000000", [])?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        let ids: Vec<i64> = body.entries.iter().map(|e| e.entry.id).collect();
+        assert_eq!(ids, [4, 3, 2, 1]);
 
         Ok(())
     }

@@ -7,8 +7,8 @@ use crate::plugins::settings::{Setting, SettingType};
 use crate::routes::v1::entries::entry_assets::ListEntryAssetsResponse;
 use crate::routes::v1::entries::entry_tags::GetEntryTagsResponse;
 use crate::routes::v1::entries::get_entry::GetEntryResponse;
-use crate::routes::v1::entries::{ListEntriesResponse, ListEntriesResponseEntry};
-use crate::routes::v1::feeds::feed_entries::FeedEntriesResponse;
+use crate::routes::v1::entries::search_entries::SearchEntriesResponse;
+use crate::routes::v1::entries::ListEntriesResponseEntry;
 use crate::routes::v1::feeds::list_feeds::ListFeedsResponse;
 use crate::routes::v1::plugins::list_plugins::{ListPluginsResponse, PluginResponse};
 use crate::routes::v1::plugins::plugin_config::PluginConfigResponse;
@@ -410,7 +410,7 @@ async fn index(State(api): State<reqwest::Client>, Query(params): Query<PagePara
         feed: None,
         ..params.listing()
     };
-    match fetch_entries(&api, listing.page, listing.show_read).await {
+    match fetch_entries(&api, listing).await {
         Ok(entries) => {
             let (feeds, tags) = tokio::join!(
                 fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)),
@@ -566,19 +566,14 @@ async fn feed_page(
         )
     };
 
-    let (feed, entries) = tokio::join!(
-        fetch_feed(&api, id),
-        fetch_feed_entries(&api, id, listing.page, listing.show_read)
-    );
+    let (feed, entries) = tokio::join!(fetch_feed(&api, id), fetch_entries(&api, listing));
     let feed = match feed {
         Ok(Some(feed)) => feed,
         Ok(None) => return not_found(),
         Err(e) => return server_unavailable(&e),
     };
     let entries = match entries {
-        Ok(Some(entries)) => entries,
-        // The feed was deleted between the two requests.
-        Ok(None) => return not_found(),
+        Ok(entries) => entries,
         Err(e) => return server_unavailable(&e),
     };
 
@@ -946,24 +941,42 @@ async fn fetch_cached_assets(api: &reqwest::Client, id: i64) -> HashMap<String, 
     }
 }
 
-/// Fetch page `page` (counting from 1) of `/v1/entries` from the Kiki API,
-/// leaving out read entries unless `show_read`.
-async fn fetch_entries(
-    api: &reqwest::Client,
-    page: u32,
-    show_read: bool,
-) -> Result<ListEntriesResponse> {
-    let offset = u64::from(page - 1) * u64::from(PAGE_SIZE);
-    Ok(api
-        .get(format!(
-            "{API_BASE}/v1/entries?offset={offset}&limit={PAGE_SIZE}&exclude_read={}",
-            !show_read
-        ))
+/// A page of a list of entries, as fetched by [`fetch_entries`].
+struct EntryPage {
+    /// Number of entries in the whole list.
+    count: usize,
+    /// The entries on the page, newest first.
+    entries: Vec<ListEntriesResponseEntry>,
+}
+
+/// Fetch the entries on this page of `listing` with `/v1/entries/search`:
+/// the entries of its feed, or of every feed, newest first. Hidden entries
+/// are left out, and so are read ones unless the listing shows them.
+async fn fetch_entries(api: &reqwest::Client, listing: Listing) -> Result<EntryPage> {
+    let offset = u64::from(listing.page - 1) * u64::from(PAGE_SIZE);
+    let hidden = SystemTag::Hidden.name();
+    let tags = if listing.show_read {
+        serde_json::json!({ "not": hidden })
+    } else {
+        serde_json::json!({ "not": { "or": [hidden, SystemTag::Read.name()] } })
+    };
+    let resp: SearchEntriesResponse = api
+        .post(format!("{API_BASE}/v1/entries/search"))
+        .json(&serde_json::json!({
+            "tags": tags,
+            "feed_id": listing.feed,
+            "offset": offset,
+            "limit": PAGE_SIZE,
+        }))
         .send()
         .await?
         .error_for_status()?
         .json()
-        .await?)
+        .await?;
+    Ok(EntryPage {
+        count: resp.count,
+        entries: resp.entries.into_iter().map(|e| e.entry).collect(),
+    })
 }
 
 /// Fetch entry `id` from the Kiki API, or `None` if there is no such entry.
@@ -996,29 +1009,6 @@ async fn fetch_feeds(api: &reqwest::Client, page: u32) -> Result<ListFeedsRespon
 async fn fetch_feed(api: &reqwest::Client, id: i64) -> Result<Option<Feed>> {
     let resp = api
         .get(format!("{API_BASE}/v1/feeds/id/{id}"))
-        .send()
-        .await?;
-    if resp.status() == StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    Ok(Some(resp.error_for_status()?.json().await?))
-}
-
-/// Fetch page `page` (counting from 1) of the entries of feed `id` from the
-/// Kiki API, leaving out read entries unless `show_read`, or `None` if there
-/// is no such feed.
-async fn fetch_feed_entries(
-    api: &reqwest::Client,
-    id: i64,
-    page: u32,
-    show_read: bool,
-) -> Result<Option<FeedEntriesResponse>> {
-    let offset = u64::from(page - 1) * u64::from(PAGE_SIZE);
-    let resp = api
-        .get(format!(
-            "{API_BASE}/v1/feeds/id/{id}/entries?offset={offset}&limit={PAGE_SIZE}&exclude_read={}",
-            !show_read
-        ))
         .send()
         .await?;
     if resp.status() == StatusCode::NOT_FOUND {
@@ -1864,7 +1854,7 @@ fn to_json_pretty(value: &Value) -> String {
 /// their tags from `tags`, keyed by entry ID.
 fn render_feed_page(
     feed: &Feed,
-    entries: &FeedEntriesResponse,
+    entries: &EntryPage,
     tags: &HashMap<i64, Vec<TagResponse>>,
     listing: Listing,
 ) -> String {
