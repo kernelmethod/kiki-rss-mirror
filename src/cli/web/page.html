@@ -77,6 +77,9 @@
     .copy-url:hover, .copy-url:focus-visible { color: #444; }
     .copy-url svg { width: 1em; height: 1em; }
     .copy-url svg > * { fill: none; stroke: currentColor; stroke-width: 2; stroke-linejoin: round; }
+    .copy-url { position: relative; }
+    .copy-url[data-status]::after { content: attr(data-status); position: absolute; left: 50%; bottom: calc(100% + 0.25rem); transform: translateX(-50%); padding: 0.125rem 0.4rem; border-radius: 0.25rem; background: #333; color: #fff; font-size: 0.75rem; line-height: 1.5; white-space: nowrap; pointer-events: none; }
+    .copy-url[data-status-error]::after { background: #900; }
     .save[aria-pressed=true] { color: #b8860b; }
     .save[aria-pressed=true] path { fill: currentColor; }
   </style>
