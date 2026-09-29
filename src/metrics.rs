@@ -15,6 +15,33 @@ pub use imp::{handle_metrics, track_http, Metrics};
 #[cfg(not(feature = "metrics"))]
 pub use stub::Metrics;
 
+use std::sync::Arc;
+
+/// r2d2 event handler that records connection acquisition into [`Metrics`].
+///
+/// Installed on the server's connection pool so every `pool.get()` reports
+/// how long it waited for a connection, and every checkout that times out
+/// counts as an acquisition error, without instrumenting each call site.
+pub struct PoolMetrics(pub Arc<Metrics>);
+
+impl std::fmt::Debug for PoolMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolMetrics").finish_non_exhaustive()
+    }
+}
+
+impl r2d2::HandleEvent for PoolMetrics {
+    fn handle_checkout(&self, event: r2d2::event::CheckoutEvent) {
+        self.0
+            .record_db_pool_acquire(event.duration().as_secs_f64(), true);
+    }
+
+    fn handle_timeout(&self, event: r2d2::event::TimeoutEvent) {
+        self.0
+            .record_db_pool_acquire(event.timeout().as_secs_f64(), false);
+    }
+}
+
 #[cfg(feature = "metrics")]
 mod imp {
     use crate::server::AppState;
@@ -822,5 +849,56 @@ mod stub {
         pub fn record_plugin_load_error(&self) {}
         #[inline]
         pub fn record_plugin_execution(&self, _duration_seconds: f64, _outcome: &'static str) {}
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod tests {
+    use super::{Metrics, PoolMetrics};
+    use r2d2_sqlite::SqliteConnectionManager;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Sum of the samples for `name` in the rendered output.
+    fn sample(metrics: &Metrics, name: &str) -> anyhow::Result<f64> {
+        let mut total = 0.0;
+        for (series, value) in metrics
+            .render()
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.rsplit_once(' '))
+        {
+            if series == name {
+                total += value.parse::<f64>()?;
+            }
+        }
+        Ok(total)
+    }
+
+    #[test]
+    fn pool_events_record_acquire_metrics() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new()?);
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_timeout(Duration::from_millis(50))
+            .event_handler(Box::new(PoolMetrics(metrics.clone())))
+            .build(SqliteConnectionManager::memory())?;
+
+        let held = pool.get()?;
+        assert_eq!(
+            sample(&metrics, "kiki_db_pool_acquire_duration_seconds_count")?,
+            1.0
+        );
+        assert_eq!(sample(&metrics, "kiki_db_pool_acquire_errors_total")?, 0.0);
+
+        // The only connection is checked out, so this one times out.
+        assert!(pool.get().is_err());
+        assert_eq!(
+            sample(&metrics, "kiki_db_pool_acquire_duration_seconds_count")?,
+            2.0
+        );
+        assert_eq!(sample(&metrics, "kiki_db_pool_acquire_errors_total")?, 1.0);
+        drop(held);
+        Ok(())
     }
 }

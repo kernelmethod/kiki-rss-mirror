@@ -305,12 +305,15 @@ impl Server {
                 }
                 Ok(())
             });
-        let pool = r2d2::Pool::new(manager).with_context(|| {
-            format!(
-                "Unable to open connection pool to database at {:?}",
-                self.db_path
-            )
-        })?;
+        let pool = r2d2::Pool::builder()
+            .event_handler(Box::new(crate::metrics::PoolMetrics(metrics.clone())))
+            .build(manager)
+            .with_context(|| {
+                format!(
+                    "Unable to open connection pool to database at {:?}",
+                    self.db_path
+                )
+            })?;
 
         // Check for pending migrations before starting the server
         {
