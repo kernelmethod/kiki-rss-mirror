@@ -94,7 +94,8 @@ pub async fn tag_feeds(
 
         let feeds = conn
             .prepare(
-                "SELECT f.id, f.title, f.url, f.description, f.last_checked, f.min_fetch_interval_seconds, f.auth_type
+                "SELECT f.id, f.title, f.url, f.description, f.last_checked, f.min_fetch_interval_seconds, f.auth_type,
+                        (SELECT COUNT(*) FROM entries WHERE feed_id = f.id)
                  FROM feeds f
                  INNER JOIN feed_tags ft ON ft.feed_id = f.id
                  WHERE ft.tag_id = ?1
@@ -115,6 +116,7 @@ pub async fn tag_feeds(
                     }),
                     min_fetch_interval_seconds: row.get(5)?,
                     auth_type,
+                    entry_count: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
