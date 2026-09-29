@@ -7,6 +7,29 @@ pub const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION")
 );
 
+/// A client for Kiki's own API, sending every request over the Unix
+/// socket at `socket`, with an overall per-request `timeout` if given.
+///
+/// This is the one place outside [`crate::fetcher::ProxiedClient`] that
+/// builds a reqwest client: nothing sent over a local socket should ever
+/// go through a proxy.
+///
+/// # Errors
+///
+/// Fails if the TLS backend cannot be initialised.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods, reason = "local socket, never proxied")]
+pub fn unix_socket_client(
+    socket: &std::path::Path,
+    timeout: Option<std::time::Duration>,
+) -> reqwest::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().unix_socket(socket).no_proxy();
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder.build()
+}
+
 /// Outcome of reading a response body under a size cap.
 #[derive(Debug)]
 pub enum CappedBody {

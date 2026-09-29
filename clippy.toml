@@ -1,0 +1,11 @@
+# Outbound HTTP must honor Kiki's proxy settings, so reqwest clients are
+# built only through `kiki_rss::fetcher::ProxiedClient` (or, for the local
+# API over a Unix socket, `kiki_rss::http::unix_socket_client`). Those two
+# places carry an `#[allow(clippy::disallowed_methods)]`; nowhere else should.
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "build clients with fetcher::ProxiedClient so the proxy settings apply" },
+    { path = "reqwest::Client::builder", reason = "start from fetcher::client_builder and build with fetcher::ProxiedClient" },
+    { path = "reqwest::ClientBuilder::new", reason = "start from fetcher::client_builder and build with fetcher::ProxiedClient" },
+    { path = "reqwest::ClientBuilder::build", reason = "build clients with fetcher::ProxiedClient so the proxy settings apply" },
+    { path = "reqwest::get", reason = "use a client from fetcher::ProxiedClient so the proxy settings apply" },
+]

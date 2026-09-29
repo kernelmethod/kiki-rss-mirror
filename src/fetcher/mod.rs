@@ -462,18 +462,10 @@ impl Fetcher {
     }
 }
 
-/// Build the HTTP client used for feed fetches.
-///
-/// # Errors
-///
-/// Fails if the TLS backend cannot be initialised.
-pub fn build_client() -> reqwest::Result<reqwest::Client> {
-    client_builder().build()
-}
-
 /// The client configuration shared by every feed fetch, for callers that
 /// need to adjust it further — the isolated fetcher swaps in its own DNS
-/// resolver.
+/// resolver. Build it with [`ProxiedClient`], so the proxy settings apply.
+#[allow(clippy::disallowed_methods, reason = "the sanctioned starting point")]
 pub fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -519,6 +511,7 @@ impl ProxiedClient {
     pub fn new(
         builder: impl Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
     ) -> reqwest::Result<Self> {
+        #[allow(clippy::disallowed_methods, reason = "no proxy is asked for yet")]
         let client = builder().build()?;
         Ok(Self::with_client(client, builder))
     }
@@ -547,6 +540,7 @@ impl ProxiedClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if current.0 != *proxy {
+            #[allow(clippy::disallowed_methods, reason = "the proxy is applied here")]
             let client = apply_proxy((self.builder)(), proxy)?.build()?;
             *current = (proxy.clone(), client);
         }
