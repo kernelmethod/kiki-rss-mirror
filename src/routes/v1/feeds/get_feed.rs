@@ -1,4 +1,5 @@
 use crate::http::FeedAuthType;
+use crate::routes::v1::entries::list_entries::NOT_HIDDEN;
 use crate::routes::v1::feeds::format_data::{
     load_atom_feed_data, load_rss_feed_data, AtomFeedData, RssFeedData,
 };
@@ -26,7 +27,7 @@ pub struct GetFeedResponse {
     /// Current authentication scheme for this feed. Credentials themselves
     /// are never returned — only the scheme in use.
     pub auth_type: FeedAuthType,
-    /// Number of entries stored for this feed.
+    /// Number of entries stored for this feed, not counting hidden ones.
     pub entry_count: i64,
 }
 
@@ -96,11 +97,11 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
     // The rusqlite interface is synchronous so we must run the INSERT
     // statement on a blocking thread.
     let task_result = task::spawn_blocking(move || {
-        let mut stmt = match conn.prepare(
+        let mut stmt = match conn.prepare(&format!(
             "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at, min_fetch_interval_seconds, auth_type,
-                (SELECT COUNT(*) FROM entries WHERE feed_id = feeds.id)
-                FROM feeds WHERE id = ?1 LIMIT 1",
-        ) {
+                (SELECT COUNT(*) FROM entries e WHERE e.feed_id = feeds.id AND {NOT_HIDDEN})
+                FROM feeds WHERE id = ?1 LIMIT 1"
+        )) {
             Ok(s) => s,
             Err(e) => {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);

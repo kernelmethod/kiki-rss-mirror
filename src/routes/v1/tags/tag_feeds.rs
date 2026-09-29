@@ -1,3 +1,4 @@
+use crate::routes::v1::entries::list_entries::NOT_HIDDEN;
 use crate::routes::v1::feeds::get_feed::{read_auth_type_column, GetFeedResponse};
 use crate::server::AppState;
 use axum::{
@@ -93,14 +94,14 @@ pub async fn tag_feeds(
             .query_row([id], |row| row.get(0))?;
 
         let feeds = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT f.id, f.title, f.url, f.description, f.last_checked, f.min_fetch_interval_seconds, f.auth_type,
-                        (SELECT COUNT(*) FROM entries WHERE feed_id = f.id)
+                        (SELECT COUNT(*) FROM entries e WHERE e.feed_id = f.id AND {NOT_HIDDEN})
                  FROM feeds f
                  INNER JOIN feed_tags ft ON ft.feed_id = f.id
                  WHERE ft.tag_id = ?1
-                 LIMIT ?2 OFFSET ?3",
-            )
+                 LIMIT ?2 OFFSET ?3"
+            ))
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
