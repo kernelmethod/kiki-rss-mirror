@@ -1,7 +1,6 @@
+use crate::db::Pool;
 use crate::tasks::assets;
 use anyhow::Result;
-use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
 use reqwest::Url;
 use tracing::{debug, warn};
 
@@ -13,7 +12,7 @@ use tracing::{debug, warn};
 /// logged and skipped.
 pub(crate) async fn cache_entry_assets(
     client: &reqwest::Client,
-    pool: &Pool<SqliteConnectionManager>,
+    pool: &Pool,
     data_dir: &std::path::Path,
     cache: &crate::config::AssetCacheSettings,
     entry_id: i64,

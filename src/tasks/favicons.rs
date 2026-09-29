@@ -15,11 +15,10 @@
 //! when Kiki looked, so that it only looks again once
 //! [`FaviconCheck::is_due`](crate::db::favicons::FaviconCheck::is_due).
 use crate::db::favicons;
+use crate::db::Pool;
 use crate::tasks::assets::{self, resolve_http_url, AssetKind};
 use anyhow::Result;
 use lol_html::{element, HtmlRewriter, Settings};
-use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
 use reqwest::Url;
 use std::cell::RefCell;
 use tracing::{debug, warn};
@@ -52,7 +51,7 @@ pub(crate) fn resolve_site_url(raw: &str, feed_url: &str) -> Option<Url> {
 /// filesystem errors are returned.
 pub(crate) async fn cache_feed_favicon(
     client: &reqwest::Client,
-    pool: &Pool<SqliteConnectionManager>,
+    pool: &Pool,
     data_dir: &std::path::Path,
     cache: &crate::config::AssetCacheSettings,
     feed_id: i64,

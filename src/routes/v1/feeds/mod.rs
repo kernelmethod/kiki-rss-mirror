@@ -1215,4 +1215,122 @@ mod test {
 
         Ok(())
     }
+
+    /// A feed's schedule as `(next_fetch_at, consecutive_failures)`.
+    fn feed_schedule(tc: &TestConfig, feed_id: i64) -> Result<(Option<i64>, i64)> {
+        Ok(tc.database_conn()?.query_row(
+            "SELECT next_fetch_at, consecutive_failures FROM feeds WHERE id = ?1",
+            [feed_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
+    }
+
+    /// Insert a feed last checked at `last_checked`, due at `next_fetch_at`,
+    /// with a 3h interval and `failures` failures in a row.
+    fn insert_scheduled_feed(
+        tc: &TestConfig,
+        last_checked: i64,
+        next_fetch_at: i64,
+        failures: i64,
+    ) -> Result<i64> {
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (title, url, min_fetch_interval_seconds, last_checked,
+                next_fetch_at, consecutive_failures)
+             VALUES ('feed', 'https://example.com/feed.xml', 10800, ?1, ?2, ?3)",
+            [last_checked, next_fetch_at, failures],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    async fn put_feed(
+        client: &reqwest::Client,
+        feed_id: i64,
+        body: serde_json::Value,
+    ) -> Result<()> {
+        let resp = client
+            .put(format!("http://localhost/v1/feeds/id/{feed_id}"))
+            .json(&body)
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_feed_reschedules_on_new_url_or_credentials() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+        let now = chrono::Utc::now().timestamp();
+
+        // Re-saving the same URL, or editing the title, leaves it alone.
+        let feed_id = insert_scheduled_feed(&tc, now, now + 3600, 2)?;
+        put_feed(
+            &client,
+            feed_id,
+            serde_json::json!({"title": "renamed", "url": "https://example.com/feed.xml"}),
+        )
+        .await?;
+        assert_eq!(feed_schedule(&tc, feed_id)?, (Some(now + 3600), 2));
+
+        // A new URL makes it due now and forgets the failure streak.
+        put_feed(
+            &client,
+            feed_id,
+            serde_json::json!({"url": "https://example.com/moved.xml"}),
+        )
+        .await?;
+        assert_eq!(feed_schedule(&tc, feed_id)?, (None, 0));
+
+        // So do new credentials.
+        let feed_id = insert_scheduled_feed(&tc, now, now + 3600, 2)?;
+        put_feed(
+            &client,
+            feed_id,
+            serde_json::json!({"auth_type": "bearer", "auth_bearer_token": "secret"}),
+        )
+        .await?;
+        assert_eq!(feed_schedule(&tc, feed_id)?, (None, 0));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_feed_shorter_interval_brings_next_fetch_forward() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+        let now = chrono::Utc::now().timestamp();
+        let last_checked = now - 1800;
+
+        // A healthy feed is due one new interval after its last check.
+        let feed_id = insert_scheduled_feed(&tc, last_checked, last_checked + 10800, 0)?;
+        put_feed(
+            &client,
+            feed_id,
+            serde_json::json!({"min_fetch_interval_seconds": 3600}),
+        )
+        .await?;
+        assert_eq!(feed_schedule(&tc, feed_id)?, (Some(last_checked + 3600), 0));
+
+        // A longer interval waits for the next fetch to take effect.
+        put_feed(
+            &client,
+            feed_id,
+            serde_json::json!({"min_fetch_interval_seconds": 86400}),
+        )
+        .await?;
+        assert_eq!(feed_schedule(&tc, feed_id)?, (Some(last_checked + 3600), 0));
+
+        // A feed that is backing off keeps its backoff.
+        let feed_id = insert_scheduled_feed(&tc, last_checked, now + 7200, 3)?;
+        put_feed(
+            &client,
+            feed_id,
+            serde_json::json!({"min_fetch_interval_seconds": 600}),
+        )
+        .await?;
+        assert_eq!(feed_schedule(&tc, feed_id)?, (Some(now + 7200), 3));
+
+        Ok(())
+    }
 }

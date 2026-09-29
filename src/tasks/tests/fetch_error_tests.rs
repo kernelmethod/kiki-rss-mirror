@@ -8,11 +8,11 @@ use chrono::Utc;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 
-fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
     let manager = SqliteConnectionManager::file(path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager)?)
+    Ok(r2d2::Pool::new(manager.into())?)
 }
 
 /// Helper: insert a feed pointing at the given URL and return the feed id,
@@ -20,7 +20,7 @@ fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManage
 fn setup_feed(
     tc: &crate::test::TestConfig,
     feed_url: &str,
-) -> Result<(i64, reqwest::Client, r2d2::Pool<SqliteConnectionManager>)> {
+) -> Result<(i64, reqwest::Client, crate::db::Pool)> {
     let conn = tc.database_conn()?;
     conn.execute(
         "INSERT INTO feeds (title, url) VALUES ('error test feed', ?1)",

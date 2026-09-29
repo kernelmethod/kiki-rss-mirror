@@ -16,17 +16,17 @@ use rusqlite::OpenFlags;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
     let manager = SqliteConnectionManager::file(path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager)?)
+    Ok(r2d2::Pool::new(manager.into())?)
 }
 
 fn setup_feed(
     tc: &crate::test::TestConfig,
     feed_url: &str,
-) -> Result<(i64, reqwest::Client, r2d2::Pool<SqliteConnectionManager>)> {
+) -> Result<(i64, reqwest::Client, crate::db::Pool)> {
     let conn = tc.database_conn()?;
     conn.execute(
         "INSERT INTO feeds (title, url) VALUES ('retry-after test feed', ?1)",
@@ -355,5 +355,34 @@ async fn test_consecutive_500s_schedule_exponential_backoff() -> Result<()> {
     );
 
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+/// A manual refresh ignores the feed's schedule, but not a `Retry-After`
+/// the server is still asking us to respect.
+#[tokio::test]
+async fn test_manual_refresh_honors_retry_after() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let feed_url = spawn_retry_after_server(StatusCode::TOO_MANY_REQUESTS, Some("300")).await?;
+    let (feed_id, client, pool) = setup_feed(&tc, &feed_url)?;
+    let metrics = super::test_metrics();
+
+    refresh_feed_manual(&client, feed_id, pool.clone(), &metrics, &super::test_tx()).await?;
+    let conn = tc.database_conn()?;
+    assert_eq!(read_schedule(&conn, feed_id)?.2, 1);
+
+    // Inside the Retry-After window: no fetch, so no second failure.
+    refresh_feed_manual(&client, feed_id, pool.clone(), &metrics, &super::test_tx()).await?;
+    assert_eq!(read_schedule(&conn, feed_id)?.2, 1);
+
+    // Once it has passed, a manual refresh goes out even though the feed
+    // is still scheduled for later.
+    conn.execute(
+        "UPDATE feeds SET retry_after_at = ?1 WHERE id = ?2",
+        [Utc::now().timestamp() - 1, feed_id],
+    )?;
+    refresh_feed_manual(&client, feed_id, pool, &metrics, &super::test_tx()).await?;
+    assert_eq!(read_schedule(&conn, feed_id)?.2, 2);
+
     Ok(())
 }

@@ -12,11 +12,11 @@ use rusqlite::OpenFlags;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
     let manager = SqliteConnectionManager::file(path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager)?)
+    Ok(r2d2::Pool::new(manager.into())?)
 }
 
 /// One-pixel PNG.
@@ -144,7 +144,7 @@ async fn start_server(site: Site) -> Result<Server> {
 /// A test database with one feed, whose favicon tasks are run by hand.
 struct Harness {
     tc: crate::test::TestConfig,
-    pool: r2d2::Pool<SqliteConnectionManager>,
+    pool: crate::db::Pool,
     client: reqwest::Client,
     feed_id: i64,
     cache: crate::config::AssetCacheSettings,

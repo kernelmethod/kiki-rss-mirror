@@ -15,11 +15,11 @@ use tokio_util::sync::CancellationToken;
 
 /// Build a connection pool using the same PRAGMA settings the server uses
 /// in production, so WAL-related PRAGMAs behave the same way under test.
-fn make_pool(path: &Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
+fn make_pool(path: &Path) -> Result<crate::db::Pool> {
     let manager = SqliteConnectionManager::file(path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_init(|c| c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager)?)
+    Ok(r2d2::Pool::new(manager.into())?)
 }
 
 fn insert_entry(conn: &rusqlite::Connection, i: i64, body_size: usize) -> Result<()> {

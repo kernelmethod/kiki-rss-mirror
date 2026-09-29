@@ -8,6 +8,8 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use tokio::task;
+use tracing::{event, Level};
 
 const SECTION: &str = "feed_fetch";
 
@@ -87,9 +89,10 @@ pub async fn get_feed_fetch_settings(State(state): State<AppState>) -> Response 
 /// Update feed fetch settings. Any field left `null` is unchanged.
 ///
 /// Changes apply to the next fetch of every feed; no restart is needed.
-/// Lowering `max_feed_bytes` does not retroactively affect already-stored
-/// entries, and `default_fetch_interval_seconds` applies only to feeds
-/// added afterwards.
+/// Lowering `max_backoff_seconds` also brings forward any fetch already
+/// scheduled further out than the new cap. Lowering `max_feed_bytes` does
+/// not retroactively affect already-stored entries, and
+/// `default_fetch_interval_seconds` applies only to feeds added afterwards.
 #[utoipa::path(
     put,
     path = "/v1/settings/feed-fetch",
@@ -108,6 +111,7 @@ pub async fn put_feed_fetch_settings(
     State(state): State<AppState>,
     Json(payload): Json<FeedFetchSettingsRequest>,
 ) -> Result<Response, Response> {
+    let backoff_changed = payload.max_backoff_seconds.is_some();
     let settings = update_config(&state, move |o| {
         let fields = [
             ("timeout_seconds", payload.timeout_seconds),
@@ -135,5 +139,40 @@ pub async fn put_feed_fetch_settings(
     })
     .await?;
 
+    if backoff_changed {
+        cap_scheduled_fetches(&state, settings.feed_fetch.max_backoff_seconds).await;
+    }
+
     Ok(Json(FeedFetchSettingsResponse::from(&settings.feed_fetch)).into_response())
+}
+
+/// Bring forward every fetch scheduled more than `max_backoff_seconds`
+/// from now, so a lowered backoff cap applies to feeds that are already
+/// waiting and not only to their next failure.
+///
+/// The settings are saved by the time this runs, so a failure is logged
+/// rather than reported: the new cap still applies from each feed's next
+/// fetch.
+async fn cap_scheduled_fetches(state: &AppState, max_backoff_seconds: u64) {
+    let pool = state.conn_pool.clone();
+    let latest = chrono::Utc::now()
+        .timestamp()
+        .saturating_add(i64::try_from(max_backoff_seconds).unwrap_or(i64::MAX));
+    let result = task::spawn_blocking(move || {
+        pool.get()?.execute(
+            "UPDATE feeds SET next_fetch_at = ?1 WHERE next_fetch_at > ?1",
+            [latest],
+        )?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => event!(Level::WARN, "failed to apply the new backoff cap: {:#}", e),
+        Err(e) => event!(
+            Level::WARN,
+            "task error applying the new backoff cap: {:?}",
+            e
+        ),
+    }
 }

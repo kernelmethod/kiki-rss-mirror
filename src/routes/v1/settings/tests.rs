@@ -273,3 +273,47 @@ async fn an_invalid_file_on_disk_is_a_conflict() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn lowering_max_backoff_brings_scheduled_fetches_forward() -> Result<()> {
+    let tc = TestBuilder::all().build()?;
+    let client = tc.client()?;
+    let now = chrono::Utc::now().timestamp();
+
+    let conn = tc.database_conn()?;
+    for (url, next_fetch_at) in [
+        ("https://example.com/soon.xml", now + 600),
+        ("https://example.com/far.xml", now + 86400),
+    ] {
+        conn.execute(
+            "INSERT INTO feeds (title, url, next_fetch_at) VALUES ('feed', ?1, ?2)",
+            rusqlite::params![url, next_fetch_at],
+        )?;
+    }
+
+    let resp = client
+        .put("http://localhost/v1/settings/feed-fetch")
+        .json(&serde_json::json!({"max_backoff_seconds": 3600}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let next_fetch_at = |url: &str| -> Result<i64> {
+        Ok(conn.query_row(
+            "SELECT next_fetch_at FROM feeds WHERE url = ?1",
+            [url],
+            |row| row.get(0),
+        )?)
+    };
+    // Already inside the new cap: unchanged.
+    assert_eq!(next_fetch_at("https://example.com/soon.xml")?, now + 600);
+    // Beyond it: brought forward to about an hour from now.
+    let far = next_fetch_at("https://example.com/far.xml")?;
+    assert!(
+        (now + 3600..now + 3700).contains(&far),
+        "expected ~{}, got {far}",
+        now + 3600
+    );
+
+    Ok(())
+}

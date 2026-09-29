@@ -148,7 +148,10 @@ pub async fn add_feed(
     // the latest version of the feed.
     if let Err(e) = state
         .task_manager_tx
-        .send(TaskManagerCommand::RefreshFeed(id))
+        .send(TaskManagerCommand::RefreshFeed {
+            feed_id: id,
+            manual: true,
+        })
         .await
     {
         event!(

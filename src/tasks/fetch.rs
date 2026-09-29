@@ -1,4 +1,5 @@
 use crate::config::Settings;
+use crate::db::{Pool, PooledConnection};
 use crate::fetcher::{
     FeedHints, FetchReply, FetchSpec, FetchedBody, Fetcher, ParseOutcome, ParsedFeed,
 };
@@ -21,8 +22,6 @@ use crate::tasks::processing::{
 use crate::tasks::scripting::{fire_fetch_error, fire_fetch_success};
 use anyhow::Result;
 use chrono::Utc;
-use r2d2::{Pool, PooledConnection};
-use r2d2_sqlite::SqliteConnectionManager;
 use reqwest::header::HeaderMap;
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -41,6 +40,8 @@ struct FeedFetchRow {
     last_full_refresh_at: Option<i64>,
     consecutive_failures: i64,
     next_fetch_at: Option<i64>,
+    /// When the server's last `Retry-After` runs out, if it has not yet.
+    retry_after_at: Option<i64>,
     min_fetch_interval: i64,
     auth: FeedAuth,
     /// Refresh hints from the last feed document that parsed, used when a
@@ -48,10 +49,7 @@ struct FeedFetchRow {
     feed_hints: FeedHints,
 }
 
-fn load_feed_fetch_row(
-    conn: &PooledConnection<SqliteConnectionManager>,
-    feed_id: i64,
-) -> Result<FeedFetchRow> {
+fn load_feed_fetch_row(conn: &PooledConnection, feed_id: i64) -> Result<FeedFetchRow> {
     let row = conn.query_row(
         "SELECT
             url,
@@ -72,7 +70,8 @@ fn load_feed_fetch_row(
             feed_skip_hours,
             feed_skip_days,
             header_expires,
-            title
+            title,
+            retry_after_at
          FROM feeds
          WHERE id = ?1",
         [feed_id],
@@ -95,6 +94,7 @@ fn load_feed_fetch_row(
                 last_full_refresh_at: row.get(5)?,
                 consecutive_failures: row.get(6)?,
                 next_fetch_at: row.get(7)?,
+                retry_after_at: row.get(19)?,
                 min_fetch_interval: row.get(8)?,
                 auth: FeedAuth {
                     auth_type,
@@ -167,10 +167,18 @@ pub(super) fn hint_source(
 /// — which may be another process — and records whatever comes back.
 /// Every database write, script event, and metric happens here, in the
 /// caller's process; the fetcher only ever sees a [`FetchSpec`].
+///
+/// A feed whose `next_fetch_at` is still in the future is skipped unless
+/// the refresh is `manual`, i.e. one a user asked for; even then, it is
+/// skipped while a server's `Retry-After` is in force. A manual refresh
+/// still sends the stored validators, so an unchanged feed costs the
+/// server a 304.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn refresh_feed(
     fetcher: &Fetcher,
     feed_id: i64,
-    pool: Pool<SqliteConnectionManager>,
+    manual: bool,
+    pool: Pool,
     settings: &Settings,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
@@ -210,17 +218,30 @@ pub(crate) async fn refresh_feed(
     });
 
     // Eligibility gate: a scheduled `next_fetch_at` in the future means skip.
-    if let Some(next_ts) = row.next_fetch_at {
-        if now_ts < next_ts {
-            debug!(
-                "{} not yet eligible; next fetch in {}",
-                rec.label,
-                format_duration(u64::try_from(next_ts - now_ts).unwrap_or(0))
-            );
-            metrics.record_feed_cache_hit("next_fetch_at");
-            rec.outcome("cache_hit");
-            return Ok(());
+    // A refresh a user asked for ignores the schedule, but not a server's
+    // `Retry-After`: that is the server asking us to stay away. The
+    // scheduler only queues feeds that are due, so for it this mostly
+    // catches a feed that another refresh rescheduled while this one sat in
+    // the queue. No fetch happens, so it is counted as a skip and not under
+    // `kiki_feed_fetch_total`.
+    let not_before = if manual {
+        // Never later than the scheduler would fetch, e.g. when the
+        // Retry-After was beyond the backoff cap.
+        match (row.retry_after_at, row.next_fetch_at) {
+            (Some(retry_at), Some(next_ts)) => Some(retry_at.min(next_ts)),
+            (retry_at, _) => retry_at,
         }
+    } else {
+        row.next_fetch_at
+    };
+    if let Some(next_ts) = not_before.filter(|&ts| now_ts < ts) {
+        debug!(
+            "{} not yet eligible; next fetch in {}",
+            rec.label,
+            format_duration(u64::try_from(next_ts - now_ts).unwrap_or(0))
+        );
+        metrics.record_feed_cache_hit("next_fetch_at");
+        return Ok(());
     }
 
     // file:// feeds are read here, because the fetcher has no filesystem
@@ -377,7 +398,7 @@ fn favicon_is_due(conn: &rusqlite::Connection, feed_id: i64) -> bool {
 
 /// Everything the outcome of one refresh is recorded against.
 struct Recorder<'a> {
-    pool: &'a Pool<SqliteConnectionManager>,
+    pool: &'a Pool,
     feed_id: i64,
     /// The feed as named in the logs; see [`feed_label`].
     label: String,
@@ -531,7 +552,10 @@ fn record_fetch_reply(
             )?;
             debug!("{} was not modified; next fetch {}", rec.label, schedule);
             metrics.record_feed_cache_hit("not_modified");
-            metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
+            metrics.record_feed_retry_scheduled(
+                schedule.reason.metric_source(),
+                (next_fetch_at - now_ts) as f64,
+            );
             rec.outcome("not_modified");
             return Ok(None);
         }
@@ -717,7 +741,10 @@ fn record_fetch_reply(
         ],
     )?;
 
-    metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
+    metrics.record_feed_retry_scheduled(
+        schedule.reason.metric_source(),
+        (next_fetch_at - now_ts) as f64,
+    );
 
     fire_fetch_success(rec.script_runner, feed_id, 200, final_url, Some(body_len));
 
@@ -859,7 +886,7 @@ fn schedule_success(
 fn retrieve_file_feed(
     feed_url: &str,
     feed_id: i64,
-    pool: Pool<SqliteConnectionManager>,
+    pool: Pool,
     cfg: SchedulerConfig,
 ) -> Result<(Vec<u8>, Schedule)> {
     let conn = pool.get()?;

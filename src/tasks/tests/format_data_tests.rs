@@ -11,11 +11,11 @@ use anyhow::Result;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 
-fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
     let manager = SqliteConnectionManager::file(path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager)?)
+    Ok(r2d2::Pool::new(manager.into())?)
 }
 
 async fn refresh_feed_at_url(tc: &crate::test::TestConfig, url: String) -> Result<i64> {

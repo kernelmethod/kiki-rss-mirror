@@ -1717,14 +1717,15 @@ fn render_feeds(resp: &ListFeedsResponse, page: u32) -> String {
                 &feed.url,
                 &url_domain(&feed.url),
                 feed.last_checked.as_deref(),
+                false,
             );
             html.push_str(&format!(
                 "<li>{}<a href=\"/feeds/{}\">{}</a> <span class=\"entry-count\">({} {})</span>{meta}</li>\n",
                 render_favicon(feed.favicon_url.as_deref()),
                 feed.id,
                 escape(display_feed_title(&feed.title)),
-                feed.entry_count,
-                if feed.entry_count == 1 { "entry" } else { "entries" }
+                feed.unread_count,
+                "unread"
             ));
         }
         html.push_str("</ol>\n");
@@ -2196,7 +2197,12 @@ fn render_feed_page(
         "<header class=\"feed-header\">\n<h2>{}{}</h2>\n{}\n",
         render_favicon(feed.favicon_url.as_deref()),
         escape(display_feed_title(&feed.title)),
-        render_feed_meta(&feed.url, &feed.url, feed.last_checked.as_deref()),
+        render_feed_meta(
+            &feed.url,
+            &url_domain(&feed.url),
+            feed.last_checked.as_deref(),
+            true,
+        ),
     );
     // Feed descriptions are shown as plain text; they come from the feed.
     if let Some(description) = feed.description.as_deref().filter(|d| !d.trim().is_empty()) {
@@ -2219,11 +2225,15 @@ fn render_feed_page(
     html
 }
 
+/// The icon on the button that copies a feed's URL.
+const COPY_ICON: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><rect x=\"9\" y=\"9\" width=\"11\" height=\"11\" rx=\"2\"/><path d=\"M5 15V6a2 2 0 0 1 2-2h9\"/></svg>";
+
 /// Render the line under a feed's title: its URL (`url`), shown as `label`
 /// but not linked, and when it was last checked (`last_checked`, in
-/// RFC 3339). When `label` isn't the whole URL, the URL is its tooltip.
-fn render_feed_meta(url: &str, label: &str, last_checked: Option<&str>) -> String {
-    let mut parts = vec![if label == url {
+/// RFC 3339). When `label` isn't the whole URL, the URL is its tooltip. If
+/// `copyable`, a button next to the URL copies the whole URL to the clipboard.
+fn render_feed_meta(url: &str, label: &str, last_checked: Option<&str>, copyable: bool) -> String {
+    let mut url_html = if label == url {
         format!("<span class=\"url\">{}</span>", escape(url))
     } else {
         format!(
@@ -2231,7 +2241,14 @@ fn render_feed_meta(url: &str, label: &str, last_checked: Option<&str>) -> Strin
             escape(url),
             escape(label)
         )
-    }];
+    };
+    if copyable {
+        url_html.push_str(&format!(
+            "<button type=\"button\" class=\"copy-url\" data-url=\"{}\" title=\"Copy feed URL\" aria-label=\"Copy feed URL\">{COPY_ICON}</button>",
+            escape(url)
+        ));
+    }
+    let mut parts = vec![url_html];
     match last_checked.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()) {
         Some(t) => parts.push(format!(
             "last checked <time datetime=\"{}\">{}</time>",

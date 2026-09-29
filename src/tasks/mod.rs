@@ -34,7 +34,7 @@ pub(crate) use favicons::cache_feed_favicon;
 pub(crate) async fn refresh_feed(
     client: &reqwest::Client,
     feed_id: i64,
-    pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    pool: crate::db::Pool,
     script_runner: Option<&dyn crate::scripting::ScriptRunner>,
     metrics: &crate::metrics::Metrics,
     task_tx: &async_channel::Sender<TaskManagerCommand>,
@@ -57,7 +57,49 @@ pub(crate) async fn refresh_feed(
 pub(crate) async fn refresh_feed_with_settings(
     client: &reqwest::Client,
     feed_id: i64,
-    pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    pool: crate::db::Pool,
+    settings: &crate::config::Settings,
+    script_runner: Option<&dyn crate::scripting::ScriptRunner>,
+    metrics: &crate::metrics::Metrics,
+    task_tx: &async_channel::Sender<TaskManagerCommand>,
+) -> anyhow::Result<()> {
+    refresh_feed_inner(
+        client,
+        feed_id,
+        false,
+        pool,
+        settings,
+        script_runner,
+        metrics,
+        task_tx,
+    )
+    .await
+}
+
+/// [`refresh_feed`] as a refresh a user asked for, which fetches even when
+/// the feed is not yet due.
+#[cfg(test)]
+pub(crate) async fn refresh_feed_manual(
+    client: &reqwest::Client,
+    feed_id: i64,
+    pool: crate::db::Pool,
+    metrics: &crate::metrics::Metrics,
+    task_tx: &async_channel::Sender<TaskManagerCommand>,
+) -> anyhow::Result<()> {
+    let settings = crate::config::Settings::default();
+    refresh_feed_inner(
+        client, feed_id, true, pool, &settings, None, metrics, task_tx,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn refresh_feed_inner(
+    client: &reqwest::Client,
+    feed_id: i64,
+    manual: bool,
+    pool: crate::db::Pool,
     settings: &crate::config::Settings,
     script_runner: Option<&dyn crate::scripting::ScriptRunner>,
     metrics: &crate::metrics::Metrics,
@@ -70,6 +112,7 @@ pub(crate) async fn refresh_feed_with_settings(
     fetch::refresh_feed(
         &fetcher,
         feed_id,
+        manual,
         pool,
         settings,
         script_runner,

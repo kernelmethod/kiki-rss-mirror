@@ -260,6 +260,21 @@ pub(crate) enum ScheduleReason {
     PermanentError,
 }
 
+impl ScheduleReason {
+    /// The `source` label this reason is counted under in
+    /// `kiki_feed_retry_scheduled_seconds`.
+    pub(crate) fn metric_source(&self) -> &'static str {
+        match self {
+            ScheduleReason::FreshnessHint { .. } => "cache_hint",
+            ScheduleReason::FeedInterval { .. } => "interval",
+            ScheduleReason::RetryAfter => "retry_after",
+            ScheduleReason::StaleIfError { .. } => "stale_if_error",
+            ScheduleReason::Backoff { .. } => "backoff",
+            ScheduleReason::PermanentError => "permanent",
+        }
+    }
+}
+
 /// How a computed wait was moved into the global cadence bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScheduleClamp {

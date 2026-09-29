@@ -69,6 +69,71 @@ enum UpdateFeedTaskError {
     Database(#[from] rusqlite::Error),
 }
 
+/// The columns of a `feeds` row that decide how and how often it is
+/// fetched, compared before and after an update to see whether the feed
+/// needs rescheduling.
+#[derive(PartialEq, Eq)]
+struct FetchConfig {
+    url: String,
+    auth: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ),
+    min_fetch_interval_seconds: i64,
+}
+
+fn read_fetch_config(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<FetchConfig> {
+    conn.query_row(
+        "SELECT url, auth_type, auth_username, auth_password, auth_bearer_token,
+            min_fetch_interval_seconds
+         FROM feeds WHERE id = ?1",
+        [id],
+        |row| {
+            Ok(FetchConfig {
+                url: row.get(0)?,
+                auth: (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
+                min_fetch_interval_seconds: row.get(5)?,
+            })
+        },
+    )
+}
+
+/// Reschedule feed `id` so an edit to how it is fetched takes effect now,
+/// rather than after the fetch that was already scheduled.
+///
+/// - A new URL or new credentials may well fix a feed that has been
+///   failing, so the feed is made due at once and its failure streak and
+///   `Retry-After` are forgotten.
+/// - A shorter interval pulls the next fetch in to one interval after the
+///   last successful check. A feed backing off after errors keeps its
+///   backoff, and a longer interval takes effect after the next fetch.
+fn reschedule_after_update(
+    conn: &rusqlite::Connection,
+    id: i64,
+    before: &FetchConfig,
+    after: &FetchConfig,
+) -> rusqlite::Result<()> {
+    if before.url != after.url || before.auth != after.auth {
+        conn.execute(
+            "UPDATE feeds
+             SET next_fetch_at = NULL, consecutive_failures = 0, retry_after_at = NULL
+             WHERE id = ?1",
+            [id],
+        )?;
+    } else if after.min_fetch_interval_seconds < before.min_fetch_interval_seconds {
+        // MIN() with a NULL `next_fetch_at` stays NULL, i.e. already due.
+        conn.execute(
+            "UPDATE feeds
+             SET next_fetch_at = MIN(next_fetch_at, COALESCE(last_checked, 0) + ?2)
+             WHERE id = ?1 AND consecutive_failures = 0",
+            [id, after.min_fetch_interval_seconds],
+        )?;
+    }
+    Ok(())
+}
+
 /// Update a feed
 ///
 /// Update data used to configure a single feed.
@@ -256,11 +321,21 @@ pub async fn update_feed(
         params.push(Box::new(id));
         let query = format!("UPDATE feeds SET {} WHERE id = ?", updates.join(", "));
 
-        // Execute the update
+        // Execute the update, and bring the feed's schedule in line with it,
+        // in one transaction. It takes the write lock up front: a deferred
+        // transaction that reads and then writes fails at once with
+        // SQLITE_BUSY (no busy_timeout wait) if a worker commits a write in
+        // between, e.g. the refresh queued when the feed was added.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let before = read_fetch_config(&tx, id)?;
         let params = rusqlite::params_from_iter(params);
-        conn.execute(&query, params).inspect_err(|e| {
+        tx.execute(&query, params).inspect_err(|e| {
             event!(Level::ERROR, "unable to execute update statement: {:?}", e);
         })?;
+        let after = read_fetch_config(&tx, id)?;
+        reschedule_after_update(&tx, id, &before, &after)?;
+        tx.commit()?;
 
         // Retrieve the updated feed data
         let feed = conn

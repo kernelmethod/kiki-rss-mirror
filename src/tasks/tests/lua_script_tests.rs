@@ -8,11 +8,11 @@ use anyhow::Result;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 
-fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
     let manager = SqliteConnectionManager::file(path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager)?)
+    Ok(r2d2::Pool::new(manager.into())?)
 }
 
 /// Insert a feed and install a Lua plugin, then return the feed id, an
@@ -20,7 +20,7 @@ fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManage
 async fn setup_feed_with_script(
     tc: &crate::test::TestConfig,
     script_text: &str,
-) -> Result<(i64, reqwest::Client, r2d2::Pool<SqliteConnectionManager>)> {
+) -> Result<(i64, reqwest::Client, crate::db::Pool)> {
     setup_feed_with_configured_script(tc, script_text, serde_json::json!({})).await
 }
 
@@ -29,7 +29,7 @@ async fn setup_feed_with_configured_script(
     tc: &crate::test::TestConfig,
     script_text: &str,
     config: serde_json::Value,
-) -> Result<(i64, reqwest::Client, r2d2::Pool<SqliteConnectionManager>)> {
+) -> Result<(i64, reqwest::Client, crate::db::Pool)> {
     let conn = tc.database_conn()?;
     conn.execute(
         "INSERT INTO feeds (title, url) VALUES ('test feed', ?1)",

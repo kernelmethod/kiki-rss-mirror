@@ -16,11 +16,11 @@ use std::sync::{Arc, Mutex};
 /// itself takes and `Date`-header rounding.
 const SLACK: i64 = 10;
 
-fn make_pool(path: &std::path::Path) -> Result<r2d2::Pool<SqliteConnectionManager>> {
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
     let manager = SqliteConnectionManager::file(path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager)?)
+    Ok(r2d2::Pool::new(manager.into())?)
 }
 
 /// An RSS body whose `<channel>` carries `channel_extra`.
@@ -42,7 +42,7 @@ async fn setup(
     SharedFeedServerState,
     i64,
     reqwest::Client,
-    r2d2::Pool<SqliteConnectionManager>,
+    crate::db::Pool,
 )> {
     let mut tc = TestBuilder::default().init_database().build()?;
     let state: SharedFeedServerState = Arc::new(Mutex::new(state));
@@ -61,11 +61,7 @@ async fn setup(
     Ok((tc, state, feed_id, client, pool))
 }
 
-async fn refresh(
-    client: &reqwest::Client,
-    feed_id: i64,
-    pool: &r2d2::Pool<SqliteConnectionManager>,
-) -> Result<()> {
+async fn refresh(client: &reqwest::Client, feed_id: i64, pool: &crate::db::Pool) -> Result<()> {
     refresh_feed(
         client,
         feed_id,

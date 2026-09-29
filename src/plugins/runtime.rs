@@ -25,7 +25,6 @@ use crate::metrics::Metrics;
 use crate::scripting::{ScriptRunnerHandle, ScriptServices, ScriptSource};
 use arc_swap::ArcSwap;
 use notify::{RecursiveMode, Watcher};
-use r2d2_sqlite::SqliteConnectionManager;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -79,7 +78,7 @@ pub struct PluginRuntime {
     /// The sources the script runner was last built from, to tell whether a
     /// reload changes anything. `None` until plugins first load.
     sources: Mutex<Option<Vec<ScriptSource>>>,
-    pool: r2d2::Pool<SqliteConnectionManager>,
+    pool: crate::db::Pool,
     metrics: Arc<Metrics>,
     script_runner: ScriptRunnerHandle,
     script_host: crate::process::ScriptHostHandle,
@@ -102,7 +101,7 @@ impl PluginRuntime {
     /// quietly change what it does.
     pub fn start(
         dir: PathBuf,
-        pool: r2d2::Pool<SqliteConnectionManager>,
+        pool: crate::db::Pool,
         metrics: Arc<Metrics>,
         script_runner: ScriptRunnerHandle,
         script_host: crate::process::ScriptHostHandle,
@@ -145,7 +144,7 @@ impl PluginRuntime {
     }
 
     /// The database the plugins' config overrides are read from.
-    pub fn pool(&self) -> &r2d2::Pool<SqliteConnectionManager> {
+    pub fn pool(&self) -> &crate::db::Pool {
         &self.pool
     }
 

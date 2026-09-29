@@ -8,10 +8,13 @@ pub mod favicons;
 pub mod log;
 pub mod migrations;
 pub mod plugins;
+mod pool;
 pub mod profile;
 pub mod retention;
 pub mod tags;
 pub mod task_queue;
+
+pub use pool::{ConnectionManager, Pool, PooledConnection};
 
 enum ConnectionType<'a> {
     DefaultConnection,

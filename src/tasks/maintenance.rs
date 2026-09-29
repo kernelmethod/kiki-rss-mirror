@@ -1,17 +1,12 @@
+use crate::db::{Pool, PooledConnection};
 use anyhow::Result;
-use r2d2::{Pool, PooledConnection};
-use r2d2_sqlite::SqliteConnectionManager;
 use tracing::{info, warn};
 
 /// Run a maintenance operation and, on success, update its `task_queue`
 /// row so the schedule survives server restarts.
-pub(crate) fn run_maintenance<F>(
-    pool: &Pool<SqliteConnectionManager>,
-    task_type: &str,
-    label: &str,
-    op: F,
-) where
-    F: FnOnce(&PooledConnection<SqliteConnectionManager>) -> Result<()>,
+pub(crate) fn run_maintenance<F>(pool: &Pool, task_type: &str, label: &str, op: F)
+where
+    F: FnOnce(&PooledConnection) -> Result<()>,
 {
     let conn = match pool.get() {
         Ok(c) => c,
