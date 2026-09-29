@@ -227,6 +227,8 @@ async fn serve_ui(
         .route("/entries/{id}/saved", put(save_entry).delete(unsave_entry))
         .route("/feeds", get(feeds_page))
         .route("/feeds/{id}", get(feed_page))
+        .route("/tags", get(tags_page))
+        .route("/tags/{id}", get(tag_page))
         .route("/plugins", get(plugins_page))
         .route("/plugins/{name}", get(plugin_page))
         .route("/plugins/{name}/config", post(update_plugin_config))
@@ -250,6 +252,9 @@ struct PageParams {
     /// On an entry page, the feed whose page to link back to, rather than
     /// the index.
     feed: Option<i64>,
+    /// On an entry page, the tag whose page to link back to, rather than
+    /// the index.
+    tag: Option<i64>,
     /// Also list entries tagged `system:read`, which are left out by
     /// default; on an entry page, whether the list it links back to does.
     show_read: Option<bool>,
@@ -264,6 +269,7 @@ impl PageParams {
     fn listing(&self) -> Listing {
         Listing {
             feed: self.feed,
+            tag: self.tag,
             page: self.page(),
             show_read: self.show_read(),
         }
@@ -274,12 +280,15 @@ impl PageParams {
     }
 }
 
-/// A page of a list of entries: of the index, or of a feed's page. Entry
-/// pages link back to the listing they were opened from.
+/// A page of a list of entries: of the index, of a feed's page, or of a
+/// tag's page. Entry pages link back to the listing they were opened from.
 #[derive(Clone, Copy)]
 struct Listing {
     /// The feed whose entries are listed, or `None` for the index.
     feed: Option<i64>,
+    /// The tag whose entries are listed, or `None` for the index. At most
+    /// one of `feed` and `tag` is set.
+    tag: Option<i64>,
     /// The page of the list, counting from 1.
     page: u32,
     /// Whether entries tagged `system:read` are listed.
@@ -289,9 +298,10 @@ struct Listing {
 impl Listing {
     /// The path of the list, without a page.
     fn path(&self) -> String {
-        match self.feed {
-            Some(id) => format!("/feeds/{id}"),
-            None => "/".to_owned(),
+        match (self.feed, self.tag) {
+            (Some(id), _) => format!("/feeds/{id}"),
+            (None, Some(id)) => format!("/tags/{id}"),
+            (None, None) => "/".to_owned(),
         }
     }
 
@@ -331,6 +341,9 @@ impl Listing {
         let mut query = Vec::new();
         if let Some(feed) = self.feed {
             query.push(format!("feed={feed}"));
+        }
+        if let Some(tag) = self.tag {
+            query.push(format!("tag={tag}"));
         }
         if self.page > 1 {
             query.push(format!("page={}", self.page));
@@ -410,9 +423,10 @@ fn server_unavailable(e: &anyhow::Error) -> Response {
 async fn index(State(api): State<reqwest::Client>, Query(params): Query<PageParams>) -> Response {
     let listing = Listing {
         feed: None,
+        tag: None,
         ..params.listing()
     };
-    match fetch_entries(&api, listing).await {
+    match fetch_entries(&api, listing, None).await {
         Ok(entries) => {
             let (feeds, tags) = tokio::join!(
                 fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)),
@@ -432,7 +446,7 @@ async fn index(State(api): State<reqwest::Client>, Query(params): Query<PagePara
 /// its feed says about it, with a link through to the entry itself.
 ///
 /// The page links back to the list of entries it was opened from: the
-/// index, or a feed's page.
+/// index, a feed's page, or a tag's page.
 async fn entry_page(
     State(api): State<reqwest::Client>,
     UrlPath(id): UrlPath<i64>,
@@ -632,6 +646,7 @@ async fn feed_page(
 ) -> Response {
     let listing = Listing {
         feed: Some(id),
+        tag: None,
         ..params.listing()
     };
     let not_found = || {
@@ -642,7 +657,7 @@ async fn feed_page(
         )
     };
 
-    let (feed, entries) = tokio::join!(fetch_feed(&api, id), fetch_entries(&api, listing));
+    let (feed, entries) = tokio::join!(fetch_feed(&api, id), fetch_entries(&api, listing, None));
     let feed = match feed {
         Ok(Some(feed)) => feed,
         Ok(None) => return not_found(),
@@ -658,6 +673,59 @@ async fn feed_page(
         StatusCode::OK,
         &format!("{} - Kiki", display_feed_title(&feed.title)),
         &render_feed_page(&feed, &entries, &tags, listing),
+    )
+}
+
+/// Render the list of tags: the total number of tags, and one page of them,
+/// each linked to its page.
+async fn tags_page(
+    State(api): State<reqwest::Client>,
+    Query(params): Query<PageParams>,
+) -> Response {
+    let page = params.page();
+    match fetch_tags(&api, page).await {
+        Ok(tags) => render_page(StatusCode::OK, "Tags - Kiki", &render_tag_list(&tags, page)),
+        Err(e) => server_unavailable(&e),
+    }
+}
+
+/// Render the page for tag `id`: one page of the entries with the tag,
+/// newest first. Read entries are left out unless the `show_read` query
+/// parameter is true, or the tag is `system:read`.
+async fn tag_page(
+    State(api): State<reqwest::Client>,
+    UrlPath(id): UrlPath<i64>,
+    Query(params): Query<PageParams>,
+) -> Response {
+    let listing = Listing {
+        feed: None,
+        tag: Some(id),
+        ..params.listing()
+    };
+    let tag = match fetch_tag(&api, id).await {
+        Ok(Some(tag)) => tag,
+        Ok(None) => {
+            return render_page(
+                StatusCode::NOT_FOUND,
+                "Tag not found - Kiki",
+                "<p>Tag not found.</p>\n<p><a href=\"/tags\">&larr; Back to tags</a></p>\n",
+            )
+        }
+        Err(e) => return server_unavailable(&e),
+    };
+    let entries = match fetch_entries(&api, listing, Some(&tag.name)).await {
+        Ok(entries) => entries,
+        Err(e) => return server_unavailable(&e),
+    };
+
+    let (feeds, tags) = tokio::join!(
+        fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)),
+        fetch_entry_tags(&api, entries.entries.iter().map(|e| e.id)),
+    );
+    render_page(
+        StatusCode::OK,
+        &format!("{} - Kiki", tag.name),
+        &render_tag_page(&tag, &entries, &feeds, &tags, listing),
     )
 }
 
@@ -1026,15 +1094,31 @@ struct EntryPage {
 }
 
 /// Fetch the entries on this page of `listing` with `/v1/entries/search`:
-/// the entries of its feed, or of every feed, newest first. Hidden entries
-/// are left out, and so are read ones unless the listing shows them.
-async fn fetch_entries(api: &reqwest::Client, listing: Listing) -> Result<EntryPage> {
+/// the entries of its feed, or with the tag named `tag`, or of every feed,
+/// newest first. Hidden entries are left out, and so are read ones unless
+/// the listing shows them — except on the pages of the `system:hidden` and
+/// `system:read` tags themselves, which would otherwise always be empty.
+async fn fetch_entries(
+    api: &reqwest::Client,
+    listing: Listing,
+    tag: Option<&str>,
+) -> Result<EntryPage> {
     let offset = u64::from(listing.page - 1) * u64::from(PAGE_SIZE);
-    let hidden = SystemTag::Hidden.name();
-    let tags = if listing.show_read {
-        serde_json::json!({ "not": hidden })
-    } else {
-        serde_json::json!({ "not": { "or": [hidden, SystemTag::Read.name()] } })
+    let mut excluded = vec![SystemTag::Hidden.name()];
+    if !listing.show_read {
+        excluded.push(SystemTag::Read.name());
+    }
+    excluded.retain(|&name| Some(name) != tag);
+    let exclude = match excluded.as_slice() {
+        [] => None,
+        [name] => Some(serde_json::json!({ "not": name })),
+        names => Some(serde_json::json!({ "not": { "or": names } })),
+    };
+    let tags = match (tag, exclude) {
+        (Some(tag), Some(exclude)) => serde_json::json!({ "and": [tag, exclude] }),
+        (Some(tag), None) => serde_json::json!(tag),
+        (None, Some(exclude)) => exclude,
+        (None, None) => Value::Null,
     };
     let resp: SearchEntriesResponse = api
         .post(format!("{API_BASE}/v1/entries/search"))
@@ -1091,6 +1175,25 @@ async fn fetch_feed(api: &reqwest::Client, id: i64) -> Result<Option<Feed>> {
         return Ok(None);
     }
     Ok(Some(resp.error_for_status()?.json().await?))
+}
+
+/// Fetch page `page` (counting from 1) of `/v1/tags` from the Kiki API.
+async fn fetch_tags(api: &reqwest::Client, page: u32) -> Result<ListTagsResponse> {
+    let offset = u64::from(page - 1) * u64::from(PAGE_SIZE);
+    Ok(api
+        .get(format!(
+            "{API_BASE}/v1/tags?offset={offset}&limit={PAGE_SIZE}"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Fetch tag `id` from the Kiki API, or `None` if there is no such tag.
+async fn fetch_tag(api: &reqwest::Client, id: i64) -> Result<Option<TagResponse>> {
+    fetch_optional(api, format!("{API_BASE}/v1/tags/id/{id}")).await
 }
 
 /// Fetch `/v1/plugins` from the Kiki API.
@@ -1254,7 +1357,8 @@ fn render_entries(
         "<div class=\"list-header\">\n<p class=\"count\">{count} {unread}{}</p>\n\
          <div class=\"list-actions\">{}{}</div>\n</div>\n",
         if count == 1 { "entry" } else { "entries" },
-        if count == 0 {
+        // Entries can be marked as read in bulk by feed, but not by tag.
+        if count == 0 || listing.tag.is_some() {
             String::new()
         } else {
             render_mark_read_button(listing.feed)
@@ -1384,23 +1488,32 @@ fn render_tags(tags: &[TagResponse]) -> String {
 
     let items: Vec<String> = tags
         .into_iter()
-        .map(|tag| match tag.kind {
-            TagKind::System => format!(
-                "<li class=\"tag system\" title=\"{}\">{}</li>",
-                escape(&tag.name),
-                escape(
-                    tag.name
-                        .strip_prefix(SYSTEM_TAG_PREFIX)
-                        .unwrap_or(&tag.name)
-                )
-            ),
-            TagKind::User => format!("<li class=\"tag\">{}</li>", escape(&tag.name)),
-        })
+        .map(|tag| format!("<li {}>{}</li>", tag_attrs(tag), escape(tag_label(tag))))
         .collect();
     format!(
         "<ul class=\"tags\" aria-label=\"Tags\">{}</ul>",
         items.concat()
     )
+}
+
+/// The name `tag` is shown under: system tags lose their `system:` prefix.
+fn tag_label(tag: &TagResponse) -> &str {
+    match tag.kind {
+        TagKind::System => tag
+            .name
+            .strip_prefix(SYSTEM_TAG_PREFIX)
+            .unwrap_or(&tag.name),
+        TagKind::User => &tag.name,
+    }
+}
+
+/// The attributes of the element `tag` is shown in: its class, and for a
+/// system tag, its full name as a tooltip.
+fn tag_attrs(tag: &TagResponse) -> String {
+    match tag.kind {
+        TagKind::System => format!("class=\"tag system\" title=\"{}\"", escape(&tag.name)),
+        TagKind::User => "class=\"tag\"".to_owned(),
+    }
 }
 
 /// Render the page for `entry`: its title, date, feed (`feed`), author,
@@ -1530,10 +1643,10 @@ fn render_entry_page(
 
 /// Render the link back to `listing`.
 fn render_back_link(listing: Listing) -> String {
-    let label = if listing.feed.is_some() {
-        "Back to feed"
-    } else {
-        "Back to entries"
+    let label = match (listing.feed, listing.tag) {
+        (Some(_), _) => "Back to feed",
+        (None, Some(_)) => "Back to tag",
+        (None, None) => "Back to entries",
     };
     format!("<p><a href=\"{}\">&larr; {label}</a></p>\n", listing.href())
 }
@@ -1579,6 +1692,71 @@ fn render_feeds(resp: &ListFeedsResponse, page: u32) -> String {
         |page| format!("/feeds?page={page}"),
         ("&larr; Previous", "Next &rarr;"),
     ));
+    html
+}
+
+/// Render the tag count, the tags on page `page`, each linked to its page,
+/// and the page links.
+fn render_tag_list(resp: &ListTagsResponse, page: u32) -> String {
+    let mut html = format!(
+        "<h2>Tags</h2>\n<p class=\"count\">{} {}</p>\n",
+        resp.count,
+        if resp.count == 1 { "tag" } else { "tags" }
+    );
+
+    if resp.tags.is_empty() {
+        html.push_str("<p>No tags on this page.</p>\n");
+    } else {
+        let items: Vec<String> = resp
+            .tags
+            .iter()
+            .map(|tag| {
+                format!(
+                    "<li><a href=\"/tags/{}\" {}>{}</a></li>",
+                    tag.id,
+                    tag_attrs(tag),
+                    escape(tag_label(tag))
+                )
+            })
+            .collect();
+        html.push_str(&format!(
+            "<ul class=\"tags tag-list\">{}</ul>\n",
+            items.concat()
+        ));
+    }
+
+    html.push_str(&render_pagination(
+        resp.count,
+        page,
+        |page| format!("/tags?page={page}"),
+        ("&larr; Previous", "Next &rarr;"),
+    ));
+    html
+}
+
+/// Render the page for `tag`: its name, and the entries on this page of
+/// `listing`, each with the title of its feed from `feeds` and its tags
+/// from `tags`.
+fn render_tag_page(
+    tag: &TagResponse,
+    entries: &EntryPage,
+    feeds: &HashMap<i64, String>,
+    tags: &HashMap<i64, Vec<TagResponse>>,
+    listing: Listing,
+) -> String {
+    let mut html = format!(
+        "<h2>Entries tagged <span {}>{}</span></h2>\n",
+        tag_attrs(tag),
+        escape(tag_label(tag))
+    );
+    html.push_str(&render_entries(
+        entries.count,
+        &entries.entries,
+        feeds,
+        tags,
+        listing,
+    ));
+    html.push_str("<p><a href=\"/tags\">&larr; Back to tags</a></p>\n");
     html
 }
 
@@ -2573,6 +2751,110 @@ mod tests {
         Ok(())
     }
 
+    /// Every page links to the list of tags, which links to each tag's page.
+    #[tokio::test]
+    async fn the_tags_page_lists_every_tag() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 1)?;
+        tag_entry(&tc, 1, "<b>news</b>")?;
+
+        let (_, body) = get_index(tc.client()?).await?;
+        assert!(body.contains(r#"<a href="/tags">Tags</a>"#), "{body}");
+
+        let (status, body) = get_page(tc.client()?, "/tags").await?;
+        assert_eq!(status, StatusCode::OK);
+        let id: i64 = tc.database_conn()?.query_row(
+            "SELECT id FROM tags WHERE name = '<b>news</b>'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            body.contains(&format!(
+                r#"<li><a href="/tags/{id}" class="tag">&lt;b&gt;news&lt;/b&gt;</a></li>"#
+            )),
+            "{body}"
+        );
+        let saved: i64 = tc.database_conn()?.query_row(
+            "SELECT id FROM tags WHERE name = 'system:saved'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            body.contains(&format!(
+                r#"<li><a href="/tags/{saved}" class="tag system" title="system:saved">saved</a></li>"#
+            )),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// A tag's page lists the unread entries with the tag, and its entries
+    /// link back to it.
+    #[tokio::test]
+    async fn a_tags_page_lists_its_entries() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 4)?;
+        tag_entry(&tc, 1, "tech")?;
+        tag_entry(&tc, 2, "tech")?;
+        tag_entry(&tc, 3, "tech")?;
+        tag_entry(&tc, 3, "system:read")?;
+        let id: i64 = tc.database_conn()?.query_row(
+            "SELECT id FROM tags WHERE name = 'tech'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let (status, body) = get_page(tc.client()?, &format!("/tags/{id}")).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("<title>tech - Kiki</title>"), "{body}");
+        assert_eq!(listed_titles(&body), ["Entry 2", "Entry 1"]);
+        assert!(
+            body.contains(&format!(r#"href="/entries/2?tag={id}""#)),
+            "{body}"
+        );
+        // Entries can't be marked as read by tag.
+        assert!(!body.contains(r#"class="mark-read""#), "{body}");
+
+        let (_, body) = get_page(tc.client()?, &format!("/tags/{id}?show_read=true")).await?;
+        assert_eq!(listed_titles(&body), ["Entry 3", "Entry 2", "Entry 1"]);
+
+        let (_, body) = get_page(tc.client()?, &format!("/entries/2?tag={id}")).await?;
+        assert!(
+            body.contains(&format!(r#"<a href="/tags/{id}">&larr; Back to tag</a>"#)),
+            "{body}"
+        );
+
+        let (status, _) = get_page(tc.client()?, "/tags/999").await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    /// The pages of the `system:read` and `system:hidden` tags list the
+    /// entries that other lists leave out.
+    #[tokio::test]
+    async fn read_and_hidden_tag_pages_list_their_entries() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 2)?;
+        tag_entry(&tc, 1, "system:read")?;
+        tag_entry(&tc, 2, "system:hidden")?;
+        let tag_id = |name: &str| -> Result<i64> {
+            Ok(tc.database_conn()?.query_row(
+                "SELECT id FROM tags WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )?)
+        };
+
+        let read = tag_id("system:read")?;
+        let (_, body) = get_page(tc.client()?, &format!("/tags/{read}")).await?;
+        assert_eq!(listed_titles(&body), ["Entry 1"]);
+
+        let hidden = tag_id("system:hidden")?;
+        let (_, body) = get_page(tc.client()?, &format!("/tags/{hidden}")).await?;
+        assert_eq!(listed_titles(&body), ["Entry 2"]);
+        Ok(())
+    }
+
     /// Every entry, in a list or on its own page, has a save button that
     /// shows whether the entry is saved.
     #[tokio::test]
@@ -3142,10 +3424,10 @@ mod tests {
     async fn pages_link_to_the_site_sections() -> Result<()> {
         let tc = TestBuilder::all().build()?;
         insert_entries(&tc, 1)?;
-        for path in ["/", "/entries/1", "/feeds", "/plugins"] {
+        for path in ["/", "/entries/1", "/feeds", "/tags", "/plugins"] {
             let (_, body) = get_page(tc.client()?, path).await?;
             assert!(
-                body.contains(r#"<nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a><a href="/plugins">Plugins</a></nav>"#),
+                body.contains(r#"<nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a href="/plugins">Plugins</a></nav>"#),
                 "{path}: {body}"
             );
         }
