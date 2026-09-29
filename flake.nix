@@ -52,6 +52,19 @@
             inherit cargoArtifacts;
           });
 
+          # A release build that keeps its symbols, for perf and flamegraphs
+          # ([profile.profiling] in Cargo.toml).
+          profilingArgs = commonArgs // {
+            pname = "kiki-rss-profiling";
+            CARGO_PROFILE = "profiling";
+            # The fixup phase would strip the symbols the profile keeps.
+            dontStrip = true;
+          };
+
+          profiling = craneLib.buildPackage (profilingArgs // {
+            cargoArtifacts = craneLib.buildDepsOnly profilingArgs;
+          });
+
           # Dev-profile builds for the clippy and test checks, so they don't
           # pay for release optimizations and LTO.
           devArgs = commonArgs // {
@@ -148,7 +161,7 @@
 
           packages = {
             default = kiki;
-            inherit docs coverage;
+            inherit docs coverage profiling;
           } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
             inherit static;
           };

@@ -172,4 +172,23 @@ pub mod test {
 
         Ok(())
     }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn test_metrics_profile_statements_and_processes() -> Result<()> {
+        let tc = TestBuilder::all().init_server().build()?;
+
+        // The server queries its database as it starts, and samples its
+        // processes' usage soon after.
+        tc.wait_for_metric("kiki_db_statement_duration_seconds_count", |v| v > 0.0)
+            .await?;
+        #[cfg(target_os = "linux")]
+        tc.wait_for_metric(
+            r#"kiki_process_resident_memory_bytes{process="server"}"#,
+            |v| v > 0.0,
+        )
+        .await?;
+
+        Ok(())
+    }
 }
