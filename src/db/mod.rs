@@ -124,6 +124,37 @@ impl Default for ConnectionBuilder<'_> {
     }
 }
 
+/// Size of the database in bytes, computed as `page_count * page_size`.
+///
+/// This is the size of the main database file as SQLite sees it, including
+/// pages on the freelist that have not been vacuumed yet. It does not include
+/// the write-ahead log, whose contents only reach the main file when the WAL
+/// is checkpointed.
+///
+/// # Errors
+///
+/// Returns an error if the pragmas cannot be queried.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::db::{self, ConnectionBuilder};
+///
+/// let conn = ConnectionBuilder::default().in_memory().create().build()?;
+/// assert!(db::size_bytes(&conn)? > 0);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn size_bytes(conn: &Connection) -> Result<u64> {
+    let bytes: i64 = conn
+        .query_row(
+            "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+            [],
+            |row| row.get(0),
+        )
+        .with_context(|| "unable to query database size")?;
+    Ok(bytes.max(0) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +262,25 @@ mod tests {
         assert_eq!(auto_vacuum, 2);
         let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
         assert_eq!(foreign_keys, 1);
+
+        Ok(())
+    }
+
+    /// Once the WAL is checkpointed, the reported size matches the size of
+    /// the database file on disk.
+    #[test]
+    fn test_size_bytes_matches_file() -> Result<()> {
+        let td = tempfile::TempDir::with_prefix("kiki_")?;
+        let path = td.path().join("kiki.db");
+        let conn = ConnectionBuilder::default()
+            .at_path(&path)
+            .create()
+            .build()?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+        let size = size_bytes(&conn)?;
+        assert!(size > 0);
+        assert_eq!(size, std::fs::metadata(&path)?.len());
 
         Ok(())
     }
