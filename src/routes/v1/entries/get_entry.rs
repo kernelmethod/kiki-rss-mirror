@@ -24,6 +24,10 @@ pub struct GetEntryResponse {
     pub title: String,
     pub url: String,
     pub content: Option<String>,
+    /// Relative Kiki URL that serves the favicon of the website the
+    /// entry's feed belongs to, or `null` if it has not been cached.
+    #[serde(default)]
+    pub feed_favicon_url: Option<String>,
     /// RSS-specific fields (description, author, enclosure, categories).
     /// Present only for entries ingested from an RSS feed.
     pub rss: Option<RssEntryData>,
@@ -63,11 +67,12 @@ pub async fn get_entry(
 
     let result = task::spawn_blocking(move || {
         let entry = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT id, feed_id, source_id, syndication_format,
-                    guid, published_at, title, url, content
+                    guid, published_at, title, url, content, {}
                 FROM entries WHERE id = ?1 LIMIT 1",
-            )
+                crate::db::favicons::favicon_hash_sql("entries.feed_id")
+            ))
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
@@ -83,6 +88,7 @@ pub async fn get_entry(
                     title: row.get(6)?,
                     url: row.get(7)?,
                     content: row.get(8)?,
+                    feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
                     rss: None,
                     atom: None,
                 })

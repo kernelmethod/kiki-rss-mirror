@@ -946,6 +946,9 @@ struct Feed {
     description: Option<String>,
     /// When the feed was last checked, in RFC 3339.
     last_checked: Option<String>,
+    /// The API URL of the feed's cached favicon.
+    #[serde(default)]
+    favicon_url: Option<String>,
 }
 
 /// Fetch the titles of the feeds in `feed_ids` from the Kiki API, keyed by
@@ -1089,7 +1092,12 @@ fn render_entry(
     listing: Listing,
 ) -> String {
     let href = listing.entry_href(entry.id);
-    let meta = render_meta(entry.published_at.as_deref(), feed, None);
+    let meta = render_meta(
+        entry.published_at.as_deref(),
+        feed,
+        entry.feed_favicon_url.as_deref(),
+        None,
+    );
     format!(
         "<a href=\"{href}\">{}</a>{meta}{}",
         escape(display_title(&entry.title)),
@@ -1170,6 +1178,7 @@ fn render_entry_page(
         render_meta(
             entry.published_at.as_deref(),
             feed,
+            entry.feed_favicon_url.as_deref(),
             (!authors.trim().is_empty()).then_some(authors.as_str()),
         ),
     );
@@ -1289,7 +1298,8 @@ fn render_feeds(resp: &ListFeedsResponse, page: u32) -> String {
                 feed.last_checked.as_deref(),
             );
             html.push_str(&format!(
-                "<li><a href=\"/feeds/{}\">{}</a> <span class=\"entry-count\">({} {})</span>{meta}</li>\n",
+                "<li>{}<a href=\"/feeds/{}\">{}</a> <span class=\"entry-count\">({} {})</span>{meta}</li>\n",
+                render_favicon(feed.favicon_url.as_deref()),
                 feed.id,
                 escape(display_feed_title(&feed.title)),
                 feed.entry_count,
@@ -1681,7 +1691,8 @@ fn render_feed_page(
     listing: Listing,
 ) -> String {
     let mut html = format!(
-        "<header class=\"feed-header\">\n<h2>{}</h2>\n{}\n",
+        "<header class=\"feed-header\">\n<h2>{}{}</h2>\n{}\n",
+        render_favicon(feed.favicon_url.as_deref()),
         escape(display_feed_title(&feed.title)),
         render_feed_meta(&feed.url, &feed.url, feed.last_checked.as_deref()),
     );
@@ -1733,7 +1744,12 @@ fn render_feed_meta(url: &str, label: &str, last_checked: Option<&str>) -> Strin
 /// Render the line under an entry's title: its publication date
 /// (`published_at`, in RFC 3339), the title of `feed`, the feed it came
 /// from, and `author`, leaving out whichever are unknown.
-fn render_meta(published_at: Option<&str>, feed: Option<&str>, author: Option<&str>) -> String {
+fn render_meta(
+    published_at: Option<&str>,
+    feed: Option<&str>,
+    favicon: Option<&str>,
+    author: Option<&str>,
+) -> String {
     let mut parts = Vec::new();
     // Show just the date; the API reports times in RFC 3339.
     if let Some(t) = published_at.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()) {
@@ -1745,7 +1761,8 @@ fn render_meta(published_at: Option<&str>, feed: Option<&str>, author: Option<&s
     }
     if let Some(feed) = feed {
         parts.push(format!(
-            "<span class=\"feed\">{}</span>",
+            "<span class=\"feed\">{}{}</span>",
+            render_favicon(favicon),
             escape(display_feed_title(feed))
         ));
     }
@@ -1758,6 +1775,22 @@ fn render_meta(published_at: Option<&str>, feed: Option<&str>, author: Option<&s
     } else {
         format!("<span class=\"meta\">{}</span>", parts.join(" &middot; "))
     }
+}
+
+/// Render the favicon the API serves at `api_url` (a feed's `favicon_url`)
+/// as a small decorative image, loaded through the web UI's asset proxy, or
+/// nothing if there is none.
+fn render_favicon(api_url: Option<&str>) -> String {
+    let Some(hash) = api_url.and_then(|u| u.strip_prefix("/v1/assets/")) else {
+        return String::new();
+    };
+    // Only ever a hash goes into the page, whatever the API said.
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return String::new();
+    }
+    format!(
+        "<img class=\"favicon\" src=\"/assets/{hash}\" alt=\"\" width=\"16\" height=\"16\" loading=\"lazy\">"
+    )
 }
 
 /// `title`, or a placeholder if it is blank.
@@ -1895,6 +1928,28 @@ mod tests {
     #[test]
     fn the_web_ui_listens_on_localhost_by_default() {
         assert_eq!(parse(&[]).listen, "127.0.0.1:8080".parse().unwrap());
+    }
+
+    /// Favicons are shown from the web UI's asset proxy, and only when the
+    /// API gave a well-formed asset URL.
+    #[test]
+    fn favicons_are_rendered_from_the_asset_proxy() {
+        let hash = "ab".repeat(32);
+        let api_url = format!("/v1/assets/{hash}");
+        let html = render_meta(None, Some("Feed"), Some(&api_url), None);
+        let img = format!(r#"<img class="favicon" src="/assets/{hash}" alt="""#);
+        assert!(html.contains(&img), "{html}");
+        for bad in [
+            "https://evil.example/x.png".to_owned(),
+            "/v1/assets/../../etc".to_owned(),
+            format!("{api_url}\"><script>"),
+        ] {
+            assert_eq!(render_favicon(Some(&bad)), "", "{bad}");
+        }
+        assert_eq!(render_favicon(None), "");
+        // Without a feed name there is nothing to put the icon beside.
+        let html = render_meta(None, None, Some(&api_url), None);
+        assert!(!html.contains("favicon"), "{html}");
     }
 
     /// Server flags are accepted alongside the web UI's own, and reach the

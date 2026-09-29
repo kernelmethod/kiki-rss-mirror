@@ -4,6 +4,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
 pub mod assets;
+pub mod favicons;
 pub mod log;
 pub mod migrations;
 pub mod plugins;
@@ -179,6 +180,7 @@ mod tests {
             "entry_sources",
             "entry_tags",
             "feed_assets",
+            "feed_favicons",
             "feed_tags",
             "feeds",
             "migrations",

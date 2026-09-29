@@ -2,6 +2,7 @@ pub mod add_feed;
 pub mod delete_feed;
 pub mod export_opml;
 pub mod feed_entries;
+pub mod feed_favicon;
 pub mod feed_tags;
 pub mod fetch_all_feeds;
 pub mod fetch_feed;
@@ -15,6 +16,7 @@ use add_feed::add_feed;
 use delete_feed::delete_feed;
 use export_opml::export_opml;
 use feed_entries::feed_entries;
+use feed_favicon::feed_favicon;
 use feed_tags::{get_feed_tags, set_feed_tags};
 use fetch_all_feeds::fetch_all_feeds;
 use fetch_feed::fetch_feed;
@@ -39,6 +41,7 @@ pub fn create_router() -> Router<AppState> {
         )
         .route("/id/{id}/tags", get(get_feed_tags).put(set_feed_tags))
         .route("/id/{id}/entries", get(feed_entries))
+        .route("/id/{id}/favicon", get(feed_favicon))
         .route("/refresh", post(fetch_all_feeds))
         .route("/refresh/{id}", post(fetch_feed))
         .route("/import", post(import_opml))

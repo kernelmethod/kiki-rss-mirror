@@ -14,6 +14,7 @@ use utoipa::OpenApi;
         crate::routes::v1::feeds::fetch_feed::fetch_feed,
         crate::routes::v1::feeds::fetch_all_feeds::fetch_all_feeds,
         crate::routes::v1::feeds::feed_entries::feed_entries,
+        crate::routes::v1::feeds::feed_favicon::feed_favicon,
         crate::routes::v1::feeds::export_opml::export_opml,
         crate::routes::v1::feeds::import_opml::import_opml,
         crate::routes::v1::feeds::feed_tags::get_feed_tags,

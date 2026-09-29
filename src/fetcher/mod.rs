@@ -229,10 +229,14 @@ pub enum ParsedFeed {
         feed: Box<AtomFeedIngestData>,
         entries: Vec<AtomEntry>,
         hints: FeedHints,
+        /// The feed's `rel="alternate"` link: the website it belongs to.
+        site_url: Option<String>,
     },
     Rss {
         entries: Vec<RssEntry>,
         hints: FeedHints,
+        /// The channel's `<link>`: the website it belongs to.
+        site_url: Option<String>,
     },
 }
 
@@ -314,6 +318,29 @@ impl ParsedFeed {
     pub fn hints(&self) -> &FeedHints {
         match self {
             ParsedFeed::Atom { hints, .. } | ParsedFeed::Rss { hints, .. } => hints,
+        }
+    }
+
+    /// The URL of the website the feed belongs to, exactly as the feed
+    /// document gives it: it may be relative, and is not checked to be
+    /// `http(s)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::fetcher::parse_feed;
+    ///
+    /// let rss = br#"<rss version="2.0"><channel><title>t</title>
+    ///     <link>https://example.com/</link><description>d</description>
+    ///     </channel></rss>"#;
+    /// let parsed = parse_feed(1, rss).expect("valid RSS");
+    /// assert_eq!(parsed.site_url(), Some("https://example.com/"));
+    /// ```
+    pub fn site_url(&self) -> Option<&str> {
+        match self {
+            ParsedFeed::Atom { site_url, .. } | ParsedFeed::Rss { site_url, .. } => {
+                site_url.as_deref()
+            }
         }
     }
 }
