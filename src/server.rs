@@ -276,9 +276,12 @@ impl Server {
 
         // Create a pool of connections that can be shared between all of
         // the threads that we spawn.
+        let statement_metrics = metrics.clone();
         let manager = SqliteConnectionManager::file(&self.db_path)
             .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-            .with_init(|c| {
+            .with_init(move |c| {
+                // Time every statement, including the pragmas below.
+                crate::db::profile::install(c, statement_metrics.clone())?;
                 // busy_timeout goes first so that the other pragmas wait
                 // for a lock too. synchronous=NORMAL is safe in WAL mode
                 // (a power loss can drop the last commits, never corrupt
@@ -523,8 +526,9 @@ impl Server {
 
 /// Periodically sample observable process state into the metrics recorder.
 ///
-/// Covers DB pool utilization, task queue depth, and domain totals that are
-/// cheap to read (feed/entry counts, feeds with fetch errors, database size).
+/// Covers DB pool utilization, task queue depth, domain totals that are
+/// cheap to read (feed/entry counts, feeds with fetch errors, database size),
+/// and the CPU and memory used by kiki's processes.
 async fn metrics_sampler_loop(
     task_manager_tx: async_channel::Sender<TaskManagerCommand>,
     pool: r2d2::Pool<SqliteConnectionManager>,
@@ -550,6 +554,20 @@ async fn metrics_sampler_loop(
                     let pool = pool.clone();
                     let metrics = metrics.clone();
                     let _ = tokio::task::spawn_blocking(move || {
+                        #[cfg(target_os = "linux")]
+                        match crate::process::stats::sample() {
+                            Ok(usage) => {
+                                for (role, u) in usage {
+                                    metrics.set_process_usage(
+                                        role.as_str(),
+                                        u.cpu_seconds,
+                                        u.resident_bytes as f64,
+                                    );
+                                }
+                            }
+                            Err(e) => debug!("failed to sample process usage: {e}"),
+                        }
+
                         let conn = match pool.get() {
                             Ok(c) => c,
                             Err(_) => return,

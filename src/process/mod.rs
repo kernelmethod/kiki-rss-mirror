@@ -64,6 +64,9 @@ pub mod feed_fetcher;
 #[cfg(all(unix, feature = "lua"))]
 pub mod script_host;
 
+#[cfg(target_os = "linux")]
+pub mod stats;
+
 /// File descriptor each child inherits its end of the socket pair on.
 ///
 /// 0/1/2 are taken by the standard streams, so 3 is the first free slot.

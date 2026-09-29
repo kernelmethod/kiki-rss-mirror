@@ -104,6 +104,15 @@ opt-level = 0
 lto = "thin"
 strip = true
 
+# A release build that profilers can read: the same optimizations, but with
+# symbols and line tables kept, so `perf report` and flamegraphs show kiki's
+# functions rather than bare addresses. Build it with
+# `cargo build --profile profiling`; the binary lands in target/profiling/.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
+
 [package.metadata.deb]
 maintainer = "kernelmethod"
 depends = "$auto"

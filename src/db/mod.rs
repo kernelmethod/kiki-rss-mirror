@@ -8,6 +8,7 @@ pub mod favicons;
 pub mod log;
 pub mod migrations;
 pub mod plugins;
+pub mod profile;
 pub mod retention;
 pub mod tags;
 pub mod task_queue;

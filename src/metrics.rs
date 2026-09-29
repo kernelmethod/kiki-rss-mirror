@@ -77,6 +77,12 @@ mod imp {
         16_777_216.0,
     ];
 
+    // Individual SQL statements: most take well under a millisecond, and
+    // anything past a second is pathological.
+    const SQL_DURATION_BUCKETS: &[f64] = &[
+        0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
+    ];
+
     const REDIRECT_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 5.0, 10.0];
 
     // Seconds-until-next-fetch buckets: covers the 60s floor through the
@@ -146,6 +152,10 @@ mod imp {
                 .set_buckets_for_metric(
                     Matcher::Full("kiki_db_pool_acquire_duration_seconds".to_string()),
                     HTTP_DURATION_BUCKETS,
+                )?
+                .set_buckets_for_metric(
+                    Matcher::Full("kiki_db_statement_duration_seconds".to_string()),
+                    SQL_DURATION_BUCKETS,
                 )?
                 .set_buckets_for_metric(
                     Matcher::Full("kiki_plugin_execution_duration_seconds".to_string()),
@@ -398,6 +408,36 @@ mod imp {
                 ),
             );
 
+            r.describe_histogram(
+                KeyName::from_const_str("kiki_db_statement_duration_seconds"),
+                None,
+                SharedString::const_str(
+                    "Duration of SQL statements, from their first step to their reset, labeled by operation and table.",
+                ),
+            );
+            r.describe_counter(
+                KeyName::from_const_str("kiki_db_statement_fullscan_steps_total"),
+                None,
+                SharedString::const_str(
+                    "Rows SQL statements stepped through in full table scans, labeled by operation and table; steady growth suggests a missing index.",
+                ),
+            );
+
+            r.describe_gauge(
+                KeyName::from_const_str("kiki_process_cpu_seconds_total"),
+                None,
+                SharedString::const_str(
+                    "CPU time used by kiki's processes, in seconds, labeled by process: the server, the feed fetcher, or the script host. Includes each process's children; resets when a process is replaced.",
+                ),
+            );
+            r.describe_gauge(
+                KeyName::from_const_str("kiki_process_resident_memory_bytes"),
+                None,
+                SharedString::const_str(
+                    "Resident memory of kiki's processes, labeled by process: the server, the feed fetcher, or the script host. Includes each process's children.",
+                ),
+            );
+
             r.describe_gauge(
                 KeyName::from_const_str("kiki_build_info"),
                 None,
@@ -640,6 +680,54 @@ mod imp {
             }
         }
 
+        /// Record one run of a SQL statement: how long it took, and how
+        /// many rows it stepped through in full table scans.
+        pub fn record_db_statement(
+            &self,
+            op: &'static str,
+            table: &str,
+            duration_seconds: f64,
+            fullscan_steps: u64,
+        ) {
+            let labels = vec![Label::new("op", op), Label::new("table", table.to_string())];
+            let key = Key::from_parts("kiki_db_statement_fullscan_steps_total", labels.clone());
+            self.recorder
+                .register_counter(&key, &METADATA)
+                .increment(fullscan_steps);
+
+            let key = Key::from_parts("kiki_db_statement_duration_seconds", labels);
+            self.recorder
+                .register_histogram(&key, &METADATA)
+                .record(duration_seconds);
+        }
+
+        // ----- Processes -----
+
+        /// Set the CPU time and resident memory used so far by one of
+        /// kiki's processes, together with its children.
+        pub fn set_process_usage(
+            &self,
+            process: &'static str,
+            cpu_seconds: f64,
+            resident_bytes: f64,
+        ) {
+            let key = Key::from_parts(
+                "kiki_process_cpu_seconds_total",
+                vec![Label::new("process", process)],
+            );
+            self.recorder
+                .register_gauge(&key, &METADATA)
+                .set(cpu_seconds);
+
+            let key = Key::from_parts(
+                "kiki_process_resident_memory_bytes",
+                vec![Label::new("process", process)],
+            );
+            self.recorder
+                .register_gauge(&key, &METADATA)
+                .set(resident_bytes);
+        }
+
         // ----- Retention -----
 
         pub fn record_retention_cleanup(
@@ -832,6 +920,26 @@ mod stub {
         pub fn set_db_pool_state(&self, _total: f64, _idle: f64) {}
         #[inline]
         pub fn record_db_pool_acquire(&self, _duration_seconds: f64, _ok: bool) {}
+        #[inline]
+        pub fn record_db_statement(
+            &self,
+            _op: &'static str,
+            _table: &str,
+            _duration_seconds: f64,
+            _fullscan_steps: u64,
+        ) {
+        }
+
+        // ----- Processes -----
+
+        #[inline]
+        pub fn set_process_usage(
+            &self,
+            _process: &'static str,
+            _cpu_seconds: f64,
+            _resident_bytes: f64,
+        ) {
+        }
 
         // ----- Retention -----
 
