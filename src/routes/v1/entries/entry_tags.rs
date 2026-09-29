@@ -289,6 +289,95 @@ pub async fn remove_entry_system_tag(
     update_entry_system_tag(state, id, name, false).await
 }
 
+#[derive(Debug, Default, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct BulkSystemTagRequest {
+    /// Only tag entries with an ID no greater than this, e.g. the newest entry the user has
+    /// seen, so that entries fetched since are left alone.
+    #[serde(default)]
+    pub up_to_id: Option<i64>,
+    /// Only tag entries from this feed.
+    #[serde(default)]
+    pub feed_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct BulkSystemTagResponse {
+    /// Number of entries that did not have the tag before, and now do.
+    pub tagged: usize,
+}
+
+/// Add a system tag to many entries
+///
+/// Apply a system tag to every entry matching the request, e.g. to mark all entries as read.
+/// `name` is the system tag's name, with or without its `system:` prefix (`read`, `saved`, or
+/// `hidden`). An empty request body (`{}`) tags every entry; `up_to_id` and `feed_id` narrow it
+/// down. Entries that already have the tag are left as they are.
+#[utoipa::path(
+    put,
+    path = "/v1/entries/system-tags/{name}",
+    params(
+        ("name" = String, Path, description = "System tag name: read, saved, or hidden"),
+    ),
+    request_body = BulkSystemTagRequest,
+    responses(
+        (status = 200, description = "Entries tagged", body = BulkSystemTagResponse),
+        (status = 404, description = "System tag not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "entries"
+)]
+#[axum::debug_handler]
+pub async fn add_entries_system_tag(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(request): Json<BulkSystemTagRequest>,
+) -> Result<Response, Response> {
+    let conn = state.conn_pool.get().map_err(|e| {
+        event!(Level::ERROR, "failed to get database connection: {:?}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?;
+
+    let result = task::spawn_blocking(move || {
+        let system_tag: SystemTag = name
+            .parse()
+            .map_err(|_| EntryTagsTaskError::UnknownSystemTag(name))?;
+        let tag_id = system_tag.id(&conn)?;
+        let tagged = conn
+            .prepare(
+                "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id)
+                 SELECT id, ?1 FROM entries
+                 WHERE (?2 IS NULL OR id <= ?2) AND (?3 IS NULL OR feed_id = ?3)",
+            )
+            .inspect_err(|e| {
+                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+            })?
+            .execute(rusqlite::params![tag_id, request.up_to_id, request.feed_id])?;
+        Ok::<BulkSystemTagResponse, EntryTagsTaskError>(BulkSystemTagResponse { tagged })
+    })
+    .await
+    .inspect_err(|e| {
+        event!(
+            Level::ERROR,
+            "task error in add_entries_system_tag: {:?}",
+            e
+        );
+    });
+
+    match result {
+        Ok(Ok(response)) => Ok(Json(response).into_response()),
+        Ok(Err(EntryTagsTaskError::UnknownSystemTag(name))) => Err((
+            StatusCode::NOT_FOUND,
+            format!("Unknown system tag: {}", name),
+        )
+            .into_response()),
+        Ok(Err(e)) => {
+            event!(Level::ERROR, "error in add_entries_system_tag: {:?}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
+        }
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()),
+    }
+}
+
 /// Add (`add == true`) or remove the system tag `name` on entry `id`, and
 /// respond with the entry's tags.
 async fn update_entry_system_tag(
