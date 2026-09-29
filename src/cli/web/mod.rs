@@ -2,7 +2,7 @@ mod sanitize;
 mod settings;
 
 use crate::cli::serve::ServeArgs;
-use crate::db::tags::{TagKind, SYSTEM_TAG_PREFIX};
+use crate::db::tags::{SystemTag, TagKind, SYSTEM_TAG_PREFIX};
 use crate::plugins::settings::{Setting, SettingType};
 use crate::routes::v1::entries::entry_assets::ListEntryAssetsResponse;
 use crate::routes::v1::entries::entry_tags::GetEntryTagsResponse;
@@ -18,7 +18,7 @@ use axum::{
     extract::{Form, Path as UrlPath, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use clap::Args;
@@ -47,21 +47,46 @@ static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\{\{(\w+)\}\}").expect("placeholder regex is valid")
 });
 
+/// The script every page runs, inlined into [`PAGE_HTML`]. It powers the
+/// save buttons shown with each entry.
+const PAGE_JS: &str = include_str!("page.js");
+
+/// The `script-src` directive that lets pages run [`PAGE_JS`] and nothing
+/// else: the script is allowed by its SHA-256 hash, so neither inline
+/// script that slips through from a feed, nor a script served from the
+/// asset cache, can run.
+static SCRIPT_SRC: LazyLock<String> = LazyLock::new(|| {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(PAGE_JS));
+    format!("script-src 'sha256-{hash}'")
+});
+
 /// `Content-Security-Policy` sent with every page.
 ///
 /// Pages carry titles and content from feeds. They are escaped or
 /// sanitized, but as a second line of defence the pages may not run any
-/// script, load anything but images from the web UI's own asset cache, or
-/// submit forms.
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src 'self'; \
-    style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+/// script but [`PAGE_JS`], connect anywhere but the web UI itself, load
+/// anything but images from the web UI's own asset cache, or submit forms.
+static CONTENT_SECURITY_POLICY: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; {}; \
+         connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        *SCRIPT_SRC
+    )
+});
 
 /// `Content-Security-Policy` sent with pages that hold forms, such as a
 /// plugin's config page. It is [`CONTENT_SECURITY_POLICY`], except that
 /// forms may be submitted to the web UI itself. These pages show nothing
 /// from feeds.
-const FORM_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src 'self'; \
-    style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+static FORM_CONTENT_SECURITY_POLICY: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; {}; \
+         connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        *SCRIPT_SRC
+    )
+});
 
 /// `Content-Security-Policy` sent with cached assets. They were downloaded
 /// from feeds, and are served from the web UI's origin, so one opened on
@@ -197,6 +222,7 @@ async fn serve_ui(
     let app = Router::new()
         .route("/", get(index))
         .route("/entries/{id}", get(entry_page))
+        .route("/entries/{id}/saved", put(save_entry).delete(unsave_entry))
         .route("/feeds", get(feeds_page))
         .route("/feeds/{id}", get(feed_page))
         .route("/plugins", get(plugins_page))
@@ -287,13 +313,13 @@ impl Listing {
 /// Fill the layout in [`PAGE_HTML`] with `title` (plain text, which is
 /// escaped) and `content` (HTML), and wrap it in a response with `status`.
 fn render_page(status: StatusCode, title: &str, content: &str) -> Response {
-    render_page_with_csp(status, title, content, CONTENT_SECURITY_POLICY)
+    render_page_with_csp(status, title, content, &CONTENT_SECURITY_POLICY)
 }
 
 /// [`render_page`], for a page with forms: the page is sent with
 /// [`FORM_CONTENT_SECURITY_POLICY`], so that its forms can be submitted.
 fn render_form_page(status: StatusCode, title: &str, content: &str) -> Response {
-    render_page_with_csp(status, title, content, FORM_CONTENT_SECURITY_POLICY)
+    render_page_with_csp(status, title, content, &FORM_CONTENT_SECURITY_POLICY)
 }
 
 /// [`render_page`], sent with the `Content-Security-Policy` `csp`.
@@ -304,6 +330,7 @@ fn render_page_with_csp(status: StatusCode, title: &str, content: &str, csp: &st
         "title" => escape(title).into_owned(),
         "version" => env!("CARGO_PKG_VERSION").to_owned(),
         "content" => content.to_owned(),
+        "script" => PAGE_JS.to_owned(),
         _ => caps[0].to_owned(),
     });
     (
@@ -404,6 +431,63 @@ async fn entry_page(
             params.listing(),
         ),
     )
+}
+
+/// Save entry `id`, giving it the `system:saved` tag. Called by the save
+/// buttons' script; see [`set_entry_saved`].
+async fn save_entry(
+    State(api): State<reqwest::Client>,
+    UrlPath(id): UrlPath<i64>,
+    headers: HeaderMap,
+) -> Response {
+    set_entry_saved(&api, id, &headers, true).await
+}
+
+/// Unsave entry `id`, removing its `system:saved` tag. Called by the save
+/// buttons' script; see [`set_entry_saved`].
+async fn unsave_entry(
+    State(api): State<reqwest::Client>,
+    UrlPath(id): UrlPath<i64>,
+    headers: HeaderMap,
+) -> Response {
+    set_entry_saved(&api, id, &headers, false).await
+}
+
+/// Add (`saved == true`) or remove the `system:saved` tag on entry `id`,
+/// responding with `204 No Content` once it is done.
+///
+/// Responds with `404 Not Found` if there is no such entry, `502 Bad
+/// Gateway` if the Kiki server cannot make the change, and `403 Forbidden`
+/// to requests from other sites, going by `headers`; see
+/// [`is_same_origin`].
+async fn set_entry_saved(
+    api: &reqwest::Client,
+    id: i64,
+    headers: &HeaderMap,
+    saved: bool,
+) -> Response {
+    if !is_same_origin(headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "Entries may only be saved from the web UI's own pages.",
+        )
+            .into_response();
+    }
+
+    let url = format!("{API_BASE}/v1/entries/id/{id}/system-tags/saved");
+    let req = if saved { api.put(url) } else { api.delete(url) };
+    match req.send().await.map(|resp| resp.status()) {
+        Ok(StatusCode::OK) => StatusCode::NO_CONTENT.into_response(),
+        Ok(StatusCode::NOT_FOUND) => (StatusCode::NOT_FOUND, "Entry not found.").into_response(),
+        Ok(status) => {
+            tracing::warn!(%status, entry_id = id, saved, "failed to update saved entry");
+            (StatusCode::BAD_GATEWAY, "The entry could not be updated.").into_response()
+        }
+        Err(e) => {
+            tracing::warn!("failed to reach the Kiki server: {e:#}");
+            (StatusCode::BAD_GATEWAY, "The Kiki server is unavailable.").into_response()
+        }
+    }
 }
 
 /// Render the list of feeds: the total number of feeds, and one page of
@@ -648,11 +732,12 @@ async fn update_plugin_config(
     }
 }
 
-/// Whether a form was submitted from one of the web UI's own pages, going
-/// by the headers the browser sent with it, `headers`.
+/// Whether a form or request was sent from one of the web UI's own pages,
+/// going by the headers the browser sent with it, `headers`.
 ///
 /// The web UI has no login, so any site open in the same browser could
-/// otherwise submit a form to it and change a plugin's config. Browsers say
+/// otherwise submit a form to it and change a plugin's config, or save an
+/// entry. Browsers say
 /// where a form came from in `Sec-Fetch-Site` or, failing that, `Origin`;
 /// a request with neither did not come from a browser that would submit a
 /// form for another site, and is let through.
@@ -1083,8 +1168,9 @@ fn render_entries(
 }
 
 /// Render a single entry in a list: its title, linked to the entry's page,
-/// and below it its publication date, the title of `feed`, the feed it came
-/// from, and its `tags`. The entry's page links back to `listing`.
+/// and its save button, and below them its publication date, the title of
+/// `feed`, the feed it came from, and its `tags`. The entry's page links
+/// back to `listing`.
 fn render_entry(
     entry: &ListEntriesResponseEntry,
     feed: Option<&str>,
@@ -1099,9 +1185,28 @@ fn render_entry(
         None,
     );
     format!(
-        "<a href=\"{href}\">{}</a>{meta}{}",
+        "<a href=\"{href}\">{}</a> {}{meta}{}",
         escape(display_title(&entry.title)),
+        render_save_button(entry.id, tags),
         render_tags(tags)
+    )
+}
+
+/// The bookmark drawn on save buttons; filled in when the entry is saved.
+const SAVE_ICON: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\">\
+    <path d=\"M6 3h12v18l-6-4.5L6 21z\"/></svg>";
+
+/// Render the button that saves entry `id`, or unsaves it if its `tags`
+/// include `system:saved`. The button does nothing on its own: the script
+/// in `page.js` sends the change to [`save_entry`] or [`unsave_entry`].
+fn render_save_button(id: i64, tags: &[TagResponse]) -> String {
+    let saved = tags
+        .iter()
+        .any(|tag| tag.kind == TagKind::System && tag.name == SystemTag::Saved.name());
+    format!(
+        "<button type=\"button\" class=\"save\" data-entry=\"{id}\" aria-pressed=\"{saved}\" \
+         aria-label=\"Save\" title=\"{}\">{SAVE_ICON}</button>",
+        if saved { "Unsave" } else { "Save" }
     )
 }
 
@@ -1173,8 +1278,9 @@ fn render_entry_page(
     let authors = authors.join(", ");
 
     let mut html = format!(
-        "<article class=\"entry\">\n<h2>{}</h2>\n{}\n",
+        "<article class=\"entry\">\n<div class=\"title-row\"><h2>{}</h2>{}</div>\n{}\n",
         escape(display_title(&entry.title)),
+        render_save_button(entry.id, tags),
         render_meta(
             entry.published_at.as_deref(),
             feed,
@@ -2228,6 +2334,137 @@ mod tests {
         Ok(())
     }
 
+    /// Every entry, in a list or on its own page, has a save button that
+    /// shows whether the entry is saved.
+    #[tokio::test]
+    async fn entries_have_save_buttons() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (id, title, url) VALUES (1, 'Feed', 'http://example.com/feed.xml')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO entries (id, feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (1, 1, 'rss', 'a', 1, 'Saved', 'http://example.com/a'),
+                    (2, 1, 'rss', 'b', 2, 'Unsaved', 'http://example.com/b')",
+            [],
+        )?;
+        tag_entry(&tc, 1, "system:saved")?;
+        let saved = r#"<button type="button" class="save" data-entry="1" aria-pressed="true" aria-label="Save" title="Unsave">"#;
+        let unsaved = r#"<button type="button" class="save" data-entry="2" aria-pressed="false" aria-label="Save" title="Save">"#;
+
+        for path in ["/", "/feeds/1"] {
+            let (status, body) = get_page(tc.client()?, path).await?;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains(saved), "{path}: {body}");
+            assert!(body.contains(unsaved), "{path}: {body}");
+            assert_eq!(listed_titles(&body), ["Unsaved", "Saved"], "{path}");
+        }
+
+        let (_, body) = get_page(tc.client()?, "/entries/1").await?;
+        assert!(body.contains(saved), "{body}");
+        let (_, body) = get_page(tc.client()?, "/entries/2").await?;
+        assert!(body.contains(unsaved), "{body}");
+        Ok(())
+    }
+
+    /// Send a `method` request for `path` to the web UI, with `headers`, and
+    /// return the response's status.
+    async fn send_request(
+        api: reqwest::Client,
+        method: reqwest::Method,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<StatusCode> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve_ui(listener, api, cancel.clone()));
+
+        let mut req = reqwest::Client::new().request(method, format!("http://{addr}{path}"));
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let status = req.send().await?.status();
+
+        cancel.cancel();
+        task.await??;
+        Ok(status)
+    }
+
+    /// Whether entry `id` has the `system:saved` tag.
+    fn is_saved(tc: &crate::test::TestConfig, id: i64) -> Result<bool> {
+        Ok(tc.database_conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+             WHERE et.entry_id = ?1 AND t.name = 'system:saved')",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// `PUT /entries/{id}/saved` saves an entry and `DELETE` unsaves it,
+    /// each any number of times; an unknown entry is not found.
+    #[tokio::test]
+    async fn entries_can_be_saved_and_unsaved() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 1)?;
+        let same_origin = [("Sec-Fetch-Site", "same-origin")];
+
+        for _ in 0..2 {
+            let status = send_request(
+                tc.client()?,
+                reqwest::Method::PUT,
+                "/entries/1/saved",
+                &same_origin,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            assert!(is_saved(&tc, 1)?);
+        }
+        for _ in 0..2 {
+            let status = send_request(
+                tc.client()?,
+                reqwest::Method::DELETE,
+                "/entries/1/saved",
+                &same_origin,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            assert!(!is_saved(&tc, 1)?);
+        }
+
+        for method in [reqwest::Method::PUT, reqwest::Method::DELETE] {
+            let status =
+                send_request(tc.client()?, method, "/entries/99/saved", &same_origin).await?;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+        Ok(())
+    }
+
+    /// Requests to save or unsave an entry from other sites are refused.
+    #[tokio::test]
+    async fn cross_site_saves_are_refused() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 2)?;
+        tag_entry(&tc, 2, "system:saved")?;
+
+        for headers in [
+            &[("Sec-Fetch-Site", "cross-site")][..],
+            &[("Sec-Fetch-Site", "same-site")],
+            &[("Origin", "http://evil.example")],
+        ] {
+            for (method, id) in [(reqwest::Method::PUT, 1), (reqwest::Method::DELETE, 2)] {
+                let path = format!("/entries/{id}/saved");
+                let status = send_request(tc.client()?, method, &path, headers).await?;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{path} {headers:?}");
+            }
+        }
+        assert!(!is_saved(&tc, 1)?);
+        assert!(is_saved(&tc, 2)?);
+        Ok(())
+    }
+
     /// On later pages of the index, entries link to pages that link back.
     #[tokio::test]
     async fn entry_pages_link_back_to_the_index_page() -> Result<()> {
@@ -2289,7 +2526,9 @@ mod tests {
             ),
             "{body}"
         );
-        assert!(!body.contains("<script>"), "{body}");
+        // The page's only script is its own.
+        assert_eq!(body.matches("<script>").count(), 1, "{body}");
+        assert!(!body.contains("alert(1)"), "{body}");
         assert!(!body.contains("onclick"), "{body}");
         assert!(
             body.contains(r#"<a href="http://example.com/posts/a" rel="noopener noreferrer">Read the full entry"#),
@@ -2501,10 +2740,13 @@ mod tests {
         Ok(())
     }
 
-    /// Pages forbid script, in case anything from a feed slips through, and
-    /// ask the browser not to look up the hosts they link to.
+    /// Pages forbid any script but their own, in case anything from a feed
+    /// slips through, and ask the browser not to look up the hosts they link
+    /// to.
     #[tokio::test]
-    async fn pages_forbid_script() -> Result<()> {
+    async fn pages_only_run_their_own_script() -> Result<()> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
         let tc = TestBuilder::all().build()?;
         insert_entries(&tc, 1)?;
         tc.database_conn()?.execute(
@@ -2518,13 +2760,34 @@ mod tests {
 
         for path in ["/", "/entries/1", "/feeds", "/feeds/1", "/plugins"] {
             let resp = reqwest::get(format!("http://{addr}{path}")).await?;
-            let csp = resp.headers()[header::CONTENT_SECURITY_POLICY].to_str()?;
+            let csp = resp.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()?
+                .to_owned();
             assert!(csp.starts_with("default-src 'none';"), "{path}: {csp}");
-            assert!(!csp.contains("script-src"), "{path}: {csp}");
+            assert!(csp.contains("connect-src 'self';"), "{path}: {csp}");
             assert_eq!(
                 resp.headers()[header::X_DNS_PREFETCH_CONTROL],
                 "off",
                 "{path}"
+            );
+
+            // The only script allowed is the one inlined into the page.
+            let body = resp.text().await?;
+            let script = body
+                .split_once("<script>")
+                .and_then(|(_, rest)| rest.split_once("</script>"))
+                .map(|(script, _)| script)
+                .context("page has no script")?;
+            let hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(script));
+            let script_src: Vec<&str> = csp
+                .split(';')
+                .map(str::trim)
+                .filter(|d| d.starts_with("script-src"))
+                .collect();
+            assert_eq!(
+                script_src,
+                [format!("script-src 'sha256-{hash}'")],
+                "{path}: {csp}"
             );
         }
 
@@ -2849,7 +3112,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert!(csp.contains("form-action 'self'"), "{csp}");
-        assert!(!csp.contains("script-src"), "{csp}");
+        assert!(csp.contains(SCRIPT_SRC.as_str()), "{csp}");
         assert!(
             body.contains("<title>hello - Plugins - Kiki</title>"),
             "{body}"
