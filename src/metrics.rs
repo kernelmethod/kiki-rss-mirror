@@ -363,6 +363,13 @@ mod imp {
                 None,
                 SharedString::const_str("Feeds whose most recent fetch attempt recorded an error."),
             );
+            r.describe_gauge(
+                KeyName::from_const_str("kiki_db_size_bytes"),
+                None,
+                SharedString::const_str(
+                    "Size of the SQLite database in bytes (page_count * page_size), excluding the WAL file.",
+                ),
+            );
 
             r.describe_gauge(
                 KeyName::from_const_str("kiki_plugins_loaded"),
@@ -675,6 +682,11 @@ mod imp {
             self.recorder.register_gauge(&key, &METADATA).set(n);
         }
 
+        pub fn set_db_size_bytes(&self, bytes: f64) {
+            let key = Key::from_name("kiki_db_size_bytes");
+            self.recorder.register_gauge(&key, &METADATA).set(bytes);
+        }
+
         // ----- Plugins -----
 
         pub fn set_plugins_loaded(&self, n: f64) {
@@ -840,6 +852,8 @@ mod stub {
         pub fn set_entries_total(&self, _n: f64) {}
         #[inline]
         pub fn set_feeds_with_fetch_error(&self, _n: f64) {}
+        #[inline]
+        pub fn set_db_size_bytes(&self, _bytes: f64) {}
 
         // ----- Plugins -----
 
