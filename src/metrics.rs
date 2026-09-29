@@ -121,7 +121,7 @@ mod imp {
                     HTTP_DURATION_BUCKETS,
                 )?
                 .set_buckets_for_metric(
-                    Matcher::Full("kiki_script_execution_duration_seconds".to_string()),
+                    Matcher::Full("kiki_plugin_execution_duration_seconds".to_string()),
                     HTTP_DURATION_BUCKETS,
                 )?
                 .build_recorder();
@@ -338,26 +338,30 @@ mod imp {
             );
 
             r.describe_gauge(
-                KeyName::from_const_str("kiki_scripts_loaded"),
+                KeyName::from_const_str("kiki_plugins_loaded"),
+                None,
+                SharedString::const_str("Number of plugins currently loaded."),
+            );
+            r.describe_counter(
+                KeyName::from_const_str("kiki_plugin_load_errors_total"),
                 None,
                 SharedString::const_str(
-                    "Number of Lua scripts successfully compiled into worker runners.",
+                    "Total failed attempts to load plugins, e.g. because a plugin failed to compile.",
                 ),
             );
             r.describe_counter(
-                KeyName::from_const_str("kiki_script_compile_errors_total"),
+                KeyName::from_const_str("kiki_plugin_executions_total"),
                 None,
-                SharedString::const_str("Total failures to compile the Lua script runner."),
-            );
-            r.describe_counter(
-                KeyName::from_const_str("kiki_script_executions_total"),
-                None,
-                SharedString::const_str("Total Lua script executions, labeled by outcome."),
+                SharedString::const_str(
+                    "Total entries run through the plugins' `entry.ingest` handlers, labeled by outcome (`ok`, `filtered`, `error`).",
+                ),
             );
             r.describe_histogram(
-                KeyName::from_const_str("kiki_script_execution_duration_seconds"),
+                KeyName::from_const_str("kiki_plugin_execution_duration_seconds"),
                 None,
-                SharedString::const_str("Duration of Lua script executions."),
+                SharedString::const_str(
+                    "Duration of running an entry through the plugins' `entry.ingest` handlers.",
+                ),
             );
 
             r.describe_gauge(
@@ -644,26 +648,26 @@ mod imp {
             self.recorder.register_gauge(&key, &METADATA).set(n);
         }
 
-        // ----- Scripts -----
+        // ----- Plugins -----
 
-        pub fn set_scripts_loaded(&self, n: f64) {
-            let key = Key::from_name("kiki_scripts_loaded");
+        pub fn set_plugins_loaded(&self, n: f64) {
+            let key = Key::from_name("kiki_plugins_loaded");
             self.recorder.register_gauge(&key, &METADATA).set(n);
         }
 
-        pub fn record_script_compile_error(&self) {
-            let key = Key::from_name("kiki_script_compile_errors_total");
+        pub fn record_plugin_load_error(&self) {
+            let key = Key::from_name("kiki_plugin_load_errors_total");
             self.recorder.register_counter(&key, &METADATA).increment(1);
         }
 
-        pub fn record_script_execution(&self, duration_seconds: f64, outcome: &'static str) {
+        pub fn record_plugin_execution(&self, duration_seconds: f64, outcome: &'static str) {
             let key = Key::from_parts(
-                "kiki_script_executions_total",
+                "kiki_plugin_executions_total",
                 vec![Label::new("outcome", outcome)],
             );
             self.recorder.register_counter(&key, &METADATA).increment(1);
 
-            let key = Key::from_name("kiki_script_execution_duration_seconds");
+            let key = Key::from_name("kiki_plugin_execution_duration_seconds");
             self.recorder
                 .register_histogram(&key, &METADATA)
                 .record(duration_seconds);
@@ -810,13 +814,13 @@ mod stub {
         #[inline]
         pub fn set_feeds_with_fetch_error(&self, _n: f64) {}
 
-        // ----- Scripts -----
+        // ----- Plugins -----
 
         #[inline]
-        pub fn set_scripts_loaded(&self, _n: f64) {}
+        pub fn set_plugins_loaded(&self, _n: f64) {}
         #[inline]
-        pub fn record_script_compile_error(&self) {}
+        pub fn record_plugin_load_error(&self) {}
         #[inline]
-        pub fn record_script_execution(&self, _duration_seconds: f64, _outcome: &'static str) {}
+        pub fn record_plugin_execution(&self, _duration_seconds: f64, _outcome: &'static str) {}
     }
 }

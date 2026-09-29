@@ -122,7 +122,7 @@ pub fn load_script_runner(
                 });
                 // Only after the swap, so that the gauge reaching a value
                 // means the plugins have taken effect.
-                metrics.set_scripts_loaded(loaded as f64);
+                metrics.set_plugins_loaded(loaded as f64);
                 fire_plugin_load(handle);
                 Ok(loaded)
             }
@@ -130,7 +130,7 @@ pub fn load_script_runner(
                 // The host answered, it just could not compile what we
                 // sent, and kept running what it had.
                 warn!("script host failed to compile Lua scripts: {}", e);
-                metrics.record_script_compile_error();
+                metrics.record_plugin_load_error();
                 Err(LoadPluginsError::Compile(e.to_string()))
             }
             Err(e) => {
@@ -140,7 +140,7 @@ pub fn load_script_runner(
                     "script host is gone ({}); scripting is disabled until the server restarts",
                     e
                 );
-                metrics.set_scripts_loaded(0.0);
+                metrics.set_plugins_loaded(0.0);
                 handle.set(None);
                 Err(LoadPluginsError::HostDead(e.to_string()))
             }
@@ -157,13 +157,13 @@ pub fn load_script_runner(
                 Some(Arc::new(runner) as Arc<dyn ScriptRunner>)
             });
             // As above, only after the swap.
-            metrics.set_scripts_loaded(count as f64);
+            metrics.set_plugins_loaded(count as f64);
             fire_plugin_load(handle);
             Ok(count)
         }
         Err(e) => {
             warn!("failed to compile Lua scripts: {}", e);
-            metrics.record_script_compile_error();
+            metrics.record_plugin_load_error();
             Err(LoadPluginsError::Compile(e.to_string()))
         }
     }

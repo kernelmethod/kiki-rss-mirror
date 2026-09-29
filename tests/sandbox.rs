@@ -646,20 +646,20 @@ mod script_isolation {
             child_pids_matching(server_pid, script_host::SUBCOMMAND)
         }
 
-        /// Block until `kiki_scripts_loaded` reaches `n`, so a test never
+        /// Block until `kiki_plugins_loaded` reaches `n`, so a test never
         /// races a reload that is still in flight.
-        fn wait_for_scripts_loaded(&mut self, n: u64, timeout: Duration) {
+        fn wait_for_plugins_loaded(&mut self, n: u64, timeout: Duration) {
             let deadline = Instant::now() + timeout;
             loop {
                 self.assert_still_running();
                 let metrics = self.get("/metrics");
                 let last = String::from_utf8_lossy(&metrics.body).into_owned();
-                if metric_value(&last, "kiki_scripts_loaded") == Some(n as f64) {
+                if metric_value(&last, "kiki_plugins_loaded") == Some(n as f64) {
                     return;
                 }
                 if Instant::now() >= deadline {
                     panic!(
-                        "kiki_scripts_loaded never reached {n} within {timeout:?}; \
+                        "kiki_plugins_loaded never reached {n} within {timeout:?}; \
                          last /metrics response:\n{last}"
                     );
                 }
@@ -702,7 +702,7 @@ mod script_isolation {
             std::fs::write(plugin.join("main.lua"), source).expect("write main.lua");
             std::fs::write(plugin.join("manifest.toml"), manifest).expect("write manifest.toml");
         });
-        kiki.wait_for_scripts_loaded(1, Duration::from_secs(10));
+        kiki.wait_for_plugins_loaded(1, Duration::from_secs(10));
         kiki
     }
 

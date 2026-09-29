@@ -187,16 +187,16 @@ fn run_scripts(
     let script_start = Instant::now();
     match runner.dispatch_transform_entry(feed_entry) {
         Ok(Some(e)) => {
-            metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "ok");
+            metrics.record_plugin_execution(script_start.elapsed().as_secs_f64(), "ok");
             Some(e)
         }
         Ok(None) => {
-            metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "filtered");
+            metrics.record_plugin_execution(script_start.elapsed().as_secs_f64(), "filtered");
             debug!("{} entry filtered by script for feed {}", format, feed_id);
             None
         }
         Err(e) => {
-            metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "error");
+            metrics.record_plugin_execution(script_start.elapsed().as_secs_f64(), "error");
             warn!(
                 "script error processing {} entry for feed {}: {}; inserting unmodified",
                 format, feed_id, e
