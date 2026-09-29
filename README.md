@@ -50,7 +50,8 @@ curl \
 ```
 
 To move feeds in or out of Kiki from another aggregator, use OPML. Folders in
-the OPML file become tags, and feeds that are already present are skipped:
+the OPML file become tags, and feeds that are already present are skipped,
+though they gain the tags of the folders they're in:
 
 ```bash
 kiki opml import subscriptions.opml   # or `-` to read from stdin
