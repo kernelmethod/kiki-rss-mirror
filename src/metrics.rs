@@ -262,7 +262,7 @@ mod imp {
                 KeyName::from_const_str("kiki_feed_retry_scheduled_seconds"),
                 None,
                 SharedString::const_str(
-                    "Seconds until the next scheduled fetch attempt, labeled by the hint source (cache_hint, retry_after, backoff, permanent).",
+                    "Seconds until the next scheduled fetch attempt, labeled by the rule that chose it (interval, cache_hint, retry_after, stale_if_error, backoff, permanent).",
                 ),
             );
             r.describe_histogram(
@@ -608,8 +608,9 @@ mod imp {
         }
 
         /// Record the gap, in seconds, between now and the scheduled next
-        /// fetch for a feed. `source` identifies why the schedule was
-        /// chosen (`cache_hint`, `retry_after`, `backoff`, or `permanent`).
+        /// fetch for a feed. `source` identifies the rule that chose the
+        /// schedule (`interval`, `cache_hint`, `retry_after`,
+        /// `stale_if_error`, `backoff`, or `permanent`).
         pub fn record_feed_retry_scheduled(&self, source: &'static str, seconds_until: f64) {
             let key = Key::from_parts(
                 "kiki_feed_retry_scheduled_seconds",

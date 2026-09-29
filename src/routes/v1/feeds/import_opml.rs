@@ -78,7 +78,10 @@ pub async fn import_opml(
     for &id in &summary.imported {
         if let Err(e) = state
             .task_manager_tx
-            .send(TaskManagerCommand::RefreshFeed(id))
+            .send(TaskManagerCommand::RefreshFeed {
+                feed_id: id,
+                manual: true,
+            })
             .await
         {
             event!(

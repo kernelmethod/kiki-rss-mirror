@@ -1961,3 +1961,98 @@ async fn test_retry_after_within_stale_if_error_is_honored() -> Result<()> {
     );
     Ok(())
 }
+
+/// A refresh a user asked for fetches a feed whose `next_fetch_at` is still
+/// in the future, and still revalidates with the stored validators.
+#[tokio::test]
+async fn test_manual_refresh_ignores_schedule() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        etag: Some("\"v1\"".into()),
+        cache_control: Some("max-age=3600".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+    let metrics = super::test_metrics();
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &metrics,
+        &super::test_tx(),
+    )
+    .await?;
+
+    // The scheduler would skip the feed for the next hour...
+    refresh_feed(
+        &client,
+        feed_id,
+        pool.clone(),
+        None,
+        &metrics,
+        &super::test_tx(),
+    )
+    .await?;
+    assert_eq!(state.lock().unwrap().request_count, 1);
+
+    // ...but a manual refresh goes through, as a conditional request.
+    refresh_feed_manual(&client, feed_id, pool, &metrics, &super::test_tx()).await?;
+    let s = state.lock().unwrap();
+    assert_eq!(s.request_count, 2, "manual refresh should fetch");
+    assert_eq!(s.not_modified_count, 1, "manual refresh should revalidate");
+    drop(s);
+
+    Ok(())
+}
+
+/// A refresh skipped because the feed is not yet due is counted as a skip,
+/// not as a fetch.
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn test_schedule_skip_is_not_counted_as_a_fetch() -> Result<()> {
+    let mut tc = TestBuilder::default().init_database().build()?;
+    let state: SharedFeedServerState = Arc::new(Mutex::new(FeedServerState {
+        cache_control: Some("max-age=3600".into()),
+        ..Default::default()
+    }));
+    tc.init_feed_server_with_state(state.clone()).await?;
+
+    let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
+    let metrics = super::test_metrics();
+
+    for _ in 0..2 {
+        refresh_feed(
+            &client,
+            feed_id,
+            pool.clone(),
+            None,
+            &metrics,
+            &super::test_tx(),
+        )
+        .await?;
+    }
+
+    let rendered = metrics.render();
+    assert!(
+        rendered.contains("kiki_feed_fetch_total{outcome=\"success\"} 1"),
+        "the first refresh should count as a fetch; got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("outcome=\"cache_hit\""),
+        "the skipped refresh should not count as a fetch; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("kiki_feed_cache_hits_total{reason=\"next_fetch_at\"} 1"),
+        "the skipped refresh should count as a skip; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("kiki_feed_retry_scheduled_seconds_count{source=\"cache_hint\"} 1"),
+        "a max-age under the feed's interval should be labelled cache_hint; got:\n{rendered}"
+    );
+
+    Ok(())
+}

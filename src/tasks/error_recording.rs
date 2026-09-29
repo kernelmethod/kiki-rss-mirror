@@ -63,22 +63,14 @@ pub(super) fn set_feed_error_with_schedule(
         .unwrap_or((0, 0, 0));
     let new_failures = current_failures.saturating_add(1);
 
-    let (outcome, retry_kind): (FetchOutcome, &'static str) = if is_transient {
-        let retry_kind = if retry_after_ts.is_some() {
-            "retry_after"
-        } else {
-            "backoff"
-        };
-        (
-            FetchOutcome::TransientErr {
-                retry_after_ts,
-                consecutive_failures: new_failures,
-                stale_if_error_secs,
-            },
-            retry_kind,
-        )
+    let outcome = if is_transient {
+        FetchOutcome::TransientErr {
+            retry_after_ts,
+            consecutive_failures: new_failures,
+            stale_if_error_secs,
+        }
     } else {
-        (FetchOutcome::PermanentErr, "permanent")
+        FetchOutcome::PermanentErr
     };
 
     let schedule = plan_next_fetch(
@@ -108,7 +100,10 @@ pub(super) fn set_feed_error_with_schedule(
         return None;
     }
 
-    metrics.record_feed_retry_scheduled(retry_kind, (next_fetch_at - now_ts) as f64);
+    metrics.record_feed_retry_scheduled(
+        schedule.reason.metric_source(),
+        (next_fetch_at - now_ts) as f64,
+    );
     metrics.record_feed_consecutive_failures(new_failures);
     Some(schedule)
 }

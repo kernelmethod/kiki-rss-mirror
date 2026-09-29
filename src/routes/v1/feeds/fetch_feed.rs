@@ -10,7 +10,8 @@ use tracing::{event, Level};
 /// Refresh single feed
 ///
 /// Queue a request to refresh an individual feed by its ID. This will force a refresh even if kiki
-/// has updated the feed recently.
+/// has updated the feed recently, unless the feed's server has asked kiki to wait with a
+/// `Retry-After` header that has not yet passed.
 #[utoipa::path(
     post,
     path = "/v1/feeds/refresh/{id}",
@@ -28,7 +29,10 @@ pub async fn fetch_feed(State(state): State<AppState>, Path(id): Path<i64>) -> R
     // Send a command to the feed fetcher workers to refresh this feed
     if let Err(e) = state
         .task_manager_tx
-        .send(TaskManagerCommand::RefreshFeed(id))
+        .send(TaskManagerCommand::RefreshFeed {
+            feed_id: id,
+            manual: true,
+        })
         .await
     {
         event!(

@@ -163,7 +163,7 @@ async fn run_worker(worker_id: usize, w: Worker) {
         let settings = w.config.current();
 
         match command {
-            TaskManagerCommand::RefreshFeed(feed_id) => {
+            TaskManagerCommand::RefreshFeed { feed_id, manual } => {
                 let guard = match InProgressGuard::try_claim(&w.refresh_in_progress, feed_id) {
                     Some(g) => {
                         w.metrics
@@ -191,6 +191,7 @@ async fn run_worker(worker_id: usize, w: Worker) {
                 let outcome = match refresh_feed(
                     &w.fetcher,
                     feed_id,
+                    manual,
                     w.pool.clone(),
                     &settings,
                     script_runner,

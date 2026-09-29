@@ -735,26 +735,36 @@ async fn periodic_command_loop(
     Ok(())
 }
 
+/// Queue a [`TaskManagerCommand::RefreshFeed`] for every feed that is due:
+/// one that has never been scheduled or whose `next_fetch_at` has passed.
+///
+/// This is the same test `refresh_feed` applies before fetching, so feeds
+/// that are not due are left out rather than queued only to be skipped.
 fn check_feeds(
     task_manager_tx: &async_channel::Sender<TaskManagerCommand>,
     pool: &crate::db::Pool,
     metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
-    debug!("Sending RefreshFeed commands for all feeds");
     let conn = pool.get()?;
+    let now_ts = chrono::Utc::now().timestamp();
 
-    // Query all feed IDs
-    let mut stmt = conn.prepare("SELECT id FROM feeds")?;
+    let feed_ids: Vec<i64> = conn
+        .prepare("SELECT id FROM feeds WHERE next_fetch_at IS NULL OR next_fetch_at <= ?1")?
+        .query_map([now_ts], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !feed_ids.is_empty() {
+        debug!(
+            "Sending RefreshFeed commands for {} due feeds",
+            feed_ids.len()
+        );
+    }
 
-    let feed_ids = stmt.query_map([], |row| {
-        let id: i64 = row.get(0)?;
-        Ok(id)
-    })?;
-
-    // Send a RefreshFeed command for each feed
     for feed_id in feed_ids {
-        let feed_id = feed_id?;
-        match task_manager_tx.try_send(TaskManagerCommand::RefreshFeed(feed_id)) {
+        let cmd = TaskManagerCommand::RefreshFeed {
+            feed_id,
+            manual: false,
+        };
+        match task_manager_tx.try_send(cmd) {
             Ok(()) => metrics.record_task_enqueued("refresh_feed"),
             Err(e) => tracing::error!(
                 "Failed to send RefreshFeed command for feed {}: {:?}",
@@ -1045,6 +1055,41 @@ mod test {
         let now = 1_000_000;
         let delay = compute_initial_delay(Duration::from_secs(3600), now + 500, now);
         assert_eq!(delay, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn check_feeds_queues_only_due_feeds() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        let pool = make_pool(&tc.database_path())?;
+        let now = chrono::Utc::now().timestamp();
+
+        let conn = pool.get()?;
+        let insert = |url: &str, next_fetch_at: Option<i64>| -> Result<i64> {
+            conn.execute(
+                "INSERT INTO feeds (title, url, next_fetch_at) VALUES ('feed', ?1, ?2)",
+                rusqlite::params![url, next_fetch_at],
+            )?;
+            Ok(conn.last_insert_rowid())
+        };
+        let never = insert("https://example.com/never.xml", None)?;
+        let due = insert("https://example.com/due.xml", Some(now - 10))?;
+        insert("https://example.com/later.xml", Some(now + 3600))?;
+        drop(conn);
+
+        let (tx, rx) = async_channel::bounded(16);
+        check_feeds(&tx, &pool, &crate::metrics::Metrics::new()?)?;
+
+        let mut queued = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            let TaskManagerCommand::RefreshFeed { feed_id, manual } = cmd else {
+                anyhow::bail!("unexpected command {cmd:?}");
+            };
+            assert!(!manual, "scheduled refreshes are not manual");
+            queued.push(feed_id);
+        }
+        queued.sort();
+        assert_eq!(queued, vec![never, due]);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]

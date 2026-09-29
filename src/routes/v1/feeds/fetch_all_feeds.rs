@@ -18,7 +18,8 @@ pub struct FetchAllFeedsResponse {
 /// Refresh all feeds
 ///
 /// Queue requests to refresh all of the feeds that kiki is configured to read from. This will
-/// force a refresh even for feeds that kiki has updated recently.
+/// force a refresh even for feeds that kiki has updated recently, except those whose server has
+/// asked kiki to wait with a `Retry-After` header that has not yet passed.
 #[utoipa::path(
     post,
     path = "/v1/feeds/refresh",
@@ -66,7 +67,10 @@ pub async fn fetch_all_feeds(State(state): State<AppState>) -> Result<Response, 
     for id in &feed_ids {
         if let Err(e) = state
             .task_manager_tx
-            .send(TaskManagerCommand::RefreshFeed(*id))
+            .send(TaskManagerCommand::RefreshFeed {
+                feed_id: *id,
+                manual: true,
+            })
             .await
         {
             event!(
