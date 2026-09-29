@@ -330,7 +330,7 @@ pub(crate) async fn refresh_feed(
         enqueue_favicon_caching(task_tx, metrics, feed_id);
     }
     clear_feed_error(&conn, feed_id);
-    info!(
+    debug!(
         "{} refreshed with {} entries, {} new; next fetch {}",
         rec.label,
         entry_count,
@@ -504,7 +504,7 @@ fn record_fetch_reply(
                     feed_id,
                 ],
             )?;
-            info!("{} was not modified; next fetch {}", rec.label, schedule);
+            debug!("{} was not modified; next fetch {}", rec.label, schedule);
             metrics.record_feed_cache_hit("not_modified");
             metrics.record_feed_retry_scheduled("cache_hint", (next_fetch_at - now_ts) as f64);
             rec.outcome("not_modified");
