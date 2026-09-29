@@ -143,8 +143,8 @@ pub struct AssetCacheSettings {
 #[serde(deny_unknown_fields)]
 pub struct RetentionSettings {
     /// Entries are deleted once their feed has stopped listing them for
-    /// more than this many days; entries still in their feed are never
-    /// deleted. `None` keeps entries forever.
+    /// more than this many days; entries still in their feed, and entries
+    /// tagged `system:saved`, are never deleted. `None` keeps entries forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_age_days: Option<i64>,
 }

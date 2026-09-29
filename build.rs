@@ -22,7 +22,7 @@ mod default_plugins {
 
     /// Plugins, by directory name under `plugins/`, that Kiki installs by
     /// default.
-    const DEFAULT_PLUGINS: &[&str] = &["filter", "strip-tracking"];
+    const DEFAULT_PLUGINS: &[&str] = &["auto-tag", "filter", "strip-tracking"];
 
     /// How deep inside a plugin directory files are bundled. Matches the depth
     /// the server looks for source files at.

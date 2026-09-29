@@ -1,0 +1,76 @@
+name = "auto-tag"
+version = "1.0.0"
+engine = "lua"
+description = "Tag entries whose fields match regular expressions, or that come from given feeds"
+license = "MIT"
+homepage = "https://github.com/kernelmethod/kiki-rss"
+
+# Each rule adds its `tag` to the entries it matches: entries whose fields
+# match its `pattern`, from its `feeds`, or both, when it has both. A rule's
+# `feeds` names feeds by id, or by the URL they are fetched from. See
+# main.lua for every setting.
+#
+# The rules are empty by default. Set them in the web UI or with, for
+# example, `kiki plugin config set auto-tag rules.toml`, where rules.toml
+# holds:
+#
+#     [[rules]]                 # tag every entry from these feeds
+#     tag = "security"
+#     feeds = [3, "https://example.com/feed.xml"]
+#
+#     [[rules]]                 # tag matching entries from any feed
+#     tag = "rust"
+#     fields = ["title", "categories"]
+#     pattern = '\brust\b'
+#     flags = "i"
+[config]
+rules = []
+rescan = true
+
+[[settings]]
+name = "rules"
+type = "list"
+label = "Rules"
+description = "Entries matching a rule get its tag. A rule needs a pattern, feeds, or both."
+
+[settings.items]
+type = "object"
+
+[[settings.items.fields]]
+name = "tag"
+type = "string"
+required = true
+label = "Tag"
+description = "The tag to add: a user tag, or a system tag such as system:saved."
+
+[[settings.items.fields]]
+name = "pattern"
+type = "string"
+label = "Pattern"
+description = "A regular expression, in the syntax of kiki.regex. Leave empty to tag every entry from the rule's feeds."
+
+[[settings.items.fields]]
+name = "flags"
+type = "string"
+label = "Flags"
+description = "kiki.regex flags, such as \"i\" for case-insensitive."
+
+[[settings.items.fields]]
+name = "fields"
+type = "list"
+items = { type = "choice", choices = ["title", "url", "content", "authors", "categories", "guid"] }
+label = "Fields"
+description = "The entry fields to match the pattern against. None ticked means title and content."
+
+[[settings.items.fields]]
+name = "feeds"
+type = "list"
+items = { type = "feed" }
+label = "Feeds"
+description = "The feeds the rule applies to, each by its id or the URL it is fetched from. Leave empty for every feed."
+
+[[settings]]
+name = "rescan"
+type = "boolean"
+label = "Rescan stored entries"
+description = "Apply the rules to the entries already stored whenever they change."
