@@ -303,7 +303,7 @@ existing home directory too, and updates it when a new release of Kiki bundles
 a new version, unless its files have been edited. It also installs
 `plugins/strip-tracking`, which uses `entry.ingest` to remove tracking
 parameters such as `utm_source` from entries' URLs and the links in their
-content, and `plugins/auto-tag`, which tags entries that match regular
+content, and tracking pixels from their content, and `plugins/auto-tag`, which tags entries that match regular
 expressions or come from given feeds.
 
 ## Events

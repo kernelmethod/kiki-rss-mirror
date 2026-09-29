@@ -58,7 +58,7 @@ fn the_manifest_is_valid() {
     let manifest = crate::plugins::PluginManifest::parse(MANIFEST).unwrap();
     assert_eq!(manifest.name, "strip-tracking");
     let names: Vec<_> = manifest.settings.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["params", "content"]);
+    assert_eq!(names, ["params", "content", "pixels", "trackers"]);
     crate::plugins::settings::check_config(&manifest.settings, &manifest.config).unwrap();
 }
 
@@ -183,6 +183,131 @@ fn bad_params_fail_to_load() {
         json!({"params": [""]}),
         json!({"params": ["*"]}),
         json!({"params": [3]}),
+    ] {
+        let err = plugin(config.clone()).err().unwrap().to_string();
+        assert!(err.contains("strip-tracking: "), "{config}: {err}");
+    }
+}
+
+#[test]
+fn images_declared_one_pixel_or_smaller_are_removed() {
+    let runner = default_plugin();
+    let cases = [
+        r#"<img src="https://example.com/p.gif" width="1" height="1">"#,
+        r#"<img src="https://example.com/p.gif" width="1" height="1" />"#,
+        r#"<IMG SRC='https://example.com/p.gif' HEIGHT='1' WIDTH='1'>"#,
+        r#"<img src=https://example.com/p.gif width=1 height=1>"#,
+        r#"<img width="0" height="0" src="https://example.com/p.gif">"#,
+        r#"<img src="https://example.com/p.gif" width="1px" height=" 1 ">"#,
+        r#"<img alt="a > b" width="1" height="1" src="https://example.com/p.gif">"#,
+        "<img\n  src=\"https://example.com/p.gif\"\n  width=\"1\"\n  height=\"1\"\n>",
+    ];
+    for pixel in cases {
+        let content = format!("<p>Before</p>{pixel}<p>After</p>");
+        assert_eq!(
+            clean_content(&runner, &content),
+            "<p>Before</p><p>After</p>",
+            "{pixel}"
+        );
+    }
+}
+
+#[test]
+fn other_images_are_kept() {
+    let runner = default_plugin();
+    for image in [
+        r#"<img src="https://example.com/photo.jpg">"#,
+        r#"<img src="https://example.com/photo.jpg" width="640" height="480">"#,
+        // A one-pixel-tall rule is not a tracker unless both sides are tiny.
+        r#"<img src="https://example.com/rule.png" width="600" height="1">"#,
+        r#"<img src="https://example.com/photo.jpg" width="1">"#,
+        r#"<img src="https://example.com/photo.jpg" data-width="1" data-height="1">"#,
+        r#"<img src="https://miro.medium.com/photo.jpg">"#,
+        r#"<img src="https://medium.com/photo.jpg">"#,
+        r#"<img src="https://notpixel.wp.com/b.gif">"#,
+        r#"<img src="https://feeds.feedburner.com/~ff/Example?d=x">"#,
+        r#"<img src="/b.gif?host=pixel.wp.com">"#,
+        r#"<imgx width="1" height="1">"#,
+        // Left unclosed, the tag is not touched.
+        r#"<img width="1" height="1""#,
+    ] {
+        assert_eq!(clean_content(&runner, image), image);
+    }
+}
+
+#[test]
+fn images_from_trackers_are_removed() {
+    let runner = default_plugin();
+    for pixel in [
+        r#"<img src="https://pixel.wp.com/b.gif?host=example.com&amp;blog=1" alt="">"#,
+        r#"<img src="//stats.wordpress.com/b.gif">"#,
+        r#"<img src="http://PIXEL.WP.COM./b.gif">"#,
+        r#"<img src="https://pixel.wp.com:443/b.gif">"#,
+        r#"<img src="https://feeds.feedburner.com/~r/Example/~4/abc123">"#,
+        r#"<img src="https://medium.com/_/stat?event=post.clientViewed">"#,
+        r#"<img src="https://www.google-analytics.com/collect?v=1">"#,
+        r#"<img src="https://google-analytics.com/collect?v=1">"#,
+        r#"<img src="https://sb.scorecardresearch.com/p?c1=2">"#,
+    ] {
+        assert_eq!(
+            clean_content(&runner, &format!("a{pixel}b")),
+            "ab",
+            "{pixel}"
+        );
+    }
+}
+
+#[test]
+fn pixels_can_be_left_alone() {
+    let runner = plugin(json!({"params": ["utm_*"], "pixels": false})).unwrap();
+    let content = r#"<img src="https://pixel.wp.com/b.gif?utm_source=x" width="1" height="1">"#;
+    assert_eq!(
+        clean_content(&runner, content),
+        r#"<img src="https://pixel.wp.com/b.gif" width="1" height="1">"#
+    );
+
+    // Pixels are removed even when links are left alone.
+    let runner = plugin(json!({"params": [], "content": false})).unwrap();
+    assert_eq!(
+        clean_content(&runner, r#"x<img src="a.gif" width="1" height="1">"#),
+        "x"
+    );
+}
+
+#[test]
+fn trackers_can_be_configured() {
+    let runner = plugin(json!({
+        "params": [],
+        "trackers": ["Tracker.Example", "*.ads.example/px", "cdn.example/t/"],
+    }))
+    .unwrap();
+    for (image, removed) in [
+        (r#"<img src="https://tracker.example/x.gif">"#, true),
+        (r#"<img src="https://www.tracker.example/x.gif">"#, false),
+        (r#"<img src="https://ads.example/px?id=1">"#, true),
+        (r#"<img src="https://eu.ads.example/px/1.gif">"#, true),
+        (r#"<img src="https://eu.ads.example/photo.jpg">"#, false),
+        (r#"<img src="https://cdn.example/t/1.gif">"#, true),
+        (r#"<img src="https://cdn.example/T/1.gif">"#, false),
+        (r#"<img src="https://pixel.wp.com/b.gif">"#, false),
+    ] {
+        let expected = if removed { "" } else { image };
+        assert_eq!(clean_content(&runner, image), expected, "{image}");
+    }
+}
+
+#[test]
+fn bad_trackers_fail_to_load() {
+    for config in [
+        json!({"trackers": "pixel.wp.com"}),
+        json!({"trackers": [""]}),
+        json!({"trackers": ["*."]}),
+        json!({"trackers": ["*"]}),
+        json!({"trackers": ["https://pixel.wp.com/"]}),
+        json!({"trackers": ["pixel.wp.com:443"]}),
+        json!({"trackers": ["a*.example"]}),
+        json!({"trackers": ["example.com/a b"]}),
+        json!({"trackers": [3]}),
     ] {
         let err = plugin(config.clone()).err().unwrap().to_string();
         assert!(err.contains("strip-tracking: "), "{config}: {err}");

@@ -143,14 +143,18 @@ Kiki also ships a `strip-tracking` plugin, in
 [`plugins/strip-tracking`](plugins/strip-tracking), installed by default like
 `filter`. It removes tracking parameters, such as `utm_source`, `fbclid` and
 `gclid`, from the query strings (and query-like fragments, such as
-`#xtor=RSS-1`) of new entries' URLs, and of the links in their content. It only
-cleans entries as they are downloaded, not the ones already stored. To strip
-other parameters, or to leave entries' content alone:
+`#xtor=RSS-1`) of new entries' URLs, and of the links in their content. It
+also removes tracking pixels from their content: images declared 1×1 or
+smaller, and images from known trackers, such as WordPress.com's stats and
+FeedBurner, so that Kiki never downloads them. It only cleans entries as they
+are downloaded, not the ones already stored. To strip other parameters or
+trackers, or to leave entries' content alone:
 
 ```bash
 kiki plugin config get strip-tracking --defaults > strip-tracking.toml
-# edit strip-tracking.toml: add names to `params` ("prefix_*" matches a prefix),
-# or set `content = false`
+# edit strip-tracking.toml: add names to `params` ("prefix_*" matches a prefix)
+# or image sources to `trackers` ("*.example.com", "example.com/pixel"),
+# or set `content = false` or `pixels = false`
 kiki plugin config set strip-tracking strip-tracking.toml
 ```
 
