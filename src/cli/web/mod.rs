@@ -50,7 +50,8 @@ static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
 
 /// The script every page runs, inlined into [`PAGE_HTML`]. It powers the
 /// save buttons shown with each entry, the filter menus on lists of entries,
-/// the search box, and the buttons that mark entries as read or delete a tag.
+/// the search box and its popup on narrow screens, and the buttons that mark
+/// entries as read or delete a tag.
 const PAGE_JS: &str = include_str!("page.js");
 
 /// The `script-src` directive that lets pages run [`PAGE_JS`] and nothing
@@ -3534,6 +3535,25 @@ mod tests {
                 "{path}: {body}"
             );
         }
+        Ok(())
+    }
+
+    /// On narrow screens the nav has a button that opens the search box in
+    /// a popup instead; the popup's box is filled in with the search too.
+    #[tokio::test]
+    async fn the_search_box_has_a_popup_for_narrow_screens() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let (_, body) = get_page(tc.client()?, "/search?q=rust").await?;
+        assert!(
+            body.contains(r#"<button type="button" class="search-open""#),
+            "{body}"
+        );
+        assert!(body.contains(r#"<dialog class="search-dialog""#), "{body}");
+        assert_eq!(
+            body.matches(r#"name="q" value="rust""#).count(),
+            2,
+            "{body}"
+        );
         Ok(())
     }
 
