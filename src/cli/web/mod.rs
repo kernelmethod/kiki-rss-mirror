@@ -49,7 +49,8 @@ static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// The script every page runs, inlined into [`PAGE_HTML`]. It powers the
-/// save buttons shown with each entry, and the filter menus on lists of entries.
+/// save buttons shown with each entry, the filter menus on lists of entries,
+/// and the buttons that mark entries as read or delete a tag.
 const PAGE_JS: &str = include_str!("page.js");
 
 /// The `script-src` directive that lets pages run [`PAGE_JS`] and nothing
@@ -228,7 +229,7 @@ async fn serve_ui(
         .route("/feeds", get(feeds_page))
         .route("/feeds/{id}", get(feed_page))
         .route("/tags", get(tags_page))
-        .route("/tags/{id}", get(tag_page))
+        .route("/tags/{id}", get(tag_page).delete(delete_tag))
         .route("/plugins", get(plugins_page))
         .route("/plugins/{name}", get(plugin_page))
         .route("/plugins/{name}/config", post(update_plugin_config))
@@ -727,6 +728,49 @@ async fn tag_page(
         &format!("{} - Kiki", tag.name),
         &render_tag_page(&tag, &entries, &feeds, &tags, listing),
     )
+}
+
+/// Delete user tag `id`, responding with `204 No Content` once it is done.
+/// Called by the delete button on the tag's page, whose script then goes
+/// back to the list of tags.
+///
+/// System tags cannot be deleted: the Kiki API refuses to, and this passes
+/// its `403 Forbidden` on. Also responds with `404 Not Found` if there is
+/// no such tag, `502 Bad Gateway` if the Kiki server cannot delete it, and
+/// `403 Forbidden` to requests from other sites, going by `headers`; see
+/// [`is_same_origin`].
+async fn delete_tag(
+    State(api): State<reqwest::Client>,
+    UrlPath(id): UrlPath<i64>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_same_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "Tags may only be deleted from the web UI's own pages.",
+        )
+            .into_response();
+    }
+
+    let resp = api
+        .delete(format!("{API_BASE}/v1/tags/id/{id}"))
+        .send()
+        .await;
+    match resp.map(|resp| resp.status()) {
+        Ok(StatusCode::NO_CONTENT) => StatusCode::NO_CONTENT.into_response(),
+        Ok(StatusCode::NOT_FOUND) => (StatusCode::NOT_FOUND, "Tag not found.").into_response(),
+        Ok(StatusCode::FORBIDDEN) => {
+            (StatusCode::FORBIDDEN, "System tags cannot be deleted.").into_response()
+        }
+        Ok(status) => {
+            tracing::warn!(%status, tag_id = id, "failed to delete tag");
+            (StatusCode::BAD_GATEWAY, "The tag could not be deleted.").into_response()
+        }
+        Err(e) => {
+            tracing::warn!("failed to reach the Kiki server: {e:#}");
+            (StatusCode::BAD_GATEWAY, "The Kiki server is unavailable.").into_response()
+        }
+    }
 }
 
 /// Render the list of installed plugins, and of the directories in the
@@ -1734,9 +1778,9 @@ fn render_tag_list(resp: &ListTagsResponse, page: u32) -> String {
     html
 }
 
-/// Render the page for `tag`: its name, and the entries on this page of
-/// `listing`, each with the title of its feed from `feeds` and its tags
-/// from `tags`.
+/// Render the page for `tag`: its name, a button that deletes it if it is a
+/// user tag, and the entries on this page of `listing`, each with the title
+/// of its feed from `feeds` and its tags from `tags`.
 fn render_tag_page(
     tag: &TagResponse,
     entries: &EntryPage,
@@ -1745,9 +1789,10 @@ fn render_tag_page(
     listing: Listing,
 ) -> String {
     let mut html = format!(
-        "<h2>Entries tagged <span {}>{}</span></h2>\n",
+        "<div class=\"title-row\">\n<h2>Entries tagged <span {}>{}</span></h2>\n{}</div>\n",
         tag_attrs(tag),
-        escape(tag_label(tag))
+        escape(tag_label(tag)),
+        render_delete_tag_button(tag),
     );
     html.push_str(&render_entries(
         entries.count,
@@ -1758,6 +1803,21 @@ fn render_tag_page(
     ));
     html.push_str("<p><a href=\"/tags\">&larr; Back to tags</a></p>\n");
     html
+}
+
+/// Render the button that deletes `tag`, or nothing for a system tag, which
+/// cannot be deleted. The button does nothing on its own: the script in
+/// `page.js` asks to confirm, then sends the request to [`delete_tag`].
+fn render_delete_tag_button(tag: &TagResponse) -> String {
+    match tag.kind {
+        TagKind::System => String::new(),
+        TagKind::User => format!(
+            "<button type=\"button\" class=\"delete-tag\" data-tag=\"{}\" \
+             data-name=\"{}\">Delete tag</button>\n",
+            tag.id,
+            escape(&tag.name)
+        ),
+    }
 }
 
 /// Render the plugin count, each plugin in `resp` with what its manifest
@@ -2825,6 +2885,85 @@ mod tests {
         );
 
         let (status, _) = get_page(tc.client()?, "/tags/999").await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    /// A user tag's page has a button that deletes the tag; a system tag's
+    /// page has none.
+    #[tokio::test]
+    async fn only_user_tag_pages_have_a_delete_button() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 1)?;
+        tag_entry(&tc, 1, "<b>news</b>")?;
+        let conn = tc.database_conn()?;
+        let id: i64 = conn.query_row(
+            "SELECT id FROM tags WHERE name = '<b>news</b>'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let (status, body) = get_page(tc.client()?, &format!("/tags/{id}")).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(&format!(
+                r#"<button type="button" class="delete-tag" data-tag="{id}" data-name="&lt;b&gt;news&lt;/b&gt;">Delete tag</button>"#
+            )),
+            "{body}"
+        );
+
+        for tag in SystemTag::ALL {
+            let id = tag.id(&conn)?;
+            let (status, body) = get_page(tc.client()?, &format!("/tags/{id}")).await?;
+            assert_eq!(status, StatusCode::OK);
+            assert!(!body.contains(r#"class="delete-tag""#), "{body}");
+        }
+        Ok(())
+    }
+
+    /// `DELETE /tags/{id}` deletes a user tag, but not a system tag;
+    /// requests from other sites are refused.
+    #[tokio::test]
+    async fn user_tags_can_be_deleted() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 1)?;
+        tag_entry(&tc, 1, "tech")?;
+        let conn = tc.database_conn()?;
+        let tag_exists = |name: &str| -> Result<bool> {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tags WHERE name = ?1)",
+                [name],
+                |row| row.get(0),
+            )?)
+        };
+        let id: i64 = conn.query_row("SELECT id FROM tags WHERE name = 'tech'", [], |row| {
+            row.get(0)
+        })?;
+        let path = format!("/tags/{id}");
+        let delete = reqwest::Method::DELETE;
+
+        for headers in [
+            &[("Sec-Fetch-Site", "cross-site")][..],
+            &[("Origin", "http://evil.example")],
+        ] {
+            let status = send_request(tc.client()?, delete.clone(), &path, headers).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{headers:?}");
+        }
+        assert!(tag_exists("tech")?);
+
+        let same_origin = [("Sec-Fetch-Site", "same-origin")];
+        for tag in SystemTag::ALL {
+            let path = format!("/tags/{}", tag.id(&conn)?);
+            let status = send_request(tc.client()?, delete.clone(), &path, &same_origin).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{tag}");
+            assert!(tag_exists(tag.name())?);
+        }
+
+        let status = send_request(tc.client()?, delete.clone(), &path, &same_origin).await?;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!tag_exists("tech")?);
+
+        let status = send_request(tc.client()?, delete, &path, &same_origin).await?;
         assert_eq!(status, StatusCode::NOT_FOUND);
         Ok(())
     }

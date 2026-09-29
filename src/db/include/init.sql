@@ -36,6 +36,15 @@ INSERT INTO tags (name, kind) VALUES
     ('system:saved', 'system'),
     ('system:hidden', 'system');
 
+-- System tags cannot be deleted, whichever way the deletion is attempted:
+-- through the API, a plugin, or SQL run directly against the database.
+CREATE TRIGGER protect_system_tags
+BEFORE DELETE ON tags
+WHEN OLD.kind = 'system'
+BEGIN
+    SELECT RAISE(ABORT, 'system tags cannot be deleted');
+END;
+
 -- Per-plugin state kept by Kiki, keyed by plugin name. Plugins themselves
 -- live on disk; see src/plugins/mod.rs. `config` holds the plugin's config
 -- overrides, a JSON object whose keys replace those of the defaults in the

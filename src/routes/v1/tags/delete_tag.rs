@@ -50,7 +50,7 @@ pub async fn delete_tag(
             Err(e) => return Err(e),
         }
 
-        conn.prepare("DELETE FROM tags WHERE id = ?1")
+        conn.prepare("DELETE FROM tags WHERE id = ?1 AND kind = 'user'")
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
