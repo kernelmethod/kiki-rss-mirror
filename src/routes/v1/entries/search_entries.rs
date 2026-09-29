@@ -45,6 +45,8 @@ pub enum TagExpr {
 pub struct SearchEntriesRequest {
     /// Tag filter expression. Supports AND/OR combinations.
     pub tags: Option<TagFilter>,
+    /// Only match entries from the feed with this ID.
+    pub feed_id: Option<i64>,
     /// Lower bound for published_at (inclusive), RFC3339 string.
     pub published_after: Option<String>,
     /// Upper bound for published_at (exclusive), RFC3339 string.
@@ -268,8 +270,10 @@ fn validate_regex(pattern: &str) -> Result<(), SearchEntriesError> {
 
 /// Search entries
 ///
-/// Search for entries using tag filters, date ranges, GLOB patterns,
-/// full-text search, and regex filters.
+/// Search for entries using tag filters, the feed they came from, date
+/// ranges, GLOB patterns, full-text search, and regex filters. Entries are
+/// sorted newest first unless sorted by relevance; entries with the same
+/// publication time are ordered by descending ID.
 /// Uses POST because the tag query requires a structured expression.
 #[utoipa::path(
     post,
@@ -348,6 +352,13 @@ pub async fn search_entries(
             next_idx = new_idx;
         }
 
+        // Feed filter
+        if let Some(feed_id) = payload.feed_id {
+            conditions.push(format!("e.feed_id = ?{}", next_idx));
+            params.push(SqlParam::from_i64(feed_id));
+            next_idx += 1;
+        }
+
         // Date filters
         if let Some(ref after) = payload.published_after {
             let ts = parse_rfc3339_to_timestamp(after)?;
@@ -423,11 +434,11 @@ pub async fn search_entries(
             let order = if sort == "relevance" {
                 "bm25(entries_fts)".to_string()
             } else {
-                "e.published_at DESC".to_string()
+                "e.published_at DESC, e.id DESC".to_string()
             };
             ("bm25(entries_fts)", order)
         } else {
-            ("NULL", "e.published_at DESC".to_string())
+            ("NULL", "e.published_at DESC, e.id DESC".to_string())
         };
 
         // Data query
