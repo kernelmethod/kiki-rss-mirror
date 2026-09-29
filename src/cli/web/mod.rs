@@ -50,7 +50,7 @@ static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
 
 /// The script every page runs, inlined into [`PAGE_HTML`]. It powers the
 /// save buttons shown with each entry, the filter menus on lists of entries,
-/// and the buttons that mark entries as read or delete a tag.
+/// the search box, and the buttons that mark entries as read or delete a tag.
 const PAGE_JS: &str = include_str!("page.js");
 
 /// The `script-src` directive that lets pages run [`PAGE_JS`] and nothing
@@ -230,6 +230,7 @@ async fn serve_ui(
         .route("/feeds/{id}", get(feed_page))
         .route("/tags", get(tags_page))
         .route("/tags/{id}", get(tag_page).delete(delete_tag))
+        .route("/search", get(search_page))
         .route("/plugins", get(plugins_page))
         .route("/plugins/{name}", get(plugin_page))
         .route("/plugins/{name}/config", post(update_plugin_config))
@@ -244,7 +245,7 @@ async fn serve_ui(
 /// Number of entries, or feeds, shown on each page of a list.
 const PAGE_SIZE: u32 = 25;
 
-/// Query parameters accepted by the index, feed and entry pages.
+/// Query parameters accepted by the index, feed, search and entry pages.
 #[derive(Deserialize)]
 struct PageParams {
     /// The page of entries to show, or to link back to, counting from 1
@@ -259,6 +260,12 @@ struct PageParams {
     /// Also list entries tagged `system:read`, which are left out by
     /// default; on an entry page, whether the list it links back to does.
     show_read: Option<bool>,
+    /// On the search page, what to search for; on an entry page, the search
+    /// whose results to link back to, rather than the index.
+    q: Option<String>,
+    /// How search results are sorted: `newest` first, or by best match
+    /// (the default).
+    sort: Option<String>,
 }
 
 impl PageParams {
@@ -271,9 +278,20 @@ impl PageParams {
         Listing {
             feed: self.feed,
             tag: self.tag,
+            search: self.search(),
             page: self.page(),
             show_read: self.show_read(),
         }
+    }
+
+    /// The search given by the `q` and `sort` parameters, or `None` if `q`
+    /// is missing or blank.
+    fn search(&self) -> Option<Search> {
+        let query = self.q.as_deref()?.trim();
+        (!query.is_empty()).then(|| Search {
+            query: query.to_owned(),
+            newest: self.sort.as_deref() == Some("newest"),
+        })
     }
 
     fn show_read(&self) -> bool {
@@ -281,28 +299,54 @@ impl PageParams {
     }
 }
 
-/// A page of a list of entries: of the index, of a feed's page, or of a
-/// tag's page. Entry pages link back to the listing they were opened from.
-#[derive(Clone, Copy)]
+/// A page of a list of entries: of the index, of a feed's page, of a tag's
+/// page, or of search results. Entry pages link back to the listing they
+/// were opened from.
+#[derive(Clone)]
 struct Listing {
     /// The feed whose entries are listed, or `None` for the index.
     feed: Option<i64>,
-    /// The tag whose entries are listed, or `None` for the index. At most
-    /// one of `feed` and `tag` is set.
+    /// The tag whose entries are listed, or `None` for the index.
     tag: Option<i64>,
+    /// The search whose results are listed, or `None` for the index. At
+    /// most one of `feed`, `tag` and `search` is set.
+    search: Option<Search>,
     /// The page of the list, counting from 1.
     page: u32,
-    /// Whether entries tagged `system:read` are listed.
+    /// Whether entries tagged `system:read` are listed. Search results
+    /// always list them, whatever this says.
     show_read: bool,
+}
+
+/// A full-text search of the entries, as typed into the search box.
+#[derive(Clone)]
+struct Search {
+    /// What was searched for, trimmed and never empty. See [`fts_query`]
+    /// for how it is understood.
+    query: String,
+    /// Whether results are sorted newest first, rather than by best match.
+    newest: bool,
+}
+
+impl Search {
+    /// The query parameters that give this search, already encoded.
+    fn query_params(&self) -> Vec<String> {
+        let mut query = vec![format!("q={}", encode_path_segment(&self.query))];
+        if self.newest {
+            query.push("sort=newest".to_owned());
+        }
+        query
+    }
 }
 
 impl Listing {
     /// The path of the list, without a page.
     fn path(&self) -> String {
-        match (self.feed, self.tag) {
-            (Some(id), _) => format!("/feeds/{id}"),
-            (None, Some(id)) => format!("/tags/{id}"),
-            (None, None) => "/".to_owned(),
+        match (self.feed, self.tag, &self.search) {
+            (Some(id), _, _) => format!("/feeds/{id}"),
+            (None, Some(id), _) => format!("/tags/{id}"),
+            (None, None, Some(_)) => "/search".to_owned(),
+            (None, None, None) => "/".to_owned(),
         }
     }
 
@@ -317,6 +361,20 @@ impl Listing {
         self.list_href(Some(page), self.show_read)
     }
 
+    /// The URL of the first page of these search results, sorted newest
+    /// first if `newest` or by best match if not, escaped for use in an
+    /// attribute.
+    fn sort_href(&self, newest: bool) -> String {
+        let listing = Listing {
+            search: self
+                .search
+                .clone()
+                .map(|search| Search { newest, ..search }),
+            ..self.clone()
+        };
+        listing.list_href(None, listing.show_read)
+    }
+
     /// The URL of the first page of the list with read entries shown or
     /// not, the other way from this one, escaped for use in an attribute.
     fn toggle_read_href(&self) -> String {
@@ -327,10 +385,13 @@ impl Listing {
     /// listing read entries if `show_read`, escaped for use in an attribute.
     fn list_href(&self, page: Option<usize>, show_read: bool) -> String {
         let mut query = Vec::new();
+        if let Some(search) = &self.search {
+            query.extend(search.query_params());
+        }
         if let Some(page) = page {
             query.push(format!("page={page}"));
         }
-        if show_read {
+        if show_read && self.search.is_none() {
             query.push("show_read=true".to_owned());
         }
         with_query(self.path(), &query)
@@ -346,10 +407,13 @@ impl Listing {
         if let Some(tag) = self.tag {
             query.push(format!("tag={tag}"));
         }
+        if let Some(search) = &self.search {
+            query.extend(search.query_params());
+        }
         if self.page > 1 {
             query.push(format!("page={}", self.page));
         }
-        if self.show_read {
+        if self.show_read && self.search.is_none() {
             query.push("show_read=true".to_owned());
         }
         with_query(format!("/entries/{id}"), &query)
@@ -372,6 +436,12 @@ fn render_page(status: StatusCode, title: &str, content: &str) -> Response {
     render_page_with_csp(status, title, content, &CONTENT_SECURITY_POLICY)
 }
 
+/// [`render_page`], for a page of search results: the search box in the
+/// layout is filled in with `query`, what was searched for.
+fn render_search_page(status: StatusCode, title: &str, query: &str, content: &str) -> Response {
+    render_layout(status, title, query, content, &CONTENT_SECURITY_POLICY)
+}
+
 /// [`render_page`], for a page with forms: the page is sent with
 /// [`FORM_CONTENT_SECURITY_POLICY`], so that its forms can be submitted.
 fn render_form_page(status: StatusCode, title: &str, content: &str) -> Response {
@@ -380,10 +450,25 @@ fn render_form_page(status: StatusCode, title: &str, content: &str) -> Response 
 
 /// [`render_page`], sent with the `Content-Security-Policy` `csp`.
 fn render_page_with_csp(status: StatusCode, title: &str, content: &str, csp: &str) -> Response {
+    render_layout(status, title, "", content, csp)
+}
+
+/// Fill the layout in [`PAGE_HTML`] with `title` and `query` (plain text,
+/// which is escaped; `query` goes in the search box) and `content` (HTML),
+/// and wrap it in a response with `status`, sent with the
+/// `Content-Security-Policy` `csp`.
+fn render_layout(
+    status: StatusCode,
+    title: &str,
+    query: &str,
+    content: &str,
+    csp: &str,
+) -> Response {
     // Fill every placeholder in one pass, so that a placeholder appearing in
     // a feed's title or content is left alone.
     let html = PLACEHOLDER.replace_all(PAGE_HTML, |caps: &regex::Captures| match &caps[1] {
         "title" => escape(title).into_owned(),
+        "query" => escape(query).into_owned(),
         "version" => env!("CARGO_PKG_VERSION").to_owned(),
         "content" => content.to_owned(),
         "script" => PAGE_JS.to_owned(),
@@ -425,9 +510,10 @@ async fn index(State(api): State<reqwest::Client>, Query(params): Query<PagePara
     let listing = Listing {
         feed: None,
         tag: None,
+        search: None,
         ..params.listing()
     };
-    match fetch_entries(&api, listing, None).await {
+    match fetch_entries(&api, &listing, None).await {
         Ok(entries) => {
             let (feeds, tags) = tokio::join!(
                 fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)),
@@ -436,7 +522,7 @@ async fn index(State(api): State<reqwest::Client>, Query(params): Query<PagePara
             render_page(
                 StatusCode::OK,
                 "Kiki",
-                &render_entries(entries.count, &entries.entries, &feeds, &tags, listing),
+                &render_entries(entries.count, &entries.entries, &feeds, &tags, &listing),
             )
         }
         Err(e) => server_unavailable(&e),
@@ -461,7 +547,7 @@ async fn entry_page(
                 "Entry not found - Kiki",
                 &format!(
                     "<p>Entry not found.</p>\n{}",
-                    render_back_link(params.listing())
+                    render_back_link(&params.listing())
                 ),
             )
         }
@@ -488,7 +574,7 @@ async fn entry_page(
             feed_title.as_deref(),
             &tags,
             &cached,
-            params.listing(),
+            &params.listing(),
         ),
     )
 }
@@ -648,6 +734,7 @@ async fn feed_page(
     let listing = Listing {
         feed: Some(id),
         tag: None,
+        search: None,
         ..params.listing()
     };
     let not_found = || {
@@ -658,7 +745,7 @@ async fn feed_page(
         )
     };
 
-    let (feed, entries) = tokio::join!(fetch_feed(&api, id), fetch_entries(&api, listing, None));
+    let (feed, entries) = tokio::join!(fetch_feed(&api, id), fetch_entries(&api, &listing, None));
     let feed = match feed {
         Ok(Some(feed)) => feed,
         Ok(None) => return not_found(),
@@ -673,7 +760,7 @@ async fn feed_page(
     render_page(
         StatusCode::OK,
         &format!("{} - Kiki", display_feed_title(&feed.title)),
-        &render_feed_page(&feed, &entries, &tags, listing),
+        &render_feed_page(&feed, &entries, &tags, &listing),
     )
 }
 
@@ -701,6 +788,7 @@ async fn tag_page(
     let listing = Listing {
         feed: None,
         tag: Some(id),
+        search: None,
         ..params.listing()
     };
     let tag = match fetch_tag(&api, id).await {
@@ -714,7 +802,7 @@ async fn tag_page(
         }
         Err(e) => return server_unavailable(&e),
     };
-    let entries = match fetch_entries(&api, listing, Some(&tag.name)).await {
+    let entries = match fetch_entries(&api, &listing, Some(&tag.name)).await {
         Ok(entries) => entries,
         Err(e) => return server_unavailable(&e),
     };
@@ -726,8 +814,101 @@ async fn tag_page(
     render_page(
         StatusCode::OK,
         &format!("{} - Kiki", tag.name),
-        &render_tag_page(&tag, &entries, &feeds, &tags, listing),
+        &render_tag_page(&tag, &entries, &feeds, &tags, &listing),
     )
+}
+
+/// Render the search page: one page of the entries matching the `q` query
+/// parameter, best match first, or newest first if the `sort` parameter is
+/// `newest`. Read entries are listed too, but hidden ones are not. With no
+/// `q`, the page only asks what to search for.
+async fn search_page(
+    State(api): State<reqwest::Client>,
+    Query(params): Query<PageParams>,
+) -> Response {
+    let listing = Listing {
+        feed: None,
+        tag: None,
+        ..params.listing()
+    };
+    let Some(search) = &listing.search else {
+        return render_page(
+            StatusCode::OK,
+            "Search - Kiki",
+            &format!("<h2>Search</h2>\n{}", render_search_help()),
+        );
+    };
+    let entries = match fetch_entries(&api, &listing, None).await {
+        Ok(entries) => entries,
+        Err(e) => return server_unavailable(&e),
+    };
+
+    let (feeds, tags) = tokio::join!(
+        fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)),
+        fetch_entry_tags(&api, entries.entries.iter().map(|e| e.id)),
+    );
+    render_search_page(
+        StatusCode::OK,
+        &format!("{} - Search - Kiki", search.query),
+        &search.query,
+        &format!(
+            "<h2>Search results for &ldquo;{}&rdquo;</h2>\n{}{}",
+            escape(&search.query),
+            render_entries(entries.count, &entries.entries, &feeds, &tags, &listing),
+            render_search_help(),
+        ),
+    )
+}
+
+/// Render the note on the search page explaining how searches are
+/// understood; see [`fts_query`].
+fn render_search_help() -> &'static str {
+    "<p class=\"hint\">Entries match when every word appears in their title, \
+     content or URL. Put words in &quot;quotes&quot; to match them as a phrase, \
+     and end a word with * to match any word starting with it.</p>\n"
+}
+
+/// Turn `input`, as typed into the search box, into an FTS5 query for the
+/// Kiki API, or `None` if it has no words to search for.
+///
+/// Rather than letting FTS5's own query syntax through — where a stray
+/// quote, a hyphen or an apostrophe is a syntax error — every word becomes
+/// its own quoted string, so that entries must contain all of them. Text in
+/// double quotes is kept together as a phrase, and a `*` after a word or
+/// phrase makes it match as a prefix. Words with no letters or digits are
+/// dropped, since FTS5 would find nothing in them to match.
+fn fts_query(input: &str) -> Option<String> {
+    let mut terms = Vec::new();
+    let mut chars = input.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut term = String::new();
+        if c == '"' {
+            chars.next();
+            term.extend(chars.by_ref().take_while(|&c| c != '"'));
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() || c == '"' {
+                    break;
+                }
+                term.push(c);
+                chars.next();
+            }
+        }
+        let mut prefix = chars.next_if_eq(&'*').is_some();
+        if let Some(stripped) = term.strip_suffix('*') {
+            term = stripped.to_owned();
+            prefix = true;
+        }
+        if term.chars().any(char::is_alphanumeric) {
+            let star = if prefix { "*" } else { "" };
+            terms.push(format!("\"{}\"{star}", term.replace('"', "\"\"")));
+        }
+    }
+    (!terms.is_empty()).then(|| terms.join(" "))
 }
 
 /// Delete user tag `id`, responding with `204 No Content` once it is done.
@@ -1139,17 +1320,40 @@ struct EntryPage {
 
 /// Fetch the entries on this page of `listing` with `/v1/entries/search`:
 /// the entries of its feed, or with the tag named `tag`, or of every feed,
-/// newest first. Hidden entries are left out, and so are read ones unless
-/// the listing shows them — except on the pages of the `system:hidden` and
+/// newest first; or the entries matching its search, sorted as it asks.
+/// Hidden entries are left out, and so are read ones unless the listing
+/// shows them or is of search results — except on the pages of the `system:hidden` and
 /// `system:read` tags themselves, which would otherwise always be empty.
+///
+/// A search with no words to search for (see [`fts_query`]) matches no
+/// entries, and the Kiki API is not asked.
 async fn fetch_entries(
     api: &reqwest::Client,
-    listing: Listing,
+    listing: &Listing,
     tag: Option<&str>,
 ) -> Result<EntryPage> {
+    let (query, sort) = match &listing.search {
+        Some(search) => match fts_query(&search.query) {
+            Some(query) => (
+                Some(query),
+                if search.newest {
+                    "published_at"
+                } else {
+                    "relevance"
+                },
+            ),
+            None => {
+                return Ok(EntryPage {
+                    count: 0,
+                    entries: Vec::new(),
+                })
+            }
+        },
+        None => (None, "published_at"),
+    };
     let offset = u64::from(listing.page - 1) * u64::from(PAGE_SIZE);
     let mut excluded = vec![SystemTag::Hidden.name()];
-    if !listing.show_read {
+    if !listing.show_read && listing.search.is_none() {
         excluded.push(SystemTag::Read.name());
     }
     excluded.retain(|&name| Some(name) != tag);
@@ -1169,6 +1373,8 @@ async fn fetch_entries(
         .json(&serde_json::json!({
             "tags": tags,
             "feed_id": listing.feed,
+            "query": query,
+            "sort": sort,
             "offset": offset,
             "limit": PAGE_SIZE,
         }))
@@ -1384,7 +1590,9 @@ async fn fetch_entry_tags(
 }
 
 /// Render the entry count (`count`, of all the entries in the list), the
-/// "Mark all as read" button, the filter menu, the entries on this page of `listing`, and the page links.
+/// "Mark all as read" button and the filter menu — or, for search results,
+/// the links that sort them — the entries on this page of `listing`, and the
+/// page links.
 /// `feeds` maps feed
 /// IDs to the titles of the feeds; entries from feeds not in it are shown
 /// without their feed. `tags` maps entry IDs to the entries' tags; entries
@@ -1394,26 +1602,37 @@ fn render_entries(
     entries: &[ListEntriesResponseEntry],
     feeds: &HashMap<i64, String>,
     tags: &HashMap<i64, Vec<TagResponse>>,
-    listing: Listing,
+    listing: &Listing,
 ) -> String {
+    let searching = listing.search.is_some();
     let unread = if listing.show_read { "" } else { "unread " };
+    let (noun, actions) = if searching {
+        (
+            if count == 1 { "result" } else { "results" },
+            render_sort(listing),
+        )
+    } else {
+        (
+            if count == 1 { "entry" } else { "entries" },
+            // Entries can be marked as read in bulk by feed, but not by tag.
+            if count == 0 || listing.tag.is_some() {
+                render_filter(listing)
+            } else {
+                render_mark_read_button(listing.feed) + &render_filter(listing)
+            },
+        )
+    };
     let mut html = format!(
-        "<div class=\"list-header\">\n<p class=\"count\">{count} {unread}{}</p>\n\
-         <div class=\"list-actions\">{}{}</div>\n</div>\n",
-        if count == 1 { "entry" } else { "entries" },
-        // Entries can be marked as read in bulk by feed, but not by tag.
-        if count == 0 || listing.tag.is_some() {
-            String::new()
-        } else {
-            render_mark_read_button(listing.feed)
-        },
-        render_filter(listing),
+        "<div class=\"list-header\">\n<p class=\"count\">{count} {}{noun}</p>\n\
+         <div class=\"list-actions\">{actions}</div>\n</div>\n",
+        if searching { "" } else { unread },
     );
 
     if entries.is_empty() {
-        html.push_str(match (count, listing.show_read) {
-            (0, true) => "<p>No entries yet.</p>\n",
-            (0, false) => "<p>No unread entries.</p>\n",
+        html.push_str(match (count, searching, listing.show_read) {
+            (0, true, _) => "<p>No entries match your search.</p>\n",
+            (0, false, true) => "<p>No entries yet.</p>\n",
+            (0, false, false) => "<p>No unread entries.</p>\n",
             _ => "<p>No entries on this page.</p>\n",
         });
     } else {
@@ -1437,9 +1656,33 @@ fn render_entries(
         count,
         listing.page,
         |page| listing.page_href(page),
-        ("&larr; Newer", "Older &rarr;"),
+        match &listing.search {
+            Some(search) if !search.newest => ("&larr; Previous", "Next &rarr;"),
+            _ => ("&larr; Newer", "Older &rarr;"),
+        },
     ));
     html
+}
+
+/// Render the links that sort a list of search results by best match or
+/// newest first, the way they are sorted now shown without a link.
+fn render_sort(listing: &Listing) -> String {
+    let newest = listing.search.as_ref().is_some_and(|s| s.newest);
+    let option = |label: &str, sorts_newest: bool| {
+        if sorts_newest == newest {
+            format!("<strong aria-current=\"true\">{label}</strong>")
+        } else {
+            format!(
+                "<a href=\"{}\">{label}</a>",
+                listing.sort_href(sorts_newest)
+            )
+        }
+    };
+    format!(
+        "<p class=\"sort\">Sort by {} &middot; {}</p>",
+        option("best match", false),
+        option("newest", true),
+    )
 }
 
 /// Render the filter menu for a list of entries: a checkbox that shows read
@@ -1447,7 +1690,7 @@ fn render_entries(
 /// `listing` with the other setting; the script in `page.js` follows the
 /// checkbox's `data-href`, so that the page needs no form, and the page's
 /// `Content-Security-Policy` can go on forbidding them.
-fn render_filter(listing: Listing) -> String {
+fn render_filter(listing: &Listing) -> String {
     let href = listing.toggle_read_href();
     format!(
         "<details class=\"filter\">\n<summary>Filter</summary>\n<div class=\"menu\">\n\
@@ -1467,7 +1710,7 @@ fn render_entry(
     entry: &ListEntriesResponseEntry,
     feed: Option<&str>,
     tags: &[TagResponse],
-    listing: Listing,
+    listing: &Listing,
 ) -> String {
     let href = listing.entry_href(entry.id);
     let meta = render_meta(
@@ -1574,7 +1817,7 @@ fn render_entry_page(
     feed: Option<&str>,
     tags: &[TagResponse],
     cached: &HashMap<String, String>,
-    listing: Listing,
+    listing: &Listing,
 ) -> String {
     let authors: Vec<&str> = match (&entry.rss, &entry.atom) {
         (Some(rss), _) => rss.author.as_deref().into_iter().collect(),
@@ -1686,11 +1929,12 @@ fn render_entry_page(
 }
 
 /// Render the link back to `listing`.
-fn render_back_link(listing: Listing) -> String {
-    let label = match (listing.feed, listing.tag) {
-        (Some(_), _) => "Back to feed",
-        (None, Some(_)) => "Back to tag",
-        (None, None) => "Back to entries",
+fn render_back_link(listing: &Listing) -> String {
+    let label = match (listing.feed, listing.tag, &listing.search) {
+        (Some(_), _, _) => "Back to feed",
+        (None, Some(_), _) => "Back to tag",
+        (None, None, Some(_)) => "Back to search results",
+        (None, None, None) => "Back to entries",
     };
     format!("<p><a href=\"{}\">&larr; {label}</a></p>\n", listing.href())
 }
@@ -1787,7 +2031,7 @@ fn render_tag_page(
     entries: &EntryPage,
     feeds: &HashMap<i64, String>,
     tags: &HashMap<i64, Vec<TagResponse>>,
-    listing: Listing,
+    listing: &Listing,
 ) -> String {
     let mut html = format!(
         "<div class=\"title-row\">\n<h2>Entries tagged <span {}>{}</span></h2>\n{}</div>\n",
@@ -2191,7 +2435,7 @@ fn render_feed_page(
     feed: &Feed,
     entries: &EntryPage,
     tags: &HashMap<i64, Vec<TagResponse>>,
-    listing: Listing,
+    listing: &Listing,
 ) -> String {
     let mut html = format!(
         "<header class=\"feed-header\">\n<h2>{}{}</h2>\n{}\n",
@@ -3227,6 +3471,178 @@ mod tests {
         Ok(())
     }
 
+    /// What is typed into the search box becomes an FTS5 query that
+    /// cannot be a syntax error: every word is quoted, phrases are kept
+    /// together, and a trailing `*` matches a prefix.
+    #[test]
+    fn search_input_becomes_a_safe_fts_query() {
+        let cases = [
+            ("rust", Some(r#""rust""#)),
+            ("  rust   release ", Some(r#""rust" "release""#)),
+            (r#""rust release" notes"#, Some(r#""rust release" "notes""#)),
+            ("rel* \"rust rel\"*", Some(r#""rel"* "rust rel"*"#)),
+            ("don't", Some(r#""don't""#)),
+            ("rust OR go NOT c", Some(r#""rust" "OR" "go" "NOT" "c""#)),
+            (r#"unclosed "quote"#, Some(r#""unclosed" "quote""#)),
+            (r#"a"b"#, Some(r#""a" "b""#)),
+            ("c++ -x", Some(r#""c++" "-x""#)),
+            ("", None),
+            ("  \"\" * - ", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(fts_query(input).as_deref(), expected, "{input}");
+        }
+    }
+
+    /// Insert the entries the search tests look for: two about Rust, one
+    /// matching far better than the other but published earlier, one that
+    /// does not mention it, and one that does but is hidden. The weaker
+    /// match is read, which does not keep it out of search results.
+    fn insert_search_entries(tc: &crate::test::TestConfig) -> Result<()> {
+        let conn = tc.database_conn()?;
+        for (id, title, content) in [
+            (1, "Rust Rust Rust", "All about rust, and more rust."),
+            (2, "Weekly notes", "Don't panic: a little rust this week."),
+            (3, "Gardening", "Tomatoes."),
+            (4, "Hidden rust", "Rust."),
+        ] {
+            conn.execute(
+                "INSERT INTO entries (id, syndication_format, guid, published_at, title, url, content)
+                 VALUES (?1, 'rss', ?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    id,
+                    1_700_000_000 + id * 86_400,
+                    title,
+                    format!("http://example.com/{id}"),
+                    content,
+                ],
+            )?;
+        }
+        tag_entry(tc, 2, "system:read")?;
+        tag_entry(tc, 4, "system:hidden")?;
+        Ok(())
+    }
+
+    /// Every page has the search box, empty unless it shows search results.
+    #[tokio::test]
+    async fn every_page_has_a_search_box() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        for path in ["/", "/feeds", "/tags", "/plugins"] {
+            let (_, body) = get_page(tc.client()?, path).await?;
+            assert!(
+                body.contains(r#"<input type="search" name="q" value="""#),
+                "{path}: {body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The search page lists the entries matching the search, best match
+    /// first, read ones included and hidden ones left out.
+    #[tokio::test]
+    async fn the_search_page_lists_matching_entries() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_search_entries(&tc)?;
+
+        let (status, body) = get_page(tc.client()?, "/search?q=rust").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("<title>rust - Search - Kiki</title>"),
+            "{body}"
+        );
+        assert!(body.contains("2 results"), "{body}");
+        assert!(body.contains(r#"value="rust""#), "{body}");
+        assert_eq!(listed_titles(&body), ["Rust Rust Rust", "Weekly notes"]);
+        assert!(
+            body.contains(r#"<a href="/search?q=rust&amp;sort=newest">newest</a>"#),
+            "{body}"
+        );
+        assert!(!body.contains(r#"class="mark-read""#), "{body}");
+        assert!(!body.contains(r#"class="filter-toggle""#), "{body}");
+
+        let (_, body) = get_page(tc.client()?, "/search?q=rust&sort=newest").await?;
+        assert_eq!(listed_titles(&body), ["Weekly notes", "Rust Rust Rust"]);
+        assert!(
+            body.contains(r#"<a href="/search?q=rust">best match</a>"#),
+            "{body}"
+        );
+
+        let (_, body) = get_page(tc.client()?, "/search?q=tomatoes%20rust").await?;
+        assert!(body.contains("0 results"), "{body}");
+        assert!(body.contains("No entries match your search."), "{body}");
+        Ok(())
+    }
+
+    /// Searches that FTS5 would reject as syntax errors are searched for
+    /// word by word, rather than failing.
+    #[tokio::test]
+    async fn searches_with_stray_punctuation_still_work() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_search_entries(&tc)?;
+
+        let (status, body) = get_page(tc.client()?, "/search?q=don%27t%20%22panic").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed_titles(&body), ["Weekly notes"]);
+
+        let (status, body) = get_page(tc.client()?, "/search?q=-%20%2A").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("No entries match your search."), "{body}");
+        Ok(())
+    }
+
+    /// Without anything to search for, the search page says how searching
+    /// works rather than listing entries.
+    #[tokio::test]
+    async fn an_empty_search_lists_nothing() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_search_entries(&tc)?;
+
+        for path in ["/search", "/search?q=%20%20"] {
+            let (status, body) = get_page(tc.client()?, path).await?;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("<h2>Search</h2>"), "{body}");
+            assert!(listed_titles(&body).is_empty(), "{body}");
+        }
+        Ok(())
+    }
+
+    /// What was searched for is escaped wherever the page shows it.
+    #[tokio::test]
+    async fn searches_are_rendered_safely() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let (_, body) = get_page(tc.client()?, "/search?q=%22%3E%3Cb%3Ex").await?;
+        assert!(!body.contains("<b>x"), "{body}");
+        assert!(body.contains(r#"value="&quot;&gt;&lt;b&gt;x""#), "{body}");
+        assert!(
+            body.contains("Search results for &ldquo;&quot;&gt;&lt;b&gt;x&rdquo;"),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// Search results link to entry pages that link back to them, sorted
+    /// and paged as they were.
+    #[tokio::test]
+    async fn entry_pages_link_back_to_search_results() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_search_entries(&tc)?;
+
+        let (_, body) = get_page(tc.client()?, "/search?q=rust%20all&sort=newest").await?;
+        let href = r#"href="/entries/1?q=rust%20all&amp;sort=newest""#;
+        assert!(body.contains(href), "{body}");
+
+        let (status, body) =
+            get_page(tc.client()?, "/entries/1?q=rust%20all&sort=newest&page=2").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(
+                r#"<a href="/search?q=rust%20all&amp;sort=newest&amp;page=2">&larr; Back to search results</a>"#
+            ),
+            "{body}"
+        );
+        Ok(())
+    }
+
     /// On later pages of the index, entries link to pages that link back.
     #[tokio::test]
     async fn entry_pages_link_back_to_the_index_page() -> Result<()> {
@@ -3583,7 +3999,7 @@ mod tests {
         for path in ["/", "/entries/1", "/feeds", "/tags", "/plugins"] {
             let (_, body) = get_page(tc.client()?, path).await?;
             assert!(
-                body.contains(r#"<nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a href="/plugins">Plugins</a></nav>"#),
+                body.contains(r#"<nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a href="/plugins">Plugins</a>"#),
                 "{path}: {body}"
             );
         }

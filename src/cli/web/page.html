@@ -8,8 +8,10 @@
     body { max-width: 48rem; margin: 0 auto; padding: 0 1rem; font-family: system-ui, sans-serif; line-height: 1.5; }
     h1 a { color: inherit; text-decoration: none; }
     h1 .version { font-size: 0.875rem; font-weight: normal; color: #666; }
-    .site-nav { margin-top: -0.5rem; }
-    .site-nav a { margin-right: 1rem; }
+    .site-nav { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem 1rem; margin-top: -0.5rem; }
+    .site-nav .search { flex: 0 1 16rem; margin-left: auto; }
+    .site-nav .search input { box-sizing: border-box; width: 100%; font: inherit; }
+    .sort { margin: 0; }
     .count { color: #666; }
     .list-header { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
     .list-actions { display: flex; align-items: baseline; gap: 1rem; }
@@ -83,7 +85,9 @@
 </head>
 <body>
   <h1><a href="/">Kiki</a> <small class="version">v{{version}}</small></h1>
-  <nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a href="/plugins">Plugins</a></nav>
+  <nav class="site-nav"><a href="/">Entries</a><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a href="/plugins">Plugins</a>
+    <form class="search" role="search" action="/search" method="get"><input type="search" name="q" value="{{query}}" placeholder="Search entries" aria-label="Search entries"></form>
+  </nav>
   {{content}}
   <script>{{script}}</script>
 </body>

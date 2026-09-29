@@ -80,6 +80,21 @@ document.addEventListener("change", (event) => {
   }
 });
 
+// Search box: submitting it loads the search page for what was typed. Pages
+// may not submit forms themselves (their `Content-Security-Policy` says
+// `form-action 'none'`), so the script goes there instead.
+document.addEventListener("submit", (event) => {
+  const form = event.target.closest("form.search");
+  if (!form) {
+    return;
+  }
+  event.preventDefault();
+  const query = new FormData(form).get("q").trim();
+  if (query) {
+    window.location.href = `/search?q=${encodeURIComponent(query)}`;
+  }
+});
+
 // "Mark all as read" buttons: clicking one, once confirmed, marks every entry
 // (or every entry from the button's feed) as read, and reloads the page.
 document.addEventListener("click", async (event) => {
