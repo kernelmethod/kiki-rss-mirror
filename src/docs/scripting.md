@@ -303,7 +303,8 @@ existing home directory too, and updates it when a new release of Kiki bundles
 a new version, unless its files have been edited. It also installs
 `plugins/strip-tracking`, which uses `entry.ingest` to remove tracking
 parameters such as `utm_source` from entries' URLs and the links in their
-content, and `plugins/auto-tag`, which tags entries that match regular
+content, and tracking pixels from their content, and can keep images from
+being downloaded for chosen feeds with `cache_assets`, and `plugins/auto-tag`, which tags entries that match regular
 expressions or come from given feeds.
 
 ## Events
@@ -340,10 +341,17 @@ following fields:
 | `authors`           | array of strings  | No      |
 | `categories`        | array of strings  | No      |
 | `tags`              | array of strings  | Yes     |
+| `cache_assets`      | boolean           | Yes     |
 
 `authors` holds an RSS item's `<author>`, or the names of an Atom entry's
 `<author>`s; `categories` holds an RSS item's `<category>` values, or the terms
 of an Atom entry's `<category>`s.
+
+`cache_assets` starts `true`. A handler that sets it to `false` keeps Kiki
+from downloading the images in the entry's content, and its enclosure, into
+the asset cache, each time the entry is fetched; setting it to `nil` leaves it
+`true`. The entry itself is stored all the same. (It has no effect on
+entries handed to a [scan](#stored-entries).)
 
 `tags` starts empty. A `tags` holding any user tag replaces the entry's user
 tags; one holding only system tags leaves them alone.

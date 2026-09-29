@@ -11,10 +11,36 @@ use rusqlite::{Connection, TransactionBehavior};
 use std::time::Instant;
 use tracing::{debug, warn};
 
+/// The entries a refresh wrote.
+#[derive(Debug, Default)]
+pub(super) struct StoredEntries {
+    /// Ids of every entry written, new or updated.
+    pub(super) ids: Vec<i64>,
+    /// Ids of the entries whose assets should be cached: those no script
+    /// set `cache_assets` to `false` on.
+    pub(super) cache_assets: Vec<i64>,
+}
+
+impl StoredEntries {
+    fn with_capacity(n: usize) -> Self {
+        StoredEntries {
+            ids: Vec::with_capacity(n),
+            cache_assets: Vec::with_capacity(n),
+        }
+    }
+
+    fn push(&mut self, entry_id: i64, entry: &FeedEntry) {
+        self.ids.push(entry_id);
+        if entry.cache_assets {
+            self.cache_assets.push(entry_id);
+        }
+    }
+}
+
 /// Store a parsed Atom feed: its feed-level data, then each entry after
 /// it has been through the script chain.
 ///
-/// Returns the ids of the entries that were written.
+/// Returns the entries that were written.
 ///
 /// The entries may have come from the isolated fetcher, so nothing in them
 /// is trusted to say which feed they belong to: `feed_id` and the
@@ -34,7 +60,7 @@ pub(super) fn process_atom_feed(
     mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
-) -> Result<Vec<i64>> {
+) -> Result<StoredEntries> {
     debug!("Parsed Atom feed {} with {} items", feed_id, entries.len());
 
     let parsed_count = entries.len();
@@ -60,7 +86,7 @@ pub(super) fn process_atom_feed(
     crate::db::favicons::set_site_url(&tx, feed_id, site_url)?;
     upsert_atom_feed_data(&tx, feed_id, &feed_data)?;
 
-    let mut inserted_entry_ids: Vec<i64> = Vec::with_capacity(entries.len());
+    let mut stored = StoredEntries::with_capacity(entries.len());
     let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
     for (feed_entry, ingest) in entries {
         let (entry_id, is_new) = upsert_entry(&tx, feed_id, "atom", &feed_entry)?;
@@ -68,22 +94,22 @@ pub(super) fn process_atom_feed(
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
         }
-        inserted_entry_ids.push(entry_id);
+        stored.push(entry_id, &feed_entry);
         seen_guids.push(feed_entry.guid);
     }
 
     mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
     tx.commit()?;
-    for _ in &inserted_entry_ids {
+    for _ in &stored.ids {
         metrics.record_feed_entry_upserted("atom");
     }
-    Ok(inserted_entry_ids)
+    Ok(stored)
 }
 
 /// Store a parsed RSS feed, each item after it has been through the
 /// script chain.
 ///
-/// Returns the ids of the entries that were written. As with
+/// Returns the entries that were written. As with
 /// [`process_atom_feed`], `feed_id` and the syndication format are
 /// re-stamped on every entry rather than trusted, and everything is
 /// written in one immediate transaction once the scripts have run.
@@ -94,7 +120,7 @@ pub(super) fn process_rss_feed(
     mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
-) -> Result<Vec<i64>> {
+) -> Result<StoredEntries> {
     debug!("Parsed RSS feed {} with {} items", feed_id, entries.len());
 
     let parsed_count = entries.len();
@@ -119,7 +145,7 @@ pub(super) fn process_rss_feed(
     )?;
     crate::db::favicons::set_site_url(&tx, feed_id, site_url)?;
 
-    let mut inserted_entry_ids: Vec<i64> = Vec::with_capacity(entries.len());
+    let mut stored = StoredEntries::with_capacity(entries.len());
     let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
     for (feed_entry, ingest) in entries {
         let (entry_id, is_new) = upsert_entry(&tx, feed_id, "rss", &feed_entry)?;
@@ -127,16 +153,16 @@ pub(super) fn process_rss_feed(
         if !feed_entry.tags.is_empty() {
             sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
         }
-        inserted_entry_ids.push(entry_id);
+        stored.push(entry_id, &feed_entry);
         seen_guids.push(feed_entry.guid);
     }
 
     mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
     tx.commit()?;
-    for _ in &inserted_entry_ids {
+    for _ in &stored.ids {
         metrics.record_feed_entry_upserted("rss");
     }
-    Ok(inserted_entry_ids)
+    Ok(stored)
 }
 
 /// Run one entry through the script chain.
@@ -161,16 +187,16 @@ fn run_scripts(
     let script_start = Instant::now();
     match runner.dispatch_transform_entry(feed_entry) {
         Ok(Some(e)) => {
-            metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "ok");
+            metrics.record_plugin_execution(script_start.elapsed().as_secs_f64(), "ok");
             Some(e)
         }
         Ok(None) => {
-            metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "filtered");
+            metrics.record_plugin_execution(script_start.elapsed().as_secs_f64(), "filtered");
             debug!("{} entry filtered by script for feed {}", format, feed_id);
             None
         }
         Err(e) => {
-            metrics.record_script_execution(script_start.elapsed().as_secs_f64(), "error");
+            metrics.record_plugin_execution(script_start.elapsed().as_secs_f64(), "error");
             warn!(
                 "script error processing {} entry for feed {}: {}; inserting unmodified",
                 format, feed_id, e

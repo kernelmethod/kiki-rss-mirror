@@ -143,15 +143,27 @@ Kiki also ships a `strip-tracking` plugin, in
 [`plugins/strip-tracking`](plugins/strip-tracking), installed by default like
 `filter`. It removes tracking parameters, such as `utm_source`, `fbclid` and
 `gclid`, from the query strings (and query-like fragments, such as
-`#xtor=RSS-1`) of new entries' URLs, and of the links in their content. It only
-cleans entries as they are downloaded, not the ones already stored. To strip
-other parameters, or to leave entries' content alone:
+`#xtor=RSS-1`) of new entries' URLs, and of the links in their content. It
+also removes tracking pixels from their content: images declared 1×1 or
+smaller, and images from known trackers, such as WordPress.com's stats and
+FeedBurner, so that Kiki never downloads them. It only cleans entries as they
+are downloaded, not the ones already stored. To strip other parameters or
+trackers, or to leave entries' content alone:
 
 ```bash
 kiki plugin config get strip-tracking --defaults > strip-tracking.toml
-# edit strip-tracking.toml: add names to `params` ("prefix_*" matches a prefix),
-# or set `content = false`
+# edit strip-tracking.toml: add names to `params` ("prefix_*" matches a prefix)
+# or image sources to `trackers` ("*.example.com", "example.com/pixel"),
+# or set `content = false` or `pixels = false`
 kiki plugin config set strip-tracking strip-tracking.toml
+```
+
+To keep Kiki from downloading any images or enclosures for some feeds, so
+that the sites serving them never hear from it, list the feeds, by id or by
+URL, in `skip_assets`:
+
+```bash
+echo 'skip_assets = [3, "https://example.com/feed.xml"]' | kiki plugin config set strip-tracking
 ```
 
 See [`plugins/strip-tracking/main.lua`](plugins/strip-tracking/main.lua) for the details.
@@ -213,8 +225,8 @@ file is invalid, every settings update through the API fails with
 
 #### Proxy
 
-To send feed fetches and asset downloads through an HTTP(S) proxy, set it
-in `kiki.toml`:
+To send feed fetches and asset downloads through an HTTP(S) or SOCKS5
+proxy, set it in `kiki.toml`:
 
 ```toml
 [proxy]
@@ -228,6 +240,17 @@ or with environment variables, which take precedence over the file:
 | --- | --- |
 | `$KIKI_PROXY` | `proxy.url` |
 | `$KIKI_NO_PROXY` | `proxy.no_proxy` |
+
+A `socks5h://` URL sends everything through a SOCKS5 proxy, host name
+lookups included, so it is the one to use with Tor:
+
+```toml
+[proxy]
+url = "socks5h://127.0.0.1:9050"
+```
+
+With `socks5://`, Kiki looks host names up itself, and those DNS queries go
+out directly, telling whoever can see them which sites Kiki fetches from.
 
 `no_proxy` is a comma-separated list of hosts to reach directly: domains
 (which include their subdomains), IP addresses, CIDR ranges, or `*`. When

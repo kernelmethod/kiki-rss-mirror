@@ -10,6 +10,7 @@
 //! Eviction is enforced inline: after each successful insertion, if the total
 //! cache size exceeds the configured cap, the least-recently-accessed rows
 //! are dropped via [`crate::db::assets::evict_to`] and their files unlinked.
+use crate::fetcher::client_builder;
 use crate::http::{read_body_capped, CappedBody};
 use anyhow::{Context, Result};
 use lol_html::html_content::Element;
@@ -19,11 +20,63 @@ use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::{debug, warn};
 
 /// Per-asset download cap. Enclosures can be large (podcasts); this is a
 /// safety valve to prevent a single rogue asset from filling the cache.
 pub const MAX_ASSET_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Time limits on the requests that cache assets and look for favicons.
+///
+/// A feed fetch has a single overall timeout, but an asset may be a
+/// [`MAX_ASSET_BYTES`] enclosure that a slow link cannot download in the
+/// same time. So the limits are split: a server must accept the connection
+/// within `connect`, and must never go `read` without sending anything,
+/// which catches a server that has stalled; `total` is a looser cap on the
+/// whole request, which catches one that sends just often enough to keep
+/// `read` from firing. Without them, a server that never answers would tie
+/// up a worker, and every task queued behind it, indefinitely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssetTimeouts {
+    /// Longest wait to connect to a server (and through a proxy, if any).
+    pub connect: Duration,
+    /// Longest wait for any data at all, while waiting for the response or
+    /// reading its body.
+    pub read: Duration,
+    /// Longest a request may take from start to finish, body included.
+    pub total: Duration,
+}
+
+impl AssetTimeouts {
+    /// The limits Kiki uses: 15 seconds to connect, 30 seconds without
+    /// data, and 5 minutes in all, which is enough to download a
+    /// [`MAX_ASSET_BYTES`] enclosure at about 1 Mbit/s.
+    pub const DEFAULT: AssetTimeouts = AssetTimeouts {
+        connect: Duration::from_secs(15),
+        read: Duration::from_secs(30),
+        total: Duration::from_secs(5 * 60),
+    };
+}
+
+/// The client configuration for caching assets and looking for favicons:
+/// feed fetches' ([`client_builder`]), with the limits in `timeouts`. Build
+/// it with [`crate::fetcher::ProxiedClient`], so the proxy settings apply.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::fetcher::ProxiedClient;
+/// use kiki_rss::tasks::assets::{asset_client_builder, AssetTimeouts};
+///
+/// let clients = ProxiedClient::new(|| asset_client_builder(AssetTimeouts::DEFAULT)).unwrap();
+/// ```
+pub fn asset_client_builder(timeouts: AssetTimeouts) -> reqwest::ClientBuilder {
+    client_builder()
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read)
+        .timeout(timeouts.total)
+}
 
 /// Kind of asset reference discovered in an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
