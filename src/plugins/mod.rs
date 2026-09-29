@@ -71,6 +71,8 @@ pub mod services;
 pub mod settings;
 
 #[cfg(all(test, feature = "lua"))]
+mod auto_tag_tests;
+#[cfg(all(test, feature = "lua"))]
 mod filter_tests;
 #[cfg(all(test, feature = "lua"))]
 mod strip_tracking_tests;
