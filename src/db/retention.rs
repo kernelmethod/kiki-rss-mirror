@@ -3,13 +3,23 @@
 /// Entries are kept for as long as their feed still lists them. A refresh
 /// that no longer lists an entry marks it dropped ([`mark_dropped`]), and
 /// only entries that have been dropped for longer than the policy's
-/// `max_age_days` are deleted ([`cleanup_all`], [`cleanup_feed`]).
+/// `max_age_days` are deleted ([`cleanup_all`], [`cleanup_feed`]). Entries
+/// tagged `system:saved` are never deleted, however long ago they were
+/// dropped; once unsaved, they are deleted by the next cleanup if they have
+/// been dropped for long enough.
 ///
 /// The policy itself is [`crate::config::RetentionSettings`]; callers pass
 /// its `max_age_days` in.
+use crate::db::tags::SystemTag;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::Connection;
+use rusqlite::{named_params, Connection};
+
+/// SQL condition, on `entries`, that excludes entries tagged with the system
+/// tag named by the `:saved_tag` parameter, i.e. [`SystemTag::Saved`].
+const NOT_SAVED: &str = "NOT EXISTS (
+    SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+    WHERE et.entry_id = entries.id AND t.kind = 'system' AND t.name = :saved_tag)";
 
 /// Mark the entries of `feed_id` whose guid is not in `seen_guids` as
 /// dropped from the feed, as of now.
@@ -39,7 +49,7 @@ pub fn mark_dropped(conn: &Connection, feed_id: i64, seen_guids: &[String]) -> R
 }
 
 /// Delete entries that were dropped from their feed more than
-/// `max_age_days` ago, across all feeds.
+/// `max_age_days` ago, across all feeds. Saved entries are kept.
 ///
 /// Returns the number of deleted entries. Returns `Ok(0)` if `max_age_days`
 /// is `None`, i.e. no retention policy is configured.
@@ -51,8 +61,11 @@ pub fn cleanup_all(conn: &Connection, max_age_days: Option<i64>) -> Result<usize
     let cutoff = cutoff_timestamp(max_age_days);
     let deleted = conn
         .execute(
-            "DELETE FROM entries WHERE dropped_at IS NOT NULL AND dropped_at < ?1",
-            [cutoff],
+            &format!(
+                "DELETE FROM entries
+                 WHERE dropped_at IS NOT NULL AND dropped_at < :cutoff AND {NOT_SAVED}"
+            ),
+            named_params! { ":cutoff": cutoff, ":saved_tag": SystemTag::Saved.name() },
         )
         .with_context(|| "failed to delete old entries")?;
 
@@ -60,7 +73,7 @@ pub fn cleanup_all(conn: &Connection, max_age_days: Option<i64>) -> Result<usize
 }
 
 /// Delete entries that were dropped from feed `feed_id` more than
-/// `max_age_days` ago.
+/// `max_age_days` ago. Saved entries are kept.
 ///
 /// Returns the number of deleted entries. Returns `Ok(0)` if `max_age_days`
 /// is `None`, i.e. no retention policy is configured.
@@ -72,9 +85,16 @@ pub fn cleanup_feed(conn: &Connection, feed_id: i64, max_age_days: Option<i64>) 
     let cutoff = cutoff_timestamp(max_age_days);
     let deleted = conn
         .execute(
-            "DELETE FROM entries
-             WHERE dropped_at IS NOT NULL AND dropped_at < ?1 AND feed_id = ?2",
-            rusqlite::params![cutoff, feed_id],
+            &format!(
+                "DELETE FROM entries
+                 WHERE dropped_at IS NOT NULL AND dropped_at < :cutoff AND feed_id = :feed_id
+                   AND {NOT_SAVED}"
+            ),
+            named_params! {
+                ":cutoff": cutoff,
+                ":feed_id": feed_id,
+                ":saved_tag": SystemTag::Saved.name(),
+            },
         )
         .with_context(|| format!("failed to delete old entries for feed {}", feed_id))?;
 
@@ -205,5 +225,42 @@ mod tests {
 
         assert_eq!(cleanup_all(&conn, Some(7)).unwrap(), 1);
         assert_eq!(guids(&conn), ["recent"]);
+    }
+
+    fn tag_entry(conn: &Connection, feed_id: i64, guid: &str, tag: &str) {
+        conn.execute(
+            "INSERT INTO entry_tags (entry_id, tag_id)
+             SELECT e.id, t.id FROM entries e, tags t
+             WHERE e.feed_id = ?1 AND e.guid = ?2 AND t.name = ?3",
+            rusqlite::params![feed_id, guid, tag],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cleanup_keeps_saved_entries() {
+        let conn = setup();
+        let old = Utc::now().timestamp() - 10 * DAY;
+        insert_entry(&conn, 1, "saved", Some(old));
+        insert_entry(&conn, 1, "read", Some(old));
+        insert_entry(&conn, 2, "saved-other", Some(old));
+        tag_entry(&conn, 1, "saved", "system:saved");
+        tag_entry(&conn, 1, "read", "system:read");
+        tag_entry(&conn, 2, "saved-other", "system:saved");
+
+        assert_eq!(cleanup_feed(&conn, 1, Some(7)).unwrap(), 1);
+        assert_eq!(guids(&conn), ["saved", "saved-other"]);
+        assert_eq!(cleanup_all(&conn, Some(7)).unwrap(), 0);
+        assert_eq!(guids(&conn), ["saved", "saved-other"]);
+
+        // Once unsaved, the entry is deleted by the next cleanup.
+        conn.execute(
+            "DELETE FROM entry_tags WHERE tag_id = (SELECT id FROM tags WHERE name = 'system:saved')
+               AND entry_id = (SELECT id FROM entries WHERE guid = 'saved')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(cleanup_all(&conn, Some(7)).unwrap(), 1);
+        assert_eq!(guids(&conn), ["saved-other"]);
     }
 }

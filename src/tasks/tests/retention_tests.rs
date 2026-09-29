@@ -216,3 +216,30 @@ async fn retention_deletes_only_long_dropped_entries() -> Result<()> {
 
     Ok(())
 }
+
+/// A saved entry the feed stopped listing survives cleanup for as long as it
+/// stays saved.
+#[tokio::test]
+async fn cleanup_keeps_saved_entries_dropped_from_the_feed() -> Result<()> {
+    let f = FileFeed::new()?;
+    f.refresh(&[("saved", "s"), ("unsaved", "u"), ("current", "c")])
+        .await?;
+    let conn = f.conn();
+    conn.execute(
+        "INSERT INTO entry_tags (entry_id, tag_id)
+         SELECT ?1, id FROM tags WHERE name = 'system:saved'",
+        [f.entry_id("saved")],
+    )?;
+
+    // Both drop off the feed, long enough ago to be past the cutoff.
+    f.refresh(&[("current", "c")]).await?;
+    assert!(f.dropped_at("saved").is_some());
+    conn.execute(
+        "UPDATE entries SET dropped_at = dropped_at - 10 * ?1",
+        [DAY],
+    )?;
+
+    assert_eq!(retention::cleanup_all(&conn, Some(7))?, 1);
+    assert_eq!(f.guids(), ["current", "saved"]);
+    Ok(())
+}

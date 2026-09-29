@@ -18,7 +18,8 @@ pub struct CleanupResponse {
 /// Purge old entries
 ///
 /// Manually trigger entry cleanup across all feeds, per the server's configured retention policy.
-/// Deletes entries that their feed stopped listing more than `max_age_days` ago.
+/// Deletes entries that their feed stopped listing more than `max_age_days` ago, except for
+/// entries tagged `system:saved`, which are kept.
 #[utoipa::path(
     post,
     path = "/v1/entries/cleanup",
