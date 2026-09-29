@@ -259,6 +259,7 @@ pub(crate) async fn refresh_feed(
             // for it to take effect.
             timeout_secs: fetch_settings.timeout_seconds,
             max_feed_bytes: fetch_settings.max_feed_bytes,
+            proxy: settings.effective_proxy(),
         };
         match fetcher.fetch(spec).await {
             Ok(reply) => match record_fetch_reply(&rec, &row, reply, force_conditionals_off) {

@@ -272,10 +272,8 @@ fn apply_to_server(home: &Path, name: &str, overrides: &ConfigOverrides) -> Resu
         .enable_all()
         .build()?
         .block_on(async {
-            let client = reqwest::Client::builder()
-                .unix_socket(socket.as_path())
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?;
+            let client =
+                crate::http::unix_socket_client(&socket, Some(std::time::Duration::from_secs(30)))?;
             let resp = client.put(url).json(overrides).send().await?;
             let resp = resp.error_for_status()?;
             Ok(resp.json::<PluginConfigResponse>().await?.reload_error)

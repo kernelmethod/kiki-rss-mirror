@@ -183,9 +183,7 @@ impl WebArgs {
 /// Build a client that sends every request to the Kiki API over the Unix
 /// socket at `socket_path`.
 fn api_client(socket_path: &Path) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .unix_socket(socket_path)
-        .build()
+    crate::http::unix_socket_client(socket_path, None)
         .context("failed to build the Kiki API client")
 }
 

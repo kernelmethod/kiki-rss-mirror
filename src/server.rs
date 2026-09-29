@@ -335,6 +335,24 @@ impl Server {
             ConfigStore::open(&self.config_path)
                 .with_context(|| format!("failed to load config file {:?}", self.config_path))?,
         );
+        // The config file's proxy was validated as it loaded; this catches
+        // a bad `$KIKI_PROXY`, which otherwise fails only at fetch time.
+        let proxy = config.current().effective_proxy();
+        proxy.validate().with_context(|| {
+            format!(
+                "invalid proxy settings from ${} or ${}",
+                config::PROXY_ENV,
+                config::NO_PROXY_ENV
+            )
+        })?;
+        if let Some(host) = proxy
+            .url
+            .as_deref()
+            .and_then(|u| url::Url::parse(u.trim()).ok())
+            .and_then(|u| u.host_str().map(str::to_owned))
+        {
+            tracing::info!(%host, "sending outbound requests through a proxy");
+        }
         if let Err(e) = config::watch::spawn_watcher(config.clone(), self.cancel_token.clone()) {
             tracing::warn!(
                 "not watching config file {:?} for changes; edits will need a restart: {:#}",

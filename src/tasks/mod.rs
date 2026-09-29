@@ -60,7 +60,10 @@ pub(crate) async fn refresh_feed_with_settings(
     metrics: &crate::metrics::Metrics,
     task_tx: &async_channel::Sender<TaskManagerCommand>,
 ) -> anyhow::Result<()> {
-    let fetcher = crate::fetcher::Fetcher::InProcess(client.clone());
+    let fetcher = crate::fetcher::Fetcher::InProcess(crate::fetcher::ProxiedClient::with_client(
+        client.clone(),
+        crate::fetcher::client_builder,
+    ));
     fetch::refresh_feed(
         &fetcher,
         feed_id,

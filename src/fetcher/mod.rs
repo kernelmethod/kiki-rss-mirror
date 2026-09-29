@@ -19,9 +19,11 @@
 pub mod parse;
 pub mod retrieve;
 
+use crate::config::ProxySettings;
 use crate::http::{FeedAuth, USER_AGENT};
 use crate::scripting::FeedEntry;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use parse::parse_feed;
@@ -76,6 +78,28 @@ pub struct FetchSpec {
 
     /// Largest body that will be read before the fetch is abandoned.
     pub max_feed_bytes: u64,
+
+    /// The proxy to fetch through, with environment overrides already
+    /// applied by the server ([`crate::config::Settings::effective_proxy`]).
+    #[serde(with = "proxy_wire")]
+    pub proxy: ProxySettings,
+}
+
+/// [`ProxySettings`] as it crosses the process boundary. Its own serde
+/// form skips unset keys, which suits TOML but not postcard: a
+/// non-self-describing format cannot tell which fields were left out.
+mod proxy_wire {
+    use crate::config::ProxySettings;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(p: &ProxySettings, s: S) -> Result<S::Ok, S::Error> {
+        (&p.url, &p.no_proxy).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<ProxySettings, D::Error> {
+        let (url, no_proxy) = Deserialize::deserialize(d)?;
+        Ok(ProxySettings { url, no_proxy })
+    }
 }
 
 /// Response headers from a feed server, restricted to
@@ -390,7 +414,7 @@ pub enum FetcherError {
 pub enum Fetcher {
     /// In this process, with the given client. Used by the library-level
     /// tests and on platforms without an isolated fetcher.
-    InProcess(reqwest::Client),
+    InProcess(ProxiedClient),
 
     /// In the sandboxed feed fetcher process.
     #[cfg(unix)]
@@ -406,7 +430,7 @@ impl Fetcher {
     ///
     /// Fails if the TLS backend cannot be initialised.
     pub fn in_process() -> reqwest::Result<Self> {
-        Ok(Fetcher::InProcess(build_client()?))
+        Ok(Fetcher::InProcess(ProxiedClient::new(client_builder)?))
     }
 
     /// Fetch, and on a `200 OK` parse, the feed described by `spec`.
@@ -417,7 +441,7 @@ impl Fetcher {
     /// itself could not serve the request; see [`FetcherError`].
     pub async fn fetch(&self, spec: FetchSpec) -> Result<FetchReply, FetcherError> {
         match self {
-            Fetcher::InProcess(client) => Ok(retrieve(client, &spec).await),
+            Fetcher::InProcess(clients) => Ok(fetch_with(clients, &spec).await),
             #[cfg(unix)]
             Fetcher::Isolated(host) => host.fetch(spec).await,
         }
@@ -438,22 +462,123 @@ impl Fetcher {
     }
 }
 
-/// Build the HTTP client used for feed fetches.
-///
-/// # Errors
-///
-/// Fails if the TLS backend cannot be initialised.
-pub fn build_client() -> reqwest::Result<reqwest::Client> {
-    client_builder().build()
-}
-
 /// The client configuration shared by every feed fetch, for callers that
 /// need to adjust it further — the isolated fetcher swaps in its own DNS
-/// resolver.
+/// resolver. Build it with [`ProxiedClient`], so the proxy settings apply.
+#[allow(clippy::disallowed_methods, reason = "the sanctioned starting point")]
 pub fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(USER_AGENT)
+}
+
+/// Builds the [`reqwest::ClientBuilder`] a [`ProxiedClient`] starts from.
+type BuilderFn = dyn Fn() -> reqwest::ClientBuilder + Send + Sync;
+
+/// An HTTP client that follows the proxy settings it is asked for.
+///
+/// A [`reqwest::Client`]'s proxy is fixed when it is built, while Kiki's
+/// proxy settings can change at any time. This keeps one client for the
+/// settings last asked for, and rebuilds it only when they change, so
+/// connection pooling survives across requests that share a proxy.
+/// Cloning is cheap and shares the cached client.
+#[derive(Clone)]
+pub struct ProxiedClient {
+    builder: Arc<BuilderFn>,
+    current: Arc<Mutex<(ProxySettings, reqwest::Client)>>,
+}
+
+impl ProxiedClient {
+    /// A client built by `builder`, initially with no explicit proxy.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the TLS backend cannot be initialised.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::ProxySettings;
+    /// use kiki_rss::fetcher::{client_builder, ProxiedClient};
+    ///
+    /// let clients = ProxiedClient::new(client_builder).unwrap();
+    /// let proxy = ProxySettings {
+    ///     url: Some("http://proxy.example:3128".into()),
+    ///     no_proxy: None,
+    /// };
+    /// let _client = clients.get(&proxy).unwrap();
+    /// ```
+    pub fn new(
+        builder: impl Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
+    ) -> reqwest::Result<Self> {
+        #[allow(clippy::disallowed_methods, reason = "no proxy is asked for yet")]
+        let client = builder().build()?;
+        Ok(Self::with_client(client, builder))
+    }
+
+    /// Like [`ProxiedClient::new`], but using `client` as-is for as long as
+    /// no proxy is asked for.
+    pub fn with_client(
+        client: reqwest::Client,
+        builder: impl Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
+    ) -> Self {
+        ProxiedClient {
+            builder: Arc::new(builder),
+            current: Arc::new(Mutex::new((ProxySettings::default(), client))),
+        }
+    }
+
+    /// Returns a client that sends requests through `proxy`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `proxy` is not a usable proxy URL, or if the TLS backend
+    /// cannot be initialised.
+    pub fn get(&self, proxy: &ProxySettings) -> reqwest::Result<reqwest::Client> {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.0 != *proxy {
+            #[allow(clippy::disallowed_methods, reason = "the proxy is applied here")]
+            let client = apply_proxy((self.builder)(), proxy)?.build()?;
+            *current = (proxy.clone(), client);
+        }
+        Ok(current.1.clone())
+    }
+}
+
+/// Configures `builder` to use `proxy`. With no proxy URL, the builder is
+/// left alone, so reqwest's default of following `HTTPS_PROXY` and friends
+/// from the environment applies.
+///
+/// # Errors
+///
+/// Fails if the proxy URL cannot be parsed.
+pub fn apply_proxy(
+    builder: reqwest::ClientBuilder,
+    proxy: &ProxySettings,
+) -> reqwest::Result<reqwest::ClientBuilder> {
+    let Some(url) = &proxy.url else {
+        return Ok(builder);
+    };
+    let no_proxy = proxy
+        .no_proxy
+        .as_deref()
+        .and_then(reqwest::NoProxy::from_string);
+    Ok(builder.proxy(reqwest::Proxy::all(url.trim())?.no_proxy(no_proxy)))
+}
+
+/// Fetch `spec` with the client for its proxy settings.
+pub async fn fetch_with(clients: &ProxiedClient, spec: &FetchSpec) -> FetchReply {
+    match clients.get(&spec.proxy) {
+        Ok(client) => retrieve(&client, spec).await,
+        // Settings are validated before they reach a fetch, so this is
+        // not expected; the error is not shown as it may contain the URL.
+        Err(_) => FetchReply::Failed {
+            message: "could not configure the HTTP client for the proxy".to_string(),
+        },
+    }
 }
 
 /// Run [`parse_feed`] on the blocking pool, timing it.
@@ -477,8 +602,88 @@ pub async fn parse_off_thread(feed_id: i64, body: Vec<u8>) -> ParseOutcome {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    const RSS: &str = r#"<rss version="2.0"><channel><title>t</title><link>http://x/</link>
+        <description>d</description><item><title>hi</title><guid>g1</guid></item>
+        </channel></rss>"#;
+
+    /// Start a stand-in HTTP proxy that serves [`RSS`] for any `/feed`
+    /// request addressed to `feed.invalid`, a host that cannot resolve, so
+    /// a fetch of it succeeds only if it went through the proxy.
+    pub(crate) async fn start_proxy() -> std::net::SocketAddr {
+        use axum::{http::Uri, routing::get, Router};
+        let app = Router::new().route(
+            "/feed",
+            get(|uri: Uri| async move {
+                assert_eq!(uri.host(), Some("feed.invalid"), "{uri}");
+                RSS
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        addr
+    }
+
+    pub(crate) fn proxied_spec(proxy: ProxySettings) -> FetchSpec {
+        FetchSpec {
+            feed_id: 1,
+            url: "http://feed.invalid/feed".to_string(),
+            etag: None,
+            last_modified: None,
+            send_conditionals: false,
+            auth: FeedAuth::default(),
+            timeout_secs: 5,
+            max_feed_bytes: 1024 * 1024,
+            proxy,
+        }
+    }
+
+    #[tokio::test]
+    async fn fetches_go_through_the_configured_proxy() {
+        let addr = start_proxy().await;
+        let clients = ProxiedClient::new(client_builder).unwrap();
+        let proxy = ProxySettings {
+            url: Some(format!("http://{addr}")),
+            no_proxy: None,
+        };
+        let reply = fetch_with(&clients, &proxied_spec(proxy.clone())).await;
+        assert!(matches!(reply, FetchReply::Body(_)), "got {reply:?}");
+
+        // Hosts listed in `no_proxy` are fetched directly, and so fail.
+        let bypassed = ProxySettings {
+            no_proxy: Some("localhost, feed.invalid".into()),
+            ..proxy
+        };
+        let reply = fetch_with(&clients, &proxied_spec(bypassed)).await;
+        assert!(matches!(reply, FetchReply::Network { .. }), "got {reply:?}");
+    }
+
+    #[test]
+    fn clients_are_rebuilt_only_when_the_proxy_changes() {
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&built);
+        let clients = ProxiedClient::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            client_builder()
+        })
+        .unwrap();
+        let count = || built.load(std::sync::atomic::Ordering::SeqCst);
+        let proxy = ProxySettings {
+            url: Some("http://proxy.example:3128".into()),
+            no_proxy: None,
+        };
+
+        clients.get(&ProxySettings::default()).unwrap();
+        assert_eq!(count(), 1);
+        clients.get(&proxy).unwrap();
+        clients.get(&proxy).unwrap();
+        assert_eq!(count(), 2);
+        clients.get(&ProxySettings::default()).unwrap();
+        assert_eq!(count(), 3);
+    }
 
     #[test]
     fn only_forwarded_headers_are_captured() {

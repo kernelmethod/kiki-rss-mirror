@@ -59,8 +59,8 @@
 //! length-prefixed framing, capped at [`MAX_FRAME_BYTES`].
 
 use crate::fetcher::{
-    client_builder, parse_off_thread, retrieve, FetchReply, FetchSpec, FetcherError, ParseOutcome,
-    MAX_REDIRECTS,
+    client_builder, fetch_with, parse_off_thread, FetchReply, FetchSpec, FetcherError,
+    ParseOutcome, ProxiedClient, MAX_REDIRECTS,
 };
 use crate::process::ipc::{
     decode, decode_prefix, encode, read_frame_async, read_frame_limited, write_frame_async,
@@ -867,10 +867,11 @@ async fn serve(stream: UnixStream) -> Result<()> {
         frames: tx.clone(),
         pending: Arc::new(Pending::new()),
     };
-    let client = client_builder()
-        .dns_resolver(Arc::new(resolver.clone()))
-        .build()
-        .context("building the HTTP client")?;
+    let builder_resolver = resolver.clone();
+    let client = ProxiedClient::new(move || {
+        client_builder().dns_resolver(Arc::new(builder_resolver.clone()))
+    })
+    .context("building the HTTP client")?;
 
     loop {
         let frame = match read_frame_async(&mut rd, MAX_FRAME_BYTES).await {
@@ -950,9 +951,9 @@ impl reqwest::dns::Resolve for ServerResolver {
     }
 }
 
-async fn run_job(client: reqwest::Client, job: Job) -> JobResult {
+async fn run_job(client: ProxiedClient, job: Job) -> JobResult {
     match job {
-        Job::Fetch(spec) => JobResult::Fetched(retrieve(&client, &spec).await),
+        Job::Fetch(spec) => JobResult::Fetched(fetch_with(&client, &spec).await),
         Job::Parse { feed_id, body } => JobResult::Parsed(parse_off_thread(feed_id, body).await),
     }
 }
@@ -1001,6 +1002,7 @@ mod tests {
             auth: FeedAuth::default(),
             timeout_secs: 5,
             max_feed_bytes: 1024 * 1024,
+            proxy: Default::default(),
         }
     }
 
@@ -1108,6 +1110,23 @@ mod tests {
         assert!(matches!(fast, Ok(FetchReply::Body(_))), "got {fast:?}");
         release.notify_one();
         assert!(matches!(slow.await.unwrap(), Ok(FetchReply::Body(_))));
+    }
+
+    /// The worker fetches through the proxy in the spec, with the proxy's
+    /// own hostname resolved by the server like any other.
+    #[tokio::test]
+    async fn fetches_go_through_the_proxy_in_the_spec() {
+        use crate::config::ProxySettings;
+        use crate::fetcher::tests::{proxied_spec, start_proxy};
+
+        let addr = start_proxy().await;
+        let host = host_with_in_thread_worker();
+        let proxy = ProxySettings {
+            url: Some(format!("http://localhost:{}", addr.port())),
+            no_proxy: None,
+        };
+        let reply = host.fetch(proxied_spec(proxy)).await.unwrap();
+        assert!(matches!(reply, FetchReply::Body(_)), "got {reply:?}");
     }
 
     /// When the far end goes away, outstanding and later requests fail
