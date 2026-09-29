@@ -524,7 +524,7 @@ impl Server {
 /// Periodically sample observable process state into the metrics recorder.
 ///
 /// Covers DB pool utilization, task queue depth, and domain totals that are
-/// cheap to read (feed/entry counts, feeds with fetch errors).
+/// cheap to read (feed/entry counts, feeds with fetch errors, database size).
 async fn metrics_sampler_loop(
     task_manager_tx: async_channel::Sender<TaskManagerCommand>,
     pool: r2d2::Pool<SqliteConnectionManager>,
@@ -572,6 +572,9 @@ async fn metrics_sampler_loop(
                             |row| row.get(0),
                         ) {
                             metrics.set_feeds_with_fetch_error(n as f64);
+                        }
+                        if let Ok(n) = crate::db::size_bytes(&conn) {
+                            metrics.set_db_size_bytes(n as f64);
                         }
                     })
                     .await;
