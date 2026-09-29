@@ -1,0 +1,80 @@
+name = "strip-tracking"
+version = "1.0.0"
+engine = "lua"
+description = "Strip tracking parameters, such as utm_source, from the URLs in new entries"
+license = "MIT"
+homepage = "https://github.com/kernelmethod/kiki-rss"
+
+# Removes the query parameters named in `params` from each new entry's URL,
+# and, unless `content` is false, from the links (href and src attributes)
+# in its content. A name ending in `*` removes every parameter starting
+# with the rest of it. Names are matched ignoring case. See main.lua for
+# the details.
+#
+# To strip more parameters, add them to the list, for example with
+# `kiki plugin config get strip-tracking --defaults`, editing its output and
+# passing it to `kiki plugin config set strip-tracking`.
+[config]
+params = [
+    # Google Analytics campaigns, and Google Ads, Microsoft Ads, Meta,
+    # Twitter/X, TikTok, LinkedIn, Instagram and Yandex click ids
+    "utm_*",
+    "gclid",
+    "gclsrc",
+    "dclid",
+    "gbraid",
+    "wbraid",
+    "_ga",
+    "_gl",
+    "msclkid",
+    "fbclid",
+    "twclid",
+    "ttclid",
+    "li_fat_id",
+    "igshid",
+    "yclid",
+    "_openstat",
+    # Mailchimp, HubSpot, Marketo, Vero, Omeda, Rakuten, Adobe, Wicked Reports
+    "mc_cid",
+    "mc_eid",
+    "_hsenc",
+    "_hsmi",
+    "__hssc",
+    "__hstc",
+    "__hsfp",
+    "hsctatracking",
+    "mkt_tok",
+    "vero_id",
+    "vero_conv",
+    "oly_anon_id",
+    "oly_enc_id",
+    "rb_clickid",
+    "s_cid",
+    "wickedid",
+    # Matomo and Piwik campaigns, and AT Internet
+    "mtm_*",
+    "matomo_*",
+    "piwik_*",
+    "pk_campaign",
+    "pk_cid",
+    "pk_content",
+    "pk_keyword",
+    "pk_kwd",
+    "pk_medium",
+    "pk_source",
+    "xtor",
+]
+content = true
+
+[[settings]]
+name = "params"
+type = "list"
+items = { type = "string" }
+label = "Parameters"
+description = "The query parameters to remove, ignoring case. A name ending in * removes every parameter that starts with the rest of it."
+
+[[settings]]
+name = "content"
+type = "boolean"
+label = "Clean links in content"
+description = "Also remove the parameters from the links (href and src attributes) in entries' content."

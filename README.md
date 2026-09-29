@@ -109,6 +109,25 @@ Whenever its rules change, the filter also applies them to the entries already
 downloaded. It never unhides entries. See
 [`plugins/filter/main.lua`](plugins/filter/main.lua) for every setting.
 
+### Stripping tracking parameters
+
+Kiki also ships a `strip-tracking` plugin, in
+[`plugins/strip-tracking`](plugins/strip-tracking), installed by default like
+`filter`. It removes tracking parameters, such as `utm_source`, `fbclid` and
+`gclid`, from the query strings (and query-like fragments, such as
+`#xtor=RSS-1`) of new entries' URLs, and of the links in their content. It only
+cleans entries as they are downloaded, not the ones already stored. To strip
+other parameters, or to leave entries' content alone:
+
+```bash
+kiki plugin config get strip-tracking --defaults > strip-tracking.toml
+# edit strip-tracking.toml: add names to `params` ("prefix_*" matches a prefix),
+# or set `content = false`
+kiki plugin config set strip-tracking strip-tracking.toml
+```
+
+See [`plugins/strip-tracking/main.lua`](plugins/strip-tracking/main.lua) for the details.
+
 ## Where Kiki keeps its files
 
 | | Default |
