@@ -6,7 +6,7 @@
 use super::super::*;
 use crate::test::TestBuilder;
 use anyhow::Result;
-use axum::{routing::get, Router};
+use axum::{response::IntoResponse, routing::get, Router};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,6 +30,9 @@ const TINY_PNG: &[u8] = &[
 
 /// Stand-in bytes for an `.ico` file; only the content type is checked.
 const FAKE_ICO: &[u8] = b"not-really-an-ico";
+
+/// The test feed's `ETag`.
+const FEED_ETAG: &str = "\"v1\"";
 
 /// What the test website serves, besides the feed.
 #[derive(Clone, Copy)]
@@ -93,7 +96,14 @@ async fn start_server(site: Site) -> Result<Server> {
     let mut app = Router::new()
         .route(
             "/feed.xml",
-            get(move || async move { ([("content-type", feed_type)], feed) }),
+            // The feed never changes, so it is 304 whenever Kiki
+            // revalidates it.
+            get(move |headers: axum::http::HeaderMap| async move {
+                if headers.get("if-none-match").is_some_and(|v| v == FEED_ETAG) {
+                    return axum::http::StatusCode::NOT_MODIFIED.into_response();
+                }
+                ([("content-type", feed_type), ("etag", FEED_ETAG)], feed).into_response()
+            }),
         )
         .route(
             "/site/",
@@ -338,5 +348,38 @@ async fn disabled_cache_skips_favicons() -> Result<()> {
     h.cache_favicon(h.feed_id).await?;
     assert_eq!(h.check()?, None);
     assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+/// A feed that was already being revalidated when favicons were introduced
+/// gets one even though its server only ever answers 304.
+#[tokio::test]
+async fn looks_for_favicon_of_unchanged_feed() -> Result<()> {
+    let server = start_server(Site {
+        link_to_home_page: true,
+        favicon_ico: true,
+        atom_icon: false,
+    })
+    .await?;
+    let mut h = Harness::new(&format!("{}/feed.xml", server.base)).await?;
+
+    // The first refresh stores the feed and its ETag, but, as before
+    // favicons existed, looks for no favicon.
+    h.cache.enabled = false;
+    assert_eq!(h.refresh().await?, 0);
+    h.cache.enabled = true;
+
+    let before = server.requests.load(Ordering::SeqCst);
+    assert_eq!(h.refresh().await?, 1);
+    assert_eq!(
+        h.favicon_source()?,
+        Some(format!("{}/icons/32.png", server.base))
+    );
+    // The feed was revalidated, not downloaded again: one 304, then the
+    // home page and the icon.
+    assert_eq!(server.requests.load(Ordering::SeqCst), before + 3);
+
+    // Found recently: the next 304 queues nothing.
+    assert_eq!(h.refresh().await?, 0);
     Ok(())
 }
