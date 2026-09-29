@@ -12,7 +12,8 @@ use crate::routes::v1::entries::ListEntriesResponseEntry;
 use crate::routes::v1::feeds::list_feeds::ListFeedsResponse;
 use crate::routes::v1::plugins::list_plugins::{ListPluginsResponse, PluginResponse};
 use crate::routes::v1::plugins::plugin_config::PluginConfigResponse;
-use crate::routes::v1::tags::list_tags::TagResponse;
+use crate::routes::v1::tags::list_tags::{ListTagsResponse, TagResponse};
+use crate::routes::v1::tags::tag_entries::AddTagEntriesRequest;
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{Form, Path as UrlPath, Query, State},
@@ -222,6 +223,7 @@ async fn serve_ui(
     let app = Router::new()
         .route("/", get(index))
         .route("/entries/{id}", get(entry_page))
+        .route("/entries/read", post(mark_entries_read))
         .route("/entries/{id}/saved", put(save_entry).delete(unsave_entry))
         .route("/feeds", get(feeds_page))
         .route("/feeds/{id}", get(feed_page))
@@ -531,6 +533,80 @@ async fn set_entry_saved(
             (StatusCode::BAD_GATEWAY, "The Kiki server is unavailable.").into_response()
         }
     }
+}
+
+/// Query parameters accepted by [`mark_entries_read`].
+#[derive(Deserialize)]
+struct MarkReadParams {
+    /// Only mark this feed's entries as read, rather than every entry.
+    feed: Option<i64>,
+}
+
+/// Mark every entry as read, or only those from the feed given in
+/// `params`, by giving them the `system:read` tag in one request to the
+/// Kiki API, once [`fetch_system_tag_id`] has looked up the tag. Called by the "Mark all as read" buttons' script, which
+/// reloads the page afterwards.
+///
+/// Responds with `204 No Content` once it is done, `502 Bad Gateway` if
+/// the Kiki server cannot make the change, and `403 Forbidden` to requests
+/// from other sites, going by `headers`; see [`is_same_origin`].
+async fn mark_entries_read(
+    State(api): State<reqwest::Client>,
+    Query(params): Query<MarkReadParams>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_same_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "Entries may only be marked as read from the web UI's own pages.",
+        )
+            .into_response();
+    }
+
+    let result = async {
+        let tag_id = fetch_system_tag_id(&api, SystemTag::Read).await?;
+        let request = AddTagEntriesRequest {
+            up_to_id: None,
+            feed_id: params.feed,
+        };
+        api.post(format!("{API_BASE}/v1/tags/id/{tag_id}/entries"))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?;
+        anyhow::Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::warn!(
+                feed_id = params.feed,
+                "failed to mark entries as read: {e:#}"
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                "The entries could not be marked as read.",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Look up the ID of the system tag `tag` through the Kiki API.
+async fn fetch_system_tag_id(api: &reqwest::Client, tag: SystemTag) -> Result<i64> {
+    let tags: ListTagsResponse = api
+        .get(format!("{API_BASE}/v1/tags?kind=system"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    tags.tags
+        .into_iter()
+        .find(|t| t.name == tag.name())
+        .map(|t| t.id)
+        .ok_or_else(|| anyhow!("the Kiki server has no {tag} tag"))
 }
 
 /// Render the list of feeds: the total number of feeds, and one page of
@@ -1161,7 +1237,7 @@ async fn fetch_entry_tags(
 }
 
 /// Render the entry count (`count`, of all the entries in the list), the
-/// filter menu, the entries on this page of `listing`, and the page links.
+/// "Mark all as read" button, the filter menu, the entries on this page of `listing`, and the page links.
 /// `feeds` maps feed
 /// IDs to the titles of the feeds; entries from feeds not in it are shown
 /// without their feed. `tags` maps entry IDs to the entries' tags; entries
@@ -1175,8 +1251,14 @@ fn render_entries(
 ) -> String {
     let unread = if listing.show_read { "" } else { "unread " };
     let mut html = format!(
-        "<div class=\"list-header\">\n<p class=\"count\">{count} {unread}{}</p>\n{}</div>\n",
+        "<div class=\"list-header\">\n<p class=\"count\">{count} {unread}{}</p>\n\
+         <div class=\"list-actions\">{}{}</div>\n</div>\n",
         if count == 1 { "entry" } else { "entries" },
+        if count == 0 {
+            String::new()
+        } else {
+            render_mark_read_button(listing.feed)
+        },
         render_filter(listing),
     );
 
@@ -1251,6 +1333,20 @@ fn render_entry(
         escape(display_title(&entry.title)),
         render_save_button(entry.id, tags),
         render_tags(tags)
+    )
+}
+
+/// Render the button that marks every entry as read, or only those from
+/// `feed`. The button does nothing on its own: the script in `page.js`
+/// sends the request to [`mark_entries_read`].
+fn render_mark_read_button(feed: Option<i64>) -> String {
+    let (data, label) = match feed {
+        Some(id) => (format!(" data-feed=\"{id}\""), "this feed&rsquo;s entries"),
+        None => (String::new(), "every entry"),
+    };
+    format!(
+        "<button type=\"button\" class=\"mark-read\"{data} \
+         title=\"Mark {label} as read\">Mark all as read</button>"
     )
 }
 
@@ -2605,6 +2701,91 @@ mod tests {
         }
         assert!(!is_saved(&tc, 1)?);
         assert!(is_saved(&tc, 2)?);
+        Ok(())
+    }
+
+    /// IDs of the entries with the `system:read` tag.
+    fn read_entries(tc: &crate::test::TestConfig) -> Result<Vec<i64>> {
+        let conn = tc.database_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT et.entry_id FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+             WHERE t.name = 'system:read' ORDER BY et.entry_id",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
+    /// The index and feed pages have a "Mark all as read" button, which
+    /// marks only the feed's entries on a feed's page. The index leaves it
+    /// out when there are no entries.
+    #[tokio::test]
+    async fn entry_lists_have_a_mark_all_as_read_button() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let (_, body) = get_index(tc.client()?).await?;
+        assert!(!body.contains("class=\"mark-read\""), "{body}");
+
+        insert_entries(&tc, 1)?;
+        let (_, body) = get_index(tc.client()?).await?;
+        assert!(
+            body.contains(
+                r#"<button type="button" class="mark-read" title="Mark every entry as read">"#
+            ),
+            "{body}"
+        );
+
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (id, title, url) VALUES (3, 'Feed', 'http://example.com/feed.xml')",
+            [],
+        )?;
+        conn.execute("UPDATE entries SET feed_id = 3", [])?;
+        let (_, body) = get_page(tc.client()?, "/feeds/3").await?;
+        assert!(
+            body.contains(r#"<button type="button" class="mark-read" data-feed="3""#),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// `POST /entries/read` marks every entry as read, or with `?feed=`,
+    /// only that feed's entries; requests from other sites are refused.
+    #[tokio::test]
+    async fn entries_can_be_marked_as_read() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 3)?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (id, title, url) VALUES (1, 'Feed', 'http://example.com/feed.xml')",
+            [],
+        )?;
+        conn.execute("UPDATE entries SET feed_id = 1 WHERE id = 2", [])?;
+        let post = reqwest::Method::POST;
+
+        for headers in [
+            &[("Sec-Fetch-Site", "cross-site")][..],
+            &[("Origin", "http://evil.example")],
+        ] {
+            let status = send_request(tc.client()?, post.clone(), "/entries/read", headers).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{headers:?}");
+        }
+        assert!(read_entries(&tc)?.is_empty());
+
+        let same_origin = [("Sec-Fetch-Site", "same-origin")];
+        let status = send_request(
+            tc.client()?,
+            post.clone(),
+            "/entries/read?feed=1",
+            &same_origin,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(read_entries(&tc)?, [2]);
+
+        let status = send_request(tc.client()?, post, "/entries/read", &same_origin).await?;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(read_entries(&tc)?, [1, 2, 3]);
         Ok(())
     }
 
