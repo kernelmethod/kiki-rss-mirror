@@ -133,3 +133,23 @@ document.addEventListener("click", async (event) => {
     button.disabled = false;
   }
 });
+
+// "Copy feed URL" buttons: clicking one copies the feed's full URL to the
+// clipboard, and briefly shows that it did.
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("button.copy-url");
+  if (!button) {
+    return;
+  }
+  const title = button.title;
+  try {
+    await navigator.clipboard.writeText(button.dataset.url);
+    button.title = "Copied!";
+  } catch (e) {
+    console.error("failed to copy feed URL:", e);
+    button.title = "Could not copy the URL";
+  }
+  setTimeout(() => {
+    button.title = title;
+  }, 2000);
+});
