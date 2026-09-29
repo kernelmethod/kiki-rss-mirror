@@ -10,6 +10,11 @@ pub enum TaskManagerCommand {
     CacheEntryAssets {
         entry_id: i64,
     },
+    /// Find and cache the favicon of the website a feed belongs to, if
+    /// Kiki has not looked recently.
+    CacheFeedFavicon {
+        feed_id: i64,
+    },
     /// Merge FTS5 index segments to improve search performance.
     OptimizeFts,
     /// Checkpoint the WAL file and refresh query-planner statistics.

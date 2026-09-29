@@ -93,14 +93,15 @@ pub async fn tag_entries(
             .query_row([id], |row| row.get(0))?;
 
         let entries = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT e.id, e.feed_id, e.source_id, e.syndication_format,
-                        e.guid, e.published_at, e.title, e.url, e.content
+                        e.guid, e.published_at, e.title, e.url, e.content, {}
                  FROM entries e
                  INNER JOIN entry_tags et ON et.entry_id = e.id
                  WHERE et.tag_id = ?1
                  LIMIT ?2 OFFSET ?3",
-            )
+                crate::db::favicons::favicon_hash_sql("e.feed_id")
+            ))
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
@@ -116,6 +117,7 @@ pub async fn tag_entries(
                     title: row.get(6)?,
                     url: row.get(7)?,
                     content: row.get(8)?,
+                    feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

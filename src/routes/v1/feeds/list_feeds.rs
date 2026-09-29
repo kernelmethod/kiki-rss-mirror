@@ -79,8 +79,10 @@ pub async fn list_feeds(
         let feeds = conn
             .prepare(&format!(
                 "SELECT id, title, url, description, last_checked, min_fetch_interval_seconds, auth_type,
-                (SELECT COUNT(*) FROM entries e WHERE e.feed_id = feeds.id AND {NOT_HIDDEN})
-                FROM feeds LIMIT ?1 OFFSET ?2"
+                (SELECT COUNT(*) FROM entries e WHERE e.feed_id = feeds.id AND {NOT_HIDDEN}),
+                site_url, {}
+                FROM feeds LIMIT ?1 OFFSET ?2",
+                crate::db::favicons::favicon_hash_sql("feeds.id")
             ))
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
@@ -98,6 +100,8 @@ pub async fn list_feeds(
                     min_fetch_interval_seconds: row.get(5)?,
                     auth_type,
                     entry_count: row.get(7)?,
+                    site_url: row.get(8)?,
+                    favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

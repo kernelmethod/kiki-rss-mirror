@@ -71,7 +71,7 @@ pub async fn list_entry_assets(
                 .into_iter()
                 .map(|r| EntryAsset {
                     original_url: r.asset.original_url,
-                    url: format!("/v1/assets/{}", r.asset.blake3),
+                    url: crate::routes::v1::assets::asset_url(&r.asset.blake3),
                     blake3: r.asset.blake3,
                     content_type: r.asset.content_type,
                     size_bytes: r.asset.size_bytes,

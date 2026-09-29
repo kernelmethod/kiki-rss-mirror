@@ -71,6 +71,12 @@ CREATE TABLE feeds (
     title                   VARCHAR NOT NULL,
     url                     VARCHAR,
     description             VARCHAR,
+
+    -- The website the feed belongs to, from the most recently parsed
+    -- document: RSS <channel><link>, or Atom's rel="alternate" link.
+    -- Always an absolute http(s) URL; NULL if the feed gives none.
+    -- Favicons are looked for here (see `feed_favicons`).
+    site_url                VARCHAR,
     last_checked            DATETIME,
     header_etag             VARCHAR,
     header_last_modified    VARCHAR,
@@ -472,6 +478,20 @@ CREATE TABLE entry_assets (
     FOREIGN KEY (asset_id) REFERENCES feed_assets(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_entry_assets_asset ON entry_assets(asset_id);
+
+-- The favicon of the website each feed belongs to, as a cached asset.
+-- `checked_at` is when Kiki last looked for one; `asset_id` is NULL if it
+-- found none. A row is removed along with its asset when the asset is
+-- evicted from the cache, so that the favicon is fetched again.
+CREATE TABLE feed_favicons (
+    feed_id     INTEGER PRIMARY KEY,
+    asset_id    INTEGER,
+    checked_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+
+    FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE,
+    FOREIGN KEY (asset_id) REFERENCES feed_assets(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_feed_favicons_asset ON feed_favicons(asset_id);
 
 ---------------------------------------------------------------------------------
 -- Full-text search index over entries (FTS5, external content)

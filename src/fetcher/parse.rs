@@ -31,6 +31,7 @@ pub fn parse_feed(feed_id: i64, body: &[u8]) -> Option<ParsedFeed> {
     if let Ok(feed) = atom_syndication::Feed::read_from(body) {
         let data = extract_atom_feed_data(&feed);
         let hints = atom_feed_hints(&feed);
+        let site_url = atom_site_url(&feed);
         let entries = feed
             .entries
             .into_iter()
@@ -40,18 +41,43 @@ pub fn parse_feed(feed_id: i64, body: &[u8]) -> Option<ParsedFeed> {
             feed: Box::new(data),
             entries,
             hints,
+            site_url,
         });
     }
     if let Ok(channel) = rss::Channel::read_from(body) {
         let hints = rss_channel_hints(&channel);
+        let site_url = Some(channel.link.trim().to_string()).filter(|l| !l.is_empty());
         let entries = channel
             .items
             .into_iter()
             .map(|i| rss_item_to_parts(feed_id, i))
             .collect();
-        return Some(ParsedFeed::Rss { entries, hints });
+        return Some(ParsedFeed::Rss {
+            entries,
+            hints,
+            site_url,
+        });
     }
     None
+}
+
+/// The website an Atom feed belongs to: its `rel="alternate"` link (the
+/// default relation when `rel` is absent), preferring one declared as HTML.
+fn atom_site_url(feed: &atom_syndication::Feed) -> Option<String> {
+    let alternates: Vec<_> = feed
+        .links
+        .iter()
+        .filter(|l| l.rel == "alternate" && !l.href.trim().is_empty())
+        .collect();
+    alternates
+        .iter()
+        .find(|l| {
+            l.mime_type
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("text/html"))
+        })
+        .or(alternates.first())
+        .map(|l| l.href.trim().to_string())
 }
 
 /// Collect the refresh hints an RSS channel declares.
@@ -295,6 +321,63 @@ mod tests {
             {feed_extra}</feed>"#
         );
         *parse_feed(1, body.as_bytes()).expect("valid Atom").hints()
+    }
+
+    fn atom_site_url_of(links: &str) -> Option<String> {
+        let body = format!(
+            r#"<feed xmlns="http://www.w3.org/2005/Atom">
+            <title>t</title><id>urn:x</id><updated>2024-01-01T00:00:00Z</updated>
+            {links}</feed>"#
+        );
+        parse_feed(1, body.as_bytes())
+            .expect("valid Atom")
+            .site_url()
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn rss_site_url_is_channel_link() {
+        let body = br#"<rss version="2.0"><channel><title>t</title>
+            <link> https://example.com/blog </link><description>d</description>
+            </channel></rss>"#;
+        let parsed = parse_feed(1, body).expect("valid RSS");
+        assert_eq!(parsed.site_url(), Some("https://example.com/blog"));
+    }
+
+    #[test]
+    fn rss_empty_channel_link_is_no_site_url() {
+        let body = br#"<rss version="2.0"><channel><title>t</title>
+            <link></link><description>d</description></channel></rss>"#;
+        assert_eq!(parse_feed(1, body).expect("valid RSS").site_url(), None);
+    }
+
+    #[test]
+    fn atom_site_url_prefers_html_alternate() {
+        assert_eq!(
+            atom_site_url_of(
+                r#"<link rel="self" href="https://example.com/feed.atom"/>
+                <link rel="alternate" type="application/json" href="https://example.com/feed.json"/>
+                <link rel="alternate" type="text/html" href="https://example.com/"/>"#
+            )
+            .as_deref(),
+            Some("https://example.com/")
+        );
+    }
+
+    #[test]
+    fn atom_link_without_rel_is_alternate() {
+        assert_eq!(
+            atom_site_url_of(r#"<link href="https://example.com/"/>"#).as_deref(),
+            Some("https://example.com/")
+        );
+    }
+
+    #[test]
+    fn atom_without_alternate_has_no_site_url() {
+        assert_eq!(
+            atom_site_url_of(r#"<link rel="self" href="https://example.com/feed"/>"#),
+            None
+        );
     }
 
     #[test]

@@ -30,6 +30,8 @@ pub const MAX_ASSET_BYTES: u64 = 32 * 1024 * 1024;
 pub enum AssetKind {
     InlineImg,
     Enclosure,
+    /// The favicon of the website a feed belongs to.
+    Favicon,
 }
 
 impl AssetKind {
@@ -37,6 +39,7 @@ impl AssetKind {
         match self {
             AssetKind::InlineImg => "inline_img",
             AssetKind::Enclosure => "enclosure",
+            AssetKind::Favicon => "favicon",
         }
     }
 }
@@ -84,15 +87,15 @@ pub fn normalize_content_type(raw: &str) -> Option<String> {
 
 /// Whether a normalized MIME type is acceptable to cache for the given kind.
 ///
-/// Inline images must match one of the safe raster image types. Enclosures
-/// additionally accept audio and video types plus a handful of common
-/// podcast-adjacent `application/*` types.
+/// Inline images and favicons must match one of the safe raster image
+/// types. Enclosures additionally accept audio and video types plus a
+/// handful of common podcast-adjacent `application/*` types.
 pub fn is_allowed_content_type(normalized: &str, kind: AssetKind) -> bool {
     if SAFE_IMAGE_TYPES.contains(&normalized) {
         return true;
     }
     match kind {
-        AssetKind::InlineImg => false,
+        AssetKind::InlineImg | AssetKind::Favicon => false,
         AssetKind::Enclosure => {
             normalized.starts_with("audio/")
                 || normalized.starts_with("video/")
@@ -197,7 +200,8 @@ pub fn unlink_asset_file(data_dir: &Path, blake3: &str) {
     }
 }
 
-/// Fetch, hash, store, and index a single asset.
+/// Fetch, hash, store, and index a single asset, and link it to entry
+/// `entry_id` as an asset of kind `kind`.
 ///
 /// Short-circuits to just linking the entry if an asset with the same
 /// `original_url` already exists in the index.
@@ -216,13 +220,52 @@ pub async fn cache_asset(
     entry_id: i64,
     kind: AssetKind,
 ) -> Result<()> {
-    // Fast path: we've already fetched this exact URL before. Just ensure the
-    // entry is linked to the existing asset row.
+    store_asset(
+        client,
+        pool,
+        data_dir,
+        max_cache_bytes,
+        asset_url,
+        kind,
+        move |conn, asset_id| {
+            crate::db::assets::link_entry_asset(conn, entry_id, asset_id, kind.as_str())
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Fetch, hash, store, and index a single asset, then call `link` with the
+/// id of its `feed_assets` row to record what it belongs to.
+///
+/// Short-circuits to just calling `link` if an asset with the same
+/// `original_url` already exists in the index. Otherwise `link` is called
+/// before the cache is evicted back under `max_cache_bytes`, so that it
+/// never sees an asset row that has already been removed.
+///
+/// Returns `Ok(true)` once `link` has been called, and `Ok(false)` when the
+/// asset could not be fetched, was too large, or was of a type not allowed
+/// for `kind`; those failures are logged rather than returned. Database and
+/// filesystem errors, and errors from `link`, are returned.
+pub async fn store_asset<F>(
+    client: &reqwest::Client,
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    data_dir: &Path,
+    max_cache_bytes: i64,
+    asset_url: &Url,
+    kind: AssetKind,
+    link: F,
+) -> Result<bool>
+where
+    F: FnOnce(&rusqlite::Connection, i64) -> Result<()> + Send + 'static,
+{
+    // Fast path: we've already fetched this exact URL before. Just link the
+    // existing asset row.
     {
         let conn = pool.get()?;
         if let Some(existing) = crate::db::assets::lookup_by_url(&conn, asset_url.as_str())? {
-            crate::db::assets::link_entry_asset(&conn, entry_id, existing.id, kind.as_str())?;
-            return Ok(());
+            link(&conn, existing.id)?;
+            return Ok(true);
         }
     }
 
@@ -231,7 +274,7 @@ pub async fn cache_asset(
         Ok(r) => r,
         Err(e) => {
             warn!("asset fetch failed for {}: {}", asset_url, e);
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -241,7 +284,7 @@ pub async fn cache_asset(
             asset_url,
             resp.status()
         );
-        return Ok(());
+        return Ok(false);
     }
 
     let raw_content_type = resp
@@ -255,7 +298,7 @@ pub async fn cache_asset(
                 "asset {} has disallowed or missing content-type {:?}, skipping",
                 asset_url, raw_content_type
             );
-            return Ok(());
+            return Ok(false);
         }
     };
     let etag = resp
@@ -279,11 +322,11 @@ pub async fn cache_asset(
                 "asset {} body of {} bytes exceeds cap {}, skipping",
                 asset_url, seen, MAX_ASSET_BYTES
             );
-            return Ok(());
+            return Ok(false);
         }
         Err(e) => {
             warn!("asset body read failed for {}: {}", asset_url, e);
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -294,7 +337,6 @@ pub async fn cache_asset(
     let url_str = asset_url.as_str().to_string();
     let data_dir = data_dir.to_path_buf();
     let pool = pool.clone();
-    let kind_str = kind.as_str().to_string();
 
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = pool.get()?;
@@ -312,7 +354,7 @@ pub async fn cache_asset(
                 last_modified.as_deref(),
             )?
         };
-        crate::db::assets::link_entry_asset(&conn, entry_id, asset_id, &kind_str)?;
+        link(&conn, asset_id)?;
 
         // Enforce cache cap inline. Cheap: one SUM and, in the common case
         // where we're under the cap, no deletes.
@@ -330,7 +372,7 @@ pub async fn cache_asset(
     })
     .await??;
 
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -426,6 +468,22 @@ mod tests {
             AssetKind::InlineImg
         ));
         assert!(!is_allowed_content_type("audio/mpeg", AssetKind::InlineImg));
+    }
+
+    #[test]
+    fn favicon_allowlist_is_raster_images_only() {
+        assert!(is_allowed_content_type("image/x-icon", AssetKind::Favicon));
+        assert!(is_allowed_content_type(
+            "image/vnd.microsoft.icon",
+            AssetKind::Favicon
+        ));
+        assert!(is_allowed_content_type("image/png", AssetKind::Favicon));
+        assert!(!is_allowed_content_type(
+            "image/svg+xml",
+            AssetKind::Favicon
+        ));
+        assert!(!is_allowed_content_type("text/html", AssetKind::Favicon));
+        assert!(!is_allowed_content_type("audio/mpeg", AssetKind::Favicon));
     }
 
     #[test]

@@ -28,6 +28,7 @@ use tracing::{debug, warn};
 /// have to upgrade a read.
 pub(super) fn process_atom_feed(
     feed_id: i64,
+    site_url: Option<&str>,
     feed_data: AtomFeedIngestData,
     entries: Vec<AtomEntry>,
     mut conn: PooledConnection<SqliteConnectionManager>,
@@ -56,6 +57,7 @@ pub(super) fn process_atom_feed(
         "UPDATE feeds SET syndication_format = 'atom' WHERE id = ?1",
         [feed_id],
     )?;
+    crate::db::favicons::set_site_url(&tx, feed_id, site_url)?;
     upsert_atom_feed_data(&tx, feed_id, &feed_data)?;
 
     let mut inserted_entry_ids: Vec<i64> = Vec::with_capacity(entries.len());
@@ -87,6 +89,7 @@ pub(super) fn process_atom_feed(
 /// written in one immediate transaction once the scripts have run.
 pub(super) fn process_rss_feed(
     feed_id: i64,
+    site_url: Option<&str>,
     entries: Vec<RssEntry>,
     mut conn: PooledConnection<SqliteConnectionManager>,
     script_runner: Option<&dyn ScriptRunner>,
@@ -114,6 +117,7 @@ pub(super) fn process_rss_feed(
         "UPDATE feeds SET syndication_format = 'rss' WHERE id = ?1",
         [feed_id],
     )?;
+    crate::db::favicons::set_site_url(&tx, feed_id, site_url)?;
 
     let mut inserted_entry_ids: Vec<i64> = Vec::with_capacity(entries.len());
     let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
@@ -268,6 +272,22 @@ pub(super) fn enqueue_asset_caching(
                 entry_id, e
             ),
         }
+    }
+}
+
+/// Enqueue a [`TaskManagerCommand::CacheFeedFavicon`] for feed `feed_id`.
+/// Best-effort, like [`enqueue_asset_caching`].
+pub(super) fn enqueue_favicon_caching(
+    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    metrics: &Metrics,
+    feed_id: i64,
+) {
+    match task_tx.try_send(TaskManagerCommand::CacheFeedFavicon { feed_id }) {
+        Ok(()) => metrics.record_task_enqueued("cache_feed_favicon"),
+        Err(e) => debug!(
+            "failed to queue CacheFeedFavicon for feed {}: {:?}",
+            feed_id, e
+        ),
     }
 }
 

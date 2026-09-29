@@ -5,6 +5,7 @@ mod command;
 mod entry_assets;
 mod error;
 mod error_recording;
+mod favicons;
 mod fetch;
 mod maintenance;
 mod parsing;
@@ -25,6 +26,8 @@ pub use worker::{spawn_workers, worker_count};
 // this path (it imports them directly from the submodules instead).
 #[allow(unused_imports)]
 pub(crate) use entry_assets::cache_entry_assets;
+#[allow(unused_imports)]
+pub(crate) use favicons::cache_feed_favicon;
 /// [`fetch::refresh_feed`] with an in-process fetcher around `client` and
 /// the default settings, which is how the tests drive it.
 #[cfg(test)]

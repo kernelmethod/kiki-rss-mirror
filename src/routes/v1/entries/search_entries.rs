@@ -433,9 +433,10 @@ pub async fn search_entries(
         // Data query
         let data_sql = format!(
             "SELECT e.id, e.feed_id, e.source_id, e.syndication_format, \
-             e.guid, e.published_at, e.title, e.url, e.content, \
+             e.guid, e.published_at, e.title, e.url, e.content, {}, \
              {} \
              FROM {}{} ORDER BY {} LIMIT ?{} OFFSET ?{}",
+            crate::db::favicons::favicon_hash_sql("e.feed_id"),
             rank_expr,
             from_clause,
             where_clause,
@@ -452,7 +453,7 @@ pub async fn search_entries(
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
             })?
             .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                let rank: Option<f64> = row.get(9)?;
+                let rank: Option<f64> = row.get(10)?;
                 Ok(SearchEntriesResponseEntry {
                     entry: ListEntriesResponseEntry {
                         id: row.get(0)?,
@@ -465,6 +466,7 @@ pub async fn search_entries(
                         title: row.get(6)?,
                         url: row.get(7)?,
                         content: row.get(8)?,
+                        feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
                     },
                     rank,
                 })

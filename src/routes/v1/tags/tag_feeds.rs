@@ -93,10 +93,12 @@ pub async fn tag_feeds(
             })?
             .query_row([id], |row| row.get(0))?;
 
+        let favicon = crate::db::favicons::favicon_hash_sql("f.id");
         let feeds = conn
             .prepare(&format!(
                 "SELECT f.id, f.title, f.url, f.description, f.last_checked, f.min_fetch_interval_seconds, f.auth_type,
-                        (SELECT COUNT(*) FROM entries e WHERE e.feed_id = f.id AND {NOT_HIDDEN})
+                        (SELECT COUNT(*) FROM entries e WHERE e.feed_id = f.id AND {NOT_HIDDEN}),
+                        f.site_url, {favicon}
                  FROM feeds f
                  INNER JOIN feed_tags ft ON ft.feed_id = f.id
                  WHERE ft.tag_id = ?1
@@ -118,6 +120,8 @@ pub async fn tag_feeds(
                     min_fetch_interval_seconds: row.get(5)?,
                     auth_type,
                     entry_count: row.get(7)?,
+                    site_url: row.get(8)?,
+                    favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

@@ -22,6 +22,28 @@ pub fn create_router() -> Router<AppState> {
         .route("/{hash}", get(get_asset).delete(delete_asset))
 }
 
+/// The API path that serves the cached asset with the blake3 hash `hash`.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::routes::v1::assets::asset_url;
+///
+/// assert_eq!(asset_url("abc"), "/v1/assets/abc");
+/// ```
+pub fn asset_url(hash: &str) -> String {
+    format!("/v1/assets/{}", hash)
+}
+
+/// Read column `idx` of `row`, a nullable asset hash, as the [`asset_url`]
+/// that serves the asset.
+pub(crate) fn read_asset_url_column(
+    row: &rusqlite::Row,
+    idx: usize,
+) -> rusqlite::Result<Option<String>> {
+    Ok(row.get::<_, Option<String>>(idx)?.map(|h| asset_url(&h)))
+}
+
 fn is_hex_hash(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -165,7 +187,7 @@ pub async fn get_asset_by_url(
     })?;
 
     match row {
-        Some(r) => Ok(Redirect::to(&format!("/v1/assets/{}", r.blake3)).into_response()),
+        Some(r) => Ok(Redirect::to(&asset_url(&r.blake3)).into_response()),
         None => Err((StatusCode::NOT_FOUND, "asset not found").into_response()),
     }
 }

@@ -14,7 +14,10 @@ use crate::tasks::cache::{
 use crate::tasks::command::TaskManagerCommand;
 use crate::tasks::error::FetchError;
 use crate::tasks::error_recording::{clear_feed_error, set_feed_error_with_schedule};
-use crate::tasks::processing::{enqueue_asset_caching, process_atom_feed, process_rss_feed};
+use crate::tasks::favicons::resolve_site_url;
+use crate::tasks::processing::{
+    enqueue_asset_caching, enqueue_favicon_caching, process_atom_feed, process_rss_feed,
+};
 use crate::tasks::scripting::{fire_fetch_error, fire_fetch_success};
 use anyhow::Result;
 use chrono::Utc;
@@ -296,15 +299,36 @@ pub(crate) async fn refresh_feed(
     };
     metrics.record_feed_parse(feed.format(), parsed.seconds, feed.entry_count() as u64);
     let entry_count = feed.entry_count();
+    // The site link comes from the feed document, so it is only kept if it
+    // is an http(s) URL; relative links are relative to the feed.
+    let site_url = feed
+        .site_url()
+        .and_then(|u| resolve_site_url(u, &row.url))
+        .map(String::from);
+    let site_url = site_url.as_deref();
     let inserted = match feed {
-        ParsedFeed::Atom { feed, entries, .. } => {
-            process_atom_feed(feed_id, *feed, entries, pool.get()?, script_runner, metrics)?
-        }
-        ParsedFeed::Rss { entries, .. } => {
-            process_rss_feed(feed_id, entries, pool.get()?, script_runner, metrics)?
-        }
+        ParsedFeed::Atom { feed, entries, .. } => process_atom_feed(
+            feed_id,
+            site_url,
+            *feed,
+            entries,
+            pool.get()?,
+            script_runner,
+            metrics,
+        )?,
+        ParsedFeed::Rss { entries, .. } => process_rss_feed(
+            feed_id,
+            site_url,
+            entries,
+            pool.get()?,
+            script_runner,
+            metrics,
+        )?,
     };
     enqueue_asset_caching(task_tx, metrics, &inserted);
+    if settings.asset_cache.enabled && favicon_is_due(&conn, feed_id) {
+        enqueue_favicon_caching(task_tx, metrics, feed_id);
+    }
     clear_feed_error(&conn, feed_id);
     info!(
         "{} refreshed with {} entries, {} new; next fetch {}",
@@ -315,6 +339,15 @@ pub(crate) async fn refresh_feed(
     );
     rec.outcome("success");
     Ok(())
+}
+
+/// Whether feed `feed_id`'s favicon should be looked for now. A database
+/// error is logged and taken as no, since the next refresh will ask again.
+fn favicon_is_due(conn: &rusqlite::Connection, feed_id: i64) -> bool {
+    crate::tasks::favicons::is_due(conn, feed_id).unwrap_or_else(|e| {
+        warn!("could not check the favicon of feed {}: {:?}", feed_id, e);
+        false
+    })
 }
 
 /// Everything the outcome of one refresh is recorded against.
