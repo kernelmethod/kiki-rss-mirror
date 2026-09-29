@@ -19,7 +19,14 @@
 //!
 //! [retention]
 //! max_age_days = 30
+//!
+//! [proxy]
+//! url = "http://proxy.example:3128"
+//! no_proxy = "localhost, .internal.example"
 //! ```
+//!
+//! The proxy can also be set with environment variables, which take
+//! precedence over the file; see [`ProxySettings`].
 //!
 //! The file is owned by Kiki: the settings API rewrites it through a
 //! [`ConfigStore`], which re-reads it from disk before every change, so
@@ -82,6 +89,8 @@ pub struct Settings {
     pub feed_fetch: FeedFetchSettings,
     pub asset_cache: AssetCacheSettings,
     pub retention: RetentionSettings,
+    #[serde(default)]
+    pub proxy: ProxySettings,
 }
 
 /// Settings governing how and how often feeds are fetched.
@@ -140,6 +149,95 @@ pub struct RetentionSettings {
     pub max_age_days: Option<i64>,
 }
 
+/// The proxy used for outbound HTTP(S): feed fetches and asset downloads.
+///
+/// Each key can also be set from the environment, which takes precedence
+/// over the config file key by key: [`PROXY_ENV`] (`KIKI_PROXY`) for
+/// [`url`](Self::url) and [`NO_PROXY_ENV`] (`KIKI_NO_PROXY`) for
+/// [`no_proxy`](Self::no_proxy). [`ProxySettings::with_env`] applies them.
+///
+/// When no proxy URL is set either way, the conventional `HTTPS_PROXY`,
+/// `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` variables are honored instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxySettings {
+    /// URL of the proxy all outbound requests go through, `http://` or
+    /// `https://`, optionally with `user:password@` credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+
+    /// Hosts that bypass [`url`](Self::url): a comma-separated list of
+    /// domains (matching their subdomains too), IP addresses, CIDR ranges,
+    /// or `*` for every host. Has no effect without `url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_proxy: Option<String>,
+}
+
+/// Environment variable overriding [`ProxySettings::url`].
+pub const PROXY_ENV: &str = "KIKI_PROXY";
+
+/// Environment variable overriding [`ProxySettings::no_proxy`].
+pub const NO_PROXY_ENV: &str = "KIKI_NO_PROXY";
+
+impl ProxySettings {
+    /// Returns these settings with any key set in the environment
+    /// replaced by the environment's value. `var` looks a variable up;
+    /// unset and empty variables are both ignored.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::ProxySettings;
+    ///
+    /// let file = ProxySettings {
+    ///     url: Some("http://file-proxy:3128".into()),
+    ///     no_proxy: Some("localhost".into()),
+    /// };
+    /// let env = |name: &str| (name == "KIKI_PROXY").then(|| "http://env-proxy:8080".to_string());
+    /// let effective = file.with_env(env);
+    /// assert_eq!(effective.url.as_deref(), Some("http://env-proxy:8080"));
+    /// assert_eq!(effective.no_proxy.as_deref(), Some("localhost"));
+    /// ```
+    pub fn with_env(mut self, var: impl Fn(&str) -> Option<String>) -> Self {
+        let var = |name| var(name).filter(|v| !v.trim().is_empty());
+        if let Some(url) = var(PROXY_ENV) {
+            self.url = Some(url);
+        }
+        if let Some(no_proxy) = var(NO_PROXY_ENV) {
+            self.no_proxy = Some(no_proxy);
+        }
+        self
+    }
+
+    /// Checks that [`url`](Self::url), if set, is a usable proxy URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Invalid`] if the URL does not parse, has a
+    /// scheme other than `http` or `https`, or has no host. The message
+    /// never repeats the URL, which may hold credentials.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let Some(raw) = &self.url else {
+            return Ok(());
+        };
+        let invalid = |why: String| Err(ConfigError::Invalid(format!("proxy.url {why}")));
+        let url = match url::Url::parse(raw.trim()) {
+            Ok(url) => url,
+            Err(e) => return invalid(format!("is not a valid URL: {e}")),
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            return invalid(format!(
+                "must use the http or https scheme, not {:?}",
+                url.scheme()
+            ));
+        }
+        if url.host_str().is_none_or(str::is_empty) {
+            return invalid("must name a host".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// Default for [`FeedFetchSettings::max_feed_bytes`]: 32 MiB.
 ///
 /// Feeds are text and even very long archive feeds sit far below this.
@@ -173,6 +271,7 @@ impl Default for Settings {
                 max_bytes: DEFAULT_ASSET_CACHE_MAX_BYTES,
             },
             retention: RetentionSettings::default(),
+            proxy: ProxySettings::default(),
         }
     }
 }
@@ -219,7 +318,13 @@ impl Settings {
                 "retention.max_age_days must be at most {MAX_RETENTION_DAYS}"
             )));
         }
-        Ok(())
+        self.proxy.validate()
+    }
+
+    /// The proxy settings in effect: the config file's, with the
+    /// environment's overrides applied (see [`ProxySettings::with_env`]).
+    pub fn effective_proxy(&self) -> ProxySettings {
+        self.proxy.clone().with_env(|name| std::env::var(name).ok())
     }
 }
 
@@ -338,7 +443,7 @@ fn merge(base: &mut toml::Table, overrides: &toml::Table) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -420,6 +525,77 @@ mod tests {
             !o.to_toml_string().unwrap().contains("asset_cache"),
             "an emptied section should be dropped"
         );
+    }
+
+    #[test]
+    fn proxy_settings_are_read_from_the_file() {
+        let o = Overrides::parse(
+            "[proxy]\nurl = \"http://user:pw@proxy.example:3128\"\nno_proxy = \"localhost\"\n",
+        )
+        .unwrap();
+        let s = o.resolve().unwrap();
+        assert_eq!(
+            s.proxy.url.as_deref(),
+            Some("http://user:pw@proxy.example:3128")
+        );
+        assert_eq!(s.proxy.no_proxy.as_deref(), Some("localhost"));
+        assert_eq!(Settings::default().proxy, ProxySettings::default());
+    }
+
+    #[test]
+    fn invalid_proxy_urls_are_rejected_without_echoing_them() {
+        for url in [
+            "not a url",
+            "socks5://secret@proxy.example:1080",
+            "ftp://proxy.example",
+            "http://",
+        ] {
+            let mut o = Overrides::default();
+            o.set("proxy", "url", url).unwrap();
+            match o.resolve() {
+                Err(ConfigError::Invalid(msg)) => {
+                    assert!(msg.starts_with("proxy.url"), "{msg}");
+                    assert!(!msg.contains("secret"), "{msg}");
+                }
+                other => panic!("{url:?} should be rejected, got {other:?}"),
+            }
+        }
+        let o = Overrides::parse("[proxy]\nurl_typo = \"http://p\"\n").unwrap();
+        assert!(matches!(o.resolve(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn proxy_environment_overrides_the_file_key_by_key() {
+        let file = ProxySettings {
+            url: Some("http://file:1".into()),
+            no_proxy: Some("file.example".into()),
+        };
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+
+        assert_eq!(file.clone().with_env(env(&[])), file);
+        // Empty variables count as unset.
+        assert_eq!(
+            file.clone()
+                .with_env(env(&[(PROXY_ENV, ""), (NO_PROXY_ENV, " ")])),
+            file
+        );
+
+        let s = file.clone().with_env(env(&[(PROXY_ENV, "http://env:2")]));
+        assert_eq!(s.url.as_deref(), Some("http://env:2"));
+        assert_eq!(s.no_proxy.as_deref(), Some("file.example"));
+
+        let s = ProxySettings::default().with_env(env(&[
+            (PROXY_ENV, "http://env:2"),
+            (NO_PROXY_ENV, "env.example"),
+        ]));
+        assert_eq!(s.url.as_deref(), Some("http://env:2"));
+        assert_eq!(s.no_proxy.as_deref(), Some("env.example"));
     }
 
     #[test]

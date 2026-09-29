@@ -183,6 +183,31 @@ by the running server; an invalid edit is logged and ignored. While the
 file is invalid, every settings update through the API fails with
 `409 Conflict` rather than overwriting it, so fix or remove it first.
 
+#### Proxy
+
+To send feed fetches and asset downloads through an HTTP(S) proxy, set it
+in `kiki.toml`:
+
+```toml
+[proxy]
+url = "http://user:password@proxy.example:3128"
+no_proxy = "localhost, .internal.example, 10.0.0.0/8"   # optional
+```
+
+or with environment variables, which take precedence over the file:
+
+| | Overrides |
+| --- | --- |
+| `$KIKI_PROXY` | `proxy.url` |
+| `$KIKI_NO_PROXY` | `proxy.no_proxy` |
+
+`no_proxy` is a comma-separated list of hosts to reach directly: domains
+(which include their subdomains), IP addresses, CIDR ranges, or `*`. When
+no proxy URL is set either way, Kiki honors the conventional
+`$HTTPS_PROXY`, `$HTTP_PROXY`, `$ALL_PROXY` and `$NO_PROXY` instead.
+Changes to the file take effect without a restart; an invalid
+`$KIKI_PROXY` stops `kiki serve` at startup.
+
 Kiki serves over a Unix socket and nothing else — it does not listen on
 TCP. A socket is reachable only by processes that can reach its path, which
 is access control Kiki does not have to implement or authenticate. To expose

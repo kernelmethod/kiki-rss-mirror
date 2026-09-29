@@ -1,6 +1,5 @@
 use crate::config::ConfigHandle;
-use crate::fetcher::Fetcher;
-use crate::http::USER_AGENT;
+use crate::fetcher::{client_builder, Fetcher, ProxiedClient};
 use crate::metrics::Metrics;
 use crate::scripting::{ScriptRunner, ScriptRunnerHandle};
 use crate::tasks::command::TaskManagerCommand;
@@ -79,7 +78,7 @@ struct Worker {
     script_runner: ScriptRunnerHandle,
     fetcher: Fetcher,
     /// Client for asset caching; feed fetches go through `fetcher`.
-    asset_client: reqwest::Client,
+    asset_client: ProxiedClient,
 }
 
 /// Determine the number of worker tasks to spawn.
@@ -115,10 +114,7 @@ pub fn spawn_workers(
     script_runner: ScriptRunnerHandle,
     fetcher: Fetcher,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
-    let asset_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(USER_AGENT)
-        .build()
+    let asset_client = ProxiedClient::new(client_builder)
         .context("failed to build the HTTP client for asset caching")?;
 
     let worker = Worker {
@@ -329,15 +325,22 @@ async fn run_worker(worker_id: usize, w: Worker) {
             }
 
             TaskManagerCommand::CacheEntryAssets { entry_id } => {
-                let outcome = match cache_entry_assets(
-                    &w.asset_client,
-                    &w.pool,
-                    &w.data_dir,
-                    &settings.asset_cache,
-                    entry_id,
-                )
-                .await
-                {
+                let result = match w.asset_client.get(&settings.effective_proxy()) {
+                    Ok(client) => {
+                        cache_entry_assets(
+                            &client,
+                            &w.pool,
+                            &w.data_dir,
+                            &settings.asset_cache,
+                            entry_id,
+                        )
+                        .await
+                    }
+                    Err(_) => Err(anyhow::anyhow!(
+                        "could not configure the HTTP client for the proxy"
+                    )),
+                };
+                let outcome = match result {
                     Ok(()) => "ok",
                     Err(e) => {
                         warn!("failed caching assets for entry {}: {:?}", entry_id, e);
