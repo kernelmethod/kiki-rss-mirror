@@ -380,3 +380,117 @@ async fn asset_cache_evicts_when_over_cap() -> Result<()> {
 
     Ok(())
 }
+
+/// How a [`start_stalling_server`] misbehaves.
+#[derive(Clone, Copy)]
+enum Stall {
+    /// Never answers the request.
+    Response,
+    /// Sends the headers and part of the body, then nothing more.
+    Body,
+    /// Sends the headers, then one byte of the body every 50 ms, for ever.
+    Drip,
+}
+
+/// Spawn a server that answers every connection as `stall` says, holding
+/// connections open until the test ends.
+async fn start_stalling_server(stall: Stall) -> Result<SocketAddr> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let headers = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\
+                               Content-Length: 1000000\r\n\r\n";
+                match stall {
+                    Stall::Response => {}
+                    Stall::Body => {
+                        let _ = stream.write_all(headers.as_bytes()).await;
+                        let _ = stream.write_all(&TINY_PNG[..16]).await;
+                    }
+                    Stall::Drip => {
+                        let _ = stream.write_all(headers.as_bytes()).await;
+                        while stream.write_all(b"x").await.is_ok() {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                drop(stream);
+            });
+        }
+    });
+    Ok(addr)
+}
+
+/// Try to cache the image at `addr` with a client limited by `timeouts`,
+/// returning whether it was cached and how long that took to decide.
+async fn cache_with_timeouts(
+    timeouts: super::super::assets::AssetTimeouts,
+    addr: SocketAddr,
+) -> Result<(bool, std::time::Duration)> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let pool = make_pool(&tc.database_path())?;
+    let client = super::super::assets::asset_client_builder(timeouts).build()?;
+    let url = reqwest::Url::parse(&format!("http://{addr}/img.png"))?;
+
+    let start = std::time::Instant::now();
+    let cached = super::super::assets::store_asset(
+        &client,
+        &pool,
+        tc.config_dir(),
+        i64::MAX,
+        &url,
+        super::super::assets::AssetKind::InlineImg,
+        |_, _| Ok(()),
+    )
+    .await?;
+    Ok((cached, start.elapsed()))
+}
+
+/// A server that stops sending, before its response or part-way through
+/// the body, is given up on once it has been quiet for the read timeout.
+#[tokio::test]
+async fn asset_downloads_time_out_when_the_server_stalls() -> Result<()> {
+    let timeouts = super::super::assets::AssetTimeouts {
+        connect: std::time::Duration::from_secs(5),
+        read: std::time::Duration::from_millis(300),
+        total: std::time::Duration::from_secs(60),
+    };
+    for stall in [Stall::Response, Stall::Body] {
+        let addr = start_stalling_server(stall).await?;
+        let (cached, elapsed) = cache_with_timeouts(timeouts, addr).await?;
+        assert!(!cached);
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+    }
+    Ok(())
+}
+
+/// A server that sends just often enough to keep the read timeout from
+/// firing is cut off by the overall timeout.
+#[tokio::test]
+async fn asset_downloads_time_out_when_the_server_drips() -> Result<()> {
+    let timeouts = super::super::assets::AssetTimeouts {
+        connect: std::time::Duration::from_secs(5),
+        read: std::time::Duration::from_secs(5),
+        total: std::time::Duration::from_millis(500),
+    };
+    let addr = start_stalling_server(Stall::Drip).await?;
+    let (cached, elapsed) = cache_with_timeouts(timeouts, addr).await?;
+    assert!(!cached);
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    Ok(())
+}
+
+/// The limits Kiki runs with leave room for a full-size enclosure.
+#[test]
+fn default_asset_timeouts_allow_large_downloads() {
+    let t = super::super::assets::AssetTimeouts::DEFAULT;
+    assert!(t.connect < t.total && t.read < t.total);
+    let bits = super::super::assets::MAX_ASSET_BYTES * 8;
+    assert!(bits / t.total.as_secs() <= 1_000_000);
+}
