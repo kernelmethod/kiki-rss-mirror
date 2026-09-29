@@ -1724,8 +1724,8 @@ fn render_feeds(resp: &ListFeedsResponse, page: u32) -> String {
                 render_favicon(feed.favicon_url.as_deref()),
                 feed.id,
                 escape(display_feed_title(&feed.title)),
-                feed.entry_count,
-                if feed.entry_count == 1 { "entry" } else { "entries" }
+                feed.unread_count,
+                "unread"
             ));
         }
         html.push_str("</ol>\n");

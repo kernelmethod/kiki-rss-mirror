@@ -1,4 +1,4 @@
-use crate::routes::v1::entries::list_entries::NOT_HIDDEN;
+use crate::routes::v1::entries::list_entries::{NOT_HIDDEN, UNREAD};
 use crate::routes::v1::feeds::get_feed::{self, read_auth_type_column};
 use crate::server::AppState;
 use axum::{
@@ -80,7 +80,8 @@ pub async fn list_feeds(
             .prepare(&format!(
                 "SELECT id, title, url, description, last_checked, min_fetch_interval_seconds, auth_type,
                 (SELECT COUNT(*) FROM entries e WHERE e.feed_id = feeds.id AND {NOT_HIDDEN}),
-                site_url, {}
+                site_url, {},
+                (SELECT COUNT(*) FROM entries e WHERE e.feed_id = feeds.id AND {UNREAD})
                 FROM feeds LIMIT ?1 OFFSET ?2",
                 crate::db::favicons::favicon_hash_sql("feeds.id")
             ))
@@ -102,6 +103,7 @@ pub async fn list_feeds(
                     entry_count: row.get(7)?,
                     site_url: row.get(8)?,
                     favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
+                    unread_count: row.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

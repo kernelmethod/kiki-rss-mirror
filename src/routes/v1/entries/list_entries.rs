@@ -30,6 +30,14 @@ pub(crate) const NOT_HIDDEN: &str = "NOT EXISTS (
             WHERE et.entry_id = e.id AND t.kind = 'system' AND t.name = 'system:hidden'
         )";
 
+/// An SQL condition that holds when the entry aliased `e` is neither tagged
+/// `system:hidden` nor `system:read`.
+pub(crate) const UNREAD: &str = "NOT EXISTS (
+            SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+            WHERE et.entry_id = e.id AND t.kind = 'system'
+              AND t.name IN ('system:hidden', 'system:read')
+        )";
+
 /// An SQL condition that holds when the entry aliased `e` is not tagged
 /// `system:hidden`, or when query parameter number `param` is true.
 pub(crate) fn not_hidden_unless(param: usize) -> String {
