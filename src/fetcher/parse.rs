@@ -246,22 +246,18 @@ fn rss_item_to_parts(feed_id: i64, item: rss::Item) -> RssEntry {
         comments,
         enclosure,
         categories,
+        dublin_core_ext,
         ..
     } = item;
 
-    let timestamp = pub_date
-        .as_deref()
-        .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
-        .map(|d| d.timestamp())
-        .unwrap_or_else(|| Utc::now().timestamp());
-
-    let guid = guid.map(|g| g.value).unwrap_or_else(|| {
-        format!(
-            "rss-{}-{}",
-            timestamp,
-            title.as_deref().unwrap_or("no-title")
-        )
-    });
+    let published = rss_item_published(pub_date.as_deref(), dublin_core_ext.as_ref());
+    let timestamp = published.unwrap_or_else(|| Utc::now().timestamp());
+    let guid = rss_item_guid(
+        guid.map(|g| g.value),
+        link.as_deref(),
+        title.as_deref(),
+        published,
+    );
 
     let (enclosure_url, enclosure_length, enclosure_mime_type) = match enclosure {
         Some(e) => (Some(e.url), e.length.parse::<i64>().ok(), Some(e.mime_type)),
@@ -301,8 +297,68 @@ fn rss_item_to_parts(feed_id: i64, item: rss::Item) -> RssEntry {
     RssEntry { entry, data }
 }
 
+/// When an RSS item was published: its `<pubDate>` (RFC 2822), or failing
+/// that its Dublin Core `<dc:date>` (W3C-DTF, i.e. RFC 3339 or a bare
+/// date), which RSS 1.0 feeds use in place of `<pubDate>`.
+///
+/// Returns `None` if the item has neither, or neither parses.
+fn rss_item_published(
+    pub_date: Option<&str>,
+    dublin_core: Option<&rss::extension::dublincore::DublinCoreExtension>,
+) -> Option<i64> {
+    let from_pub_date = pub_date
+        .and_then(|d| chrono::DateTime::parse_from_rfc2822(d.trim()).ok())
+        .map(|d| d.timestamp());
+    from_pub_date.or_else(|| {
+        dublin_core?
+            .dates()
+            .iter()
+            .find_map(|d| parse_w3c_date(d.trim()))
+    })
+}
+
+/// Parse a W3C-DTF timestamp: a full RFC 3339 date-time, or a bare
+/// `YYYY-MM-DD` date, taken as midnight UTC.
+fn parse_w3c_date(date: &str) -> Option<i64> {
+    if let Ok(d) = chrono::DateTime::parse_from_rfc3339(date) {
+        return Some(d.timestamp());
+    }
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|d| d.and_utc().timestamp())
+}
+
+/// The guid to store an RSS item under.
+///
+/// This is what refreshes match stored entries on, so it must come out the
+/// same every time the feed lists the item: its `<guid>` if it has one,
+/// otherwise its `<link>`, otherwise its title and publication date. RSS
+/// 1.0 items, for one, carry no `<guid>`. The time of the fetch never goes
+/// into it, or every refresh would store the item anew.
+fn rss_item_guid(
+    guid: Option<String>,
+    link: Option<&str>,
+    title: Option<&str>,
+    published: Option<i64>,
+) -> String {
+    // A <guid> is kept verbatim, as it always has been, so entries already
+    // stored under one still match.
+    if let Some(guid) = guid.filter(|g| !g.trim().is_empty()) {
+        return guid;
+    }
+    if let Some(link) = link.map(str::trim).filter(|l| !l.is_empty()) {
+        return link.to_string();
+    }
+    let title = title.unwrap_or("no-title");
+    match published {
+        Some(ts) => format!("rss-{ts}-{title}"),
+        None => format!("rss-{title}"),
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -482,5 +538,89 @@ mod tests {
             "<sy:updatePeriod>fortnightly</sy:updatePeriod><sy:updateFrequency>lots</sy:updateFrequency>",
         );
         assert_eq!(hints.update_interval_secs, Some(24 * 60 * 60));
+    }
+
+    /// Parse `body` as RSS and return its entries.
+    fn rss_entries(body: &str) -> Vec<FeedEntry> {
+        let entries = match parse_feed(1, body.as_bytes()).expect("valid feed") {
+            ParsedFeed::Rss { entries, .. } => Some(entries),
+            ParsedFeed::Atom { .. } => None,
+        };
+        let entries = entries.expect("parsed as RSS");
+        entries.into_iter().map(|e| e.entry).collect()
+    }
+
+    /// An RSS 1.0 (RDF) document with one item, shaped like the ACM Digital
+    /// Library's table-of-contents feeds: no `<guid>`, no `<pubDate>`.
+    fn rdf_feed(item_extra: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+            <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                xmlns="http://purl.org/rss/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <channel rdf:about="https://example.com/toc"><title>t</title>
+                <link>https://example.com/toc</link><description>d</description></channel>
+            <item rdf:about="https://example.com/doi/1"><title>A Paper</title>{item_extra}</item>
+            </rdf:RDF>"#
+        )
+    }
+
+    #[test]
+    fn rss_item_guid_wins_over_link() {
+        let entries = rss_entries(
+            r#"<rss version="2.0"><channel><title>t</title><link>http://x/</link>
+            <description>d</description><item><title>hi</title><guid>g1</guid>
+            <link>http://x/1</link></item></channel></rss>"#,
+        );
+        assert_eq!(entries[0].guid, "g1");
+    }
+
+    #[test]
+    fn rss_item_without_guid_falls_back_to_link() {
+        let body = rdf_feed(
+            "<link>https://example.com/doi/1?af=R</link><dc:date>2026-09-01T00:00:00Z</dc:date>",
+        );
+        let entries = rss_entries(&body);
+        assert_eq!(entries[0].guid, "https://example.com/doi/1?af=R");
+    }
+
+    #[test]
+    fn rss_item_without_guid_or_link_is_stable_across_parses() {
+        // Neither a guid, a link nor a date: the fetch time must not leak
+        // into the guid, or each refresh stores the item again.
+        let body = rdf_feed("");
+        let first = rss_entries(&body)[0].guid.clone();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = rss_entries(&body)[0].guid.clone();
+        assert_eq!(first, second);
+        assert_eq!(first, "rss-A Paper");
+    }
+
+    #[test]
+    fn rss_item_without_guid_or_link_uses_title_and_date() {
+        let entries = rss_entries(&rdf_feed("<dc:date>2026-09-01T00:00:00Z</dc:date>"));
+        assert_eq!(entries[0].guid, "rss-1788220800-A Paper");
+    }
+
+    #[test]
+    fn rss_item_dc_date_is_publication_date() {
+        let entries = rss_entries(&rdf_feed("<dc:date>2026-09-01T12:00:00+02:00</dc:date>"));
+        assert_eq!(entries[0].published_at, Some(1788256800));
+    }
+
+    #[test]
+    fn rss_item_bare_dc_date_is_midnight_utc() {
+        let entries = rss_entries(&rdf_feed("<dc:date>2026-09-01</dc:date>"));
+        assert_eq!(entries[0].published_at, Some(1788220800));
+    }
+
+    #[test]
+    fn rss_item_pub_date_wins_over_dc_date() {
+        let entries = rss_entries(
+            r#"<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel>
+            <title>t</title><link>http://x/</link><description>d</description>
+            <item><title>hi</title><pubDate>Tue, 01 Sep 2026 00:00:00 GMT</pubDate>
+            <dc:date>2020-01-01T00:00:00Z</dc:date></item></channel></rss>"#,
+        );
+        assert_eq!(entries[0].published_at, Some(1788220800));
     }
 }
