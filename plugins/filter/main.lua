@@ -1,13 +1,10 @@
--- Hide entries whose fields match, or fail to match, regular expressions,
--- and tag the entries that match others.
+-- Hide entries whose fields match, or fail to match, regular expressions.
 --
 -- Config:
 --
 --   exclude  A list of rules. An entry matching any of them is hidden.
 --   include  A list of rules. An entry whose feed has include rules, and
 --            that matches none of them, is hidden.
---   tag      A list of rules, each with a `tag` too. An entry matching a
---            rule is tagged with its tag. Hidden entries are not tagged.
 --   rescan   Whether to apply the rules to the entries already stored
 --            when they change. Defaults to true.
 --
@@ -25,16 +22,12 @@
 --   feeds    Optional list of the feeds the rule applies to, each given
 --            by its id or by the URL it is fetched from. Without it, the
 --            rule applies to every feed.
---   tag      For tag rules only: the tag to add, a user tag or a system
---            tag such as system:saved.
 --
 -- Hidden entries are tagged system:hidden. The filter never unhides an
--- entry or removes a tag, so loosening a rule leaves the entries it hid
--- hidden, and the entries it tagged tagged.
+-- entry, so loosening a rule leaves the entries it hid hidden.
 --
--- Since the tags a plugin returns for an entry replace its user tags (see
--- the scripting documentation), a tag rule that matches an entry fetched
--- again replaces the user tags it was given since with the rule's tag.
+-- The filter adds no other tags: the auto-tag plugin does that. Versions
+-- before 3.0.0 took `tag` rules too; they are now ignored, with a warning.
 
 local config = ...
 
@@ -136,15 +129,7 @@ local function compile_rules(name)
         fail(name, "must be a list of rules")
     end
     for i, rule in ipairs(list) do
-        local where = string.format("%s[%d]", name, i)
-        local compiled = compile_rule(where, rule)
-        if name == "tag" then
-            if type(rule.tag) ~= "string" or rule.tag == "" then
-                fail(where, "'tag' must be a tag name")
-            end
-            compiled.tag = rule.tag
-        end
-        table.insert(rules, compiled)
+        table.insert(rules, compile_rule(string.format("%s[%d]", name, i), rule))
     end
     return rules
 end
@@ -153,7 +138,11 @@ end
 -- on every entry.
 local exclude = compile_rules("exclude")
 local include = compile_rules("include")
-local tag_rules = compile_rules("tag")
+
+if type(config.tag) == "table" and #config.tag > 0 then
+    kiki.log("warn", "filter: ignoring the 'tag' rules; the filter no longer tags "
+        .. "entries, so move them to the auto-tag plugin's rules")
+end
 
 local function applies(rule, entry)
     if rule.feeds == nil or rule.feeds[entry.feed_id] then
@@ -208,33 +197,12 @@ local function has_tag(entry, name)
     return false
 end
 
--- Adds `name` to the entry's tags. A stored entry, handed to a scan, is
--- tagged directly, since a scan only applies the system tags its handler
--- adds.
-local function add_tag(entry, name)
-    if entry.id ~= nil then
-        kiki.entries.tag(entry.id, name)
-    elseif not has_tag(entry, name) then
-        -- An earlier plugin may have added the tag already. (Entries
-        -- passed to a scan always arrive with `tags` empty.)
-        table.insert(entry.tags, name)
-    end
-end
-
 local function filter(entry)
     local reason = reason_to_hide(entry)
     if reason then
         kiki.log("debug", string.format("filter: hiding %q: %s", entry.guid, reason))
         if not has_tag(entry, HIDDEN) then
             table.insert(entry.tags, HIDDEN)
-        end
-        return entry
-    end
-    for _, rule in ipairs(tag_rules) do
-        if applies(rule, entry) and matches(rule, entry) then
-            kiki.log("debug", string.format(
-                "filter: tagging %q %s: %s matched", entry.guid, rule.tag, rule.where))
-            add_tag(entry, rule.tag)
         end
     end
     return entry
@@ -276,17 +244,17 @@ kiki.on("plugin.load", function()
     if config.rescan == false then
         return
     end
-    -- `tag` is only recorded when there are tag rules, so that rules
-    -- recorded before tag rules existed still compare equal.
-    local tag = config.tag
-    if tag ~= nil and #tag == 0 then
-        tag = nil
+    local rules = { exclude = config.exclude or {}, include = config.include or {} }
+    -- Versions before 3.0.0 recorded their tag rules too. Those no longer
+    -- apply, so dropping them should not rescan.
+    local recorded = kiki.store.get("rules")
+    if type(recorded) == "table" then
+        recorded.tag = nil
     end
-    local rules = { exclude = config.exclude or {}, include = config.include or {}, tag = tag }
-    if deep_equal(kiki.store.get("rules"), rules) then
+    if deep_equal(recorded, rules) then
         return
     end
-    if #exclude == 0 and #include == 0 and #tag_rules == 0 then
+    if #exclude == 0 and #include == 0 then
         kiki.store.set("rules", rules)
         return
     end
