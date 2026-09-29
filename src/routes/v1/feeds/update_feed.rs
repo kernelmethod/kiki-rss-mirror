@@ -322,8 +322,12 @@ pub async fn update_feed(
         let query = format!("UPDATE feeds SET {} WHERE id = ?", updates.join(", "));
 
         // Execute the update, and bring the feed's schedule in line with it,
-        // in one transaction.
-        let tx = conn.unchecked_transaction()?;
+        // in one transaction. It takes the write lock up front: a deferred
+        // transaction that reads and then writes fails at once with
+        // SQLITE_BUSY (no busy_timeout wait) if a worker commits a write in
+        // between, e.g. the refresh queued when the feed was added.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         let before = read_fetch_config(&tx, id)?;
         let params = rusqlite::params_from_iter(params);
         tx.execute(&query, params).inspect_err(|e| {
