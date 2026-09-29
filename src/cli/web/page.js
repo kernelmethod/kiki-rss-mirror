@@ -70,3 +70,39 @@ function setSaved(button, saved) {
     tags.prepend(tag);
   }
 }
+
+// Filter menus: ticking or unticking a filter's checkbox loads the list with
+// the filter changed, from the URL the page gives in its `data-href`.
+document.addEventListener("change", (event) => {
+  const toggle = event.target.closest("input.filter-toggle");
+  if (toggle) {
+    window.location.href = toggle.dataset.href;
+  }
+});
+
+// "Mark all as read" buttons: clicking one, once confirmed, marks every entry
+// (or every entry from the button's feed) as read, and reloads the page.
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("button.mark-read");
+  if (!button || button.disabled) {
+    return;
+  }
+  const feed = button.dataset.feed;
+  const what = feed ? "every entry from this feed" : "every entry";
+  if (!confirm(`Mark ${what} as read?`)) {
+    return;
+  }
+  button.disabled = true;
+  try {
+    const query = feed ? `?feed=${encodeURIComponent(feed)}` : "";
+    const resp = await fetch(`/entries/read${query}`, { method: "POST" });
+    if (!resp.ok) {
+      throw new Error(`${resp.status} ${resp.statusText}`);
+    }
+    location.reload();
+  } catch (e) {
+    console.error("failed to mark entries as read:", e);
+    button.title = "Could not mark the entries as read";
+    button.disabled = false;
+  }
+});

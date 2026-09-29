@@ -912,6 +912,71 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_search_feed_id() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+        {
+            let conn = tc.database_conn()?;
+            conn.execute(
+                "INSERT INTO feeds (id, title, url, syndication_format)
+                 VALUES (2, 'Other Feed', 'http://example.com/other', 'rss')",
+                [],
+            )?;
+            conn.execute("UPDATE entries SET feed_id = 2 WHERE id IN (2, 4)", [])?;
+        }
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"feed_id": 2}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 2);
+        let titles: Vec<&str> = body
+            .entries
+            .iter()
+            .map(|e| e.entry.title.as_str())
+            .collect();
+        assert_eq!(titles, ["Sports Update", "Science Discovery"]);
+
+        // It combines with the other filters.
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"feed_id": 1, "tags": {"not": "news"}}))
+            .send()
+            .await?;
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].entry.title, "Tech Review");
+
+        Ok(())
+    }
+
+    /// Entries published at the same time come out in descending ID order,
+    /// so that paging through them neither skips nor repeats any.
+    #[tokio::test]
+    async fn test_search_orders_ties_by_id() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+        tc.database_conn()?
+            .execute("UPDATE entries SET published_at = 1700000000", [])?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        let ids: Vec<i64> = body.entries.iter().map(|e| e.entry.id).collect();
+        assert_eq!(ids, [4, 3, 2, 1]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_search_date_range() -> Result<()> {
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;

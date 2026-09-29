@@ -11,6 +11,13 @@
     .site-nav { margin-top: -0.5rem; }
     .site-nav a { margin-right: 1rem; }
     .count { color: #666; }
+    .list-header { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+    .list-actions { display: flex; align-items: baseline; gap: 1rem; }
+    .mark-read:disabled { cursor: progress; opacity: 0.5; }
+    .filter { position: relative; }
+    .filter summary { font-size: 1rem; }
+    .filter .menu { position: absolute; right: 0; z-index: 1; margin-top: 0.25rem; padding: 0.5rem 0.75rem; border: 1px solid #ddd; border-radius: 0.25rem; background: #fff; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1); white-space: nowrap; }
+    .filter label { cursor: pointer; }
     .entries { padding-left: 0; list-style: none; }
     .entries > li, .feeds > li { padding: 0.5rem 0; border-bottom: 1px solid #ddd; }
     .feeds { padding-left: 0; list-style: none; }
