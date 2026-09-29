@@ -225,6 +225,8 @@ pub(crate) async fn refresh_feed(
 
     // file:// feeds are read here, because the fetcher has no filesystem
     // access, and only the parse is handed off.
+    // Set when the server answers 304 Not Modified.
+    let mut not_modified = false;
     let fetched = if row.url.starts_with("file://") {
         match retrieve_file_feed(&row.url, feed_id, pool.clone(), cfg) {
             Ok((content, schedule)) => fetcher
@@ -265,13 +267,16 @@ pub(crate) async fn refresh_feed(
             proxy: settings.effective_proxy(),
         };
         match fetcher.fetch(spec).await {
-            Ok(reply) => match record_fetch_reply(&rec, &row, reply, force_conditionals_off) {
-                Ok(parsed) => Ok(parsed),
-                Err(e) => {
-                    rec.outcome("other");
-                    return Err(e);
+            Ok(reply) => {
+                not_modified = matches!(reply, FetchReply::NotModified { .. });
+                match record_fetch_reply(&rec, &row, reply, force_conditionals_off) {
+                    Ok(parsed) => Ok(parsed),
+                    Err(e) => {
+                        rec.outcome("other");
+                        return Err(e);
+                    }
                 }
-            },
+            }
             Err(e) => Err(e),
         }
     };
@@ -279,8 +284,16 @@ pub(crate) async fn refresh_feed(
     let (parsed, schedule) = match fetched {
         Ok(Some(fetched)) => fetched,
         // The outcome (304, HTTP error, oversized body, ...) has been
-        // recorded and there is nothing to store.
-        Ok(None) => return Ok(()),
+        // recorded and there is nothing to store. An unchanged feed is
+        // still a working one, so its favicon is looked for all the same:
+        // otherwise a feed whose server keeps answering 304 would only get
+        // one after its content changed.
+        Ok(None) => {
+            if not_modified {
+                queue_favicon_if_due(settings, &conn, task_tx, metrics, feed_id);
+            }
+            return Ok(());
+        }
         // The fetcher itself failed, not the feed server. Recorded as a
         // transient error so the feed backs off: if its content is what
         // crashed the fetcher, retrying on the next tick would only crash
@@ -326,9 +339,7 @@ pub(crate) async fn refresh_feed(
         )?,
     };
     enqueue_asset_caching(task_tx, metrics, &inserted);
-    if settings.asset_cache.enabled && favicon_is_due(&conn, feed_id) {
-        enqueue_favicon_caching(task_tx, metrics, feed_id);
-    }
+    queue_favicon_if_due(settings, &conn, task_tx, metrics, feed_id);
     clear_feed_error(&conn, feed_id);
     info!(
         "{} refreshed with {} entries, {} new; next fetch {}",
@@ -339,6 +350,20 @@ pub(crate) async fn refresh_feed(
     );
     rec.outcome("success");
     Ok(())
+}
+
+/// Queue a look for feed `feed_id`'s favicon if the asset cache is enabled
+/// and Kiki has not looked recently.
+fn queue_favicon_if_due(
+    settings: &Settings,
+    conn: &rusqlite::Connection,
+    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    metrics: &Metrics,
+    feed_id: i64,
+) {
+    if settings.asset_cache.enabled && favicon_is_due(conn, feed_id) {
+        enqueue_favicon_caching(task_tx, metrics, feed_id);
+    }
 }
 
 /// Whether feed `feed_id`'s favicon should be looked for now. A database
