@@ -568,3 +568,73 @@ async fn assets_the_fetcher_should_have_refused_are_not_stored() -> Result<()> {
     assert_eq!(n, 0);
     Ok(())
 }
+
+/// Many tasks storing the same bytes at once, as when several feeds from
+/// one website look for its favicon together, all succeed and share one
+/// asset row and one file.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_stores_of_the_same_bytes_share_one_asset() -> Result<()> {
+    use crate::fetcher::assets::{AssetReply, FetchedAsset};
+    use crate::process::feed_fetcher::{FeedFetcherHost, Job, JobResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tc = TestBuilder::default().init_database().build()?;
+    let pool = make_pool(&tc.database_path())?;
+    let host = FeedFetcherHost::with_fake_worker(|job| match job {
+        Job::FetchAsset(_) => JobResult::Asset(AssetReply::Fetched(Box::new(FetchedAsset {
+            content_type: "image/png".into(),
+            etag: None,
+            last_modified: None,
+            bytes: TINY_PNG.to_vec(),
+        }))),
+        _ => JobResult::Failed {
+            message: "unexpected job".into(),
+        },
+    });
+    let fetcher = crate::fetcher::Fetcher::Isolated(Arc::new(host));
+    let linked = Arc::new(AtomicUsize::new(0));
+
+    let mut stores = tokio::task::JoinSet::new();
+    for i in 0..16 {
+        let (fetcher, pool, linked) = (fetcher.clone(), pool.clone(), linked.clone());
+        let data_dir = tc.config_dir().to_path_buf();
+        stores.spawn(async move {
+            let cache = super::super::assets::AssetCache {
+                fetcher: &fetcher,
+                proxy: &Default::default(),
+                pool: &pool,
+                data_dir: &data_dir,
+                max_bytes: i64::MAX,
+            };
+            let url = reqwest::Url::parse(&format!("http://site{i}.invalid/favicon.ico"))?;
+            super::super::assets::store_asset(
+                &cache,
+                &url,
+                super::super::assets::AssetKind::Favicon,
+                move |_, _| {
+                    linked.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+        });
+    }
+    while let Some(stored) = stores.join_next().await {
+        assert!(stored??);
+    }
+    assert_eq!(linked.load(Ordering::SeqCst), 16);
+
+    let n: i64 = tc
+        .database_conn()?
+        .query_row("SELECT COUNT(*) FROM feed_assets", [], |r| r.get(0))?;
+    assert_eq!(n, 1);
+    let hash = blake3::hash(TINY_PNG).to_hex().to_string();
+    let path = super::super::assets::asset_path(tc.config_dir(), &hash);
+    assert_eq!(std::fs::read(&path)?, TINY_PNG);
+    let leftovers = std::fs::read_dir(path.parent().unwrap())?
+        .filter(|e| e.as_ref().is_ok_and(|e| e.path() != path))
+        .count();
+    assert_eq!(leftovers, 0);
+    Ok(())
+}
