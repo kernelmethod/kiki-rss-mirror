@@ -147,281 +147,355 @@ async fn run_worker(worker_id: usize, w: Worker) {
 
         w.metrics.inc_workers_busy();
         let task_start = Instant::now();
-        let settings = w.config.current();
 
-        match command {
-            TaskManagerCommand::RefreshFeed { feed_id, manual } => {
-                let guard = match InProgressGuard::try_claim(&w.refresh_in_progress, feed_id) {
-                    Some(g) => {
-                        w.metrics
-                            .set_feeds_refresh_in_progress(in_progress_len(&w.refresh_in_progress));
-                        g
-                    }
-                    None => {
-                        debug!(
-                            "Worker {}: feed {} already in progress, skipping refresh",
-                            worker_id, feed_id
-                        );
-                        w.metrics.record_task_processed(
-                            "refresh_feed",
-                            "skipped_in_progress",
-                            task_start.elapsed().as_secs_f64(),
-                        );
-                        w.metrics.dec_workers_busy();
-                        continue;
-                    }
-                };
-
-                let runner_snapshot = w.script_runner.current();
-                let script_runner: Option<&dyn ScriptRunner> = runner_snapshot.as_deref();
-
-                let outcome = match refresh_feed(
-                    &w.fetcher,
-                    feed_id,
-                    manual,
-                    w.db.clone(),
-                    &settings,
-                    script_runner,
-                    &w.metrics,
-                    &w.tx,
-                )
-                .await
-                {
-                    Ok(()) => "ok",
-                    Err(e) => {
-                        error!(
-                            "An error occurred while refreshing feed {}: {:?}",
-                            feed_id, e
-                        );
-                        let schedule = w.db.write_blocking(|conn| {
-                            set_feed_error(
-                                conn,
-                                feed_id,
-                                &FetchError::Other {
-                                    message: format!("{}", e),
-                                },
-                                &settings.feed_fetch,
-                                &w.metrics,
-                            )
-                        });
-                        if let Ok(Some(schedule)) = schedule {
-                            info!("Feed {}: next attempt {}", feed_id, schedule);
-                        }
-                        "error"
-                    }
-                };
-
-                drop(guard);
-                w.metrics
-                    .set_feeds_refresh_in_progress(in_progress_len(&w.refresh_in_progress));
-
-                w.metrics.record_task_processed(
-                    "refresh_feed",
-                    outcome,
-                    task_start.elapsed().as_secs_f64(),
-                );
-
-                // Queue retention cleanup for this feed.
-                if let Err(e) = w.tx.try_send(TaskManagerCommand::CleanupFeed(feed_id)) {
-                    warn!("Failed to queue cleanup for feed {}: {:?}", feed_id, e);
-                } else {
-                    w.metrics.record_task_enqueued("cleanup_feed");
-                }
-            }
-
-            TaskManagerCommand::CleanupFeed(feed_id) => {
-                let _guard = match InProgressGuard::try_claim(&w.cleanup_in_progress, feed_id) {
-                    Some(g) => g,
-                    None => {
-                        debug!(
-                            "Worker {}: feed {} already in progress, skipping cleanup",
-                            worker_id, feed_id
-                        );
-                        w.metrics.record_task_processed(
-                            "cleanup_feed",
-                            "skipped_in_progress",
-                            task_start.elapsed().as_secs_f64(),
-                        );
-                        w.metrics.dec_workers_busy();
-                        continue;
-                    }
-                };
-
-                let cleanup_start = Instant::now();
-                let mut outcome = "ok";
-                let cleaned = w.db.write_blocking(|conn| {
-                    crate::db::retention::cleanup_feed(
-                        conn,
-                        feed_id,
-                        settings.retention.max_age_days,
-                    )
-                });
-                if let Ok(cleaned) = cleaned {
-                    match cleaned {
-                        Ok(0) => {}
-                        Ok(n) => {
-                            info!(
-                                "Retention cleanup deleted {} old entries for feed {}",
-                                n, feed_id
-                            );
-                            w.metrics.record_retention_cleanup(
-                                "feed",
-                                cleanup_start.elapsed().as_secs_f64(),
-                                n as u64,
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Retention cleanup failed for feed {}: {:?}", feed_id, e);
-                            outcome = "error";
-                        }
-                    }
-                } else {
-                    outcome = "error";
-                }
-
-                w.metrics.record_task_processed(
-                    "cleanup_feed",
-                    outcome,
-                    task_start.elapsed().as_secs_f64(),
-                );
-            }
-
-            TaskManagerCommand::CleanupAll => {
-                let cleanup_start = Instant::now();
-                let mut outcome = "ok";
-                let cleaned = w.db.write_blocking(|conn| {
-                    crate::db::retention::cleanup_all(conn, settings.retention.max_age_days)
-                });
-                if let Ok(cleaned) = cleaned {
-                    match cleaned {
-                        Ok(0) => {}
-                        Ok(n) => {
-                            info!("Retention cleanup deleted {} entries", n);
-                            w.metrics.record_retention_cleanup(
-                                "all",
-                                cleanup_start.elapsed().as_secs_f64(),
-                                n as u64,
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Retention cleanup failed: {:?}", e);
-                            outcome = "error";
-                        }
-                    }
-                } else {
-                    outcome = "error";
-                }
-
-                w.metrics.record_task_processed(
-                    "cleanup_all",
-                    outcome,
-                    task_start.elapsed().as_secs_f64(),
-                );
-            }
-
-            TaskManagerCommand::CacheEntryAssets { entry_id } => {
-                let result = cache_entry_assets(
-                    &w.fetcher,
-                    &settings.effective_proxy(),
-                    &w.db,
-                    &w.data_dir,
-                    &settings.asset_cache,
-                    entry_id,
-                )
-                .await;
-                let outcome = match result {
-                    Ok(()) => "ok",
-                    Err(e) => {
-                        warn!("failed caching assets for entry {}: {:?}", entry_id, e);
-                        "error"
-                    }
-                };
-                w.metrics.record_task_processed(
-                    "cache_entry_assets",
-                    outcome,
-                    task_start.elapsed().as_secs_f64(),
-                );
-            }
-
-            TaskManagerCommand::CacheFeedFavicon { feed_id } => {
-                let result = cache_feed_favicon(
-                    &w.fetcher,
-                    &settings.effective_proxy(),
-                    &w.db,
-                    &w.data_dir,
-                    &settings.asset_cache,
-                    feed_id,
-                )
-                .await;
-                let outcome = match result {
-                    Ok(()) => "ok",
-                    Err(e) => {
-                        warn!("failed caching the favicon of feed {}: {:?}", feed_id, e);
-                        "error"
-                    }
-                };
-                w.metrics.record_task_processed(
-                    "cache_feed_favicon",
-                    outcome,
-                    task_start.elapsed().as_secs_f64(),
-                );
-            }
-
-            TaskManagerCommand::OptimizeFts => {
-                run_maintenance(
-                    &w.db,
-                    crate::db::task_queue::TASK_FTS_OPTIMIZE,
-                    "FTS5 optimize",
-                    |conn| {
-                        conn.execute(
-                            "INSERT INTO entries_fts(entries_fts) VALUES ('optimize')",
-                            [],
-                        )?;
-                        Ok(())
-                    },
-                );
-                w.metrics.record_task_processed(
-                    "optimize_fts",
-                    "ok",
-                    task_start.elapsed().as_secs_f64(),
-                );
-            }
-
-            TaskManagerCommand::WalCheckpointAnalyze => {
-                run_maintenance(
-                    &w.db,
-                    crate::db::task_queue::TASK_WAL_CHECKPOINT_ANALYZE,
-                    "WAL checkpoint and ANALYZE",
-                    |conn| {
-                        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); ANALYZE;")?;
-                        Ok(())
-                    },
-                );
-                w.metrics.record_task_processed(
-                    "wal_checkpoint_analyze",
-                    "ok",
-                    task_start.elapsed().as_secs_f64(),
-                );
-            }
-
-            TaskManagerCommand::IncrementalVacuum => {
-                run_maintenance(
-                    &w.db,
-                    crate::db::task_queue::TASK_INCREMENTAL_VACUUM,
-                    "incremental vacuum",
-                    |conn| {
-                        conn.execute_batch("PRAGMA incremental_vacuum;")?;
-                        Ok(())
-                    },
-                );
-                w.metrics.record_task_processed(
-                    "incremental_vacuum",
-                    "ok",
-                    task_start.elapsed().as_secs_f64(),
-                );
-            }
+        // Each command runs in a task of its own, so that a panic while
+        // handling it unwinds that task alone rather than this loop: the
+        // worker lives on to take the next command.
+        let handled = tokio::spawn({
+            let w = w.clone();
+            let command = command.clone();
+            async move { handle_command(worker_id, &w, command, task_start).await }
+        })
+        .await;
+        if let Err(e) = handled {
+            recover_from_failed_command(&w, command, task_start, e);
         }
 
         w.metrics.dec_workers_busy();
+    }
+}
+
+/// Deal with a command whose task did not finish: log it, count it, and,
+/// for a feed refresh, record the failure against the feed.
+///
+/// Recording it is what stops one bad feed from taking the workers down
+/// one after another: the refresh may have panicked before it rescheduled
+/// the feed, which would leave it due again on the scheduler's next tick,
+/// to panic in the next worker. As a transient error it backs off instead.
+fn recover_from_failed_command(
+    w: &Worker,
+    command: TaskManagerCommand,
+    task_start: Instant,
+    e: tokio::task::JoinError,
+) {
+    let what = if e.is_panic() {
+        format!("panicked: {}", panic_message(e.into_panic()))
+    } else {
+        "was cancelled".to_string()
+    };
+    error!("task {:?} {}", command, what);
+    w.metrics
+        .record_task_processed(command.name(), "panic", task_start.elapsed().as_secs_f64());
+
+    if let TaskManagerCommand::RefreshFeed { feed_id, .. } = command {
+        // The unwind released the feed's claim, but skipped the update of
+        // the gauge that follows a refresh.
+        w.metrics
+            .set_feeds_refresh_in_progress(in_progress_len(&w.refresh_in_progress));
+        let settings = w.config.current();
+        let schedule = w.db.write_blocking(|conn| {
+            set_feed_error(
+                conn,
+                feed_id,
+                &FetchError::Other {
+                    message: format!("refreshing the feed {}", what),
+                },
+                &settings.feed_fetch,
+                &w.metrics,
+            )
+        });
+        match schedule {
+            Ok(Some(schedule)) => info!("Feed {}: next attempt {}", feed_id, schedule),
+            Ok(None) => {}
+            Err(e) => error!("could not record the failure of feed {}: {:?}", feed_id, e),
+        }
+    }
+}
+
+/// The message a panic was raised with, if it was a string.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(s) => *s,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(s) => (*s).to_string(),
+            Err(_) => "(no message)".to_string(),
+        },
+    }
+}
+
+/// Carry out one command. Runs in a task of its own; see [`run_worker`].
+async fn handle_command(
+    worker_id: usize,
+    w: &Worker,
+    command: TaskManagerCommand,
+    task_start: Instant,
+) {
+    let settings = w.config.current();
+
+    match command {
+        TaskManagerCommand::RefreshFeed { feed_id, manual } => {
+            let guard = match InProgressGuard::try_claim(&w.refresh_in_progress, feed_id) {
+                Some(g) => {
+                    w.metrics
+                        .set_feeds_refresh_in_progress(in_progress_len(&w.refresh_in_progress));
+                    g
+                }
+                None => {
+                    debug!(
+                        "Worker {}: feed {} already in progress, skipping refresh",
+                        worker_id, feed_id
+                    );
+                    w.metrics.record_task_processed(
+                        "refresh_feed",
+                        "skipped_in_progress",
+                        task_start.elapsed().as_secs_f64(),
+                    );
+                    return;
+                }
+            };
+
+            let runner_snapshot = w.script_runner.current();
+            let script_runner: Option<&dyn ScriptRunner> = runner_snapshot.as_deref();
+
+            let outcome = match refresh_feed(
+                &w.fetcher,
+                feed_id,
+                manual,
+                w.db.clone(),
+                &settings,
+                script_runner,
+                &w.metrics,
+                &w.tx,
+            )
+            .await
+            {
+                Ok(()) => "ok",
+                Err(e) => {
+                    error!(
+                        "An error occurred while refreshing feed {}: {:?}",
+                        feed_id, e
+                    );
+                    let schedule = w.db.write_blocking(|conn| {
+                        set_feed_error(
+                            conn,
+                            feed_id,
+                            &FetchError::Other {
+                                message: format!("{}", e),
+                            },
+                            &settings.feed_fetch,
+                            &w.metrics,
+                        )
+                    });
+                    if let Ok(Some(schedule)) = schedule {
+                        info!("Feed {}: next attempt {}", feed_id, schedule);
+                    }
+                    "error"
+                }
+            };
+
+            drop(guard);
+            w.metrics
+                .set_feeds_refresh_in_progress(in_progress_len(&w.refresh_in_progress));
+
+            w.metrics.record_task_processed(
+                "refresh_feed",
+                outcome,
+                task_start.elapsed().as_secs_f64(),
+            );
+
+            // Queue retention cleanup for this feed.
+            if let Err(e) = w.tx.try_send(TaskManagerCommand::CleanupFeed(feed_id)) {
+                warn!("Failed to queue cleanup for feed {}: {:?}", feed_id, e);
+            } else {
+                w.metrics.record_task_enqueued("cleanup_feed");
+            }
+        }
+
+        TaskManagerCommand::CleanupFeed(feed_id) => {
+            let _guard = match InProgressGuard::try_claim(&w.cleanup_in_progress, feed_id) {
+                Some(g) => g,
+                None => {
+                    debug!(
+                        "Worker {}: feed {} already in progress, skipping cleanup",
+                        worker_id, feed_id
+                    );
+                    w.metrics.record_task_processed(
+                        "cleanup_feed",
+                        "skipped_in_progress",
+                        task_start.elapsed().as_secs_f64(),
+                    );
+                    return;
+                }
+            };
+
+            let cleanup_start = Instant::now();
+            let mut outcome = "ok";
+            let cleaned = w.db.write_blocking(|conn| {
+                crate::db::retention::cleanup_feed(conn, feed_id, settings.retention.max_age_days)
+            });
+            if let Ok(cleaned) = cleaned {
+                match cleaned {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        info!(
+                            "Retention cleanup deleted {} old entries for feed {}",
+                            n, feed_id
+                        );
+                        w.metrics.record_retention_cleanup(
+                            "feed",
+                            cleanup_start.elapsed().as_secs_f64(),
+                            n as u64,
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Retention cleanup failed for feed {}: {:?}", feed_id, e);
+                        outcome = "error";
+                    }
+                }
+            } else {
+                outcome = "error";
+            }
+
+            w.metrics.record_task_processed(
+                "cleanup_feed",
+                outcome,
+                task_start.elapsed().as_secs_f64(),
+            );
+        }
+
+        TaskManagerCommand::CleanupAll => {
+            let cleanup_start = Instant::now();
+            let mut outcome = "ok";
+            let cleaned = w.db.write_blocking(|conn| {
+                crate::db::retention::cleanup_all(conn, settings.retention.max_age_days)
+            });
+            if let Ok(cleaned) = cleaned {
+                match cleaned {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        info!("Retention cleanup deleted {} entries", n);
+                        w.metrics.record_retention_cleanup(
+                            "all",
+                            cleanup_start.elapsed().as_secs_f64(),
+                            n as u64,
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Retention cleanup failed: {:?}", e);
+                        outcome = "error";
+                    }
+                }
+            } else {
+                outcome = "error";
+            }
+
+            w.metrics.record_task_processed(
+                "cleanup_all",
+                outcome,
+                task_start.elapsed().as_secs_f64(),
+            );
+        }
+
+        TaskManagerCommand::CacheEntryAssets { entry_id } => {
+            let result = cache_entry_assets(
+                &w.fetcher,
+                &settings.effective_proxy(),
+                &w.db,
+                &w.data_dir,
+                &settings.asset_cache,
+                entry_id,
+            )
+            .await;
+            let outcome = match result {
+                Ok(()) => "ok",
+                Err(e) => {
+                    warn!("failed caching assets for entry {}: {:?}", entry_id, e);
+                    "error"
+                }
+            };
+            w.metrics.record_task_processed(
+                "cache_entry_assets",
+                outcome,
+                task_start.elapsed().as_secs_f64(),
+            );
+        }
+
+        TaskManagerCommand::CacheFeedFavicon { feed_id } => {
+            let result = cache_feed_favicon(
+                &w.fetcher,
+                &settings.effective_proxy(),
+                &w.db,
+                &w.data_dir,
+                &settings.asset_cache,
+                feed_id,
+            )
+            .await;
+            let outcome = match result {
+                Ok(()) => "ok",
+                Err(e) => {
+                    warn!("failed caching the favicon of feed {}: {:?}", feed_id, e);
+                    "error"
+                }
+            };
+            w.metrics.record_task_processed(
+                "cache_feed_favicon",
+                outcome,
+                task_start.elapsed().as_secs_f64(),
+            );
+        }
+
+        TaskManagerCommand::OptimizeFts => {
+            run_maintenance(
+                &w.db,
+                crate::db::task_queue::TASK_FTS_OPTIMIZE,
+                "FTS5 optimize",
+                |conn| {
+                    conn.execute(
+                        "INSERT INTO entries_fts(entries_fts) VALUES ('optimize')",
+                        [],
+                    )?;
+                    Ok(())
+                },
+            );
+            w.metrics.record_task_processed(
+                "optimize_fts",
+                "ok",
+                task_start.elapsed().as_secs_f64(),
+            );
+        }
+
+        TaskManagerCommand::WalCheckpointAnalyze => {
+            run_maintenance(
+                &w.db,
+                crate::db::task_queue::TASK_WAL_CHECKPOINT_ANALYZE,
+                "WAL checkpoint and ANALYZE",
+                |conn| {
+                    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); ANALYZE;")?;
+                    Ok(())
+                },
+            );
+            w.metrics.record_task_processed(
+                "wal_checkpoint_analyze",
+                "ok",
+                task_start.elapsed().as_secs_f64(),
+            );
+        }
+
+        TaskManagerCommand::IncrementalVacuum => {
+            run_maintenance(
+                &w.db,
+                crate::db::task_queue::TASK_INCREMENTAL_VACUUM,
+                "incremental vacuum",
+                |conn| {
+                    conn.execute_batch("PRAGMA incremental_vacuum;")?;
+                    Ok(())
+                },
+            );
+            w.metrics.record_task_processed(
+                "incremental_vacuum",
+                "ok",
+                task_start.elapsed().as_secs_f64(),
+            );
+        }
     }
 }

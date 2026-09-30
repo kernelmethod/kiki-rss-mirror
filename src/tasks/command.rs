@@ -25,3 +25,19 @@ pub enum TaskManagerCommand {
     /// Reclaim free pages via `PRAGMA incremental_vacuum`.
     IncrementalVacuum,
 }
+
+impl TaskManagerCommand {
+    /// The name the command is counted under in the task metrics.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            TaskManagerCommand::RefreshFeed { .. } => "refresh_feed",
+            TaskManagerCommand::CleanupFeed(_) => "cleanup_feed",
+            TaskManagerCommand::CleanupAll => "cleanup_all",
+            TaskManagerCommand::CacheEntryAssets { .. } => "cache_entry_assets",
+            TaskManagerCommand::CacheFeedFavicon { .. } => "cache_feed_favicon",
+            TaskManagerCommand::OptimizeFts => "optimize_fts",
+            TaskManagerCommand::WalCheckpointAnalyze => "wal_checkpoint_analyze",
+            TaskManagerCommand::IncrementalVacuum => "incremental_vacuum",
+        }
+    }
+}
