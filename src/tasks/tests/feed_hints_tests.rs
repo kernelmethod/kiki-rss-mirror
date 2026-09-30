@@ -224,8 +224,8 @@ async fn test_removed_ttl_is_cleared() -> Result<()> {
         |row| row.get(0),
     )?;
     assert_eq!(ttl, None);
-    // Back to the default 3-hour per-feed interval.
-    assert_near(next_fetch_at(&tc, feed_id), now + 10_800, "next_fetch_at");
+    // Back to the default 24-hour per-feed interval.
+    assert_near(next_fetch_at(&tc, feed_id), now + 86_400, "next_fetch_at");
     Ok(())
 }
 

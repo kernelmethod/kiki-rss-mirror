@@ -136,9 +136,11 @@ CREATE TABLE feeds (
     -- longer max-age, we will refresh at least this often. Also used as
     -- the fallback interval when the server sends no cache hint.
     -- New feeds are given `feed_fetch.default_fetch_interval_seconds` from
-    -- the config; the column default of 3 hours (10800 seconds) only
-    -- covers rows inserted without it.
-    min_fetch_interval_seconds  INTEGER NOT NULL DEFAULT 10800,
+    -- the config; the column default of 24 hours (86400 seconds) only
+    -- covers rows inserted without it. Databases created before the default
+    -- changed from 3 hours keep the old column default: SQLite cannot alter
+    -- it without rebuilding the table.
+    min_fetch_interval_seconds  INTEGER NOT NULL DEFAULT 86400,
 
     -- Unix timestamp (seconds) of the earliest moment this feed is
     -- eligible for the next fetch. NULL means "fetch immediately" and is

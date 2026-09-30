@@ -1124,7 +1124,7 @@ async fn test_pragma_no_cache_without_cache_control() -> Result<()> {
     )?;
     let nf = next_fetch_at.expect("next_fetch_at should be set");
     // Pragma: no-cache should suppress the Expires hint, so the next fetch
-    // should fall back to min_fetch_interval (default 10800s) rather than
+    // should fall back to min_fetch_interval (default 86400s) rather than
     // being gated by the Expires header an hour out.
     assert!(
         nf - before > 3600,
@@ -1890,8 +1890,8 @@ async fn test_past_expires_uses_per_feed_interval() -> Result<()> {
     let (offset, stored) = next_fetch_offset_with_expires(past).await?;
     assert!(stored.is_some(), "the server's Expires is still recorded");
     assert!(
-        (10_800..=10_810).contains(&offset),
-        "should use the default 3h per-feed interval; got offset {offset}"
+        (86_400..=86_410).contains(&offset),
+        "should use the default 24h per-feed interval; got offset {offset}"
     );
     Ok(())
 }
@@ -1904,8 +1904,8 @@ async fn test_invalid_expires_gives_no_freshness() -> Result<()> {
     let (offset, stored) = next_fetch_offset_with_expires("0".into()).await?;
     assert_eq!(stored, None);
     assert!(
-        (10_800..=10_810).contains(&offset),
-        "should use the default 3h per-feed interval; got offset {offset}"
+        (86_400..=86_410).contains(&offset),
+        "should use the default 24h per-feed interval; got offset {offset}"
     );
     Ok(())
 }

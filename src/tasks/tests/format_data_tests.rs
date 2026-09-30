@@ -320,7 +320,7 @@ async fn re_ingest_does_not_duplicate() -> Result<()> {
         [tc.rich_atom_feed_url()],
     )?;
     let feed_id = conn.last_insert_rowid();
-    // min_fetch_interval defaults to 10800; clear last_checked between
+    // min_fetch_interval defaults to 86400; clear last_checked between
     // refreshes so the second call isn't skipped.
     drop(conn);
 
