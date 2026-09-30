@@ -1,5 +1,7 @@
+use crate::config::ProxySettings;
 use crate::db::Pool;
-use crate::tasks::assets;
+use crate::fetcher::Fetcher;
+use crate::tasks::assets::{self, AssetCache};
 use anyhow::Result;
 use reqwest::Url;
 use tracing::{debug, warn};
@@ -7,19 +9,33 @@ use tracing::{debug, warn};
 /// Download and cache the external assets referenced by an entry.
 ///
 /// Runs in an async worker: looks up the entry's post-script `content` HTML
-/// plus its feed URL and any RSS enclosure, extracts `<img src>` URLs, and
-/// delegates each to [`assets::cache_asset`]. Individual asset failures are
-/// logged and skipped.
+/// plus its feed URL and any RSS enclosure, has `fetcher` find the
+/// `<img src>` URLs in the HTML, and delegates each to
+/// [`assets::cache_asset`]. Individual asset failures are logged and
+/// skipped.
+///
+/// # Errors
+///
+/// Returns database errors. A fetcher that cannot serve a request is
+/// logged like any other failed asset.
 pub(crate) async fn cache_entry_assets(
-    client: &reqwest::Client,
+    fetcher: &Fetcher,
+    proxy: &ProxySettings,
     pool: &Pool,
     data_dir: &std::path::Path,
-    cache: &crate::config::AssetCacheSettings,
+    settings: &crate::config::AssetCacheSettings,
     entry_id: i64,
 ) -> Result<()> {
-    if !cache.enabled {
+    if !settings.enabled {
         return Ok(());
     }
+    let cache = AssetCache {
+        fetcher,
+        proxy,
+        pool,
+        data_dir,
+        max_bytes: settings.max_bytes,
+    };
 
     #[derive(Debug)]
     struct EntryCtx {
@@ -76,19 +92,31 @@ pub(crate) async fn cache_entry_assets(
         }
     };
 
-    // Inline images from the entry's HTML content.
-    if let Some(content) = ctx.content.as_deref() {
-        for url in assets::extract_asset_urls(content, &base) {
-            if let Err(e) = assets::cache_asset(
-                client,
-                pool,
-                data_dir,
-                cache.max_bytes,
-                &url,
-                entry_id,
-                assets::AssetKind::InlineImg,
-            )
+    // Inline images from the entry's HTML content, found by the fetcher so
+    // that the HTML is never parsed here. What it sends back is checked
+    // again: only `http(s)` URLs, each once.
+    if let Some(content) = ctx.content {
+        // A failure here still leaves the enclosure to cache below.
+        let found = fetcher
+            .extract_images(content, &base)
             .await
+            .unwrap_or_else(|e| {
+                warn!("finding the images in entry {} failed: {}", entry_id, e);
+                Vec::new()
+            });
+        let mut urls: Vec<Url> = Vec::new();
+        for url in found
+            .iter()
+            .filter_map(|u| Url::parse(u).ok())
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+        {
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        for url in urls {
+            if let Err(e) =
+                assets::cache_asset(&cache, &url, entry_id, assets::AssetKind::InlineImg).await
             {
                 warn!("cache_asset failed for {}: {:?}", url, e);
             }
@@ -101,16 +129,8 @@ pub(crate) async fn cache_entry_assets(
             .ok()
             .filter(|u| matches!(u.scheme(), "http" | "https"))
         {
-            if let Err(e) = assets::cache_asset(
-                client,
-                pool,
-                data_dir,
-                cache.max_bytes,
-                &url,
-                entry_id,
-                assets::AssetKind::Enclosure,
-            )
-            .await
+            if let Err(e) =
+                assets::cache_asset(&cache, &url, entry_id, assets::AssetKind::Enclosure).await
             {
                 warn!("cache_asset failed for enclosure {}: {:?}", url, e);
             }

@@ -7,6 +7,11 @@
 //! the server, next to the SQLite handle, the asset cache and — in UDS
 //! mode — the listening socket that is Kiki's only access control.
 //!
+//! Caching assets is the same kind of work — downloading entries' images
+//! and enclosures, and feeds' favicons, and parsing HTML to find them — so
+//! it runs here too ([`Job::FetchAsset`], [`Job::FindPageIcons`],
+//! [`Job::ExtractImages`]), and the server holds no HTTP client at all.
+//!
 //! This module moves that work into a child that holds none of those: no
 //! database, no writable filesystem (Landlock grants only read access to
 //! the TLS trust stores), no way to create a Unix socket, bind, or listen
@@ -58,6 +63,10 @@
 //! back, in any order. Frames use [`crate::process::ipc`]'s
 //! length-prefixed framing, capped at [`MAX_FRAME_BYTES`].
 
+use crate::fetcher::assets::{
+    asset_client_builder, extract_asset_urls, fetch_asset, find_page_icons, AssetReply, AssetSpec,
+    AssetTimeouts, PageIcons, PageSpec,
+};
 use crate::fetcher::{
     client_builder, fetch_with, parse_off_thread, FetchReply, FetchSpec, FetcherError,
     ParseOutcome, ProxiedClient, MAX_REDIRECTS,
@@ -103,8 +112,13 @@ pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 /// stops waiting: time to parse, and to cross two process boundaries.
 const DEADLINE_SLACK: Duration = Duration::from_secs(30);
 
-/// How long the server waits for a `file://` body to be parsed.
+/// How long the server waits for a `file://` body to be parsed, or for an
+/// entry's images to be found.
 const PARSE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long the server waits for an asset to be downloaded, or a page to
+/// be searched for icons: the requests' own overall limit, plus slack.
+const ASSET_DEADLINE: Duration = AssetTimeouts::DEFAULT.total.saturating_add(DEADLINE_SLACK);
 
 /// How long the supervisor waits for a worker to finish a frame it has
 /// started writing, or to accept one, before declaring it wedged.
@@ -178,6 +192,16 @@ pub enum Job {
         #[serde(with = "serde_bytes")]
         body: Vec<u8>,
     },
+
+    /// Download an asset: an entry's image or enclosure, or a favicon.
+    FetchAsset(AssetSpec),
+
+    /// Fetch a web page and find the icons it links to.
+    FindPageIcons(PageSpec),
+
+    /// Find the images an entry's HTML `content` shows, resolving them
+    /// against `base`.
+    ExtractImages { content: String, base: String },
 }
 
 /// A message from the fetcher back to the server.
@@ -193,6 +217,9 @@ pub struct Response {
 pub enum JobResult {
     Fetched(FetchReply),
     Parsed(ParseOutcome),
+    Asset(AssetReply),
+    PageIcons(PageIcons),
+    Images(Vec<String>),
 
     /// The job could not be completed: the worker crashed while serving
     /// it, the task serving it panicked, or the reply was too large to
@@ -434,6 +461,74 @@ impl FeedFetcherHost {
             JobResult::Parsed(outcome) => Ok(outcome),
             other => Err(unexpected(other)),
         }
+    }
+
+    /// Download the asset described by `spec`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::fetch`].
+    pub async fn fetch_asset(&self, spec: AssetSpec) -> Result<AssetReply, FetcherError> {
+        match self.request(Job::FetchAsset(spec), ASSET_DEADLINE).await? {
+            JobResult::Asset(reply) => Ok(reply),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Fetch the web page in `spec` and find the icons it links to.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::fetch`].
+    pub async fn find_page_icons(&self, spec: PageSpec) -> Result<PageIcons, FetcherError> {
+        match self
+            .request(Job::FindPageIcons(spec), ASSET_DEADLINE)
+            .await?
+        {
+            JobResult::PageIcons(icons) => Ok(icons),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Find the images an entry's HTML `content` shows.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::fetch`].
+    pub async fn extract_images(
+        &self,
+        content: String,
+        base: String,
+    ) -> Result<Vec<String>, FetcherError> {
+        match self
+            .request(Job::ExtractImages { content, base }, PARSE_DEADLINE)
+            .await?
+        {
+            JobResult::Images(urls) => Ok(urls),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// A host whose far end answers every request with `answer`, on a
+    /// thread of its own, standing in for a worker that may not follow the
+    /// rules — so tests can check what the server does with its replies.
+    #[cfg(test)]
+    pub(crate) fn with_fake_worker(answer: impl Fn(Job) -> JobResult + Send + 'static) -> Self {
+        #[allow(clippy::unwrap_used)]
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            while let Ok(frame) = read_frame_limited(&mut theirs, MAX_FRAME_BYTES) {
+                let Ok(ToFetcher::Request(request)) = decode(&frame) else {
+                    continue;
+                };
+                let reply = encode_response(request.id, answer(request.job));
+                if write_frame_limited(&mut theirs, &reply, MAX_FRAME_BYTES).is_err() {
+                    return;
+                }
+            }
+        });
+        #[allow(clippy::unwrap_used)]
+        Self::from_stream(ours, None).unwrap()
     }
 
     /// Whether the channel to the fetcher is still usable.
@@ -867,11 +962,19 @@ async fn serve(stream: UnixStream) -> Result<()> {
         frames: tx.clone(),
         pending: Arc::new(Pending::new()),
     };
-    let builder_resolver = resolver.clone();
-    let client = ProxiedClient::new(move || {
-        client_builder().dns_resolver(Arc::new(builder_resolver.clone()))
-    })
-    .context("building the HTTP client")?;
+    let feeds_resolver = resolver.clone();
+    let assets_resolver = resolver.clone();
+    let clients = Clients {
+        feeds: ProxiedClient::new(move || {
+            client_builder().dns_resolver(Arc::new(feeds_resolver.clone()))
+        })
+        .context("building the HTTP client")?,
+        assets: ProxiedClient::new(move || {
+            asset_client_builder(AssetTimeouts::DEFAULT)
+                .dns_resolver(Arc::new(assets_resolver.clone()))
+        })
+        .context("building the HTTP client for assets")?,
+    };
 
     loop {
         let frame = match read_frame_async(&mut rd, MAX_FRAME_BYTES).await {
@@ -890,13 +993,13 @@ async fn serve(stream: UnixStream) -> Result<()> {
             Err(e) => return Err(e).context("decoding a request"),
         };
 
-        let client = client.clone();
+        let clients = clients.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             let id = request.id;
             // Run the job on a task of its own so a panic in it becomes an
             // answer instead of a request the server waits out.
-            let result = match tokio::spawn(run_job(client, request.job)).await {
+            let result = match tokio::spawn(run_job(clients, request.job)).await {
                 Ok(r) => r,
                 Err(e) => JobResult::Failed {
                     message: format!("fetch task failed: {e}"),
@@ -951,10 +1054,31 @@ impl reqwest::dns::Resolve for ServerResolver {
     }
 }
 
-async fn run_job(client: ProxiedClient, job: Job) -> JobResult {
+/// The worker's HTTP clients, which resolve hostnames through the server.
+#[derive(Clone)]
+struct Clients {
+    feeds: ProxiedClient,
+    assets: ProxiedClient,
+}
+
+async fn run_job(clients: Clients, job: Job) -> JobResult {
     match job {
-        Job::Fetch(spec) => JobResult::Fetched(fetch_with(&client, &spec).await),
+        Job::Fetch(spec) => JobResult::Fetched(fetch_with(&clients.feeds, &spec).await),
         Job::Parse { feed_id, body } => JobResult::Parsed(parse_off_thread(feed_id, body).await),
+        Job::FetchAsset(spec) => JobResult::Asset(fetch_asset(&clients.assets, &spec).await),
+        Job::FindPageIcons(spec) => {
+            JobResult::PageIcons(find_page_icons(&clients.assets, &spec).await)
+        }
+        Job::ExtractImages { content, base } => {
+            let urls = match reqwest::Url::parse(&base) {
+                Ok(base) => extract_asset_urls(&content, &base)
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            JobResult::Images(urls)
+        }
     }
 }
 
@@ -1159,6 +1283,93 @@ mod tests {
         assert!(matches!(err, FetcherError::Unavailable(_)), "got {err:?}");
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(!host.is_alive());
+    }
+
+    /// Asset downloads, icon searches and image extraction all run in the
+    /// worker, with hostnames resolved by the server as for feeds.
+    #[tokio::test]
+    async fn asset_jobs_round_trip_through_a_worker() {
+        use crate::fetcher::assets::{AssetKind, AssetReply, AssetSpec, PageSpec};
+        use axum::{routing::get, Router};
+
+        const PNG: &[u8] = b"\x89PNG not really";
+        let app = Router::new()
+            .route(
+                "/img.png",
+                get(|| async { ([("content-type", "image/png")], PNG) }),
+            )
+            .route(
+                "/evil.svg",
+                get(|| async { ([("content-type", "image/svg+xml")], "<svg/>") }),
+            )
+            .route(
+                "/",
+                get(|| async {
+                    (
+                        [("content-type", "text/html")],
+                        r#"<head><link rel="icon" href="/img.png"></head>"#,
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let base = format!("http://localhost:{port}");
+
+        let host = host_with_in_thread_worker();
+        let asset = |path: &str, kind| AssetSpec {
+            url: format!("{base}{path}"),
+            kind,
+            proxy: Default::default(),
+        };
+
+        match host
+            .fetch_asset(asset("/img.png", AssetKind::InlineImg))
+            .await
+            .unwrap()
+        {
+            AssetReply::Fetched(a) => {
+                assert_eq!(a.content_type, "image/png");
+                assert_eq!(a.bytes, PNG);
+            }
+            other => panic!("expected the image, got {other:?}"),
+        }
+        let reply = host
+            .fetch_asset(asset("/evil.svg", AssetKind::InlineImg))
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, AssetReply::DisallowedType { .. }),
+            "got {reply:?}"
+        );
+        let reply = host
+            .fetch_asset(asset("/missing.png", AssetKind::InlineImg))
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, AssetReply::HttpStatus { status: 404 }),
+            "got {reply:?}"
+        );
+
+        let icons = host
+            .find_page_icons(PageSpec {
+                url: format!("{base}/"),
+                proxy: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(icons.icons, [format!("{base}/img.png")]);
+        assert!(icons.problem.is_none(), "{:?}", icons.problem);
+
+        let images = host
+            .extract_images(
+                r#"<img src="/a.png"><img src="javascript:x"><img src="/a.png">"#.into(),
+                format!("{base}/post/1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(images, [format!("{base}/a.png")]);
+        assert!(host.is_alive());
     }
 
     #[test]

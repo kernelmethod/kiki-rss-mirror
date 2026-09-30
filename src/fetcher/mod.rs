@@ -1,9 +1,12 @@
-//! Retrieving and parsing feeds, with no access to Kiki's state.
+//! Retrieving and parsing feeds, and downloading their assets, with no
+//! access to Kiki's state.
 //!
 //! Everything a feed refresh does with untrusted bytes — the HTTP
 //! exchange, TLS, decompression, reading a capped body, and parsing the
 //! result as Atom or RSS — lives here, as functions of their inputs
-//! alone. Nothing in this module touches the database, the asset cache,
+//! alone. So does everything asset caching does with them — downloading
+//! images, enclosures and favicons, and parsing HTML to find them; see
+//! [`assets`]. Nothing in this module touches the database, the asset cache,
 //! metrics, or scripts: [`crate::tasks`] reads what a fetch needs out of
 //! the database into a [`FetchSpec`], and writes what comes back in a
 //! [`FetchReply`] into it.
@@ -16,12 +19,14 @@
 //! Everything that crosses the process boundary is plain data, and all of
 //! it is `Serialize` + `Deserialize` so it can be sent over the IPC channel.
 
+pub mod assets;
 pub mod parse;
 pub mod retrieve;
 
 use crate::config::ProxySettings;
 use crate::http::{FeedAuth, USER_AGENT};
 use crate::scripting::FeedEntry;
+use assets::{AssetReply, AssetSpec, PageIcons, PageSpec};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -433,15 +438,20 @@ pub enum FetcherError {
     Timeout(Duration),
 }
 
-/// Where feed retrieval and parsing happen.
+/// Where feed retrieval and parsing, and asset downloads, happen.
 ///
-/// Callers get the same [`FetchReply`] either way; the variants differ
-/// only in which process holds the network client and the parser.
+/// Callers get the same replies either way; the variants differ only in
+/// which process holds the network clients and the parsers.
 #[derive(Clone)]
 pub enum Fetcher {
-    /// In this process, with the given client. Used by the library-level
+    /// In this process, with the given clients. Used by the library-level
     /// tests and on platforms without an isolated fetcher.
-    InProcess(ProxiedClient),
+    InProcess {
+        /// For feeds; see [`client_builder`].
+        feeds: ProxiedClient,
+        /// For assets and favicons; see [`assets::asset_client_builder`].
+        assets: ProxiedClient,
+    },
 
     /// In the sandboxed feed fetcher process.
     #[cfg(unix)]
@@ -451,13 +461,19 @@ pub enum Fetcher {
 impl Fetcher {
     /// An in-process fetcher with the client configuration production
     /// uses: no automatic redirects (they are followed by [`retrieve()`], so
-    /// credentials can be dropped cross-origin) and Kiki's user agent.
+    /// credentials can be dropped cross-origin), Kiki's user agent, and
+    /// [`assets::AssetTimeouts::DEFAULT`] for assets.
     ///
     /// # Errors
     ///
     /// Fails if the TLS backend cannot be initialised.
     pub fn in_process() -> reqwest::Result<Self> {
-        Ok(Fetcher::InProcess(ProxiedClient::new(client_builder)?))
+        Ok(Fetcher::InProcess {
+            feeds: ProxiedClient::new(client_builder)?,
+            assets: ProxiedClient::new(|| {
+                assets::asset_client_builder(assets::AssetTimeouts::DEFAULT)
+            })?,
+        })
     }
 
     /// Fetch, and on a `200 OK` parse, the feed described by `spec`.
@@ -468,7 +484,7 @@ impl Fetcher {
     /// itself could not serve the request; see [`FetcherError`].
     pub async fn fetch(&self, spec: FetchSpec) -> Result<FetchReply, FetcherError> {
         match self {
-            Fetcher::InProcess(clients) => Ok(fetch_with(clients, &spec).await),
+            Fetcher::InProcess { feeds, .. } => Ok(fetch_with(feeds, &spec).await),
             #[cfg(unix)]
             Fetcher::Isolated(host) => host.fetch(spec).await,
         }
@@ -482,9 +498,61 @@ impl Fetcher {
     /// As for [`Self::fetch`].
     pub async fn parse(&self, feed_id: i64, body: Vec<u8>) -> Result<ParseOutcome, FetcherError> {
         match self {
-            Fetcher::InProcess(_) => Ok(parse_off_thread(feed_id, body).await),
+            Fetcher::InProcess { .. } => Ok(parse_off_thread(feed_id, body).await),
             #[cfg(unix)]
             Fetcher::Isolated(host) => host.parse(feed_id, body).await,
+        }
+    }
+
+    /// Download the asset described by `spec`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::fetch`]; failures of the download itself are
+    /// [`AssetReply`] variants.
+    pub async fn fetch_asset(&self, spec: AssetSpec) -> Result<AssetReply, FetcherError> {
+        match self {
+            Fetcher::InProcess {
+                assets: clients, ..
+            } => Ok(assets::fetch_asset(clients, &spec).await),
+            #[cfg(unix)]
+            Fetcher::Isolated(host) => host.fetch_asset(spec).await,
+        }
+    }
+
+    /// Fetch the web page in `spec` and find the icons it links to.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::fetch`]; a page that cannot be read yields no icons.
+    pub async fn find_page_icons(&self, spec: PageSpec) -> Result<PageIcons, FetcherError> {
+        match self {
+            Fetcher::InProcess {
+                assets: clients, ..
+            } => Ok(assets::find_page_icons(clients, &spec).await),
+            #[cfg(unix)]
+            Fetcher::Isolated(host) => host.find_page_icons(spec).await,
+        }
+    }
+
+    /// Find the images an entry's HTML `content` shows, resolved against
+    /// `base`; see [`assets::extract_asset_urls`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::fetch`].
+    pub async fn extract_images(
+        &self,
+        content: String,
+        base: &reqwest::Url,
+    ) -> Result<Vec<String>, FetcherError> {
+        match self {
+            Fetcher::InProcess { .. } => Ok(assets::extract_asset_urls(&content, base)
+                .into_iter()
+                .map(String::from)
+                .collect()),
+            #[cfg(unix)]
+            Fetcher::Isolated(host) => host.extract_images(content, base.to_string()).await,
         }
     }
 }

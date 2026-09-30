@@ -442,7 +442,7 @@ impl Server {
             config.clone(),
             script_runner.clone(),
             fetcher,
-        )?;
+        );
         let workers_exited = wait_for_workers(worker_handles);
 
         tokio::spawn(metrics_sampler_loop(

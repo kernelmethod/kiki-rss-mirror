@@ -1,216 +1,43 @@
-//! Feed asset caching — URL extraction and download helpers.
+//! Feed asset caching — storing and indexing downloaded assets.
 //!
 //! Given an entry's post-script `content` HTML and its originating feed URL,
-//! [`extract_asset_urls`] pulls out every `<img src>` reference, resolves
-//! relative URLs against the entry/feed URL, and filters out non-http(s)
-//! schemes. [`cache_asset`] then downloads each referenced asset, hashes it,
-//! writes the bytes under `{data_dir}/assets/<shard>/<blake3>`, and records
-//! the mapping in the database.
+//! the feed fetcher finds every `<img src>` reference
+//! ([`Fetcher::extract_images`]), and [`cache_asset`] then has it download
+//! each one ([`Fetcher::fetch_asset`]). The downloading and the HTML
+//! parsing happen in the sandboxed feed fetcher (see
+//! [`crate::fetcher::assets`]); what is left here is what needs the
+//! database and the asset cache: checking what came back, hashing it,
+//! writing the bytes under `{data_dir}/assets/<shard>/<blake3>`, and
+//! recording the mapping in the database.
 //!
 //! Eviction is enforced inline: after each successful insertion, if the total
 //! cache size exceeds the configured cap, the least-recently-accessed rows
 //! are dropped via [`crate::db::assets::evict_to`] and their files unlinked.
-use crate::fetcher::client_builder;
-use crate::http::{read_body_capped, CappedBody};
+use crate::config::ProxySettings;
+use crate::fetcher::assets::{AssetReply, AssetSpec};
+use crate::fetcher::Fetcher;
 use anyhow::{Context, Result};
-use lol_html::html_content::Element;
-use lol_html::{element, HtmlRewriter, Settings};
 use reqwest::Url;
-use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tracing::{debug, warn};
 
-/// Per-asset download cap. Enclosures can be large (podcasts); this is a
-/// safety valve to prevent a single rogue asset from filling the cache.
-pub const MAX_ASSET_BYTES: u64 = 32 * 1024 * 1024;
+pub use crate::fetcher::assets::{
+    is_allowed_content_type, normalize_content_type, AssetKind, MAX_ASSET_BYTES,
+};
 
-/// Time limits on the requests that cache assets and look for favicons.
-///
-/// A feed fetch has a single overall timeout, but an asset may be a
-/// [`MAX_ASSET_BYTES`] enclosure that a slow link cannot download in the
-/// same time. So the limits are split: a server must accept the connection
-/// within `connect`, and must never go `read` without sending anything,
-/// which catches a server that has stalled; `total` is a looser cap on the
-/// whole request, which catches one that sends just often enough to keep
-/// `read` from firing. Without them, a server that never answers would tie
-/// up a worker, and every task queued behind it, indefinitely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AssetTimeouts {
-    /// Longest wait to connect to a server (and through a proxy, if any).
-    pub connect: Duration,
-    /// Longest wait for any data at all, while waiting for the response or
-    /// reading its body.
-    pub read: Duration,
-    /// Longest a request may take from start to finish, body included.
-    pub total: Duration,
-}
-
-impl AssetTimeouts {
-    /// The limits Kiki uses: 15 seconds to connect, 30 seconds without
-    /// data, and 5 minutes in all, which is enough to download a
-    /// [`MAX_ASSET_BYTES`] enclosure at about 1 Mbit/s.
-    pub const DEFAULT: AssetTimeouts = AssetTimeouts {
-        connect: Duration::from_secs(15),
-        read: Duration::from_secs(30),
-        total: Duration::from_secs(5 * 60),
-    };
-}
-
-/// The client configuration for caching assets and looking for favicons:
-/// feed fetches' ([`client_builder`]), with the limits in `timeouts`. Build
-/// it with [`crate::fetcher::ProxiedClient`], so the proxy settings apply.
-///
-/// # Examples
-///
-/// ```
-/// use kiki_rss::fetcher::ProxiedClient;
-/// use kiki_rss::tasks::assets::{asset_client_builder, AssetTimeouts};
-///
-/// let clients = ProxiedClient::new(|| asset_client_builder(AssetTimeouts::DEFAULT)).unwrap();
-/// ```
-pub fn asset_client_builder(timeouts: AssetTimeouts) -> reqwest::ClientBuilder {
-    client_builder()
-        .connect_timeout(timeouts.connect)
-        .read_timeout(timeouts.read)
-        .timeout(timeouts.total)
-}
-
-/// Kind of asset reference discovered in an entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssetKind {
-    InlineImg,
-    Enclosure,
-    /// The favicon of the website a feed belongs to.
-    Favicon,
-}
-
-impl AssetKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            AssetKind::InlineImg => "inline_img",
-            AssetKind::Enclosure => "enclosure",
-            AssetKind::Favicon => "favicon",
-        }
-    }
-}
-
-/// Image MIME types we're willing to cache and serve. Deliberately excludes
-/// `image/svg+xml`: SVG is XML and can embed executable script, which would
-/// run when a browser navigates directly to the asset URL.
-const SAFE_IMAGE_TYPES: &[&str] = &[
-    "image/png",
-    "image/jpeg",
-    "image/gif",
-    "image/webp",
-    "image/avif",
-    "image/bmp",
-    "image/heic",
-    "image/heif",
-    "image/tiff",
-    "image/x-icon",
-    "image/vnd.microsoft.icon",
-];
-
-/// Parse a `Content-Type` header value into a normalized `type/subtype` form.
-///
-/// Strips media-type parameters (e.g. `; charset=utf-8`), trims whitespace,
-/// and lowercases. Returns `None` when the input is empty or doesn't match
-/// `type/subtype`.
-pub fn normalize_content_type(raw: &str) -> Option<String> {
-    let main = raw.split(';').next()?.trim();
-    let (ty, subty) = main.split_once('/')?;
-    let ty = ty.trim();
-    let subty = subty.trim();
-    if ty.is_empty()
-        || subty.is_empty()
-        || ty.chars().any(char::is_whitespace)
-        || subty.chars().any(char::is_whitespace)
-    {
-        return None;
-    }
-    Some(format!(
-        "{}/{}",
-        ty.to_ascii_lowercase(),
-        subty.to_ascii_lowercase()
-    ))
-}
-
-/// Whether a normalized MIME type is acceptable to cache for the given kind.
-///
-/// Inline images and favicons must match one of the safe raster image
-/// types. Enclosures additionally accept audio and video types plus a
-/// handful of common podcast-adjacent `application/*` types.
-pub fn is_allowed_content_type(normalized: &str, kind: AssetKind) -> bool {
-    if SAFE_IMAGE_TYPES.contains(&normalized) {
-        return true;
-    }
-    match kind {
-        AssetKind::InlineImg | AssetKind::Favicon => false,
-        AssetKind::Enclosure => {
-            normalized.starts_with("audio/")
-                || normalized.starts_with("video/")
-                || matches!(normalized, "application/ogg" | "application/pdf")
-        }
-    }
-}
-
-/// Parse `content` as HTML and return every resolved `<img src>` URL whose
-/// scheme is `http(s)`. Relative URLs are resolved against `base`. Duplicates
-/// within a single entry are collapsed preserving first-seen order.
-pub fn extract_asset_urls(content: &str, base: &Url) -> Vec<Url> {
-    let out: RefCell<Vec<Url>> = RefCell::new(Vec::new());
-
-    let collect = |el: &mut Element| {
-        if let Some(src) = el.get_attribute("src") {
-            if let Some(url) = resolve_http_url(&src, base) {
-                let mut v = out.borrow_mut();
-                if !v.iter().any(|u| u == &url) {
-                    v.push(url);
-                }
-            }
-        }
-        Ok(())
-    };
-
-    {
-        // lol_html rewriter is streaming but we don't actually rewrite — we
-        // use it purely as a safe HTML parser. A no-op output sink is fine.
-        let mut rewriter = HtmlRewriter::new(
-            Settings {
-                element_content_handlers: vec![element!("img", collect)],
-                ..Settings::default()
-            },
-            |_: &[u8]| {},
-        );
-
-        if rewriter.write(content.as_bytes()).is_ok() {
-            let _ = rewriter.end();
-        }
-        // Dropping `rewriter` here releases the borrow on `out`.
-    }
-
-    out.into_inner()
-}
-
-/// Resolve `raw` against `base`, returning it only if the result is an
-/// `http(s)` URL.
-pub(crate) fn resolve_http_url(raw: &str, base: &Url) -> Option<Url> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let resolved = match Url::parse(trimmed) {
-        Ok(u) => u,
-        Err(url::ParseError::RelativeUrlWithoutBase) => base.join(trimmed).ok()?,
-        Err(_) => return None,
-    };
-    match resolved.scheme() {
-        "http" | "https" => Some(resolved),
-        _ => None,
-    }
+/// Where assets are downloaded through and stored.
+pub struct AssetCache<'a> {
+    /// Downloads assets; normally the sandboxed feed fetcher.
+    pub fetcher: &'a Fetcher,
+    /// The proxy to download through.
+    pub proxy: &'a ProxySettings,
+    pub pool: &'a crate::db::Pool,
+    /// Kiki's data directory, holding the `assets/` tree.
+    pub data_dir: &'a Path,
+    /// Evict the least recently used assets once the cache is larger.
+    pub max_bytes: i64,
 }
 
 /// Path to the cached bytes for the given blake3 hash under `data_dir`.
@@ -260,30 +87,20 @@ pub fn unlink_asset_file(data_dir: &Path, blake3: &str) {
 /// `original_url` already exists in the index.
 ///
 /// After storing, evicts the oldest assets until the cache is back under
-/// `max_cache_bytes`.
+/// [`AssetCache::max_bytes`].
 ///
-/// Returns `Ok(())` even when the fetch fails — individual asset failures
-/// shouldn't block the rest of the entry. Errors are logged at WARN.
+/// Returns `Ok(())` even when the download fails — individual asset
+/// failures shouldn't block the rest of the entry. Those are logged at
+/// WARN; database, filesystem and fetcher errors are returned.
 pub async fn cache_asset(
-    client: &reqwest::Client,
-    pool: &crate::db::Pool,
-    data_dir: &Path,
-    max_cache_bytes: i64,
+    cache: &AssetCache<'_>,
     asset_url: &Url,
     entry_id: i64,
     kind: AssetKind,
 ) -> Result<()> {
-    store_asset(
-        client,
-        pool,
-        data_dir,
-        max_cache_bytes,
-        asset_url,
-        kind,
-        move |conn, asset_id| {
-            crate::db::assets::link_entry_asset(conn, entry_id, asset_id, kind.as_str())
-        },
-    )
+    store_asset(cache, asset_url, kind, move |conn, asset_id| {
+        crate::db::assets::link_entry_asset(conn, entry_id, asset_id, kind.as_str())
+    })
     .await?;
     Ok(())
 }
@@ -293,18 +110,20 @@ pub async fn cache_asset(
 ///
 /// Short-circuits to just calling `link` if an asset with the same
 /// `original_url` already exists in the index. Otherwise `link` is called
-/// before the cache is evicted back under `max_cache_bytes`, so that it
-/// never sees an asset row that has already been removed.
+/// before the cache is evicted back under [`AssetCache::max_bytes`], so
+/// that it never sees an asset row that has already been removed.
+///
+/// What the fetcher sends back is checked again before it is stored: its
+/// content type must be allowed for `kind`, and it must fit under
+/// [`MAX_ASSET_BYTES`].
 ///
 /// Returns `Ok(true)` once `link` has been called, and `Ok(false)` when the
 /// asset could not be fetched, was too large, or was of a type not allowed
 /// for `kind`; those failures are logged rather than returned. Database and
-/// filesystem errors, and errors from `link`, are returned.
+/// filesystem errors, errors from `link`, and a fetcher that could not
+/// serve the request at all, are returned.
 pub async fn store_asset<F>(
-    client: &reqwest::Client,
-    pool: &crate::db::Pool,
-    data_dir: &Path,
-    max_cache_bytes: i64,
+    cache: &AssetCache<'_>,
     asset_url: &Url,
     kind: AssetKind,
     link: F,
@@ -315,81 +134,85 @@ where
     // Fast path: we've already fetched this exact URL before. Just link the
     // existing asset row.
     {
-        let conn = pool.get()?;
+        let conn = cache.pool.get()?;
         if let Some(existing) = crate::db::assets::lookup_by_url(&conn, asset_url.as_str())? {
             link(&conn, existing.id)?;
             return Ok(true);
         }
     }
 
-    // Download. Enforce the per-asset size cap as we stream.
-    let resp = match client.get(asset_url.clone()).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("asset fetch failed for {}: {}", asset_url, e);
+    let reply = cache
+        .fetcher
+        .fetch_asset(AssetSpec {
+            url: asset_url.to_string(),
+            kind,
+            proxy: cache.proxy.clone(),
+        })
+        .await
+        .with_context(|| format!("fetching asset {asset_url}"))?;
+    let asset = match reply {
+        AssetReply::Fetched(asset) => asset,
+        AssetReply::Network { message } => {
+            warn!("asset fetch failed for {}: {}", asset_url, message);
             return Ok(false);
         }
-    };
-
-    if !resp.status().is_success() {
-        debug!(
-            "asset fetch non-success for {}: {}",
-            asset_url,
-            resp.status()
-        );
-        return Ok(false);
-    }
-
-    let raw_content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok());
-    let content_type = match raw_content_type.and_then(normalize_content_type) {
-        Some(ct) if is_allowed_content_type(&ct, kind) => ct,
-        _ => {
+        AssetReply::HttpStatus { status } => {
+            debug!("asset fetch non-success for {}: {}", asset_url, status);
+            return Ok(false);
+        }
+        AssetReply::DisallowedType { content_type } => {
             warn!(
                 "asset {} has disallowed or missing content-type {:?}, skipping",
-                asset_url, raw_content_type
+                asset_url, content_type
             );
             return Ok(false);
         }
-    };
-    let etag = resp
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let last_modified = resp
-        .headers()
-        .get(reqwest::header::LAST_MODIFIED)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    // Streamed under the cap: checking `Content-Length` up front and then
-    // calling `bytes()` would still buffer the whole body for a server
-    // that lies about (or omits) the header.
-    let bytes = match read_body_capped(resp, MAX_ASSET_BYTES).await {
-        Ok(CappedBody::Complete(b)) => b,
-        Ok(CappedBody::TooLarge { seen }) => {
+        AssetReply::TooLarge { seen } => {
             warn!(
                 "asset {} body of {} bytes exceeds cap {}, skipping",
                 asset_url, seen, MAX_ASSET_BYTES
             );
             return Ok(false);
         }
-        Err(e) => {
-            warn!("asset body read failed for {}: {}", asset_url, e);
+        AssetReply::Failed { message } => {
+            warn!("asset body read failed for {}: {}", asset_url, message);
             return Ok(false);
         }
     };
+
+    // The fetcher checked both of these already; a fetcher that has been
+    // compromised would not have, so check them again.
+    let content_type = match normalize_content_type(&asset.content_type) {
+        Some(ct) if is_allowed_content_type(&ct, kind) => ct,
+        _ => {
+            warn!(
+                "fetcher returned asset {} with disallowed content-type {:?}, skipping",
+                asset_url, asset.content_type
+            );
+            return Ok(false);
+        }
+    };
+    if asset.bytes.len() as u64 > MAX_ASSET_BYTES {
+        warn!(
+            "fetcher returned asset {} of {} bytes, over cap {}, skipping",
+            asset_url,
+            asset.bytes.len(),
+            MAX_ASSET_BYTES
+        );
+        return Ok(false);
+    }
+    let bytes = asset.bytes;
+    let etag = asset.etag;
+    let last_modified = asset.last_modified;
 
     let hash = blake3::hash(&bytes).to_hex().to_string();
     let size = bytes.len() as i64;
 
     // Check again by hash — a different URL may have yielded the same bytes.
     let url_str = asset_url.as_str().to_string();
-    let data_dir = data_dir.to_path_buf();
-    let pool = pool.clone();
+    let data_dir = cache.data_dir.to_path_buf();
+    let pool = cache.pool.clone();
+    let max_cache_bytes = cache.max_bytes;
 
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = pool.get()?;
@@ -433,126 +256,9 @@ where
 mod tests {
     use super::*;
 
-    fn base() -> Url {
-        Url::parse("http://example.com/feed").unwrap()
-    }
-
-    #[test]
-    fn extract_absolute_img_urls() {
-        let html = r#"<p>hi</p><img src="http://a.test/1.png"><img src="https://b.test/2.jpg">"#;
-        let urls = extract_asset_urls(html, &base());
-        assert_eq!(urls.len(), 2);
-        assert_eq!(urls[0].as_str(), "http://a.test/1.png");
-        assert_eq!(urls[1].as_str(), "https://b.test/2.jpg");
-    }
-
-    #[test]
-    fn relative_img_resolved_against_base() {
-        let html = r#"<img src="/img.png"><img src="sub/x.gif">"#;
-        let urls = extract_asset_urls(html, &base());
-        assert_eq!(urls[0].as_str(), "http://example.com/img.png");
-        assert_eq!(urls[1].as_str(), "http://example.com/sub/x.gif");
-    }
-
-    #[test]
-    fn data_and_non_http_schemes_dropped() {
-        let html = r#"<img src="data:image/png;base64,AAAA"><img src="javascript:alert(1)"><img src="ftp://x/x.png">"#;
-        let urls = extract_asset_urls(html, &base());
-        assert!(urls.is_empty());
-    }
-
-    #[test]
-    fn duplicate_img_urls_deduped() {
-        let html = r#"<img src="http://a.test/x.png"><img src="http://a.test/x.png">"#;
-        let urls = extract_asset_urls(html, &base());
-        assert_eq!(urls.len(), 1);
-    }
-
-    #[test]
-    fn malformed_html_does_not_crash() {
-        let html = r#"<img src="http://a.test/x.png" <unclosed <img src="http://b.test/y.png">"#;
-        let _ = extract_asset_urls(html, &base());
-    }
-
     #[test]
     fn asset_path_uses_shard() {
         let p = asset_path(Path::new("/tmp/data"), "abcdef1234");
         assert_eq!(p, PathBuf::from("/tmp/data/assets/ab/abcdef1234"));
-    }
-
-    #[test]
-    fn normalize_content_type_strips_params_and_lowercases() {
-        assert_eq!(
-            normalize_content_type("image/PNG").as_deref(),
-            Some("image/png")
-        );
-        assert_eq!(
-            normalize_content_type("image/jpeg; charset=utf-8").as_deref(),
-            Some("image/jpeg")
-        );
-        assert_eq!(
-            normalize_content_type("  Image/Jpeg ;boundary=x  ").as_deref(),
-            Some("image/jpeg")
-        );
-    }
-
-    #[test]
-    fn normalize_content_type_rejects_garbage() {
-        assert!(normalize_content_type("").is_none());
-        assert!(normalize_content_type("notatype").is_none());
-        assert!(normalize_content_type("image/").is_none());
-        assert!(normalize_content_type("/png").is_none());
-        // Internal whitespace inside a token is rejected.
-        assert!(normalize_content_type("image/pn g").is_none());
-    }
-
-    #[test]
-    fn inline_img_allowlist_rejects_html_and_svg() {
-        assert!(is_allowed_content_type("image/png", AssetKind::InlineImg));
-        assert!(is_allowed_content_type("image/jpeg", AssetKind::InlineImg));
-        assert!(is_allowed_content_type("image/webp", AssetKind::InlineImg));
-        assert!(!is_allowed_content_type("text/html", AssetKind::InlineImg));
-        assert!(!is_allowed_content_type(
-            "application/javascript",
-            AssetKind::InlineImg
-        ));
-        assert!(!is_allowed_content_type(
-            "image/svg+xml",
-            AssetKind::InlineImg
-        ));
-        assert!(!is_allowed_content_type("audio/mpeg", AssetKind::InlineImg));
-    }
-
-    #[test]
-    fn favicon_allowlist_is_raster_images_only() {
-        assert!(is_allowed_content_type("image/x-icon", AssetKind::Favicon));
-        assert!(is_allowed_content_type(
-            "image/vnd.microsoft.icon",
-            AssetKind::Favicon
-        ));
-        assert!(is_allowed_content_type("image/png", AssetKind::Favicon));
-        assert!(!is_allowed_content_type(
-            "image/svg+xml",
-            AssetKind::Favicon
-        ));
-        assert!(!is_allowed_content_type("text/html", AssetKind::Favicon));
-        assert!(!is_allowed_content_type("audio/mpeg", AssetKind::Favicon));
-    }
-
-    #[test]
-    fn enclosure_allowlist_accepts_media_types() {
-        assert!(is_allowed_content_type("audio/mpeg", AssetKind::Enclosure));
-        assert!(is_allowed_content_type("audio/ogg", AssetKind::Enclosure));
-        assert!(is_allowed_content_type("video/mp4", AssetKind::Enclosure));
-        assert!(is_allowed_content_type("image/png", AssetKind::Enclosure));
-        assert!(is_allowed_content_type(
-            "application/pdf",
-            AssetKind::Enclosure
-        ));
-        assert!(!is_allowed_content_type("text/html", AssetKind::Enclosure));
-        assert!(!is_allowed_content_type(
-            "image/svg+xml",
-            AssetKind::Enclosure
-        ));
     }
 }
