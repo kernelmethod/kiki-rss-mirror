@@ -39,7 +39,9 @@ pub struct AddFeedResponse {
 
 /// Add a new feed
 ///
-/// Register a new feed from which to fetch content.
+/// Register a new feed from which to fetch content. Each feed must have its
+/// own URL: adding a feed with the URL of an existing one fails with
+/// `409 Conflict`.
 #[utoipa::path(
     post,
     path = "/v1/feeds/create",
@@ -47,6 +49,7 @@ pub struct AddFeedResponse {
     responses(
         (status = 201, description = "Feed created successfully", body = AddFeedResponse),
         (status = 400, description = "Invalid authentication parameters"),
+        (status = 409, description = "A feed with this URL already exists"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "feeds"
@@ -112,6 +115,11 @@ pub async fn add_feed(
 
     let id = match task_result {
         Ok(Ok(id)) => id,
+        Ok(Err(rusqlite::Error::SqliteFailure(err, _)))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            return (StatusCode::CONFLICT, "A feed with this URL already exists").into_response();
+        }
         Ok(Err(e)) => {
             event!(
                 Level::ERROR,

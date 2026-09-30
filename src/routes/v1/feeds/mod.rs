@@ -1225,10 +1225,11 @@ mod test {
         )?)
     }
 
-    /// Insert a feed last checked at `last_checked`, due at `next_fetch_at`,
-    /// with a 3h interval and `failures` failures in a row.
+    /// Insert a feed with URL `url`, last checked at `last_checked`, due at
+    /// `next_fetch_at`, with a 3h interval and `failures` failures in a row.
     fn insert_scheduled_feed(
         tc: &TestConfig,
+        url: &str,
         last_checked: i64,
         next_fetch_at: i64,
         failures: i64,
@@ -1237,8 +1238,8 @@ mod test {
         conn.execute(
             "INSERT INTO feeds (title, url, min_fetch_interval_seconds, last_checked,
                 next_fetch_at, consecutive_failures)
-             VALUES ('feed', 'https://example.com/feed.xml', 10800, ?1, ?2, ?3)",
-            [last_checked, next_fetch_at, failures],
+             VALUES ('feed', ?1, 10800, ?2, ?3, ?4)",
+            rusqlite::params![url, last_checked, next_fetch_at, failures],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -1264,7 +1265,8 @@ mod test {
         let now = chrono::Utc::now().timestamp();
 
         // Re-saving the same URL, or editing the title, leaves it alone.
-        let feed_id = insert_scheduled_feed(&tc, now, now + 3600, 2)?;
+        let feed_id =
+            insert_scheduled_feed(&tc, "https://example.com/feed.xml", now, now + 3600, 2)?;
         put_feed(
             &client,
             feed_id,
@@ -1283,7 +1285,8 @@ mod test {
         assert_eq!(feed_schedule(&tc, feed_id)?, (None, 0));
 
         // So do new credentials.
-        let feed_id = insert_scheduled_feed(&tc, now, now + 3600, 2)?;
+        let feed_id =
+            insert_scheduled_feed(&tc, "https://example.com/other.xml", now, now + 3600, 2)?;
         put_feed(
             &client,
             feed_id,
@@ -1303,7 +1306,13 @@ mod test {
         let last_checked = now - 1800;
 
         // A healthy feed is due one new interval after its last check.
-        let feed_id = insert_scheduled_feed(&tc, last_checked, last_checked + 10800, 0)?;
+        let feed_id = insert_scheduled_feed(
+            &tc,
+            "https://example.com/feed.xml",
+            last_checked,
+            last_checked + 10800,
+            0,
+        )?;
         put_feed(
             &client,
             feed_id,
@@ -1322,7 +1331,13 @@ mod test {
         assert_eq!(feed_schedule(&tc, feed_id)?, (Some(last_checked + 3600), 0));
 
         // A feed that is backing off keeps its backoff.
-        let feed_id = insert_scheduled_feed(&tc, last_checked, now + 7200, 3)?;
+        let feed_id = insert_scheduled_feed(
+            &tc,
+            "https://example.com/other.xml",
+            last_checked,
+            now + 7200,
+            3,
+        )?;
         put_feed(
             &client,
             feed_id,

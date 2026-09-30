@@ -624,16 +624,26 @@ fn record_fetch_reply(
     metrics.record_feed_redirects(redirects);
     let headers = headers.to_header_map();
 
-    // If we followed a permanent redirect, update the stored URL in the database
+    // If we followed a permanent redirect, update the stored URL in the
+    // database, unless another feed has that URL already: feed URLs are
+    // unique, and the other feed fetches the same content anyway.
     if permanent_redirect && final_url != feed_url {
-        info!(
-            "{} permanently redirected to {}; updating stored URL",
-            rec.label, final_url
-        );
-        conn.execute(
-            "UPDATE feeds SET url = ?1 WHERE id = ?2",
+        let updated = conn.execute(
+            "UPDATE feeds SET url = ?1 WHERE id = ?2
+               AND NOT EXISTS (SELECT 1 FROM feeds WHERE url = ?1)",
             (&final_url, feed_id),
         )?;
+        if updated > 0 {
+            info!(
+                "{} permanently redirected to {}; updated stored URL",
+                rec.label, final_url
+            );
+        } else {
+            warn!(
+                "{} permanently redirected to {}, which another feed has already; keeping the stored URL",
+                rec.label, final_url
+            );
+        }
     }
 
     let now_ts = Utc::now().timestamp();
