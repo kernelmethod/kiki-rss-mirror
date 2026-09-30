@@ -105,10 +105,7 @@ async fn refresh_feed_inner(
     metrics: &crate::metrics::Metrics,
     task_tx: &async_channel::Sender<TaskManagerCommand>,
 ) -> anyhow::Result<()> {
-    let fetcher = crate::fetcher::Fetcher::InProcess(crate::fetcher::ProxiedClient::with_client(
-        client.clone(),
-        crate::fetcher::client_builder,
-    ));
+    let fetcher = test_fetcher(client);
     fetch::refresh_feed(
         &fetcher,
         feed_id,
@@ -121,6 +118,20 @@ async fn refresh_feed_inner(
     )
     .await
 }
+/// An in-process [`crate::fetcher::Fetcher`] that fetches feeds, and
+/// downloads assets, with `client` for as long as no proxy is asked for.
+#[cfg(test)]
+pub(crate) fn test_fetcher(client: &reqwest::Client) -> crate::fetcher::Fetcher {
+    use crate::fetcher::assets::{asset_client_builder, AssetTimeouts};
+    use crate::fetcher::{client_builder, Fetcher, ProxiedClient};
+    Fetcher::InProcess {
+        feeds: ProxiedClient::with_client(client.clone(), client_builder),
+        assets: ProxiedClient::with_client(client.clone(), || {
+            asset_client_builder(AssetTimeouts::DEFAULT)
+        }),
+    }
+}
+
 #[allow(unused_imports)]
 pub(crate) use maintenance::run_maintenance;
 

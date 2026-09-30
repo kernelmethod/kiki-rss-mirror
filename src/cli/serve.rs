@@ -143,6 +143,20 @@ impl ServeArgs {
         self.resolve_socket_path(&data_dir, &env)
     }
 
+    /// Whether `--no-sandbox` was given, so another command running a
+    /// server child can lift its own sandbox along with the child's.
+    #[cfg(feature = "web-ui")]
+    pub fn no_sandbox(&self) -> bool {
+        self.no_sandbox
+    }
+
+    /// Whether `--seccomp-log-only` was given, so another command running a
+    /// server child can match the child's setting.
+    #[cfg(feature = "web-ui")]
+    pub fn seccomp_log_only(&self) -> bool {
+        self.seccomp_log_only
+    }
+
     /// Render these arguments back into a `kiki serve` command line that
     /// listens on `socket_path`, so another command can start a server
     /// child whose socket it already knows.

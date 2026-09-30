@@ -208,7 +208,8 @@ impl Harness {
 
     async fn cache_favicon(&self, feed_id: i64) -> Result<()> {
         cache_feed_favicon(
-            &self.client,
+            &test_fetcher(&self.client),
+            &Default::default(),
             &self.pool,
             self.tc.config_dir(),
             &self.cache,

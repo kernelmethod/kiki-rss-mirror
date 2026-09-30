@@ -15,7 +15,7 @@
 //!
 //! | Process | Started by | Filesystem | Network | Sandbox profile |
 //! |---|---|---|---|---|
-//! | server | `kiki serve` | data dir + socket dir + SQLite temp dir (rw), system paths (ro) | outbound (asset caching) + listening | [`SandboxProfile::Server`] |
+//! | server | `kiki serve` | data dir + socket dir + SQLite temp dir (rw), system paths (ro) | listening; DNS for the fetcher | [`SandboxProfile::Server`] |
 //! | feed fetcher | the server, at startup | TLS trust stores (ro) | outbound TCP only; DNS via the server | [`SandboxProfile::FeedFetcher`] |
 //! | script host | the server, at startup | none | none | [`SandboxProfile::ScriptHost`] |
 //!
@@ -25,9 +25,10 @@
 //!
 //! The feed fetcher ([`feed_fetcher`]) does every step of a feed refresh
 //! that handles untrusted bytes — the HTTP exchange, TLS, decompression,
-//! and parsing — and hands the server back plain data. The server keeps
-//! the database, scheduling, and script dispatch. The script host
-//! ([`script_host`]) runs user-supplied Lua.
+//! and parsing — and hands the server back plain data. It downloads
+//! assets and favicons the same way, so the server makes no HTTP(S)
+//! requests at all. The server keeps the database, scheduling, and script
+//! dispatch. The script host ([`script_host`]) runs user-supplied Lua.
 //!
 //! # Spawning order
 //!

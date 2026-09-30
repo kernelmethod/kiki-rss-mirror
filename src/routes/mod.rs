@@ -188,6 +188,12 @@ pub mod test {
             |v| v > 0.0,
         )
         .await?;
+        #[cfg(target_os = "linux")]
+        tc.wait_for_metric(
+            r#"kiki_process_proportional_memory_bytes{process="server"}"#,
+            |v| v > 0.0,
+        )
+        .await?;
 
         Ok(())
     }

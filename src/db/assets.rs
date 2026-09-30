@@ -74,6 +74,10 @@ fn row_to_asset(row: &rusqlite::Row) -> rusqlite::Result<AssetRow> {
 }
 
 /// Insert a new `feed_assets` row and return its rowid.
+///
+/// If a row with the same `blake3` hash already exists — another task may
+/// have stored the same bytes since the caller last looked — nothing is
+/// inserted and the id of the existing row is returned instead.
 pub fn insert_asset(
     conn: &Connection,
     blake3: &str,
@@ -83,21 +87,31 @@ pub fn insert_asset(
     etag: Option<&str>,
     last_modified: Option<&str>,
 ) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO feed_assets
+    let inserted = conn
+        .execute(
+            "INSERT INTO feed_assets
             (blake3, original_url, content_type, size_bytes, etag, last_modified)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            blake3,
-            original_url,
-            content_type,
-            size_bytes,
-            etag,
-            last_modified
-        ],
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(blake3) DO NOTHING",
+            params![
+                blake3,
+                original_url,
+                content_type,
+                size_bytes,
+                etag,
+                last_modified
+            ],
+        )
+        .with_context(|| format!("failed to insert feed_assets row for {}", blake3))?;
+    if inserted > 0 {
+        return Ok(conn.last_insert_rowid());
+    }
+    conn.query_row(
+        "SELECT id FROM feed_assets WHERE blake3 = ?1",
+        [blake3],
+        |row| row.get(0),
     )
-    .with_context(|| format!("failed to insert feed_assets row for {}", blake3))?;
-    Ok(conn.last_insert_rowid())
+    .with_context(|| format!("failed to look up existing feed_assets row for {}", blake3))
 }
 
 /// Associate an asset with an entry. Idempotent: duplicate (entry, asset)
@@ -249,6 +263,17 @@ mod tests {
         let deleted = delete_by_hash(&conn, "abc").unwrap().unwrap();
         assert_eq!(deleted.id, id);
         assert!(lookup_by_hash(&conn, "abc").unwrap().is_none());
+    }
+
+    #[test]
+    fn insert_existing_hash_returns_existing_id() {
+        let conn = mem_conn();
+        let first = insert_asset(&conn, "abc", "http://x/a.png", None, 10, None, None).unwrap();
+        let second = insert_asset(&conn, "abc", "http://y/b.png", None, 10, None, None).unwrap();
+        assert_eq!(first, second);
+        let row = lookup_by_hash(&conn, "abc").unwrap().unwrap();
+        assert_eq!(row.original_url, "http://x/a.png");
+        assert_eq!(total_cache_size(&conn).unwrap(), 10);
     }
 
     #[test]

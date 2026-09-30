@@ -30,23 +30,22 @@ const RO_RESOLVER_PATHS: &[&str] = &[
 
 /// Read-only paths needed to verify TLS certificates: the common
 /// CA-certificate locations on Debian/Ubuntu, Fedora/RHEL, Arch, and
-/// musl-based systems, and the entropy devices. Missing paths are
-/// silently skipped.
+/// musl-based systems. Missing paths are silently skipped.
 ///
-/// Granted to both the server (which still fetches assets) and the feed
-/// fetcher.
+/// Granted only to the feed fetcher, which makes every one of Kiki's
+/// outbound HTTP(S) requests: feeds, assets and favicons alike.
 const RO_TLS_PATHS: &[&str] = &[
-    // TLS trust stores
     "/etc/ssl",
     "/etc/pki",
     "/etc/ca-certificates",
     "/usr/share/ca-certificates",
     "/usr/local/share/ca-certificates",
     "/usr/lib/ssl",
-    // Entropy
-    "/dev/urandom",
-    "/dev/random",
 ];
+
+/// The entropy devices, read-only, for anything that reads them rather
+/// than calling `getrandom`. Granted to the server and the feed fetcher.
+const RO_ENTROPY_PATHS: &[&str] = &["/dev/urandom", "/dev/random"];
 
 /// Read-only introspection paths granted to the server only: CPU
 /// topology, limits, and cgroup info that tokio, num_cpus, and friends
@@ -134,10 +133,12 @@ fn collect_symlink_targets(dir: &Path, depth: usize, roots: &[PathBuf], out: &mu
 }
 
 /// Read-only paths for the TLS trust stores, including those named by
-/// `SSL_CERT_FILE`/`SSL_CERT_DIR` and wherever their symlinks lead.
+/// `SSL_CERT_FILE`/`SSL_CERT_DIR` and wherever their symlinks lead, and
+/// the entropy devices.
 fn tls_paths() -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = existing(RO_TLS_PATHS).chain(tls_env_paths()).collect();
     paths.extend(symlink_targets(&paths));
+    paths.extend(existing(RO_ENTROPY_PATHS));
     paths
 }
 
@@ -157,9 +158,9 @@ pub fn apply(config: &SandboxConfig) -> Result<()> {
 
 /// Read-write and read-only path sets for a profile.
 ///
-/// The script host gets neither: an empty ruleset that handles every
-/// access right denies the entire filesystem, which is exactly what a
-/// process that only ever talks to an inherited socket needs.
+/// The script host and the web UI get neither: an empty ruleset that
+/// handles every access right denies the entire filesystem, which is
+/// exactly what a process that only ever talks to sockets needs.
 fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
     match profile {
         SandboxProfile::Server {
@@ -178,14 +179,16 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
             if !rw_paths.iter().any(|p| path_within(temp_dir, p)) {
                 rw_paths.push(temp_dir.clone());
             }
+            // No TLS trust stores: the server makes no HTTP(S) requests
+            // of its own, as the feed fetcher downloads assets too.
             let ro_paths: Vec<PathBuf> = resolver_paths()
                 .into_iter()
-                .chain(tls_paths())
+                .chain(existing(RO_ENTROPY_PATHS))
                 .chain(existing(RO_INTROSPECTION_PATHS))
                 .collect();
             (rw_paths, ro_paths)
         }
-        SandboxProfile::ScriptHost => (Vec::new(), Vec::new()),
+        SandboxProfile::ScriptHost | SandboxProfile::WebUi => (Vec::new(), Vec::new()),
         SandboxProfile::FeedFetcher => (Vec::new(), tls_paths()),
     }
 }
@@ -212,6 +215,17 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
         ruleset = ruleset
             .handle_access(AccessNet::BindTcp)?
             .scope(Scope::AbstractUnixSocket | Scope::Signal)?;
+    }
+    if matches!(config.profile, SandboxProfile::WebUi) {
+        // Handling both TCP rights with no rule allowing any port denies
+        // every TCP bind and connect (Linux 6.7+, ABI v4). The listener was
+        // bound before the sandbox went up, and the API is reached over a
+        // Unix socket, so the web UI needs neither. Signals stay unscoped:
+        // the web UI stops its `kiki serve` child with `SIGTERM`, and that
+        // child was started outside this sandbox.
+        ruleset = ruleset
+            .handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp)?
+            .scope(Scope::AbstractUnixSocket)?;
     }
     let ruleset = ruleset
         .create()?
@@ -303,6 +317,28 @@ const DENIED_COMMON: &[i64] = &[
     libc::SYS_migrate_pages,
     libc::SYS_move_pages,
     libc::SYS_uselib,
+    // io_uring performs I/O on the process's behalf without passing
+    // through seccomp at all, and has been a steady source of kernel
+    // exploits; userfaultfd is the classic primitive for widening kernel
+    // race windows. Tokio and SQLite use neither.
+    libc::SYS_io_uring_setup,
+    libc::SYS_io_uring_enter,
+    libc::SYS_io_uring_register,
+    libc::SYS_userfaultfd,
+    // Reaching into, or comparing, another process's resources:
+    // ptrace-adjacent, and never needed.
+    libc::SYS_pidfd_getfd,
+    libc::SYS_process_madvise,
+    libc::SYS_kcmp,
+    // Opening files by handle sidesteps path-based checks.
+    libc::SYS_name_to_handle_at,
+    libc::SYS_open_by_handle_at,
+    // Host administration.
+    libc::SYS_fanotify_init,
+    libc::SYS_syslog,
+    libc::SYS_vhangup,
+    libc::SYS_sethostname,
+    libc::SYS_setdomainname,
     // No Kiki process spawns children after its sandbox is installed —
     // the server spawns the script host *before* calling `apply`.
     // Blocking exec means an attacker who gains code execution still
@@ -333,6 +369,32 @@ const DENIED_SCRIPT_HOST: &[i64] = &[
 /// resolves hostnames for it, it never calls `getaddrinfo` — which would
 /// otherwise need to bind a netlink socket.
 const DENIED_FEED_FETCHER: &[i64] = &[libc::SYS_bind, libc::SYS_listen, libc::SYS_accept4];
+
+/// The only address families the server may create sockets in: Unix, for
+/// its API listener and for resolvers that answer over a local socket
+/// (nscd, sssd, systemd-resolved), and IPv4/IPv6, for DNS queries sent
+/// straight to a name server. Everything else — netlink, packet, `AF_ALG`,
+/// Bluetooth, and the rest of the long tail of rarely-exercised kernel
+/// protocol code — is refused.
+///
+/// glibc's `getaddrinfo` also opens a netlink socket to learn which
+/// address families the host has configured; when that fails it assumes
+/// both, and resolution carries on. The systemd unit's
+/// `RestrictAddressFamilies=` makes the same choice.
+const SERVER_SOCKET_FAMILIES: &[i32] = &[libc::AF_UNIX, libc::AF_INET, libc::AF_INET6];
+
+/// Which `socket(2)` address families a profile may use.
+enum SocketDomains {
+    /// Refuse these families and allow every other.
+    Deny(&'static [i32]),
+    /// Allow only these families and refuse every other.
+    AllowOnly(&'static [i32]),
+}
+
+/// Extra syscalls denied to the web UI: binding an address and listening.
+/// Its listener is bound and listening before the sandbox goes up, and it
+/// only ever accepts on that one, so `accept4` stays allowed.
+const DENIED_WEB_UI: &[i64] = &[libc::SYS_bind, libc::SYS_listen];
 
 fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
     use seccompiler::{
@@ -370,6 +432,7 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
         SandboxProfile::Server { .. } => &[],
         SandboxProfile::ScriptHost => &[DENIED_SCRIPT_HOST, arch_specific_sockets],
         SandboxProfile::FeedFetcher => &[DENIED_FEED_FETCHER, arch_specific_sockets],
+        SandboxProfile::WebUi => &[DENIED_WEB_UI],
     };
 
     let denied: Vec<i64> = DENIED_COMMON
@@ -393,8 +456,18 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
     let program: BpfProgram = filter.try_into().context("compiling seccomp BPF program")?;
     apply_filter_all_threads(&program).context("installing seccomp BPF program")?;
 
-    if matches!(config.profile, SandboxProfile::FeedFetcher) {
-        apply_unix_socket_filter(arch, config.log_only)?;
+    let domains = match config.profile {
+        // Unix, IPv4 and IPv6 sockets only.
+        SandboxProfile::Server { .. } => Some(SocketDomains::AllowOnly(SERVER_SOCKET_FAMILIES)),
+        // Internet sockets only: no Unix ones.
+        SandboxProfile::FeedFetcher => Some(SocketDomains::Deny(&[libc::AF_UNIX])),
+        // Unix sockets only: no Internet (or netlink, or packet) ones.
+        SandboxProfile::WebUi => Some(SocketDomains::AllowOnly(&[libc::AF_UNIX])),
+        // Every socket call is already denied outright.
+        SandboxProfile::ScriptHost => None,
+    };
+    if let Some(domains) = domains {
+        apply_socket_domain_filter(arch, &domains, config.log_only)?;
     }
 
     if config.log_only {
@@ -413,40 +486,63 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
     Ok(())
 }
 
-/// Refuse `socket(AF_UNIX, ...)` with `EACCES`.
+/// Refuse with `EACCES` every `socket(domain, ...)` call whose `domain`
+/// `domains` does not allow.
 ///
-/// The feed fetcher needs Internet sockets but has no use for Unix ones —
-/// its channel to the server is inherited, and the supervisor makes its
-/// worker channels with `socketpair`, which this does not touch. Without
-/// it, a compromised fetcher could connect to the server's API socket,
-/// which carries no authentication of its own.
+/// For the feed fetcher this refuses Unix sockets: it needs Internet
+/// sockets but has no use for Unix ones — its channel to the server is
+/// inherited, and the supervisor makes its worker channels with
+/// `socketpair`, which this does not touch. Without it, a compromised
+/// fetcher could connect to the server's API socket, which carries no
+/// authentication of its own.
+///
+/// For the web UI it refuses everything *but* Unix sockets: it talks to
+/// the API over the server's Unix socket and to browsers over a listener
+/// it bound before the sandbox went up, so a new Internet socket could
+/// only be a compromised web UI reaching out.
+///
+/// For the server it allows [`SERVER_SOCKET_FAMILIES`] alone.
 ///
 /// The call fails with an error rather than killing the process: nothing
-/// in the fetcher should try, but a library that probes for a local
-/// service (as glibc's resolver does for nscd) should see it as absent
-/// rather than crash-loop the worker. Installed as a second filter: the
-/// kernel applies every installed filter and takes the most severe
-/// verdict.
-fn apply_unix_socket_filter(arch: seccompiler::TargetArch, log_only: bool) -> Result<()> {
+/// should try, but a library that probes for a local service (as glibc's
+/// resolver does for nscd) should see it as absent rather than crash the
+/// process. Installed as a separate filter: the kernel applies every
+/// installed filter and takes the most severe verdict.
+fn apply_socket_domain_filter(
+    arch: seccompiler::TargetArch,
+    domains: &SocketDomains,
+    log_only: bool,
+) -> Result<()> {
     use seccompiler::{
         apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
         SeccompCondition, SeccompFilter, SeccompRule,
     };
     use std::collections::BTreeMap;
 
-    let is_unix = SeccompCondition::new(
-        0,
-        SeccompCmpArgLen::Dword,
-        SeccompCmpOp::Eq,
-        libc::AF_UNIX as u64,
-    )
-    .context("building the AF_UNIX condition")?;
-    let rules: BTreeMap<i64, Vec<SeccompRule>> = [(
-        libc::SYS_socket,
-        vec![SeccompRule::new(vec![is_unix]).context("building the AF_UNIX rule")?],
-    )]
-    .into_iter()
-    .collect();
+    let domain_is = |op: SeccompCmpOp, family: i32| {
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, op, family as u64)
+            .context("building a socket domain condition")
+    };
+    // A syscall matches when any one rule does, and a rule when all of
+    // its conditions do.
+    let socket_rules: Vec<SeccompRule> = match domains {
+        SocketDomains::Deny(families) => families
+            .iter()
+            .map(|&f| {
+                SeccompRule::new(vec![domain_is(SeccompCmpOp::Eq, f)?])
+                    .context("building a socket domain rule")
+            })
+            .collect::<Result<_>>()?,
+        SocketDomains::AllowOnly(families) => {
+            let conditions = families
+                .iter()
+                .map(|&f| domain_is(SeccompCmpOp::Ne, f))
+                .collect::<Result<_>>()?;
+            vec![SeccompRule::new(conditions).context("building the socket domain rule")?]
+        }
+    };
+    let rules: BTreeMap<i64, Vec<SeccompRule>> =
+        [(libc::SYS_socket, socket_rules)].into_iter().collect();
 
     let match_action = if log_only {
         SeccompAction::Log
@@ -454,11 +550,11 @@ fn apply_unix_socket_filter(arch: seccompiler::TargetArch, log_only: bool) -> Re
         SeccompAction::Errno(libc::EACCES as u32)
     };
     let filter = SeccompFilter::new(rules, SeccompAction::Allow, match_action, arch)
-        .context("constructing the AF_UNIX seccomp filter")?;
+        .context("constructing the socket domain seccomp filter")?;
     let program: BpfProgram = filter
         .try_into()
-        .context("compiling the AF_UNIX seccomp filter")?;
-    apply_filter_all_threads(&program).context("installing the AF_UNIX seccomp filter")?;
+        .context("compiling the socket domain seccomp filter")?;
+    apply_filter_all_threads(&program).context("installing the socket domain seccomp filter")?;
     Ok(())
 }
 
@@ -590,8 +686,29 @@ mod tests {
         let env_paths = tls_env_paths();
         for p in &ro {
             assert!(
-                RO_TLS_PATHS.iter().any(|allowed| Path::new(allowed) == p) || env_paths.contains(p),
+                RO_TLS_PATHS
+                    .iter()
+                    .chain(RO_ENTROPY_PATHS)
+                    .any(|allowed| Path::new(allowed) == p)
+                    || env_paths.contains(p),
                 "unexpected read-only path for the feed fetcher: {p:?}"
+            );
+        }
+    }
+
+    /// Every HTTP(S) request is made by the feed fetcher, so the server has
+    /// no use for the TLS trust stores.
+    #[test]
+    fn server_gets_no_tls_trust_stores() {
+        let (_, ro) = landlock_paths(&SandboxProfile::Server {
+            data_dir: PathBuf::from("/var/lib/kiki"),
+            socket_dir: PathBuf::from("/var/lib/kiki"),
+            temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
+        });
+        for p in &ro {
+            assert!(
+                !RO_TLS_PATHS.iter().any(|tls| p.starts_with(tls)),
+                "the server must not be granted a TLS trust store: {p:?}"
             );
         }
     }
@@ -603,6 +720,42 @@ mod tests {
         assert!(DENIED_FEED_FETCHER.contains(&libc::SYS_accept4));
         assert!(!DENIED_FEED_FETCHER.contains(&libc::SYS_socket));
         assert!(!DENIED_FEED_FETCHER.contains(&libc::SYS_connect));
+    }
+
+    #[test]
+    fn web_ui_gets_no_filesystem_access() {
+        let (rw, ro) = landlock_paths(&SandboxProfile::WebUi);
+        assert!(rw.is_empty(), "the web UI must get no writable paths");
+        assert!(ro.is_empty(), "the web UI must get no readable paths");
+    }
+
+    /// The web UI accepts on the listener it bound before the sandbox, and
+    /// connects to the API's Unix socket, but opens no new listener.
+    #[test]
+    fn the_web_ui_may_accept_and_connect_but_not_listen() {
+        assert!(DENIED_WEB_UI.contains(&libc::SYS_bind));
+        assert!(DENIED_WEB_UI.contains(&libc::SYS_listen));
+        assert!(!DENIED_WEB_UI.contains(&libc::SYS_accept4));
+        assert!(!DENIED_WEB_UI.contains(&libc::SYS_socket));
+        assert!(!DENIED_WEB_UI.contains(&libc::SYS_connect));
+    }
+
+    /// The server keeps the families its API listener and the system
+    /// resolver need, and nothing else.
+    #[test]
+    fn the_server_may_only_create_unix_and_internet_sockets() {
+        for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
+            assert!(SERVER_SOCKET_FAMILIES.contains(&family));
+        }
+        for family in [libc::AF_NETLINK, libc::AF_PACKET, libc::AF_ALG] {
+            assert!(!SERVER_SOCKET_FAMILIES.contains(&family));
+        }
+    }
+
+    #[test]
+    fn every_profile_denies_io_uring_and_userfaultfd() {
+        assert!(DENIED_COMMON.contains(&libc::SYS_io_uring_setup));
+        assert!(DENIED_COMMON.contains(&libc::SYS_userfaultfd));
     }
 
     #[test]

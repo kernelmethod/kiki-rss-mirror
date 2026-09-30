@@ -247,15 +247,14 @@ impl Server {
     /// Run the server synchronously, creating a Tokio runtime and installing
     /// signal handlers. This is the entry point used by the CLI.
     pub fn run(self) -> Result<()> {
-        let rt = if self.single_threaded {
+        let mut builder = if self.single_threaded {
             tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
         } else {
             tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?
         };
+        let rt = crate::memory::release_on_park(&mut builder)
+            .enable_all()
+            .build()?;
         let cancel = self.cancel_token.clone();
         rt.block_on(async {
             tokio::spawn(shutdown_signal(cancel));
@@ -308,7 +307,10 @@ impl Server {
                 }
                 Ok(())
             });
+        // SQLite allows one writer at a time, so more connections mostly
+        // add readers, each holding a page cache of its own.
         let pool = r2d2::Pool::builder()
+            .max_size(5)
             .event_handler(Box::new(crate::metrics::PoolMetrics(metrics.clone())))
             .build(crate::db::ConnectionManager::new(manager).with_metrics(metrics.clone()))
             .with_context(|| {
@@ -442,7 +444,7 @@ impl Server {
             config.clone(),
             script_runner.clone(),
             fetcher,
-        )?;
+        );
         let workers_exited = wait_for_workers(worker_handles);
 
         tokio::spawn(metrics_sampler_loop(
@@ -562,6 +564,7 @@ async fn metrics_sampler_loop(
                                         role.as_str(),
                                         u.cpu_seconds,
                                         u.resident_bytes as f64,
+                                        u.proportional_bytes.map(|b| b as f64),
                                     );
                                 }
                             }

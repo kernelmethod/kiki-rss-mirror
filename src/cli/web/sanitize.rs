@@ -5,7 +5,7 @@
 //! elements, drops every attribute except the links and image sources it
 //! can check, and removes everything else.
 
-use crate::tasks::assets::resolve_http_url;
+use crate::fetcher::assets::resolve_http_url;
 use lol_html::errors::RewritingError;
 use lol_html::html_content::{ContentType, Element};
 use lol_html::{doc_comments, element, HtmlRewriter, Settings};
