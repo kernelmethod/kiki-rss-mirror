@@ -27,6 +27,7 @@ use tracing::{debug, warn};
 pub use crate::fetcher::assets::{
     is_allowed_content_type, normalize_content_type, AssetKind, MAX_ASSET_BYTES,
 };
+use crate::fetcher::svg::{sanitize_svg, SVG_CONTENT_TYPE};
 
 /// Where assets are downloaded through and stored.
 pub struct AssetCache<'a> {
@@ -198,6 +199,13 @@ where
             );
             return Ok(false);
         }
+        AssetReply::UnsafeSvg => {
+            warn!(
+                "asset {} is an SVG that cannot be sanitized, skipping",
+                asset_url
+            );
+            return Ok(false);
+        }
         AssetReply::Failed { message } => {
             warn!("asset body read failed for {}: {}", asset_url, message);
             return Ok(false);
@@ -225,7 +233,23 @@ where
         );
         return Ok(false);
     }
-    let bytes = asset.bytes;
+    // SVG is only safe to serve once sanitized, which the fetcher did;
+    // do it again rather than trust it. Sanitizing is idempotent, so this
+    // changes nothing unless the fetcher skipped it.
+    let bytes = if content_type == SVG_CONTENT_TYPE {
+        match sanitize_svg(&asset.bytes) {
+            Some(clean) => clean,
+            None => {
+                warn!(
+                    "fetcher returned asset {} as an SVG that cannot be sanitized, skipping",
+                    asset_url
+                );
+                return Ok(false);
+            }
+        }
+    } else {
+        asset.bytes
+    };
     let etag = asset.etag;
     let last_modified = asset.last_modified;
 

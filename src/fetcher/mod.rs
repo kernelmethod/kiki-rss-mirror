@@ -22,6 +22,7 @@
 pub mod assets;
 pub mod parse;
 pub mod retrieve;
+pub mod svg;
 
 use crate::config::ProxySettings;
 use crate::http::{FeedAuth, USER_AGENT};
