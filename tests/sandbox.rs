@@ -1096,3 +1096,353 @@ mod script_isolation {
         kiki.shutdown();
     }
 }
+
+// --------------------------------------------------------------------
+// Web UI sandbox
+// --------------------------------------------------------------------
+
+#[cfg(feature = "web-ui")]
+mod web_ui {
+    use super::*;
+    use std::net::TcpStream;
+
+    /// A running `kiki web` subprocess, with its `kiki serve` child, in its
+    /// own temp data directory. Dropped instances are killed and reaped.
+    struct KikiWeb {
+        _dir: TempDir,
+        socket: PathBuf,
+        addr: SocketAddr,
+        child: Option<Child>,
+    }
+
+    impl KikiWeb {
+        /// Spawn `kiki web` with the given extra flags and wait for it to
+        /// serve its index page.
+        fn spawn(extra_args: &[&str]) -> Self {
+            let dir = TempDir::with_prefix("kiki-web-sandbox-test").expect("create tempdir");
+            let init_status = Command::new(KIKI_BIN)
+                .args(["init", "--no-default-plugins"])
+                .env("KIKI_HOME", dir.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("spawn kiki init");
+            assert!(init_status.success(), "kiki init failed: {init_status:?}");
+
+            // Reserve a free port, then hand it to kiki.
+            let addr = TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .expect("reserve a port");
+            let socket = dir.path().join("kiki.sock");
+            let child = Command::new(KIKI_BIN)
+                .current_dir(dir.path())
+                .arg("web")
+                .arg("--listen")
+                .arg(addr.to_string())
+                .arg("--uds")
+                .arg(&socket)
+                .args(extra_args)
+                .env("KIKI_HOME", dir.path())
+                .env("RUST_LOG", "warn")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn kiki web");
+
+            let mut web = KikiWeb {
+                _dir: dir,
+                socket,
+                addr,
+                child: Some(child),
+            };
+            web.wait_until_ready(Duration::from_secs(10));
+            web
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.as_ref().expect("child").id()
+        }
+
+        /// Poll until the index page renders, which takes both the web UI
+        /// and the server behind it.
+        fn wait_until_ready(&mut self, timeout: Duration) {
+            let start = Instant::now();
+            while start.elapsed() < timeout {
+                self.assert_still_running();
+                if TcpStream::connect(self.addr).is_ok() && self.get("/").status == 200 {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            panic!("kiki web did not serve its index within {timeout:?}");
+        }
+
+        fn assert_still_running(&mut self) {
+            let child = self.child.as_mut().expect("child");
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                panic!(
+                    "kiki web exited unexpectedly mid-test: {}",
+                    describe_exit(status)
+                );
+            }
+        }
+
+        /// GET `path` from the web UI.
+        fn get(&self, path: &str) -> HttpResponse {
+            let mut stream = TcpStream::connect(self.addr).expect("connect to the web UI");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            stream.write_all(req.as_bytes()).expect("write request");
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).expect("read response");
+            let line = raw.split(|&b| b == b'\n').next().expect("empty response");
+            let status = std::str::from_utf8(line)
+                .expect("non-utf8 status line")
+                .split_whitespace()
+                .nth(1)
+                .and_then(|c| c.parse().ok())
+                .expect("status code");
+            let split = raw
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(raw.len(), |p| p + 4);
+            HttpResponse {
+                status,
+                body: raw[split..].to_vec(),
+            }
+        }
+
+        /// The `kiki serve` child's PID.
+        fn server_pid(&self) -> u32 {
+            *child_pids_matching(self.pid(), "serve")
+                .first()
+                .expect("a kiki serve child")
+        }
+
+        /// Wait for `kiki web` to exit and return its status.
+        fn wait(mut self) -> std::process::ExitStatus {
+            let mut child = self.child.take().expect("child");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().expect("try_wait") {
+                    return status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    panic!("kiki web did not exit");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        /// Send SIGTERM and assert a clean exit, with the server gone too.
+        fn shutdown(self) {
+            let server = self.server_pid();
+            // SAFETY: signalling our own, unreaped child is always safe.
+            unsafe {
+                libc::kill(self.pid() as libc::pid_t, libc::SIGTERM);
+            }
+            let status = self.wait();
+            assert!(status.success(), "kiki web: {}", describe_exit(status));
+            assert!(
+                wait_for_exit(server, Duration::from_secs(5)),
+                "the kiki serve child outlived the web UI"
+            );
+        }
+    }
+
+    impl Drop for KikiWeb {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// Every page renders with the web UI sandboxed — a newly denied
+    /// syscall on a handler's path would kill it with SIGSYS — and the
+    /// sandbox is really installed.
+    #[test]
+    fn the_sandboxed_web_ui_serves_every_page() {
+        let (addr, _rss) = spawn_local_rss_server();
+        let mut web = KikiWeb::spawn(&[]);
+        assert_eq!(
+            seccomp_mode(web.pid()),
+            Some(2),
+            "the web UI is not sandboxed"
+        );
+
+        let feed = http_request(
+            &web.socket,
+            "POST",
+            "/v1/feeds/create",
+            Some(&format!(
+                r#"{{"title":"web sandbox","url":"http://{addr}/feed.xml"}}"#
+            )),
+        )
+        .assert_success()
+        .json()["id"]
+            .as_i64()
+            .expect("feed id");
+        http_request(
+            &web.socket,
+            "POST",
+            &format!("/v1/feeds/refresh/{feed}"),
+            Some(""),
+        )
+        .assert_success();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let entry = loop {
+            web.assert_still_running();
+            let entries = http_request(&web.socket, "GET", "/v1/entries?limit=1", None)
+                .assert_success()
+                .json();
+            if let Some(id) = entries["entries"][0]["id"].as_i64() {
+                break id;
+            }
+            assert!(Instant::now() < deadline, "the entry never appeared");
+            thread::sleep(Duration::from_millis(200));
+        };
+
+        for path in [
+            "/".to_owned(),
+            "/feeds".to_owned(),
+            format!("/feeds/{feed}"),
+            format!("/entries/{entry}"),
+            "/tags".to_owned(),
+            "/search?q=hello".to_owned(),
+            "/plugins".to_owned(),
+        ] {
+            let resp = web.get(&path);
+            web.assert_still_running();
+            assert_eq!(resp.status, 200, "{path}: {}", resp.body_str());
+        }
+        assert!(web
+            .get(&format!("/entries/{entry}"))
+            .body_str()
+            .contains("hello from a sandboxed fetch"));
+        web.shutdown();
+    }
+
+    #[test]
+    fn no_sandbox_leaves_the_web_ui_unsandboxed() {
+        let mut web = KikiWeb::spawn(&["--no-sandbox"]);
+        assert_eq!(seccomp_mode(web.pid()), Some(0));
+        web.get("/feeds").assert_success();
+        web.assert_still_running();
+        web.shutdown();
+    }
+
+    /// Set by [`the_web_ui_sandbox_is_enforced`] when it re-runs this test
+    /// binary to probe the sandbox; names the directory holding the probe's
+    /// targets.
+    const PROBE_ENV: &str = "KIKI_WEB_UI_SANDBOX_PROBE";
+
+    /// The address of a TCP listener for the probe to try to reach.
+    const PROBE_TCP_ENV: &str = "KIKI_WEB_UI_SANDBOX_PROBE_TCP";
+
+    /// Printed by the probe once every check has passed.
+    const PROBE_PASSED: &str = "web UI sandbox probe passed";
+
+    /// The Landlock ABI version the kernel supports, or 0 without Landlock.
+    fn landlock_abi() -> i64 {
+        // SAFETY: with a null attribute pointer and the VERSION flag,
+        // landlock_create_ruleset(2) only reports the ABI version.
+        let abi = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<libc::c_void>(),
+                0usize,
+                1u32, // LANDLOCK_CREATE_RULESET_VERSION
+            )
+        };
+        abi.max(0)
+    }
+
+    /// The other half of [`the_web_ui_sandbox_is_enforced`]: does nothing
+    /// unless that test ran it, in which case it installs the web UI's
+    /// sandbox on itself and checks what gets through.
+    #[test]
+    fn web_ui_sandbox_probe() {
+        let Some(dir) = std::env::var_os(PROBE_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let tcp: SocketAddr = std::env::var(PROBE_TCP_ENV)
+            .expect("probe TCP address")
+            .parse()
+            .expect("valid probe TCP address");
+        let secret = dir.join("secret");
+
+        kiki_rss::sandbox::apply(&kiki_rss::sandbox::SandboxConfig::web_ui(false))
+            .expect("install the web UI sandbox");
+
+        // What the web UI needs still works: reaching the API's socket.
+        UnixStream::connect(dir.join("api.sock")).expect("connect to the API socket");
+
+        // Nothing else on the network does: seccomp refuses the socket.
+        let err = std::net::TcpStream::connect(tcp).expect_err("TCP connect was allowed");
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES), "{err}");
+        TcpListener::bind("127.0.0.1:0").expect_err("TCP bind was allowed");
+        std::net::UdpSocket::bind("127.0.0.1:0").expect_err("UDP socket was allowed");
+
+        // Nor does the filesystem, where the kernel has Landlock.
+        if landlock_abi() >= 1 {
+            std::fs::read(&secret).expect_err("reading a file was allowed");
+            std::fs::read_dir("/").expect_err("listing / was allowed");
+            std::fs::write(dir.join("new"), "x").expect_err("creating a file was allowed");
+        } else {
+            println!("Landlock unavailable; skipping the filesystem checks");
+        }
+        println!("{PROBE_PASSED}");
+    }
+
+    /// The web UI's sandbox really denies what it claims to: run
+    /// [`web_ui_sandbox_probe`] in a fresh process, which the sandbox then
+    /// confines, and check it passed rather than died with SIGSYS.
+    #[test]
+    fn the_web_ui_sandbox_is_enforced() {
+        let dir = TempDir::with_prefix("kiki-web-probe").expect("create tempdir");
+        std::fs::write(dir.path().join("secret"), "hidden").expect("write secret");
+        let api = std::os::unix::net::UnixListener::bind(dir.path().join("api.sock"))
+            .expect("bind the API socket");
+        let tcp = TcpListener::bind("127.0.0.1:0").expect("bind a TCP listener");
+
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "web_ui::web_ui_sandbox_probe", "--nocapture"])
+            .env(PROBE_ENV, dir.path())
+            .env(PROBE_TCP_ENV, tcp.local_addr().expect("addr").to_string())
+            .output()
+            .expect("run the probe");
+        drop(api);
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains(PROBE_PASSED),
+            "probe failed ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
+    }
+
+    /// The web UI notices, from inside its sandbox, that the server it
+    /// started has died, and exits with an error rather than a signal.
+    #[test]
+    fn the_sandboxed_web_ui_exits_with_its_server() {
+        let web = KikiWeb::spawn(&[]);
+        // SAFETY: SIGKILL to a process this test tree owns.
+        unsafe {
+            libc::kill(web.server_pid() as libc::pid_t, libc::SIGKILL);
+        }
+        let status = web.wait();
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "kiki web: {}",
+            describe_exit(status)
+        );
+    }
+}

@@ -14,15 +14,17 @@
 //!   small read-only set of system paths needed for DNS. The feed fetcher,
 //!   which makes all of Kiki's HTTP(S) requests, gets only the TLS trust
 //!   stores (it has the server resolve hostnames for it), and the script
-//!   host gets *nothing at all*. Where the kernel
+//!   host and the web UI get *nothing at all*. Where the kernel
 //!   supports it, the feed fetcher is also barred from binding TCP ports
 //!   and from reaching abstract Unix sockets or signalling processes
-//!   outside its own sandbox.
+//!   outside its own sandbox, and the web UI from binding or connecting
+//!   to TCP ports and from reaching abstract Unix sockets.
 //! * **seccomp-bpf** blocks a denylist of syscalls the profile never uses
 //!   (`ptrace`, `mount`, `unshare`, `bpf`, `kexec_load`, module loading,
-//!   and friends; plus, for the script host, every socket call, and for
+//!   and friends; plus, for the script host, every socket call; for
 //!   the feed fetcher, binding, listening, accepting, and creating Unix
-//!   sockets).
+//!   sockets; and for the web UI, binding, listening, and creating any
+//!   socket but a Unix one).
 //!   The default action for unmatched syscalls is `Allow` — this is a
 //!   defence-in-depth layer that eliminates the most dangerous escape
 //!   primitives without risking that a benign syscall we forgot about
@@ -30,7 +32,8 @@
 //!
 //! Both restrictions are installed before the process touches untrusted
 //! input — for the server, before it opens its listening socket(s); for
-//! the children, before they read their first byte of IPC. They are
+//! the children, before they read their first byte of IPC; for the web
+//! UI, before it accepts its first connection. They are
 //! inherited by every thread and task spawned later, and by the feed
 //! fetcher's forked workers.
 //!
@@ -84,6 +87,19 @@ pub enum SandboxProfile {
     /// them, or create a Unix socket: the last keeps it away from the
     /// server's API socket, whose only access control is reachability.
     FeedFetcher,
+
+    /// The `kiki web` UI: accepts browser connections on a TCP listener it
+    /// bound before the sandbox went up, and turns each request into calls
+    /// to the Kiki API over the server's Unix socket.
+    ///
+    /// This profile grants **no filesystem access whatsoever**: every page
+    /// and cached asset it serves comes from the API. It may accept
+    /// connections on its existing listener and connect to Unix sockets,
+    /// but may not bind or listen on a new socket, create any socket that
+    /// is not a Unix one, or make TCP connections — so a compromised web
+    /// UI can reach the Kiki API and nothing else on the network. It may
+    /// still signal the `kiki serve` child it started, to stop it.
+    WebUi,
 }
 
 /// Sandbox configuration derived from CLI flags and the process's role.
@@ -132,12 +148,21 @@ impl SandboxConfig {
         }
     }
 
+    /// Configuration for the `kiki web` UI process.
+    pub fn web_ui(log_only: bool) -> Self {
+        SandboxConfig {
+            profile: SandboxProfile::WebUi,
+            log_only,
+        }
+    }
+
     /// A short name for the profile, used in log messages.
     pub fn profile_name(&self) -> &'static str {
         match self.profile {
             SandboxProfile::Server { .. } => "server",
             SandboxProfile::ScriptHost => "script-host",
             SandboxProfile::FeedFetcher => "feed-fetcher",
+            SandboxProfile::WebUi => "web-ui",
         }
     }
 }
@@ -150,6 +175,10 @@ mod linux;
 /// Must be called before any untrusted input is accepted. On Linux this
 /// installs Landlock filesystem rules and a seccomp-bpf syscall filter
 /// that are inherited by every thread spawned after the call returns.
+///
+/// Landlock restricts only the calling thread and those it spawns later,
+/// so call this while the process is still single-threaded — before
+/// building a multi-threaded tokio runtime, for instance.
 ///
 /// Note that every profile denies `execve`, so a process must spawn any
 /// children it needs *before* calling this.

@@ -158,9 +158,9 @@ pub fn apply(config: &SandboxConfig) -> Result<()> {
 
 /// Read-write and read-only path sets for a profile.
 ///
-/// The script host gets neither: an empty ruleset that handles every
-/// access right denies the entire filesystem, which is exactly what a
-/// process that only ever talks to an inherited socket needs.
+/// The script host and the web UI get neither: an empty ruleset that
+/// handles every access right denies the entire filesystem, which is
+/// exactly what a process that only ever talks to sockets needs.
 fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
     match profile {
         SandboxProfile::Server {
@@ -188,7 +188,7 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
                 .collect();
             (rw_paths, ro_paths)
         }
-        SandboxProfile::ScriptHost => (Vec::new(), Vec::new()),
+        SandboxProfile::ScriptHost | SandboxProfile::WebUi => (Vec::new(), Vec::new()),
         SandboxProfile::FeedFetcher => (Vec::new(), tls_paths()),
     }
 }
@@ -215,6 +215,17 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
         ruleset = ruleset
             .handle_access(AccessNet::BindTcp)?
             .scope(Scope::AbstractUnixSocket | Scope::Signal)?;
+    }
+    if matches!(config.profile, SandboxProfile::WebUi) {
+        // Handling both TCP rights with no rule allowing any port denies
+        // every TCP bind and connect (Linux 6.7+, ABI v4). The listener was
+        // bound before the sandbox went up, and the API is reached over a
+        // Unix socket, so the web UI needs neither. Signals stay unscoped:
+        // the web UI stops its `kiki serve` child with `SIGTERM`, and that
+        // child was started outside this sandbox.
+        ruleset = ruleset
+            .handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp)?
+            .scope(Scope::AbstractUnixSocket)?;
     }
     let ruleset = ruleset
         .create()?
@@ -337,9 +348,15 @@ const DENIED_SCRIPT_HOST: &[i64] = &[
 /// otherwise need to bind a netlink socket.
 const DENIED_FEED_FETCHER: &[i64] = &[libc::SYS_bind, libc::SYS_listen, libc::SYS_accept4];
 
+/// Extra syscalls denied to the web UI: binding an address and listening.
+/// Its listener is bound and listening before the sandbox goes up, and it
+/// only ever accepts on that one, so `accept4` stays allowed.
+const DENIED_WEB_UI: &[i64] = &[libc::SYS_bind, libc::SYS_listen];
+
 fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
     use seccompiler::{
-        apply_filter_all_threads, BpfProgram, SeccompAction, SeccompFilter, SeccompRule,
+        apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpOp, SeccompFilter,
+        SeccompRule,
     };
     use std::collections::BTreeMap;
 
@@ -373,6 +390,7 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
         SandboxProfile::Server { .. } => &[],
         SandboxProfile::ScriptHost => &[DENIED_SCRIPT_HOST, arch_specific_sockets],
         SandboxProfile::FeedFetcher => &[DENIED_FEED_FETCHER, arch_specific_sockets],
+        SandboxProfile::WebUi => &[DENIED_WEB_UI],
     };
 
     let denied: Vec<i64> = DENIED_COMMON
@@ -396,8 +414,16 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
     let program: BpfProgram = filter.try_into().context("compiling seccomp BPF program")?;
     apply_filter_all_threads(&program).context("installing seccomp BPF program")?;
 
-    if matches!(config.profile, SandboxProfile::FeedFetcher) {
-        apply_unix_socket_filter(arch, config.log_only)?;
+    match config.profile {
+        // Internet sockets only: no Unix ones.
+        SandboxProfile::FeedFetcher => {
+            apply_socket_domain_filter(arch, SeccompCmpOp::Eq, config.log_only)?;
+        }
+        // Unix sockets only: no Internet (or netlink, or packet) ones.
+        SandboxProfile::WebUi => {
+            apply_socket_domain_filter(arch, SeccompCmpOp::Ne, config.log_only)?;
+        }
+        SandboxProfile::Server { .. } | SandboxProfile::ScriptHost => {}
     }
 
     if config.log_only {
@@ -416,37 +442,42 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
     Ok(())
 }
 
-/// Refuse `socket(AF_UNIX, ...)` with `EACCES`.
+/// Refuse with `EACCES` every `socket(domain, ...)` call whose `domain`
+/// compares to `AF_UNIX` by `op`.
 ///
-/// The feed fetcher needs Internet sockets but has no use for Unix ones —
-/// its channel to the server is inherited, and the supervisor makes its
+/// With [`SeccompCmpOp::Eq`] this refuses Unix sockets, for the feed
+/// fetcher: it needs Internet sockets but has no use for Unix ones — its
+/// channel to the server is inherited, and the supervisor makes its
 /// worker channels with `socketpair`, which this does not touch. Without
 /// it, a compromised fetcher could connect to the server's API socket,
 /// which carries no authentication of its own.
 ///
+/// With [`SeccompCmpOp::Ne`] it refuses everything *but* Unix sockets, for
+/// the web UI: it talks to the API over the server's Unix socket and to
+/// browsers over a listener it bound before the sandbox went up, so a new
+/// Internet socket could only be a compromised web UI reaching out.
+///
 /// The call fails with an error rather than killing the process: nothing
-/// in the fetcher should try, but a library that probes for a local
-/// service (as glibc's resolver does for nscd) should see it as absent
-/// rather than crash-loop the worker. Installed as a second filter: the
-/// kernel applies every installed filter and takes the most severe
-/// verdict.
-fn apply_unix_socket_filter(arch: seccompiler::TargetArch, log_only: bool) -> Result<()> {
+/// should try, but a library that probes for a local service (as glibc's
+/// resolver does for nscd) should see it as absent rather than crash the
+/// process. Installed as a separate filter: the kernel applies every
+/// installed filter and takes the most severe verdict.
+fn apply_socket_domain_filter(
+    arch: seccompiler::TargetArch,
+    op: seccompiler::SeccompCmpOp,
+    log_only: bool,
+) -> Result<()> {
     use seccompiler::{
-        apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
-        SeccompCondition, SeccompFilter, SeccompRule,
+        apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCondition,
+        SeccompFilter, SeccompRule,
     };
     use std::collections::BTreeMap;
 
-    let is_unix = SeccompCondition::new(
-        0,
-        SeccompCmpArgLen::Dword,
-        SeccompCmpOp::Eq,
-        libc::AF_UNIX as u64,
-    )
-    .context("building the AF_UNIX condition")?;
+    let domain = SeccompCondition::new(0, SeccompCmpArgLen::Dword, op, libc::AF_UNIX as u64)
+        .context("building the socket domain condition")?;
     let rules: BTreeMap<i64, Vec<SeccompRule>> = [(
         libc::SYS_socket,
-        vec![SeccompRule::new(vec![is_unix]).context("building the AF_UNIX rule")?],
+        vec![SeccompRule::new(vec![domain]).context("building the socket domain rule")?],
     )]
     .into_iter()
     .collect();
@@ -457,11 +488,11 @@ fn apply_unix_socket_filter(arch: seccompiler::TargetArch, log_only: bool) -> Re
         SeccompAction::Errno(libc::EACCES as u32)
     };
     let filter = SeccompFilter::new(rules, SeccompAction::Allow, match_action, arch)
-        .context("constructing the AF_UNIX seccomp filter")?;
+        .context("constructing the socket domain seccomp filter")?;
     let program: BpfProgram = filter
         .try_into()
-        .context("compiling the AF_UNIX seccomp filter")?;
-    apply_filter_all_threads(&program).context("installing the AF_UNIX seccomp filter")?;
+        .context("compiling the socket domain seccomp filter")?;
+    apply_filter_all_threads(&program).context("installing the socket domain seccomp filter")?;
     Ok(())
 }
 
@@ -627,6 +658,24 @@ mod tests {
         assert!(DENIED_FEED_FETCHER.contains(&libc::SYS_accept4));
         assert!(!DENIED_FEED_FETCHER.contains(&libc::SYS_socket));
         assert!(!DENIED_FEED_FETCHER.contains(&libc::SYS_connect));
+    }
+
+    #[test]
+    fn web_ui_gets_no_filesystem_access() {
+        let (rw, ro) = landlock_paths(&SandboxProfile::WebUi);
+        assert!(rw.is_empty(), "the web UI must get no writable paths");
+        assert!(ro.is_empty(), "the web UI must get no readable paths");
+    }
+
+    /// The web UI accepts on the listener it bound before the sandbox, and
+    /// connects to the API's Unix socket, but opens no new listener.
+    #[test]
+    fn the_web_ui_may_accept_and_connect_but_not_listen() {
+        assert!(DENIED_WEB_UI.contains(&libc::SYS_bind));
+        assert!(DENIED_WEB_UI.contains(&libc::SYS_listen));
+        assert!(!DENIED_WEB_UI.contains(&libc::SYS_accept4));
+        assert!(!DENIED_WEB_UI.contains(&libc::SYS_socket));
+        assert!(!DENIED_WEB_UI.contains(&libc::SYS_connect));
     }
 
     #[test]
