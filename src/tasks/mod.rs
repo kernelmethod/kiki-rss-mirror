@@ -34,7 +34,7 @@ pub(crate) use favicons::cache_feed_favicon;
 pub(crate) async fn refresh_feed(
     client: &reqwest::Client,
     feed_id: i64,
-    pool: crate::db::Pool,
+    pool: crate::db::Db,
     script_runner: Option<&dyn crate::scripting::ScriptRunner>,
     metrics: &crate::metrics::Metrics,
     task_tx: &async_channel::Sender<TaskManagerCommand>,
@@ -57,7 +57,7 @@ pub(crate) async fn refresh_feed(
 pub(crate) async fn refresh_feed_with_settings(
     client: &reqwest::Client,
     feed_id: i64,
-    pool: crate::db::Pool,
+    pool: crate::db::Db,
     settings: &crate::config::Settings,
     script_runner: Option<&dyn crate::scripting::ScriptRunner>,
     metrics: &crate::metrics::Metrics,
@@ -82,7 +82,7 @@ pub(crate) async fn refresh_feed_with_settings(
 pub(crate) async fn refresh_feed_manual(
     client: &reqwest::Client,
     feed_id: i64,
-    pool: crate::db::Pool,
+    pool: crate::db::Db,
     metrics: &crate::metrics::Metrics,
     task_tx: &async_channel::Sender<TaskManagerCommand>,
 ) -> anyhow::Result<()> {
@@ -99,7 +99,7 @@ async fn refresh_feed_inner(
     client: &reqwest::Client,
     feed_id: i64,
     manual: bool,
-    pool: crate::db::Pool,
+    pool: crate::db::Db,
     settings: &crate::config::Settings,
     script_runner: Option<&dyn crate::scripting::ScriptRunner>,
     metrics: &crate::metrics::Metrics,

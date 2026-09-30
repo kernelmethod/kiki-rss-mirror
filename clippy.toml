@@ -9,3 +9,12 @@ disallowed-methods = [
     { path = "reqwest::ClientBuilder::build", reason = "build clients with fetcher::ProxiedClient so the proxy settings apply" },
     { path = "reqwest::get", reason = "use a client from fetcher::ProxiedClient so the proxy settings apply" },
 ]
+
+# A pooled connection held across an `.await` stays checked out for as long
+# as the task is suspended (e.g. a whole feed fetch), and a task that then
+# asks the pool for another can deadlock with the tasks holding the rest.
+# Only `kiki_rss::db::Db` checks connections out, and never across an await;
+# this keeps it that way.
+await-holding-invalid-types = [
+    { path = "r2d2::PooledConnection", reason = "don't hold a pooled connection across an await; go through db::Db" },
+]

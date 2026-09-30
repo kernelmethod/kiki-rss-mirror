@@ -1,5 +1,6 @@
 use crate::server::AppState;
 use axum::{extract::State, http::StatusCode, Json};
+use tracing::debug;
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct RootResponse {
@@ -20,27 +21,26 @@ pub struct RootResponse {
 )]
 #[axum::debug_handler]
 pub async fn root(State(state): State<AppState>) -> (StatusCode, Json<RootResponse>) {
-    let schema_version = match state.conn_pool.get() {
-        Ok(conn) => {
-            let mut stmt =
-                match conn.prepare("SELECT name FROM migrations ORDER BY id DESC LIMIT 1") {
-                    Ok(s) => s,
-                    Err(_) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(RootResponse {
-                                version: env!("CARGO_PKG_VERSION").to_string(),
-                                schema_version: "unknown".to_string(),
-                            }),
-                        );
-                    }
-                };
-            match stmt.query_row([], |row| row.get::<_, String>(0)) {
-                Ok(name) => name,
-                Err(_) => "unknown".to_string(),
-            }
+    let schema_version = state
+        .db
+        .read(|conn| {
+            conn.query_row(
+                "SELECT name FROM migrations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .await;
+    let schema_version = match schema_version {
+        Ok(Ok(name)) => name,
+        Ok(Err(e)) => {
+            debug!("could not read the schema version: {e:?}");
+            "unknown".to_string()
         }
-        Err(_) => "unknown".to_string(),
+        Err(e) => {
+            debug!("could not read the schema version: {e:?}");
+            "unknown".to_string()
+        }
     };
 
     (

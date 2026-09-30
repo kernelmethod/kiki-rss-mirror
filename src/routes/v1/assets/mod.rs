@@ -10,7 +10,6 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
-use tokio::task;
 use tracing::{event, Level};
 
 #[cfg(test)]
@@ -80,25 +79,25 @@ pub async fn get_asset(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim_matches('"').to_string());
 
-    let pool = state.conn_pool.clone();
+    let db = state.db.clone();
     let hash_cloned = hash.clone();
-    let row = task::spawn_blocking(move || -> anyhow::Result<Option<db_assets::AssetRow>> {
-        let conn = pool.get()?;
-        let row = db_assets::lookup_by_hash(&conn, &hash_cloned)?;
-        if row.is_some() {
-            let _ = db_assets::touch(&conn, &hash_cloned);
-        }
-        Ok(row)
-    })
-    .await
-    .map_err(|e| {
-        event!(Level::ERROR, "task error in get_asset: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?
-    .map_err(|e| {
-        event!(Level::ERROR, "db error in get_asset: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let row = db
+        .read(move |conn| -> anyhow::Result<Option<db_assets::AssetRow>> {
+            let row = db_assets::lookup_by_hash(conn, &hash_cloned)?;
+            if row.is_some() {
+                let _ = db_assets::touch(conn, &hash_cloned);
+            }
+            Ok(row)
+        })
+        .await
+        .map_err(|e| {
+            event!(Level::ERROR, "task error in get_asset: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })?
+        .map_err(|e| {
+            event!(Level::ERROR, "db error in get_asset: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })?;
 
     let asset = match row {
         Some(r) => r,
@@ -170,21 +169,21 @@ pub async fn get_asset_by_url(
     State(state): State<AppState>,
     Query(q): Query<ByUrlQuery>,
 ) -> Result<Response, Response> {
-    let pool = state.conn_pool.clone();
+    let db = state.db.clone();
     let url = q.url.clone();
-    let row = task::spawn_blocking(move || -> anyhow::Result<Option<db_assets::AssetRow>> {
-        let conn = pool.get()?;
-        db_assets::lookup_by_url(&conn, &url)
-    })
-    .await
-    .map_err(|e| {
-        event!(Level::ERROR, "task error in get_asset_by_url: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?
-    .map_err(|e| {
-        event!(Level::ERROR, "db error in get_asset_by_url: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let row = db
+        .read(move |conn| -> anyhow::Result<Option<db_assets::AssetRow>> {
+            db_assets::lookup_by_url(conn, &url)
+        })
+        .await
+        .map_err(|e| {
+            event!(Level::ERROR, "task error in get_asset_by_url: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })?
+        .map_err(|e| {
+            event!(Level::ERROR, "db error in get_asset_by_url: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })?;
 
     match row {
         Some(r) => Ok(Redirect::to(&asset_url(&r.blake3)).into_response()),
@@ -215,22 +214,22 @@ pub async fn delete_asset(
         return Err((StatusCode::BAD_REQUEST, "invalid hash").into_response());
     }
 
-    let pool = state.conn_pool.clone();
+    let db = state.db.clone();
     let data_dir = state.data_dir.clone();
     let hash_cloned = hash.clone();
-    let deleted = task::spawn_blocking(move || -> anyhow::Result<Option<db_assets::AssetRow>> {
-        let conn = pool.get()?;
-        db_assets::delete_by_hash(&conn, &hash_cloned)
-    })
-    .await
-    .map_err(|e| {
-        event!(Level::ERROR, "task error in delete_asset: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?
-    .map_err(|e| {
-        event!(Level::ERROR, "db error in delete_asset: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let deleted = db
+        .write(move |conn| -> anyhow::Result<Option<db_assets::AssetRow>> {
+            db_assets::delete_by_hash(conn, &hash_cloned)
+        })
+        .await
+        .map_err(|e| {
+            event!(Level::ERROR, "task error in delete_asset: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })?
+        .map_err(|e| {
+            event!(Level::ERROR, "db error in delete_asset: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })?;
 
     match deleted {
         Some(row) => {

@@ -1,5 +1,5 @@
 use crate::config::ConfigHandle;
-use crate::db::Pool;
+use crate::db::Db;
 use crate::fetcher::Fetcher;
 use crate::metrics::Metrics;
 use crate::scripting::{ScriptRunner, ScriptRunnerHandle};
@@ -67,7 +67,7 @@ fn in_progress_len(set: &InProgressSet) -> f64 {
 struct Worker {
     rx: async_channel::Receiver<TaskManagerCommand>,
     tx: async_channel::Sender<TaskManagerCommand>,
-    pool: Pool,
+    db: Db,
     token: CancellationToken,
     refresh_in_progress: InProgressSet,
     cleanup_in_progress: InProgressSet,
@@ -97,7 +97,7 @@ pub fn worker_count() -> usize {
 pub fn spawn_workers(
     rx: async_channel::Receiver<TaskManagerCommand>,
     tx: async_channel::Sender<TaskManagerCommand>,
-    pool: Pool,
+    db: Db,
     token: CancellationToken,
     num_workers: usize,
     metrics: Arc<Metrics>,
@@ -109,7 +109,7 @@ pub fn spawn_workers(
     let worker = Worker {
         rx,
         tx,
-        pool,
+        db,
         token,
         refresh_in_progress: Arc::new(Mutex::new(HashSet::new())),
         cleanup_in_progress: Arc::new(Mutex::new(HashSet::new())),
@@ -179,7 +179,7 @@ async fn run_worker(worker_id: usize, w: Worker) {
                     &w.fetcher,
                     feed_id,
                     manual,
-                    w.pool.clone(),
+                    w.db.clone(),
                     &settings,
                     script_runner,
                     &w.metrics,
@@ -193,18 +193,19 @@ async fn run_worker(worker_id: usize, w: Worker) {
                             "An error occurred while refreshing feed {}: {:?}",
                             feed_id, e
                         );
-                        if let Ok(conn) = w.pool.get() {
-                            if let Some(schedule) = set_feed_error(
-                                &conn,
+                        let schedule = w.db.write_blocking(|conn| {
+                            set_feed_error(
+                                conn,
                                 feed_id,
                                 &FetchError::Other {
                                     message: format!("{}", e),
                                 },
                                 &settings.feed_fetch,
                                 &w.metrics,
-                            ) {
-                                info!("Feed {}: next attempt {}", feed_id, schedule);
-                            }
+                            )
+                        });
+                        if let Ok(Some(schedule)) = schedule {
+                            info!("Feed {}: next attempt {}", feed_id, schedule);
                         }
                         "error"
                     }
@@ -248,12 +249,15 @@ async fn run_worker(worker_id: usize, w: Worker) {
 
                 let cleanup_start = Instant::now();
                 let mut outcome = "ok";
-                if let Ok(conn) = w.pool.get() {
-                    match crate::db::retention::cleanup_feed(
-                        &conn,
+                let cleaned = w.db.write_blocking(|conn| {
+                    crate::db::retention::cleanup_feed(
+                        conn,
                         feed_id,
                         settings.retention.max_age_days,
-                    ) {
+                    )
+                });
+                if let Ok(cleaned) = cleaned {
+                    match cleaned {
                         Ok(0) => {}
                         Ok(n) => {
                             info!(
@@ -285,9 +289,11 @@ async fn run_worker(worker_id: usize, w: Worker) {
             TaskManagerCommand::CleanupAll => {
                 let cleanup_start = Instant::now();
                 let mut outcome = "ok";
-                if let Ok(conn) = w.pool.get() {
-                    match crate::db::retention::cleanup_all(&conn, settings.retention.max_age_days)
-                    {
+                let cleaned = w.db.write_blocking(|conn| {
+                    crate::db::retention::cleanup_all(conn, settings.retention.max_age_days)
+                });
+                if let Ok(cleaned) = cleaned {
+                    match cleaned {
                         Ok(0) => {}
                         Ok(n) => {
                             info!("Retention cleanup deleted {} entries", n);
@@ -317,7 +323,7 @@ async fn run_worker(worker_id: usize, w: Worker) {
                 let result = cache_entry_assets(
                     &w.fetcher,
                     &settings.effective_proxy(),
-                    &w.pool,
+                    &w.db,
                     &w.data_dir,
                     &settings.asset_cache,
                     entry_id,
@@ -341,7 +347,7 @@ async fn run_worker(worker_id: usize, w: Worker) {
                 let result = cache_feed_favicon(
                     &w.fetcher,
                     &settings.effective_proxy(),
-                    &w.pool,
+                    &w.db,
                     &w.data_dir,
                     &settings.asset_cache,
                     feed_id,
@@ -363,7 +369,7 @@ async fn run_worker(worker_id: usize, w: Worker) {
 
             TaskManagerCommand::OptimizeFts => {
                 run_maintenance(
-                    &w.pool,
+                    &w.db,
                     crate::db::task_queue::TASK_FTS_OPTIMIZE,
                     "FTS5 optimize",
                     |conn| {
@@ -383,7 +389,7 @@ async fn run_worker(worker_id: usize, w: Worker) {
 
             TaskManagerCommand::WalCheckpointAnalyze => {
                 run_maintenance(
-                    &w.pool,
+                    &w.db,
                     crate::db::task_queue::TASK_WAL_CHECKPOINT_ANALYZE,
                     "WAL checkpoint and ANALYZE",
                     |conn| {
@@ -400,7 +406,7 @@ async fn run_worker(worker_id: usize, w: Worker) {
 
             TaskManagerCommand::IncrementalVacuum => {
                 run_maintenance(
-                    &w.pool,
+                    &w.db,
                     crate::db::task_queue::TASK_INCREMENTAL_VACUUM,
                     "incremental vacuum",
                     |conn| {

@@ -3,7 +3,6 @@ use axum::{
     extract::{Path, State},
     response::{IntoResponse, Response},
 };
-use tokio::task;
 use tracing::{event, Level};
 
 /// Delete an entry
@@ -26,29 +25,22 @@ pub async fn delete_entry(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal error",
-        )
-            .into_response()
-    })?;
+    let result = state
+        .db
+        .write(move |conn| {
+            let changes = conn
+                .prepare("DELETE FROM entries WHERE id = ?1")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .execute([id])
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "failed to delete entry: {:?}", e);
+                })?;
 
-    let result = task::spawn_blocking(move || {
-        let changes = conn
-            .prepare("DELETE FROM entries WHERE id = ?1")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .execute([id])
-            .inspect_err(|e| {
-                event!(Level::ERROR, "failed to delete entry: {:?}", e);
-            })?;
-
-        Ok::<usize, rusqlite::Error>(changes)
-    })
-    .await;
+            Ok::<usize, rusqlite::Error>(changes)
+        })
+        .await;
 
     match result {
         Ok(Ok(changes)) => {

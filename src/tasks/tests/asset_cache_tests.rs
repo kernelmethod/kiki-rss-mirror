@@ -7,16 +7,11 @@ use super::super::*;
 use crate::test::TestBuilder;
 use anyhow::Result;
 use axum::{routing::get, Router};
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::OpenFlags;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
-    let manager = SqliteConnectionManager::file(path)
-        .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-        .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager.into())?)
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Db> {
+    crate::db::Db::open(path, Default::default())
 }
 
 /// One-pixel PNG (89 bytes) — a valid image the test server can return.
@@ -462,7 +457,7 @@ async fn cache_with_timeouts(
     let cache = super::super::assets::AssetCache {
         fetcher: &fetcher,
         proxy: &Default::default(),
-        pool: &pool,
+        db: &pool,
         data_dir: tc.config_dir(),
         max_bytes: i64::MAX,
     };
@@ -548,7 +543,7 @@ async fn assets_the_fetcher_should_have_refused_are_not_stored() -> Result<()> {
     let cache = super::super::assets::AssetCache {
         fetcher: &fetcher,
         proxy: &Default::default(),
-        pool: &pool,
+        db: &pool,
         data_dir: tc.config_dir(),
         max_bytes: i64::MAX,
     };
@@ -603,7 +598,7 @@ async fn concurrent_stores_of_the_same_bytes_share_one_asset() -> Result<()> {
             let cache = super::super::assets::AssetCache {
                 fetcher: &fetcher,
                 proxy: &Default::default(),
-                pool: &pool,
+                db: &pool,
                 data_dir: &data_dir,
                 max_bytes: i64::MAX,
             };

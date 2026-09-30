@@ -13,7 +13,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use tokio::task;
 use tracing::{event, Level};
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
@@ -99,17 +98,9 @@ pub struct GetFeedDetailResponse {
 )]
 #[axum::debug_handler]
 pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
-    let conn = match state.conn_pool.get() {
-        Ok(conn) => conn,
-        Err(e) => {
-            event!(Level::ERROR, "failed to get database connection: {:?}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
-        }
-    };
-
     // The rusqlite interface is synchronous so we must run the INSERT
     // statement on a blocking thread.
-    let task_result = task::spawn_blocking(move || {
+    let task_result = state.db.read(move |conn| {
         let mut stmt = match conn.prepare(&format!(
             "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at, min_fetch_interval_seconds, auth_type,
                 (SELECT COUNT(*) FROM entries e WHERE e.feed_id = feeds.id AND {NOT_HIDDEN}),
@@ -155,14 +146,14 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
         };
         drop(stmt);
 
-        let rss = match load_rss_feed_data(&conn, feed.id) {
+        let rss = match load_rss_feed_data(conn, feed.id) {
             Ok(r) => r,
             Err(e) => {
                 event!(Level::ERROR, "failed to load rss_feed_data: {:?}", e);
                 return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
             }
         };
-        let atom = match load_atom_feed_data(&conn, feed.id) {
+        let atom = match load_atom_feed_data(conn, feed.id) {
             Ok(a) => a,
             Err(e) => {
                 event!(Level::ERROR, "failed to load atom_feed_data: {:?}", e);

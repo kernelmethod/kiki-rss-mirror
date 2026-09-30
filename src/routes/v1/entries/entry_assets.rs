@@ -9,7 +9,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task;
 use tracing::{event, Level};
 
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
@@ -48,22 +47,22 @@ pub async fn list_entry_assets(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, Response> {
-    let pool = state.conn_pool.clone();
-    let res = task::spawn_blocking(
-        move || -> anyhow::Result<Option<Vec<db_assets::EntryAssetRow>>> {
-            let conn = pool.get()?;
-            let exists: Option<i64> = conn
-                .query_row("SELECT id FROM entries WHERE id = ?1", [id], |row| {
-                    row.get(0)
-                })
-                .ok();
-            match exists {
-                Some(_) => Ok(Some(db_assets::list_entry_assets(&conn, id)?)),
-                None => Ok(None),
-            }
-        },
-    )
-    .await;
+    let db = state.db.clone();
+    let res = db
+        .read(
+            move |conn| -> anyhow::Result<Option<Vec<db_assets::EntryAssetRow>>> {
+                let exists: Option<i64> = conn
+                    .query_row("SELECT id FROM entries WHERE id = ?1", [id], |row| {
+                        row.get(0)
+                    })
+                    .ok();
+                match exists {
+                    Some(_) => Ok(Some(db_assets::list_entry_assets(conn, id)?)),
+                    None => Ok(None),
+                }
+            },
+        )
+        .await;
 
     match res {
         Ok(Ok(Some(rows))) => {

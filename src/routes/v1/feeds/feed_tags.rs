@@ -8,7 +8,6 @@ use axum::{
 use rusqlite::TransactionBehavior;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::task;
 use tracing::{event, Level};
 
 use crate::db::tags::TagKind;
@@ -61,43 +60,40 @@ pub async fn get_feed_tags(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let result = state
+        .db
+        .read(move |conn| {
+            // Check if feed exists
+            let exists: bool = conn
+                .prepare("SELECT EXISTS(SELECT 1 FROM feeds WHERE id = ?1)")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([id], |row| row.get(0))?;
 
-    let result = task::spawn_blocking(move || {
-        // Check if feed exists
-        let exists: bool = conn
-            .prepare("SELECT EXISTS(SELECT 1 FROM feeds WHERE id = ?1)")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| row.get(0))?;
+            if !exists {
+                return Err(FeedTagsTaskError::FeedNotFound);
+            }
 
-        if !exists {
-            return Err(FeedTagsTaskError::FeedNotFound);
-        }
-
-        let tags = conn
-            .prepare(
-                "SELECT t.id, t.name, t.kind FROM tags t
+            let tags = conn
+                .prepare(
+                    "SELECT t.id, t.name, t.kind FROM tags t
                  INNER JOIN feed_tags ft ON ft.tag_id = t.id
                  WHERE ft.feed_id = ?1
                  ORDER BY t.id",
-            )
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_map([id], TagResponse::from_row)?
-            .collect::<Result<Vec<_>, _>>()?;
+                )
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_map([id], TagResponse::from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
 
-        Ok::<GetFeedTagsResponse, FeedTagsTaskError>(GetFeedTagsResponse { tags })
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in get_feed_tags: {:?}", e);
-    });
+            Ok::<GetFeedTagsResponse, FeedTagsTaskError>(GetFeedTagsResponse { tags })
+        })
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in get_feed_tags: {:?}", e);
+        });
 
     match result {
         Ok(Ok(response)) => Ok(Json(response).into_response()),
@@ -139,93 +135,90 @@ pub async fn set_feed_tags(
     Path(id): Path<i64>,
     Json(payload): Json<SetFeedTagsRequest>,
 ) -> Result<Response, Response> {
-    let mut conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let result = state
+        .db
+        .write(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to begin transaction: {:?}", e);
+                })?;
 
-    let result = task::spawn_blocking(move || {
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to begin transaction: {:?}", e);
-            })?;
-
-        // Check if feed exists
-        let exists: bool = tx
-            .prepare("SELECT EXISTS(SELECT 1 FROM feeds WHERE id = ?1)")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| row.get(0))?;
-
-        if !exists {
-            return Err(FeedTagsTaskError::FeedNotFound);
-        }
-
-        // Validate all tag IDs exist and are user tags
-        for &tag_id in &payload.tag_ids {
-            let kind = tx
-                .prepare("SELECT kind FROM tags WHERE id = ?1")
+            // Check if feed exists
+            let exists: bool = tx
+                .prepare("SELECT EXISTS(SELECT 1 FROM feeds WHERE id = ?1)")
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
                 })?
-                .query_row([tag_id], |row| row.get::<_, TagKind>(0));
+                .query_row([id], |row| row.get(0))?;
 
-            match kind {
-                Ok(TagKind::User) => {}
-                Ok(TagKind::System) => return Err(FeedTagsTaskError::SystemTag(tag_id)),
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    return Err(FeedTagsTaskError::TagNotFound(tag_id))
-                }
-                Err(e) => return Err(e.into()),
+            if !exists {
+                return Err(FeedTagsTaskError::FeedNotFound);
             }
-        }
 
-        // Delete existing associations
-        tx.prepare("DELETE FROM feed_tags WHERE feed_id = ?1")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .execute([id])?;
+            // Validate all tag IDs exist and are user tags
+            for &tag_id in &payload.tag_ids {
+                let kind = tx
+                    .prepare("SELECT kind FROM tags WHERE id = ?1")
+                    .inspect_err(|e| {
+                        event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                    })?
+                    .query_row([tag_id], |row| row.get::<_, TagKind>(0));
 
-        // Insert new associations
-        {
-            let mut stmt = tx
-                .prepare("INSERT INTO feed_tags (feed_id, tag_id) VALUES (?1, ?2)")
+                match kind {
+                    Ok(TagKind::User) => {}
+                    Ok(TagKind::System) => return Err(FeedTagsTaskError::SystemTag(tag_id)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        return Err(FeedTagsTaskError::TagNotFound(tag_id))
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            // Delete existing associations
+            tx.prepare("DELETE FROM feed_tags WHERE feed_id = ?1")
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-                })?;
+                })?
+                .execute([id])?;
 
-            for &tag_id in &payload.tag_ids {
-                stmt.execute(rusqlite::params![id, tag_id])?;
+            // Insert new associations
+            {
+                let mut stmt = tx
+                    .prepare("INSERT INTO feed_tags (feed_id, tag_id) VALUES (?1, ?2)")
+                    .inspect_err(|e| {
+                        event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                    })?;
+
+                for &tag_id in &payload.tag_ids {
+                    stmt.execute(rusqlite::params![id, tag_id])?;
+                }
             }
-        }
 
-        // Return the updated tags
-        let tags = tx
-            .prepare(
-                "SELECT t.id, t.name, t.kind FROM tags t
+            // Return the updated tags
+            let tags = tx
+                .prepare(
+                    "SELECT t.id, t.name, t.kind FROM tags t
                  INNER JOIN feed_tags ft ON ft.tag_id = t.id
                  WHERE ft.feed_id = ?1
                  ORDER BY t.id",
-            )
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_map([id], TagResponse::from_row)?
-            .collect::<Result<Vec<_>, _>>()?;
+                )
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_map([id], TagResponse::from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
 
-        tx.commit().inspect_err(|e| {
-            event!(Level::ERROR, "unable to commit transaction: {:?}", e);
-        })?;
+            tx.commit().inspect_err(|e| {
+                event!(Level::ERROR, "unable to commit transaction: {:?}", e);
+            })?;
 
-        Ok::<GetFeedTagsResponse, FeedTagsTaskError>(GetFeedTagsResponse { tags })
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in set_feed_tags: {:?}", e);
-    });
+            Ok::<GetFeedTagsResponse, FeedTagsTaskError>(GetFeedTagsResponse { tags })
+        })
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in set_feed_tags: {:?}", e);
+        });
 
     match result {
         Ok(Ok(response)) => Ok(Json(response).into_response()),

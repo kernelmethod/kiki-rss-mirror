@@ -7,17 +7,13 @@ use super::super::*;
 use crate::db::retention;
 use crate::test::{TestBuilder, TestConfig};
 use anyhow::Result;
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use std::path::PathBuf;
 
 const DAY: i64 = 86400;
 
-fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
-    let manager = SqliteConnectionManager::file(path)
-        .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-        .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager.into())?)
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Db> {
+    crate::db::Db::open(path, Default::default())
 }
 
 /// Write an RSS document listing `items`, as `(guid, title)` pairs. Every
