@@ -226,6 +226,12 @@ fn run_scripts(
 /// Updating in place keeps the entry's id stable across refreshes, and
 /// with it everything keyed on that id (tags, cached assets, the search
 /// index). The entry is in the feed again, so `dropped_at` is cleared.
+///
+/// A new entry takes the id after the highest ever used, recorded in
+/// `entry_id_high_water`, rather than SQLite's default of one past the
+/// highest in use, so that ids only ever increase even after the newest
+/// entries are deleted. It is stamped with the current time as its
+/// `ingested_at`, which an update leaves alone.
 fn upsert_entry(
     tx: &rusqlite::Transaction,
     feed_id: i64,
@@ -239,14 +245,20 @@ fn upsert_entry(
     )?;
     let entry_id = tx.query_row(
         "INSERT INTO entries (
+            id,
             feed_id,
             syndication_format,
             guid,
             published_at,
             title,
             url,
-            content
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            content,
+            ingested_at
+        ) VALUES (
+            (SELECT MAX(hw.id, COALESCE((SELECT MAX(id) FROM entries), 0)) + 1
+             FROM entry_id_high_water hw),
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch()
+        )
         ON CONFLICT(feed_id, guid) DO UPDATE SET
             syndication_format = excluded.syndication_format,
             published_at = excluded.published_at,
@@ -517,6 +529,63 @@ mod tests {
         sync_entry_tags(&conn, entry_id, &["system:hidden".into()], true)?;
         assert_eq!(entry_tag_names(&conn, entry_id)?, ["a", "system:hidden"]);
 
+        Ok(())
+    }
+
+    fn feed_entry(guid: &str, title: &str) -> FeedEntry {
+        FeedEntry {
+            id: None,
+            feed_id: 1,
+            syndication_format: "rss".into(),
+            guid: guid.into(),
+            published_at: Some(1700000000),
+            title: title.into(),
+            url: Some("http://example.com/".into()),
+            content: None,
+            authors: Vec::new(),
+            categories: Vec::new(),
+            tags: Vec::new(),
+            cache_assets: true,
+        }
+    }
+
+    /// New entries never reuse the id of a deleted one, even the newest,
+    /// and are stamped with the time they were stored, which updates to the
+    /// entry leave alone.
+    #[test]
+    fn upsert_entry_ids_only_increase() -> Result<()> {
+        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute(
+            "INSERT INTO feeds (id, title, url) VALUES (1, 'f', 'u')",
+            [],
+        )?;
+        let upsert = |conn: &mut Connection, guid: &str, title: &str| -> Result<(i64, bool)> {
+            let tx = conn.transaction()?;
+            let stored = upsert_entry(&tx, 1, "rss", &feed_entry(guid, title))?;
+            tx.commit()?;
+            Ok(stored)
+        };
+
+        assert_eq!(upsert(&mut conn, "a", "a")?, (1, true));
+        assert_eq!(upsert(&mut conn, "b", "b")?, (2, true));
+        conn.execute("DELETE FROM entries WHERE id = 2", [])?;
+        assert_eq!(upsert(&mut conn, "c", "c")?, (3, true));
+
+        // An update keeps the entry's id and when it was ingested
+        conn.execute("UPDATE entries SET ingested_at = 5 WHERE id = 1", [])?;
+        assert_eq!(upsert(&mut conn, "a", "a, edited")?, (1, false));
+        let (title, ingested_at): (String, i64) = conn.query_row(
+            "SELECT title, ingested_at FROM entries WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((title.as_str(), ingested_at), ("a, edited", 5));
+
+        let ingested_at: i64 =
+            conn.query_row("SELECT ingested_at FROM entries WHERE id = 3", [], |row| {
+                row.get(0)
+            })?;
+        assert!((chrono::Utc::now().timestamp() - ingested_at).abs() < 60);
         Ok(())
     }
 }

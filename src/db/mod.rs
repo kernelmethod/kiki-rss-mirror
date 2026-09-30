@@ -217,6 +217,7 @@ mod tests {
             "entries_fts_docsize",
             "entries_fts_idx",
             "entry_assets",
+            "entry_id_high_water",
             "entry_sources",
             "entry_tags",
             "feed_assets",

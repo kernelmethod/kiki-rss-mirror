@@ -1,6 +1,8 @@
 use crate::routes::v1::entries::format_data::{
     load_atom_entry_data, load_rss_entry_data, AtomEntryData, RssEntryData,
 };
+use crate::routes::v1::entries::rows::{attach_tags, entry_columns, entry_from_row};
+use crate::routes::v1::tags::list_tags::TagResponse;
 use crate::server::AppState;
 use axum::{
     extract::{Path, State},
@@ -23,10 +25,17 @@ pub struct GetEntryResponse {
     pub title: String,
     pub url: String,
     pub content: Option<String>,
+    /// When Kiki first stored the entry, in RFC3339 format.
+    #[serde(default)]
+    pub ingested_at: Option<String>,
     /// Relative Kiki URL that serves the favicon of the website the
     /// entry's feed belongs to, or `null` if it has not been cached.
     #[serde(default)]
     pub feed_favicon_url: Option<String>,
+    /// Every tag applied to the entry, both user tags and system tags (such
+    /// as `system:read` and `system:saved`).
+    #[serde(default)]
+    pub tags: Vec<TagResponse>,
     /// RSS-specific fields (description, author, enclosure, categories).
     /// Present only for entries ingested from an RSS feed.
     pub rss: Option<RssEntryData>,
@@ -60,31 +69,13 @@ pub async fn get_entry(
         .read(move |conn| {
             let entry = conn
                 .prepare(&format!(
-                    "SELECT id, feed_id, source_id, syndication_format,
-                    guid, published_at, title, url, content, {}
-                FROM entries WHERE id = ?1 LIMIT 1",
-                    crate::db::favicons::favicon_hash_sql("entries.feed_id")
+                    "SELECT {} FROM entries e WHERE e.id = ?1 LIMIT 1",
+                    entry_columns()
                 ))
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
                 })?
-                .query_row([id], |row| {
-                    Ok(GetEntryResponse {
-                        id: row.get(0)?,
-                        feed_id: row.get(1)?,
-                        source_id: row.get(2)?,
-                        syndication_format: row.get(3)?,
-                        guid: row.get(4)?,
-                        published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
-                            .map(|d| d.to_rfc3339()),
-                        title: row.get(6)?,
-                        url: row.get(7)?,
-                        content: row.get(8)?,
-                        feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
-                        rss: None,
-                        atom: None,
-                    })
-                })
+                .query_row([id], entry_from_row)
                 .map(Some)
                 .or_else(|e| match e {
                     rusqlite::Error::QueryReturnedNoRows => Ok(None),
@@ -95,14 +86,32 @@ pub async fn get_entry(
                 })?;
 
             let entry = match entry {
-                Some(mut e) => {
-                    e.rss = load_rss_entry_data(conn, e.id).inspect_err(|err| {
+                Some(e) => {
+                    let mut entries = [e];
+                    attach_tags(conn, &mut entries)?;
+                    let [e] = entries;
+                    let rss = load_rss_entry_data(conn, e.id).inspect_err(|err| {
                         event!(Level::ERROR, "failed to load rss_entry_data: {:?}", err);
                     })?;
-                    e.atom = load_atom_entry_data(conn, e.id).inspect_err(|err| {
+                    let atom = load_atom_entry_data(conn, e.id).inspect_err(|err| {
                         event!(Level::ERROR, "failed to load atom_entry_data: {:?}", err);
                     })?;
-                    Some(e)
+                    Some(GetEntryResponse {
+                        id: e.id,
+                        feed_id: e.feed_id,
+                        source_id: e.source_id,
+                        syndication_format: e.syndication_format,
+                        guid: e.guid,
+                        published_at: e.published_at,
+                        title: e.title,
+                        url: e.url,
+                        content: e.content,
+                        ingested_at: e.ingested_at,
+                        feed_favicon_url: e.feed_favicon_url,
+                        tags: e.tags,
+                        rss,
+                        atom,
+                    })
                 }
                 None => None,
             };

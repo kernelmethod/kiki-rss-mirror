@@ -57,6 +57,10 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0009_pending_entry_assets",
         sql: include_str!("include/migrations/0009_pending_entry_assets.sql"),
     },
+    Migration {
+        name: "0010_entry_sync",
+        sql: include_str!("include/migrations/0010_entry_sync.sql"),
+    },
 ];
 
 /// The migration that drops the `scripts` table in favour of plugins.
@@ -206,6 +210,10 @@ mod tests {
             name    VARCHAR UNIQUE NOT NULL
         );
         CREATE TABLE feed_tags (feed_id INTEGER NOT NULL, tag_id INTEGER NOT NULL);
+        CREATE TABLE entries (
+            id              INTEGER PRIMARY KEY,
+            published_at    DATETIME NOT NULL
+        );
         CREATE TABLE entry_tags (entry_id INTEGER NOT NULL, tag_id INTEGER NOT NULL);
         CREATE INDEX idx_entry_tags_entry_id ON entry_tags(entry_id);
         CREATE INDEX idx_entry_tags_tag_id ON entry_tags(tag_id);
@@ -453,6 +461,58 @@ mod tests {
                 []
             )
             .is_err());
+        Ok(())
+    }
+
+    /// `0010_entry_sync` adds `entries.ingested_at`, backfilled from each
+    /// entry's publication time but never later than now, and the id
+    /// high-water mark, starting at the highest id in use, with the same
+    /// shape as a freshly-initialized database's.
+    #[test]
+    fn test_entry_sync_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        let far_future = 32503680000i64; // the year 3000
+        conn.execute(
+            "INSERT INTO entries (id, published_at) VALUES (1, 1700000000), (7, ?1)",
+            [far_future],
+        )?;
+        run_pending_migrations(&mut conn)?;
+
+        let fresh = ConnectionBuilder::default().in_memory().create().build()?;
+        let sql = |conn: &Connection, name: &str| -> Result<String> {
+            Ok(conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )?)
+        };
+        for name in [
+            "idx_entry_ingested_at",
+            "entry_id_high_water",
+            "entries_id_high_water",
+        ] {
+            assert_eq!(sql(&conn, name)?, sql(&fresh, name)?);
+        }
+
+        let ingested = |id: i64| -> Result<i64> {
+            Ok(conn.query_row(
+                "SELECT ingested_at FROM entries WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )?)
+        };
+        assert_eq!(ingested(1)?, 1700000000);
+        assert!(ingested(7)? < far_future);
+
+        let high_water = |conn: &Connection| -> Result<i64> {
+            Ok(conn.query_row("SELECT id FROM entry_id_high_water", [], |row| row.get(0))?)
+        };
+        assert_eq!(high_water(&conn)?, 7);
+        conn.execute("DELETE FROM entries WHERE id = 7", [])?;
+        assert_eq!(high_water(&conn)?, 7);
+        conn.execute("INSERT INTO entries (id, published_at) VALUES (9, 0)", [])?;
+        assert_eq!(high_water(&conn)?, 9);
         Ok(())
     }
 }

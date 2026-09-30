@@ -1,5 +1,7 @@
-use crate::db::favicons::favicon_hash_sql;
-use crate::routes::v1::assets::read_asset_url_column;
+use crate::routes::v1::entries::rows::{
+    attach_tags, entry_columns, entry_from_row, id_range, EntrySort,
+};
+use crate::routes::v1::tags::list_tags::TagResponse;
 use crate::server::AppState;
 use axum::{
     extract::{Query, State},
@@ -20,6 +22,14 @@ pub struct ListEntriesQueryParams {
     /// Also list entries tagged `system:hidden`, which are left out by
     /// default (default: false).
     pub include_hidden: Option<bool>,
+    /// Only list entries with an ID greater than this. With `sort=id`, pass
+    /// the last ID of one page to get the next.
+    pub since_id: Option<i64>,
+    /// Only list entries with an ID less than this. With `sort=id_desc`,
+    /// pass the last ID of one page to get the next.
+    pub max_id: Option<i64>,
+    /// The order to list entries in (default: `published_at`).
+    pub sort: Option<EntrySort>,
 }
 
 /// An SQL condition that holds when the entry aliased `e` is not tagged
@@ -61,10 +71,17 @@ pub struct ListEntriesResponseEntry {
     pub title: String,
     pub url: String,
     pub content: Option<String>,
+    /// When Kiki first stored the entry, in RFC3339 format.
+    #[serde(default)]
+    pub ingested_at: Option<String>,
     /// Relative Kiki URL that serves the favicon of the website the
     /// entry's feed belongs to, or `null` if it has not been cached.
     #[serde(default)]
     pub feed_favicon_url: Option<String>,
+    /// Every tag applied to the entry, both user tags and system tags (such
+    /// as `system:read` and `system:saved`).
+    #[serde(default)]
+    pub tags: Vec<TagResponse>,
 }
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
@@ -86,9 +103,12 @@ impl Default for ListEntriesError {
 /// List all entries
 ///
 /// Retrieve a paginated list of all RSS and Atom entries that the server has retrieved,
-/// newest first. Entries with the same publication time are ordered by descending ID.
-/// Entries tagged `system:hidden` are left out, and not counted, unless
-/// `include_hidden` is true.
+/// newest first, or in the order given by `sort`. Entries with the same publication time
+/// are ordered by descending ID. Entries tagged `system:hidden` are left out, and not
+/// counted, unless `include_hidden` is true.
+///
+/// To sync incrementally, list with `sort=id` and `since_id` set to the highest ID seen so
+/// far: entry IDs only ever increase, so this returns exactly the entries stored since.
 #[utoipa::path(
     get,
     path = "/v1/entries",
@@ -106,53 +126,47 @@ pub async fn list_entries(
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
     let include_hidden = params.include_hidden.unwrap_or(false);
+    let (since_id, max_id) = (params.since_id, params.max_id);
+    let sort = params.sort.unwrap_or_default();
 
     let result = state
         .db
         .read(move |conn| {
             let count = conn
                 .prepare(&format!(
-                    "SELECT COUNT(*) FROM entries e WHERE {}",
-                    not_hidden_unless(1)
+                    "SELECT COUNT(*) FROM entries e WHERE {} AND {}",
+                    not_hidden_unless(1),
+                    id_range(since_id, max_id)
                 ))
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
                 })?
                 .query_row([include_hidden], |count| count.get(0))?;
 
-            let entries = conn
+            let mut entries = conn
                 .prepare(&format!(
-                    "SELECT id, feed_id, source_id, syndication_format,
-                    guid, published_at, title, url, content, {}
+                    "SELECT {}
                 FROM entries e
-                WHERE {}
-                ORDER BY published_at DESC, id DESC
+                WHERE {} AND {}
+                ORDER BY {}
                 LIMIT ?1 OFFSET ?2",
-                    favicon_hash_sql("e.feed_id"),
-                    not_hidden_unless(3)
+                    entry_columns(),
+                    not_hidden_unless(3),
+                    id_range(since_id, max_id),
+                    sort.order_by()
                 ))
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
                 })?
-                .query_map(rusqlite::params![limit, offset, include_hidden], |row| {
-                    Ok(ListEntriesResponseEntry {
-                        id: row.get(0)?,
-                        feed_id: row.get(1)?,
-                        source_id: row.get(2)?,
-                        syndication_format: row.get(3)?,
-                        guid: row.get(4)?,
-                        published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
-                            .map(|d| d.to_rfc3339()),
-                        title: row.get(6)?,
-                        url: row.get(7)?,
-                        content: row.get(8)?,
-                        feed_favicon_url: read_asset_url_column(row, 9)?,
-                    })
-                })?
+                .query_map(
+                    rusqlite::params![limit, offset, include_hidden],
+                    entry_from_row,
+                )?
                 .collect::<Result<Vec<_>, _>>()
                 .inspect_err(|e| {
                     event!(Level::ERROR, "failed to create entry list: {:?}", e);
                 })?;
+            attach_tags(conn, &mut entries)?;
 
             Ok::<ListEntriesResponse, rusqlite::Error>(ListEntriesResponse {
                 count,
