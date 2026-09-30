@@ -252,8 +252,8 @@ impl ProxySettings {
 /// Feeds are text and even very long archive feeds sit far below this.
 pub const DEFAULT_MAX_FEED_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Default for [`FeedFetchSettings::default_fetch_interval_seconds`]: 3 hours.
-pub const DEFAULT_FETCH_INTERVAL_SECONDS: u64 = 3 * 60 * 60;
+/// Default for [`FeedFetchSettings::default_fetch_interval_seconds`]: 24 hours.
+pub const DEFAULT_FETCH_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 
 /// Default for [`AssetCacheSettings::max_bytes`]: 1 GiB.
 pub const DEFAULT_ASSET_CACHE_MAX_BYTES: i64 = 1024 * 1024 * 1024;
