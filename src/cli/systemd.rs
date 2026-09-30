@@ -186,7 +186,11 @@ Description=Kiki RSS feed aggregator (user)
 After=default.target
 
 [Service]
-Type=simple
+Type=notify
+# Kiki says when it is ready, and pings the watchdog while it can still
+# fetch feeds; a server that hangs is restarted.
+NotifyAccess=main
+WatchdogSec=60
 WorkingDirectory={data_dir}
 {environment}{runtime_dir}ExecStartPre=\"{binary}\" init --check
 ExecStart=\"{binary}\" serve

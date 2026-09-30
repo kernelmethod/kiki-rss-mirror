@@ -59,6 +59,14 @@ impl ServeArgs {
             tracing::warn!("unable to forward SQLite's error log: {e}");
         }
 
+        // While the process is still single-threaded, since this clears
+        // the variables it reads, and before the sandbox is installed,
+        // which would keep the server from reaching the socket.
+        let notifier = crate::notify::Notifier::from_env().unwrap_or_else(|e| {
+            tracing::warn!("unable to reach the service manager's notification socket: {e}");
+            None
+        });
+
         let env = Env::from_process();
 
         let data_dir = paths::resolve_data_dir(&env)?;
@@ -119,6 +127,7 @@ impl ServeArgs {
         let builder = server::ServerBuilder::new(&db_path)
             .autofetch()
             .feed_fetcher(feed_fetcher)
+            .notifier(notifier)
             .socket_path(&socket_path);
         #[cfg(all(unix, feature = "lua"))]
         let builder = builder.script_host(script_host);

@@ -92,6 +92,9 @@ pub(super) fn process_atom_feed(
         for (feed_entry, ingest) in entries {
             let (entry_id, is_new) = upsert_entry(&tx, feed_id, "atom", &feed_entry)?;
             insert_atom_entry_data(&tx, entry_id, &ingest)?;
+            if is_new && feed_entry.cache_assets {
+                crate::db::pending_assets::add(&tx, entry_id)?;
+            }
             if !feed_entry.tags.is_empty() {
                 sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
             }
@@ -155,6 +158,9 @@ pub(super) fn process_rss_feed(
         for (feed_entry, ingest) in entries {
             let (entry_id, is_new) = upsert_entry(&tx, feed_id, "rss", &feed_entry)?;
             insert_rss_entry_data(&tx, entry_id, &ingest, feed_entry.content.as_deref())?;
+            if is_new && feed_entry.cache_assets {
+                crate::db::pending_assets::add(&tx, entry_id)?;
+            }
             if !feed_entry.tags.is_empty() {
                 sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
             }

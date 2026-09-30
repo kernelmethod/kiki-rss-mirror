@@ -6,6 +6,7 @@ use rusqlite::Connection;
 pub const TASK_FTS_OPTIMIZE: &str = "fts_optimize";
 pub const TASK_WAL_CHECKPOINT_ANALYZE: &str = "wal_checkpoint_analyze";
 pub const TASK_INCREMENTAL_VACUUM: &str = "incremental_vacuum";
+pub const TASK_INTEGRITY_CHECK: &str = "integrity_check";
 
 /// Ensure a `task_queue` row exists for `task_type` and return its
 /// `last_run_at` timestamp.

@@ -7,8 +7,10 @@ pub mod assets;
 pub mod favicons;
 pub mod feeds;
 mod handle;
+pub mod integrity;
 pub mod log;
 pub mod migrations;
+pub mod pending_assets;
 pub mod plugins;
 mod pool;
 pub mod profile;
@@ -222,6 +224,7 @@ mod tests {
             "feed_tags",
             "feeds",
             "migrations",
+            "pending_entry_assets",
             "plugin_store",
             "plugins",
             "rss_categories",

@@ -428,10 +428,22 @@ pub struct RssCategory {
 /// the machinery doing the fetching failed, not the feed server.
 #[derive(Debug, thiserror::Error)]
 pub enum FetcherError {
-    /// The isolated fetcher process is gone, or its worker crashed while
-    /// serving this request.
+    /// The isolated fetcher's worker crashed while serving this request,
+    /// or the request could not be sent or answered.
     #[error("feed fetcher unavailable: {0}")]
     Unavailable(String),
+
+    /// The channel to the isolated fetcher process is gone: nothing more
+    /// will be fetched until the server restarts. Says nothing about the
+    /// request, which may never have reached the fetcher.
+    #[error("the feed fetcher process is no longer running")]
+    Gone,
+
+    /// The isolated fetcher's worker died while serving this request and
+    /// nothing else, even when it was retried on its own: the request
+    /// itself is what kills it. Carries how the worker died.
+    #[error("{0} while handling only this request")]
+    Crashed(String),
 
     /// The isolated fetcher did not answer within its deadline.
     #[error("feed fetcher did not answer within {0:?}")]

@@ -633,3 +633,47 @@ async fn concurrent_stores_of_the_same_bytes_share_one_asset() -> Result<()> {
     assert_eq!(leftovers, 0);
     Ok(())
 }
+
+/// Storing new entries records their asset caching as pending, even when
+/// the queue drops the task, so it can be retried; refreshing the same
+/// entries again adds nothing more.
+#[tokio::test(flavor = "multi_thread")]
+async fn new_entries_are_recorded_as_pending_asset_caching() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let conn = tc.database_conn()?;
+    conn.execute(
+        "INSERT INTO feeds (title, url) VALUES ('pending', ?1)",
+        [tc.example_feed_url()],
+    )?;
+    let feed_id = conn.last_insert_rowid();
+    let client = reqwest::Client::new();
+    let pool = make_pool(&tc.database_path())?;
+    let pending = || -> Result<i64> {
+        Ok(
+            conn.query_row("SELECT COUNT(*) FROM pending_entry_assets", [], |r| {
+                r.get(0)
+            })?,
+        )
+    };
+
+    // A queue with no receiver, which drops every task.
+    let tx = super::test_tx();
+    tx.close();
+    refresh_feed_manual(&client, feed_id, pool.clone(), &super::test_metrics(), &tx).await?;
+    let entries: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
+        [feed_id],
+        |r| r.get(0),
+    )?;
+    assert!(entries > 0);
+    assert_eq!(pending()?, entries);
+
+    conn.execute("DELETE FROM pending_entry_assets", [])?;
+    conn.execute(
+        "UPDATE feeds SET header_body_hash = NULL WHERE id = ?1",
+        [feed_id],
+    )?;
+    refresh_feed_manual(&client, feed_id, pool, &super::test_metrics(), &tx).await?;
+    assert_eq!(pending()?, 0, "entries already stored are not new");
+    Ok(())
+}

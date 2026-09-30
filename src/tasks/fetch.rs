@@ -15,7 +15,7 @@ use crate::tasks::cache::{
 };
 use crate::tasks::command::TaskManagerCommand;
 use crate::tasks::error::FetchError;
-use crate::tasks::error_recording::{clear_feed_error, set_feed_error_with_schedule};
+use crate::tasks::error_recording::{clear_feed_error, defer_feed, set_feed_error_with_schedule};
 use crate::tasks::favicons::resolve_site_url;
 use crate::tasks::processing::{
     enqueue_asset_caching, enqueue_favicon_caching, process_atom_feed, process_rss_feed,
@@ -362,10 +362,32 @@ fn store_refresh(
             }
             return Ok(());
         }
+        // The fetcher process is gone, and the server stops when it
+        // notices. That is no fault of the feed's, so nothing is recorded
+        // against it: it is only put off, so that it is not queued again
+        // and again in the meantime.
+        Err(FetcherError::Gone) => {
+            warn!("{}: not fetched: {}", rec.label, FetcherError::Gone);
+            rec.db
+                .write_blocking(|conn| defer_feed(conn, feed_id, rec.cfg.min_cadence))??;
+            rec.outcome("fetcher_gone");
+            return Ok(());
+        }
+        // The feed is what kills the fetcher's worker: it waits the full
+        // backoff cap, like any other permanent error, rather than
+        // crashing the worker again at the next opportunity.
+        Err(FetcherError::Crashed(message)) => {
+            let url = row.url.clone();
+            rec.fail(
+                FetchError::FetcherCrashed { url, message },
+                "fetcher",
+                "fetcher_crashed",
+            );
+            return Ok(());
+        }
         // The fetcher itself failed, not the feed server. Recorded as a
-        // transient error so the feed backs off: if its content is what
-        // crashed the fetcher, retrying on the next tick would only crash
-        // it again.
+        // transient error so the feed backs off rather than being retried
+        // on the next tick.
         Err(e) => {
             let message = format!("{}", e);
             rec.fail(FetchError::Other { message }, "fetcher", "fetcher_error");

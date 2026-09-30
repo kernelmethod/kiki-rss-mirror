@@ -414,6 +414,13 @@ mod imp {
                 SharedString::const_str("Feeds whose most recent fetch attempt recorded an error."),
             );
             r.describe_gauge(
+                KeyName::from_const_str("kiki_db_integrity_ok"),
+                None,
+                SharedString::const_str(
+                    "1 if the last `PRAGMA quick_check` of the database found no problems, 0 if it found some.",
+                ),
+            );
+            r.describe_gauge(
                 KeyName::from_const_str("kiki_db_size_bytes"),
                 None,
                 SharedString::const_str(
@@ -861,6 +868,13 @@ mod imp {
             self.recorder.register_gauge(&key, &METADATA).set(bytes);
         }
 
+        pub fn set_db_integrity_ok(&self, ok: bool) {
+            let key = Key::from_name("kiki_db_integrity_ok");
+            self.recorder
+                .register_gauge(&key, &METADATA)
+                .set(if ok { 1.0 } else { 0.0 });
+        }
+
         // ----- Plugins -----
 
         pub fn set_plugins_loaded(&self, n: f64) {
@@ -1059,6 +1073,8 @@ mod stub {
         pub fn set_feeds_with_fetch_error(&self, _n: f64) {}
         #[inline]
         pub fn set_db_size_bytes(&self, _bytes: f64) {}
+        #[inline]
+        pub fn set_db_integrity_ok(&self, _ok: bool) {}
 
         // ----- Plugins -----
 

@@ -20,6 +20,10 @@ pub enum FetchError {
     /// The response body exceeded the maximum feed size and was not read.
     #[serde(rename = "body_too_large")]
     BodyTooLarge { url: String, limit: u64 },
+    /// Fetching or parsing the feed kills the isolated fetcher's worker,
+    /// even when nothing else is being fetched alongside it.
+    #[serde(rename = "fetcher_crashed")]
+    FetcherCrashed { url: String, message: String },
     /// A network or other unexpected error occurred.
     #[serde(rename = "other")]
     Other { message: String },
@@ -48,6 +52,9 @@ impl fmt::Display for FetchError {
                     url, limit
                 )
             }
+            FetchError::FetcherCrashed { url, message } => {
+                write!(f, "Fetching {} crashes the feed fetcher: {}", url, message)
+            }
             FetchError::Other { message } => write!(f, "{}", message),
         }
     }
@@ -60,7 +67,7 @@ impl FetchError {
     /// Transient: 408 Request Timeout, 429 Too Many Requests, any 5xx,
     /// network/timeout errors (`Other`).
     /// Permanent: other 4xx statuses, malformed feed bodies, redirect
-    /// loops, oversized bodies.
+    /// loops, oversized bodies, feeds that crash the fetcher.
     pub fn is_transient(&self) -> bool {
         match self {
             FetchError::HttpStatus { status, .. } => {
@@ -69,7 +76,8 @@ impl FetchError {
             FetchError::Other { .. } => true,
             FetchError::InvalidFeed { .. }
             | FetchError::TooManyRedirects { .. }
-            | FetchError::BodyTooLarge { .. } => false,
+            | FetchError::BodyTooLarge { .. }
+            | FetchError::FetcherCrashed { .. } => false,
         }
     }
 }

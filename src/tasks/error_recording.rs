@@ -158,3 +158,24 @@ pub(super) fn clear_feed_error(conn: &Connection, feed_id: i64) {
         error!("Failed to clear fetch error for feed {}: {:?}", feed_id, e);
     }
 }
+
+/// Put off the next fetch of a feed by `secs` seconds, without recording
+/// an error or counting a failure against it.
+///
+/// For refreshes that failed through no fault of the feed's, such as the
+/// fetcher process being gone, which would otherwise leave the feed due
+/// and have the scheduler queue it again every few seconds.
+///
+/// # Errors
+///
+/// Returns an error if the feed's row cannot be updated.
+pub(super) fn defer_feed(conn: &Connection, feed_id: i64, secs: u64) -> rusqlite::Result<()> {
+    let at = Utc::now()
+        .timestamp()
+        .saturating_add(i64::try_from(secs).unwrap_or(i64::MAX));
+    conn.execute(
+        "UPDATE feeds SET next_fetch_at = MAX(COALESCE(next_fetch_at, 0), ?1) WHERE id = ?2",
+        (at, feed_id),
+    )?;
+    Ok(())
+}
