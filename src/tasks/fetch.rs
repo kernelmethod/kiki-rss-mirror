@@ -1,4 +1,5 @@
 use crate::config::Settings;
+use crate::db::feeds::merge_feed_into;
 use crate::db::{Pool, PooledConnection};
 use crate::fetcher::{
     FeedHints, FetchReply, FetchSpec, FetchedBody, Fetcher, ParseOutcome, ParsedFeed,
@@ -624,8 +625,29 @@ fn record_fetch_reply(
     metrics.record_feed_redirects(redirects);
     let headers = headers.to_header_map();
 
-    // If we followed a permanent redirect, update the stored URL in the database
+    // If we followed a permanent redirect, the feed now lives at
+    // `final_url`. If another feed has that URL already, the two are the
+    // same feed, so this one is merged into it and there is nothing left
+    // to store. Otherwise the stored URL is updated to match.
     if permanent_redirect && final_url != feed_url {
+        if let Some(merged) = merge_feed_into(&conn, feed_id, &final_url)? {
+            info!(
+                "{} permanently redirected to {}, the URL of feed {}; merged it into that feed",
+                rec.label, final_url, merged.into
+            );
+            if let Some(runner) = rec.script_runner {
+                runner.dispatch_observe(
+                    crate::scripting::Event::FeedRemoved,
+                    crate::scripting::EventPayload::Feed {
+                        id: feed_id,
+                        url: merged.url,
+                        title: merged.title,
+                    },
+                );
+            }
+            rec.outcome("merged");
+            return Ok(None);
+        }
         info!(
             "{} permanently redirected to {}; updating stored URL",
             rec.label, final_url

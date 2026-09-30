@@ -49,6 +49,10 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0007_protect_system_tags",
         sql: include_str!("include/migrations/0007_protect_system_tags.sql"),
     },
+    Migration {
+        name: "0008_unique_feed_urls",
+        sql: include_str!("include/migrations/0008_unique_feed_urls.sql"),
+    },
 ];
 
 /// The migration that drops the `scripts` table in favour of plugins.
@@ -417,6 +421,34 @@ mod tests {
             .execute("DELETE FROM tags WHERE name = 'system:read'", [])
             .is_err());
         assert_eq!(conn.execute("DELETE FROM tags WHERE name = 'news'", [])?, 1);
+        Ok(())
+    }
+
+    /// `0008_unique_feed_urls` adds the unique index on `feeds.url`, with
+    /// the same shape as a freshly-initialized database's.
+    #[test]
+    fn test_unique_feed_urls_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        conn.execute_batch("INSERT INTO feeds (title, url) VALUES ('f', 'http://x/');")?;
+        run_pending_migrations(&mut conn)?;
+
+        let fresh = ConnectionBuilder::default().in_memory().create().build()?;
+        let sql = |conn: &Connection| -> Result<String> {
+            Ok(conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'idx_feeds_url_unique'",
+                [],
+                |row| row.get(0),
+            )?)
+        };
+        assert_eq!(sql(&conn)?, sql(&fresh)?);
+
+        assert!(conn
+            .execute(
+                "INSERT INTO feeds (title, url) VALUES ('g', 'http://x/')",
+                []
+            )
+            .is_err());
         Ok(())
     }
 }

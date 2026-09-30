@@ -65,6 +65,9 @@ enum UpdateFeedTaskError {
         auth_type: FeedAuthType,
     },
 
+    #[error("a feed with this URL already exists")]
+    DuplicateUrl,
+
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
 }
@@ -148,6 +151,7 @@ fn reschedule_after_update(
         (status = 200, description = "Feed updated successfully", body = UpdateFeedResponse),
         (status = 400, description = "No update fields provided, or invalid field values"),
         (status = 404, description = "Feed not found"),
+        (status = 409, description = "Another feed already has the new URL"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "feeds"
@@ -330,9 +334,18 @@ pub async fn update_feed(
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         let before = read_fetch_config(&tx, id)?;
         let params = rusqlite::params_from_iter(params);
-        tx.execute(&query, params).inspect_err(|e| {
-            event!(Level::ERROR, "unable to execute update statement: {:?}", e);
-        })?;
+        match tx.execute(&query, params) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(UpdateFeedTaskError::DuplicateUrl);
+            }
+            Err(e) => {
+                event!(Level::ERROR, "unable to execute update statement: {:?}", e);
+                return Err(e.into());
+            }
+        }
         let after = read_fetch_config(&tx, id)?;
         reschedule_after_update(&tx, id, &before, &after)?;
         tx.commit()?;
@@ -384,6 +397,9 @@ pub async fn update_feed(
         }
         Ok(Err(UpdateFeedTaskError::InvalidAuth(e))) => {
             Err((StatusCode::BAD_REQUEST, format!("{e}")).into_response())
+        }
+        Ok(Err(UpdateFeedTaskError::DuplicateUrl)) => {
+            Err((StatusCode::CONFLICT, "A feed with this URL already exists").into_response())
         }
         Ok(Err(UpdateFeedTaskError::Database(_))) => {
             event!(Level::ERROR, "database error in update_feed");
@@ -502,6 +518,55 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let feed = resp.json::<GetFeedResponse>().await?;
         assert_eq!(feed.url, "https://example.com/moved.xml");
+
+        Ok(())
+    }
+
+    /// Adding a feed with the URL of an existing one fails with `409
+    /// Conflict`, and so does moving a feed to another feed's URL.
+    #[tokio::test]
+    async fn test_feed_urls_are_unique() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let id = create_plain_feed(&client).await?;
+
+        let resp = client
+            .post("http://localhost/v1/feeds/create")
+            .json(&AddFeedRequest {
+                title: "copy".into(),
+                url: "https://example.com/original.xml".into(),
+                ..Default::default()
+            })
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        let other = create_feed(
+            &client,
+            AddFeedRequest {
+                title: "other".into(),
+                url: "https://example.com/other.xml".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let before = read_feed_row(&tc, other)?;
+        let resp = put_feed(
+            &client,
+            other,
+            &UpdateFeedRequest {
+                title: Some("renamed".into()),
+                url: Some("https://example.com/original.xml".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(read_feed_row(&tc, other)?, before);
+        assert_eq!(
+            read_feed_row(&tc, id)?.url.as_deref(),
+            Some("https://example.com/original.xml")
+        );
 
         Ok(())
     }
