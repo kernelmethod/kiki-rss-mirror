@@ -748,8 +748,8 @@ async fn mark_entries_read(
     let result = async {
         let tag_id = fetch_system_tag_id(&api, SystemTag::Read).await?;
         let request = AddTagEntriesRequest {
-            up_to_id: None,
             feed_id: params.feed,
+            ..Default::default()
         };
         api.post(format!("{API_BASE}/v1/tags/id/{tag_id}/entries"))
             .json(&request)

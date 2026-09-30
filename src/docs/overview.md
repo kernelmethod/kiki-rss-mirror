@@ -32,6 +32,30 @@ reconsidered some day:
 * API authentication. _All_ requests to the API are unauthenticated; see
   [Security](#Security).
 
+## Syncing entries
+
+Clients that keep their own copy of Kiki's entries, such as a sync layer for
+another reader's API, can fetch just what changed:
+
+* **Entry IDs only ever increase**, even after entries are deleted, so the
+  highest ID a client has seen marks where it left off. The entry listings
+  (`GET /v1/entries`, `/v1/feeds/id/{id}/entries`,
+  `/v1/tags/id/{id}/entries`) and `POST /v1/entries/search` take
+  `since_id` and `max_id`, and sort by ID with `sort=id` or `sort=id_desc`.
+  Passing the last ID of one page as the next page's `since_id` pages
+  through entries without skipping any, unlike `offset`.
+* **Every entry carries its tags** (so whether it is read or saved) and
+  `ingested_at`, when Kiki first stored it. Search can filter on
+  `ingested_after` and `ingested_before`.
+* **`POST /v1/entries/search/ids`** takes a search and returns only the
+  matching IDs, up to 10000 at a time, e.g. every unread entry with the tag
+  filter `{"not": "system:read"}`.
+* **`POST /v1/entries/batch`** gets up to 1000 entries by ID at once.
+* **`POST` and `DELETE /v1/tags/id/{id}/entries`** add a tag to, or remove it
+  from, many entries at once, picked by `entry_ids`, `feed_id` and
+  `up_to_id`. With a system tag's ID, they mark entries read or unread,
+  saved or unsaved.
+
 ## Security
 
 The Kiki API does not implement any sort of authentication. This means that

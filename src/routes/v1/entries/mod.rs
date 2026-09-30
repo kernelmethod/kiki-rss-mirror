@@ -1,3 +1,4 @@
+pub mod batch_entries;
 pub mod cleanup;
 pub mod delete_entry;
 pub mod entry_assets;
@@ -5,8 +6,10 @@ pub mod entry_tags;
 pub mod format_data;
 pub mod get_entry;
 pub mod list_entries;
+pub mod rows;
 pub mod search_entries;
 
+use batch_entries::batch_entries;
 use cleanup::cleanup;
 use delete_entry::delete_entry;
 use entry_assets::list_entry_assets;
@@ -14,7 +17,7 @@ use entry_tags::{add_entry_system_tag, get_entry_tags, remove_entry_system_tag, 
 use get_entry::get_entry;
 #[allow(unused_imports)]
 pub use list_entries::{list_entries, ListEntriesResponse, ListEntriesResponseEntry};
-use search_entries::search_entries;
+use search_entries::{search_entries, search_entry_ids};
 
 use crate::server::AppState;
 use axum::{
@@ -26,7 +29,9 @@ pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_entries))
         .route("/cleanup", post(cleanup))
+        .route("/batch", post(batch_entries))
         .route("/search", post(search_entries))
+        .route("/search/ids", post(search_entry_ids))
         .route("/id/{id}", get(get_entry).delete(delete_entry))
         .route("/id/{id}/tags", get(get_entry_tags).put(set_entry_tags))
         .route(
@@ -1398,6 +1403,240 @@ mod test {
         assert_eq!(body.count, 1);
         assert_eq!(body.entries[0].entry.title, "Tech Review");
 
+        Ok(())
+    }
+
+    /// Helper to populate sync test data: feed 1 with entries 1, 2 and 3,
+    /// published in the order 2, 3, 1 and ingested in the order 1, 2, 3.
+    /// Entry 2 is read and entry 3 has the user tag "news" (ID 4).
+    fn populate_sync_entries(tc: &TestConfig) -> Result<()> {
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (title, url, syndication_format)
+             VALUES ('Feed', 'http://example.com/feed', 'rss')",
+            [],
+        )?;
+        for (id, published_at) in [(1, 1700000300i64), (2, 1700000100), (3, 1700000200)] {
+            conn.execute(
+                "INSERT INTO entries
+                    (id, feed_id, syndication_format, guid, published_at, title, url, ingested_at)
+                 VALUES (?1, 1, 'rss', ?1, ?2, 'Entry ' || ?1, 'http://example.com/', ?3)",
+                rusqlite::params![id, published_at, 1800000000 + id],
+            )?;
+        }
+        conn.execute("INSERT INTO tags (name) VALUES ('news')", [])?;
+        conn.execute(
+            "INSERT INTO entry_tags (entry_id, tag_id) VALUES (2, ?1), (3, 4)",
+            [SystemTag::Read.id(&conn)?],
+        )?;
+        Ok(())
+    }
+
+    fn ids(entries: &[ListEntriesResponseEntry]) -> Vec<i64> {
+        entries.iter().map(|e| e.id).collect()
+    }
+
+    fn tag_names(entry: &ListEntriesResponseEntry) -> Vec<&str> {
+        entry.tags.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    /// Listed entries carry every tag applied to them, and when Kiki
+    /// stored them.
+    #[tokio::test]
+    async fn test_list_entries_include_tags_and_ingested_at() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_sync_entries(&tc)?;
+
+        let resp = client.get("http://localhost/v1/entries").send().await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<ListEntriesResponse>().await?;
+        assert_eq!(ids(&body.entries), [1, 3, 2]);
+        assert_eq!(tag_names(&body.entries[0]), Vec::<&str>::new());
+        assert_eq!(tag_names(&body.entries[1]), ["news"]);
+        assert_eq!(body.entries[1].tags[0].kind, TagKind::User);
+        assert_eq!(tag_names(&body.entries[2]), ["system:read"]);
+        assert_eq!(body.entries[2].tags[0].kind, TagKind::System);
+        assert_eq!(
+            body.entries[0].ingested_at.as_deref(),
+            Some("2027-01-15T08:00:01+00:00")
+        );
+
+        let resp = client
+            .get("http://localhost/v1/entries/id/2")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let entry = resp.json::<get_entry::GetEntryResponse>().await?;
+        let names: Vec<&str> = entry.tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["system:read"]);
+        assert_eq!(
+            entry.ingested_at.as_deref(),
+            Some("2027-01-15T08:00:02+00:00")
+        );
+        Ok(())
+    }
+
+    /// `sort`, `since_id` and `max_id` page through entries by ID, in
+    /// either direction, on every entry listing.
+    #[tokio::test]
+    async fn test_list_entries_sync_by_id() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_sync_entries(&tc)?;
+
+        let list = |query: &'static str| {
+            let client = client.clone();
+            async move {
+                let resp = client
+                    .get(format!("http://localhost{query}"))
+                    .send()
+                    .await?;
+                assert_eq!(resp.status(), StatusCode::OK, "{query}");
+                let body = resp.json::<ListEntriesResponse>().await?;
+                anyhow::Ok((ids(&body.entries), body.count))
+            }
+        };
+
+        assert_eq!(list("/v1/entries?sort=id").await?, (vec![1, 2, 3], 3));
+        assert_eq!(
+            list("/v1/entries?sort=id&since_id=1&limit=1").await?,
+            (vec![2], 2)
+        );
+        assert_eq!(
+            list("/v1/entries?sort=id_desc&max_id=3").await?,
+            (vec![2, 1], 2)
+        );
+        assert_eq!(list("/v1/entries?since_id=1&max_id=3").await?, (vec![2], 1));
+        assert_eq!(
+            list("/v1/feeds/id/1/entries?sort=id&since_id=1").await?,
+            (vec![2, 3], 2)
+        );
+        assert_eq!(
+            list("/v1/feeds/id/1/entries?sort=id_desc").await?,
+            (vec![3, 2, 1], 3)
+        );
+
+        let resp = client
+            .get("http://localhost/v1/entries?sort=newest")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    /// `POST /batch` returns the entries asked for that exist, in the
+    /// order asked for, each once, with their tags.
+    #[tokio::test]
+    async fn test_batch_entries() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_sync_entries(&tc)?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/batch")
+            .json(&serde_json::json!({"ids": [3, 999, 2, 3]}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<batch_entries::BatchEntriesResponse>().await?;
+        assert_eq!(ids(&body.entries), [3, 2]);
+        assert_eq!(tag_names(&body.entries[0]), ["news"]);
+        assert_eq!(tag_names(&body.entries[1]), ["system:read"]);
+
+        let resp = client
+            .post("http://localhost/v1/entries/batch")
+            .json(&serde_json::json!({"ids": []}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<batch_entries::BatchEntriesResponse>().await?;
+        assert!(body.entries.is_empty());
+
+        let too_many: Vec<i64> = (1..=batch_entries::MAX_BATCH_IDS as i64 + 1).collect();
+        let resp = client
+            .post("http://localhost/v1/entries/batch")
+            .json(&serde_json::json!({ "ids": too_many }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    /// `POST /search/ids` takes the same filters as the search, including
+    /// the ID and ingestion time ranges, and returns just the IDs.
+    #[tokio::test]
+    async fn test_search_entry_ids() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_sync_entries(&tc)?;
+
+        let search = |body: serde_json::Value| {
+            let client = client.clone();
+            async move {
+                let resp = client
+                    .post("http://localhost/v1/entries/search/ids")
+                    .json(&body)
+                    .send()
+                    .await?;
+                assert_eq!(resp.status(), StatusCode::OK, "{body}");
+                anyhow::Ok(
+                    resp.json::<search_entries::SearchEntryIdsResponse>()
+                        .await?,
+                )
+            }
+        };
+
+        let unread = search(serde_json::json!({
+            "tags": {"not": "system:read"},
+            "sort": "id"
+        }))
+        .await?;
+        assert_eq!(unread.ids, [1, 3]);
+        assert_eq!(unread.count, 2);
+        assert_eq!(unread.limit, search_entries::DEFAULT_ID_LIMIT);
+
+        let body = search(serde_json::json!({"since_id": 1, "sort": "id"})).await?;
+        assert_eq!(body.ids, [2, 3]);
+
+        let body = search(serde_json::json!({
+            "ingested_after": "2027-01-15T08:00:02Z",
+            "ingested_before": "2027-01-15T08:00:04Z"
+        }))
+        .await?;
+        assert_eq!(body.ids, [3, 2]);
+
+        let body = search(serde_json::json!({"limit": 1_000_000, "offset": 1})).await?;
+        assert_eq!(body.ids, [3, 2]);
+        assert_eq!(body.count, 3);
+        assert_eq!(body.limit, search_entries::MAX_ID_LIMIT);
+
+        let resp = client
+            .post("http://localhost/v1/entries/search/ids")
+            .json(&serde_json::json!({"sort": "relevance"}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    /// Full search results carry tags too, and sort by ID on request.
+    #[tokio::test]
+    async fn test_search_entries_sync_by_id() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_sync_entries(&tc)?;
+
+        let resp = client
+            .post("http://localhost/v1/entries/search")
+            .json(&serde_json::json!({"sort": "id_desc", "max_id": 3}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+        let found: Vec<i64> = body.entries.iter().map(|e| e.entry.id).collect();
+        assert_eq!(found, [2, 1]);
+        assert_eq!(tag_names(&body.entries[0].entry), ["system:read"]);
         Ok(())
     }
 }
