@@ -516,7 +516,7 @@ impl TestConfig {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             if self.server_handle.as_ref().is_some_and(|h| h.is_finished()) {
-                bail!("HTTP server exited before listening on {:?}", &p);
+                bail!("HTTP server exited before listening on {:?}", p);
             }
             if std::os::unix::net::UnixStream::connect(&p).is_ok() {
                 return Ok(reqwest::Client::builder().unix_socket(p));
@@ -524,7 +524,7 @@ impl TestConfig {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        bail!("HTTP server has not been started on {:?}", &p);
+        bail!("HTTP server has not been started on {:?}", p);
     }
 
     /// Return the path to a file in the `test/` data directory.
