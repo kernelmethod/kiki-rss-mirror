@@ -21,6 +21,7 @@ use reqwest::Url;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 pub use crate::fetcher::assets::{
@@ -50,23 +51,39 @@ pub fn asset_path(data_dir: &Path, blake3: &str) -> PathBuf {
 }
 
 /// Write `bytes` atomically to the asset path for `blake3`.
+///
+/// Safe to call from several tasks at once for the same hash: each writes
+/// its own temporary file, and since the bytes are the same whichever
+/// rename lands last leaves the same file behind.
 pub fn write_asset_file(data_dir: &Path, blake3: &str, bytes: &[u8]) -> Result<PathBuf> {
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let final_path = asset_path(data_dir, blake3);
     let parent = final_path
         .parent()
         .context("asset path has no parent directory")?;
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create asset directory {:?}", parent))?;
-    let tmp_path = parent.join(format!("{}.tmp", blake3));
-    {
-        let mut f = fs::File::create(&tmp_path)
+    let tmp_path = parent.join(format!(
+        "{}.{}.{}.tmp",
+        blake3,
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut f = fs::File::create_new(&tmp_path)
             .with_context(|| format!("failed to create temp file {:?}", tmp_path))?;
         f.write_all(bytes)
             .with_context(|| format!("failed to write asset bytes to {:?}", tmp_path))?;
         f.sync_all().ok();
+        drop(f);
+        fs::rename(&tmp_path, &final_path)
+            .with_context(|| format!("failed to rename {:?} -> {:?}", tmp_path, final_path))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
     }
-    fs::rename(&tmp_path, &final_path)
-        .with_context(|| format!("failed to rename {:?} -> {:?}", tmp_path, final_path))?;
+    result?;
     Ok(final_path)
 }
 
@@ -260,5 +277,40 @@ mod tests {
     fn asset_path_uses_shard() {
         let p = asset_path(Path::new("/tmp/data"), "abcdef1234");
         assert_eq!(p, PathBuf::from("/tmp/data/assets/ab/abcdef1234"));
+    }
+
+    /// Several writers storing the same bytes at once all succeed, and
+    /// leave just the finished file behind.
+    #[test]
+    fn concurrent_writes_of_the_same_asset_succeed() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"the same bytes, every time".to_vec();
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let writers = 16;
+        let barrier = Arc::new(Barrier::new(writers));
+
+        let handles: Vec<_> = (0..writers)
+            .map(|_| {
+                let data_dir = dir.path().to_path_buf();
+                let (hash, bytes, barrier) = (hash.clone(), bytes.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_asset_file(&data_dir, &hash, &bytes)
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let path = asset_path(dir.path(), &hash);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let files: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(files, vec![std::ffi::OsString::from(&hash)]);
     }
 }
