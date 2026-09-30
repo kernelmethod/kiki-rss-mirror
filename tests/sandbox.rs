@@ -1254,6 +1254,22 @@ mod web_ui {
         }
     }
 
+    /// How many seccomp filters `pid` runs under.
+    ///
+    /// Compared against the test process's own count rather than zero, and
+    /// rather than reading the `Seccomp` mode: a test harness may itself
+    /// run under a filter (the Nix build sandbox does), which every process
+    /// here inherits.
+    fn seccomp_filters(pid: u32) -> u32 {
+        let status =
+            std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read /proc status");
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Seccomp_filters:"))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("a Seccomp_filters line (Linux 5.9+)")
+    }
+
     impl Drop for KikiWeb {
         fn drop(&mut self) {
             if let Some(mut child) = self.child.take() {
@@ -1270,10 +1286,9 @@ mod web_ui {
     fn the_sandboxed_web_ui_serves_every_page() {
         let (addr, _rss) = spawn_local_rss_server();
         let mut web = KikiWeb::spawn(&[]);
-        assert_eq!(
-            seccomp_mode(web.pid()),
-            Some(2),
-            "the web UI is not sandboxed"
+        assert!(
+            seccomp_filters(web.pid()) > seccomp_filters(std::process::id()),
+            "the web UI installed no seccomp filter of its own"
         );
 
         let feed = http_request(
@@ -1331,7 +1346,11 @@ mod web_ui {
     #[test]
     fn no_sandbox_leaves_the_web_ui_unsandboxed() {
         let mut web = KikiWeb::spawn(&["--no-sandbox"]);
-        assert_eq!(seccomp_mode(web.pid()), Some(0));
+        assert_eq!(
+            seccomp_filters(web.pid()),
+            seccomp_filters(std::process::id()),
+            "the web UI installed a seccomp filter despite --no-sandbox"
+        );
         web.get("/feeds").assert_success();
         web.assert_still_running();
         web.shutdown();
