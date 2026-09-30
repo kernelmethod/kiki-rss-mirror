@@ -564,6 +564,7 @@ async fn metrics_sampler_loop(
                                         role.as_str(),
                                         u.cpu_seconds,
                                         u.resident_bytes as f64,
+                                        u.proportional_bytes.map(|b| b as f64),
                                     );
                                 }
                             }

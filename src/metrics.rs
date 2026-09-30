@@ -468,7 +468,14 @@ mod imp {
                 KeyName::from_const_str("kiki_process_resident_memory_bytes"),
                 None,
                 SharedString::const_str(
-                    "Resident memory of kiki's processes, labeled by process: the server, the feed fetcher, or the script host. Includes each process's children.",
+                    "Resident memory of kiki's processes, labeled by process: the server, the feed fetcher, or the script host. Includes each process's children. Pages shared between processes are counted once per process, so this overstates kiki's total; see kiki_process_proportional_memory_bytes.",
+                ),
+            );
+            r.describe_gauge(
+                KeyName::from_const_str("kiki_process_proportional_memory_bytes"),
+                None,
+                SharedString::const_str(
+                    "Proportional set size (PSS) of kiki's processes, labeled by process: the server, the feed fetcher, or the script host. Includes each process's children. Each page shared between processes is divided among them, so the values sum to the memory kiki occupies.",
                 ),
             );
 
@@ -738,13 +745,15 @@ mod imp {
 
         // ----- Processes -----
 
-        /// Set the CPU time and resident memory used so far by one of
-        /// kiki's processes, together with its children.
+        /// Set the CPU time and memory used so far by one of kiki's
+        /// processes, together with its children. `proportional_bytes` is
+        /// left as it was when `None`.
         pub fn set_process_usage(
             &self,
             process: &'static str,
             cpu_seconds: f64,
             resident_bytes: f64,
+            proportional_bytes: Option<f64>,
         ) {
             let key = Key::from_parts(
                 "kiki_process_cpu_seconds_total",
@@ -761,6 +770,16 @@ mod imp {
             self.recorder
                 .register_gauge(&key, &METADATA)
                 .set(resident_bytes);
+
+            if let Some(proportional_bytes) = proportional_bytes {
+                let key = Key::from_parts(
+                    "kiki_process_proportional_memory_bytes",
+                    vec![Label::new("process", process)],
+                );
+                self.recorder
+                    .register_gauge(&key, &METADATA)
+                    .set(proportional_bytes);
+            }
         }
 
         /// Record page I/O done by a database connection: `cache_hits`
@@ -999,6 +1018,7 @@ mod stub {
             _process: &'static str,
             _cpu_seconds: f64,
             _resident_bytes: f64,
+            _proportional_bytes: Option<f64>,
         ) {
         }
 
