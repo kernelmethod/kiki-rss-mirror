@@ -2,7 +2,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use kiki_rss::cli;
 
-#[cfg(target_env = "musl")]
+// mimalloc returns freed memory to the OS, unlike glibc under tokio's
+// thread pool, whose per-thread arenas grow and rarely shrink. It
+// also avoids musl's malloc, which is slow under contention. Its secure
+// mode (guard pages, encrypted free lists, randomized allocation) hardens
+// the heap against the untrusted feeds and plugins kiki parses and runs.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

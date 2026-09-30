@@ -37,6 +37,8 @@ blake3 = "1"
 chrono = "0.4"
 dirs = "6"
 lol_html = "2"
+# The global allocator; see src/main.rs.
+mimalloc = { version = "0.1", features = ["secure"] }
 url = "2"
 clap = { version = "4.5", features = ["cargo", "derive"], optional = true }
 quick-xml = { version = "0.37", features = ["serialize", "escape-html"] }
@@ -77,10 +79,6 @@ zstd = { version = "0.14", default-features = false, optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 seccompiler = "0.5"
-
-# musl's malloc is slow under contention, so musl builds use mimalloc instead.
-[target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = "0.1"
 
 [dev-dependencies]
 flate2 = "1"
