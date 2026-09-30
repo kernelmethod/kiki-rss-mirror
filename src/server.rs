@@ -394,6 +394,8 @@ impl Server {
             None => crate::fetcher::Fetcher::in_process()?,
         };
 
+        let fetcher_lost = fetcher_lost(self.feed_fetcher.clone());
+
         let worker_handles = tasks::spawn_workers(
             rx,
             tx.clone(),
@@ -478,6 +480,13 @@ impl Server {
             _ = workers_exited => {
                 self.cancel_token.cancel();
                 bail!("all task workers exited; stopping the server")
+            }
+            // Likewise without the fetcher, which cannot be restarted from
+            // inside the sandbox: exit with an error, so that a supervisor
+            // such as systemd restarts the server and the fetcher with it.
+            _ = fetcher_lost => {
+                self.cancel_token.cancel();
+                bail!("the feed fetcher process exited; stopping the server so it can be restarted")
             }
         }
     }
@@ -610,6 +619,22 @@ async fn cleanup_loop(
     }
 
     Ok(())
+}
+
+/// Wait until the channel to the isolated feed fetcher fails. Never
+/// returns when feeds are fetched in this process.
+#[cfg(unix)]
+async fn fetcher_lost(handle: crate::process::FeedFetcherHandle) {
+    match handle {
+        Some(host) => host.closed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// See the `unix` variant.
+#[cfg(not(unix))]
+async fn fetcher_lost(_: crate::process::FeedFetcherHandle) {
+    std::future::pending().await
 }
 
 /// Wait for every task worker in `handles` to finish, logging any that
@@ -983,6 +1008,41 @@ mod test {
             .join()
             .expect("panic in server thread")?;
 
+        Ok(())
+    }
+
+    /// Losing the feed fetcher stops the server with an error, rather than
+    /// leaving it up with nothing to fetch feeds.
+    #[cfg(unix)]
+    #[test]
+    fn losing_the_feed_fetcher_stops_the_server() -> Result<()> {
+        use crate::process::feed_fetcher::FeedFetcherHost;
+
+        let tc = TestBuilder::default().init_database().build()?;
+        let socket = tc.config_dir().join("fetcher-test.sock");
+        let (host, far_end) = FeedFetcherHost::with_far_end();
+        let server = ServerBuilder::new(&tc.database_path())
+            .socket_path(&socket)
+            .worker_count(1)
+            .feed_fetcher(Some(Arc::new(host)))
+            .build();
+        let token = server.cancel_token();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(server.run());
+        });
+
+        // Up and running while the fetcher is.
+        let early = done_rx.recv_timeout(Duration::from_millis(300));
+        assert!(early.is_err(), "the server stopped early: {early:?}");
+
+        drop(far_end);
+        let result = done_rx.recv_timeout(Duration::from_secs(5));
+        token.cancel();
+        let err = result
+            .expect("the server should stop once the fetcher is gone")
+            .expect_err("losing the fetcher should be an error");
+        assert!(format!("{err:#}").contains("feed fetcher"), "{err:#}");
         Ok(())
     }
 

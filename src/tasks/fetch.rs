@@ -15,7 +15,7 @@ use crate::tasks::cache::{
 };
 use crate::tasks::command::TaskManagerCommand;
 use crate::tasks::error::FetchError;
-use crate::tasks::error_recording::{clear_feed_error, set_feed_error_with_schedule};
+use crate::tasks::error_recording::{clear_feed_error, defer_feed, set_feed_error_with_schedule};
 use crate::tasks::favicons::resolve_site_url;
 use crate::tasks::processing::{
     enqueue_asset_caching, enqueue_favicon_caching, process_atom_feed, process_rss_feed,
@@ -360,6 +360,17 @@ fn store_refresh(
                     queue_favicon_if_due(settings, conn, task_tx, metrics, feed_id)
                 })?;
             }
+            return Ok(());
+        }
+        // The fetcher process is gone, and the server stops when it
+        // notices. That is no fault of the feed's, so nothing is recorded
+        // against it: it is only put off, so that it is not queued again
+        // and again in the meantime.
+        Err(FetcherError::Gone) => {
+            warn!("{}: not fetched: {}", rec.label, FetcherError::Gone);
+            rec.db
+                .write_blocking(|conn| defer_feed(conn, feed_id, rec.cfg.min_cadence))??;
+            rec.outcome("fetcher_gone");
             return Ok(());
         }
         // The fetcher itself failed, not the feed server. Recorded as a

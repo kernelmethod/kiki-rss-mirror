@@ -86,7 +86,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, warn};
 
 /// The hidden subcommand the server re-execs itself with.
@@ -281,6 +281,9 @@ fn encode_to(msg: &ToFetcher) -> Result<Vec<u8>, FetcherError> {
 struct Pending<T> {
     waiters: Mutex<Option<HashMap<u64, oneshot::Sender<T>>>>,
     next_id: AtomicU64,
+    /// Becomes `true` when the channel closes, for whoever needs to learn
+    /// of it without having a request outstanding.
+    closed: watch::Sender<bool>,
 }
 
 impl<T> Pending<T> {
@@ -288,6 +291,7 @@ impl<T> Pending<T> {
         Pending {
             waiters: Mutex::new(Some(HashMap::new())),
             next_id: AtomicU64::new(1),
+            closed: watch::Sender::new(false),
         }
     }
 
@@ -321,7 +325,18 @@ impl<T> Pending<T> {
     /// Fail every waiter and refuse new ones. Returns whether this call
     /// was the one that closed it.
     fn close(&self) -> bool {
-        self.lock().take().is_some()
+        let closed = self.lock().take().is_some();
+        if closed {
+            self.closed.send_replace(true);
+        }
+        closed
+    }
+
+    /// Wait until the channel has closed; see [`Self::close`].
+    async fn closed(&self) {
+        let mut rx = self.closed.subscribe();
+        // Only fails if the sender is dropped, which `self` prevents.
+        let _ = rx.wait_for(|closed| *closed).await;
     }
 
     fn is_open(&self) -> bool {
@@ -335,7 +350,7 @@ fn retire(pending: &Pending<JobResult>, why: &str) {
     if pending.close() {
         warn!(
             reason = why,
-            "feed fetcher: channel failed, feed fetching is disabled until restart"
+            "feed fetcher: channel failed; nothing more can be fetched, so the server will stop"
         );
     }
 }
@@ -509,6 +524,17 @@ impl FeedFetcherHost {
         }
     }
 
+    /// A host together with the far end of its channel, which nothing
+    /// serves: tests drop it to see what the server does when the fetcher
+    /// goes away.
+    #[cfg(test)]
+    pub(crate) fn with_far_end() -> (Self, UnixStream) {
+        #[allow(clippy::unwrap_used)]
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        #[allow(clippy::unwrap_used)]
+        (Self::from_stream(ours, None).unwrap(), theirs)
+    }
+
     /// A host whose far end answers every request with `answer`, on a
     /// thread of its own, standing in for a worker that may not follow the
     /// rules — so tests can check what the server does with its replies.
@@ -536,8 +562,14 @@ impl FeedFetcherHost {
         self.pending.is_open()
     }
 
+    /// Wait until the channel to the fetcher fails, after which no request
+    /// can succeed. Returns at once if it already has.
+    pub async fn closed(&self) {
+        self.pending.closed().await
+    }
+
     async fn request(&self, job: Job, deadline: Duration) -> Result<JobResult, FetcherError> {
-        let gone = || FetcherError::Unavailable("the fetcher process is no longer running".into());
+        let gone = || FetcherError::Gone;
         let (id, rx) = self.pending.register().ok_or_else(gone)?;
 
         // Refused before it reaches the wire, so the channel is fine.
@@ -1283,9 +1315,28 @@ mod tests {
 
         let start = Instant::now();
         let err = host.parse(1, RSS.to_vec()).await.unwrap_err();
-        assert!(matches!(err, FetcherError::Unavailable(_)), "got {err:?}");
+        assert!(matches!(err, FetcherError::Gone), "got {err:?}");
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(!host.is_alive());
+    }
+
+    /// Whoever waits on [`FeedFetcherHost::closed`] learns the channel has
+    /// failed without having a request of its own outstanding, and later
+    /// waiters return at once.
+    #[tokio::test]
+    async fn closed_resolves_when_the_channel_fails() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let host = FeedFetcherHost::from_stream(ours, None).unwrap();
+        let open = tokio::time::timeout(Duration::from_millis(100), host.closed()).await;
+        assert!(open.is_err(), "closed() returned while the channel was up");
+
+        drop(theirs);
+        tokio::time::timeout(Duration::from_secs(5), host.closed())
+            .await
+            .expect("closed() should return once the channel fails");
+        tokio::time::timeout(Duration::from_secs(1), host.closed())
+            .await
+            .expect("closed() should return at once when already closed");
     }
 
     /// Asset downloads, icon searches and image extraction all run in the

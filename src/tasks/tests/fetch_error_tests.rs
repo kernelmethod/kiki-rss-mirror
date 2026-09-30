@@ -658,3 +658,51 @@ async fn test_permanent_redirect_to_existing_feed_merges() -> Result<()> {
     assert_eq!(entries, ["old"]);
     Ok(())
 }
+
+/// A refresh that finds the fetcher process gone records nothing against
+/// the feed, which did nothing wrong, but still puts it off so the
+/// scheduler does not queue it again every few seconds.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gone_fetcher_is_not_charged_to_the_feed() -> Result<()> {
+    use crate::process::feed_fetcher::FeedFetcherHost;
+    use std::sync::Arc;
+
+    let tc = TestBuilder::default().init_database().build()?;
+    let (feed_id, _client, pool) = setup_feed(&tc, "http://example.invalid/feed.xml")?;
+    let (host, far_end) = FeedFetcherHost::with_far_end();
+    drop(far_end);
+    host.closed().await;
+    let fetcher = crate::fetcher::Fetcher::Isolated(Arc::new(host));
+
+    let before = Utc::now().timestamp();
+    super::super::fetch::refresh_feed(
+        &fetcher,
+        feed_id,
+        false,
+        pool,
+        &crate::config::Settings::default(),
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let (error, _) = read_stored_error(&conn, feed_id)?;
+    assert_eq!(error, None);
+    let (failures, next_fetch_at): (i64, Option<i64>) = conn.query_row(
+        "SELECT consecutive_failures, next_fetch_at FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(failures, 0);
+    let min_cadence = crate::config::Settings::default()
+        .feed_fetch
+        .min_polling_cadence_seconds as i64;
+    assert!(
+        next_fetch_at.is_some_and(|t| t >= before + min_cadence),
+        "the feed should be put off, got {next_fetch_at:?}"
+    );
+    Ok(())
+}
