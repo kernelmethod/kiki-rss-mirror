@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use kiki_rss::cli;
 
 // mimalloc returns freed memory to the OS, unlike glibc under tokio's
-// thread pool, whose per-thread arenas grow and rarely shrink. It
+// thread pool, whose per-thread arenas grow and rarely shrink — though
+// only when a thread calls into it again, which is why kiki's runtimes
+// collect as their threads park (see kiki_rss::memory). It
 // also avoids musl's malloc, which is slow under contention. Its secure
 // mode (guard pages, encrypted free lists, randomized allocation) hardens
 // the heap against the untrusted feeds and plugins kiki parses and runs.
