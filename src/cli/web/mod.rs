@@ -14,6 +14,7 @@ use crate::routes::v1::plugins::list_plugins::{ListPluginsResponse, PluginRespon
 use crate::routes::v1::plugins::plugin_config::PluginConfigResponse;
 use crate::routes::v1::tags::list_tags::{ListTagsResponse, TagResponse};
 use crate::routes::v1::tags::tag_entries::AddTagEntriesRequest;
+use crate::sandbox::{self, SandboxConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{Form, Path as UrlPath, Query, State},
@@ -30,11 +31,11 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::LazyLock;
 use tokio::net::TcpListener;
-use tokio::process::{Child, Command};
 use tokio::signal;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -109,7 +110,9 @@ const API_BASE: &str = "http://kiki";
 /// for the web UI. The Kiki server runs as a separate `kiki serve` child
 /// process rather than in this one: its sandbox applies to the whole
 /// process and denies `execve`, and the web UI should neither live under
-/// that profile nor loosen it.
+/// that profile nor loosen it. The web UI gets a sandbox of its own, which
+/// grants it no filesystem access and no network access but its listener
+/// and the server's socket; `--no-sandbox` lifts both.
 ///
 /// The browser never talks to the Kiki API. The web UI is the API's only
 /// client: it calls the server over the Unix socket and renders what it
@@ -139,53 +142,60 @@ impl WebArgs {
     /// # Errors
     ///
     /// Returns an error if the Kiki server cannot be started or exits
-    /// unsuccessfully, or if the web UI cannot bind to its address.
+    /// unsuccessfully, if the web UI cannot bind to its address, or if its
+    /// sandbox cannot be installed.
     pub fn run(&self) -> Result<()> {
         tracing_subscriber::fmt::init();
 
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(self.run_async())
-    }
+        // Everything that needs the filesystem, a new listening socket, or
+        // `execve` happens here, before the sandbox forbids it. That has to
+        // be before the tokio runtime too: Landlock restricts only the
+        // thread that installs it and the threads that thread starts later,
+        // and a multi-threaded runtime starts its workers as it is built.
 
-    async fn run_async(&self) -> Result<()> {
         // Resolve the socket here and hand it to the child, rather than
         // letting each process resolve it on its own, so the web UI is
         // certain to connect to the server it started.
         let socket_path = self.serve.socket_path()?;
         let api = api_client(&socket_path)?;
 
-        let listener = TcpListener::bind(self.listen)
-            .await
+        let listener = std::net::TcpListener::bind(self.listen)
             .with_context(|| format!("unable to bind the web UI to {}", self.listen))?;
+        listener.set_nonblocking(true)?;
         tracing::info!("web UI listening on http://{}", listener.local_addr()?);
 
-        let mut server = self.spawn_server(&socket_path)?;
+        let server = self.spawn_server(&socket_path)?;
 
-        let cancel = CancellationToken::new();
-        let web = tokio::spawn(serve_ui(listener, api, cancel.clone()));
+        // Counted before the sandbox hides the cgroup files that bound it.
+        let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
 
-        let status = tokio::select! {
-            status = server.wait() => {
-                let status = status.context("failed to wait on the Kiki server")?;
-                tracing::warn!(%status, "Kiki server exited; stopping the web UI");
-                Some(status)
-            }
-            _ = shutdown_signal() => None,
-        };
+        self.apply_sandbox()?;
 
-        cancel.cancel();
-        let status = match status {
-            Some(status) => status,
-            None => stop_server(&mut server).await?,
-        };
-        web.await.map_err(|_| anyhow!("panic in web UI task"))??;
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()?
+            .block_on(run_async(listener, api, server))
+    }
 
-        if !status.success() {
-            bail!("Kiki server exited with {status}");
+    /// Install the web UI's sandbox, unless `--no-sandbox` was given.
+    ///
+    /// The web UI has no use for the filesystem, and none for the network
+    /// beyond the listener it already has and the server's Unix socket, so
+    /// the [`SandboxProfile::WebUi`](crate::sandbox::SandboxProfile::WebUi)
+    /// profile denies it both. It must go up after the server has been
+    /// spawned, since it denies `execve`; the server is outside it, and
+    /// installs its own.
+    fn apply_sandbox(&self) -> Result<()> {
+        if self.serve.no_sandbox() {
+            tracing::warn!(
+                "sandbox disabled via --no-sandbox; the web UI runs with full filesystem \
+                 and syscall access"
+            );
+            return Ok(());
         }
-        Ok(())
+        let config = SandboxConfig::web_ui(self.serve.seccomp_log_only());
+        sandbox::apply(&config).context("failed to install the web UI sandbox")
     }
 
     /// Start `kiki serve` as a child process listening on `socket_path`,
@@ -194,17 +204,86 @@ impl WebArgs {
     /// The child gets its own process group, so a Ctrl+C at the terminal
     /// reaches only this process, which then stops the server itself. That
     /// keeps shutdown in one order no matter how it was asked for.
-    fn spawn_server(&self, socket_path: &Path) -> Result<Child> {
+    fn spawn_server(&self, socket_path: &Path) -> Result<ServerProcess> {
         let exe = std::env::current_exe().context("locating the kiki executable")?;
-        let child = Command::new(exe)
+        let child = std::process::Command::new(exe)
             .arg("serve")
             .args(self.serve.to_argv(socket_path))
             .process_group(0)
-            .kill_on_drop(true)
             .spawn()
             .context("failed to start the Kiki server")?;
         tracing::info!(pid = child.id(), "started Kiki server");
-        Ok(child)
+        Ok(ServerProcess(child))
+    }
+}
+
+/// Serve the web UI on `listener` alongside the Kiki `server`, until one of
+/// them stops.
+async fn run_async(
+    listener: std::net::TcpListener,
+    api: reqwest::Client,
+    mut server: ServerProcess,
+) -> Result<()> {
+    let listener = TcpListener::from_std(listener)?;
+    let cancel = CancellationToken::new();
+    let web = tokio::spawn(serve_ui(listener, api, cancel.clone()));
+
+    let status = tokio::select! {
+        status = server.wait() => {
+            let status = status.context("failed to wait on the Kiki server")?;
+            tracing::warn!(%status, "Kiki server exited; stopping the web UI");
+            Some(status)
+        }
+        _ = shutdown_signal() => None,
+    };
+
+    cancel.cancel();
+    let status = match status {
+        Some(status) => status,
+        None => stop_server(&mut server).await?,
+    };
+    web.await.map_err(|_| anyhow!("panic in web UI task"))??;
+
+    if !status.success() {
+        bail!("Kiki server exited with {status}");
+    }
+    Ok(())
+}
+
+/// The `kiki serve` child of `kiki web`.
+///
+/// A plain [`std::process::Child`] rather than a tokio one, because it is
+/// spawned before the sandbox goes up, and so before there is a runtime to
+/// spawn it on. It is killed if dropped while still running, so an error
+/// in the web UI never leaves an orphaned server behind.
+struct ServerProcess(std::process::Child);
+
+impl ServerProcess {
+    /// Wait for the server to exit, without blocking the runtime.
+    ///
+    /// Only this handle ever reaps the child, so until this returns its pid
+    /// cannot be reused, and [`stop_server`] can safely signal it.
+    async fn wait(&mut self) -> Result<ExitStatus> {
+        // Listen for SIGCHLD before checking, so an exit between the check
+        // and the wait still wakes us.
+        let mut sigchld = signal::unix::signal(signal::unix::SignalKind::child())?;
+        loop {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
+            }
+            if sigchld.recv().await.is_none() {
+                bail!("SIGCHLD stream closed while waiting on the Kiki server");
+            }
+        }
+    }
+}
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 }
 
@@ -2633,12 +2712,13 @@ fn render_pagination(
 
 /// Ask the Kiki server to shut down gracefully with `SIGTERM`, and wait
 /// for it to exit.
-async fn stop_server(server: &mut Child) -> Result<ExitStatus> {
-    if let Some(pid) = server.id() {
-        let pid = libc::pid_t::try_from(pid).context("Kiki server pid out of range")?;
+async fn stop_server(server: &mut ServerProcess) -> Result<ExitStatus> {
+    if server.0.try_wait()?.is_none() {
+        let pid = libc::pid_t::try_from(server.0.id()).context("Kiki server pid out of range")?;
         // SAFETY: kill(2) has no memory-safety preconditions. The child has
-        // not been reaped yet (`id()` returned `Some`), so the pid still
-        // names it and cannot have been reused.
+        // not been reaped yet (`try_wait` returned `None`, and only
+        // `ServerProcess` reaps it), so the pid still names it and cannot
+        // have been reused.
         if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
             tracing::warn!(
                 error = %std::io::Error::last_os_error(),
