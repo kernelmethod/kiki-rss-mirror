@@ -612,10 +612,10 @@ async fn test_permanent_redirect_updates_url() -> Result<()> {
     Ok(())
 }
 
-/// A permanent redirect to the URL of another feed leaves the stored URL as
-/// it is, since feed URLs are unique, and the feed is still refreshed.
+/// A permanent redirect to the URL of another feed merges the redirected
+/// feed into that one: its tags and entries move over and it is deleted.
 #[tokio::test]
-async fn test_permanent_redirect_to_existing_feed_keeps_url() -> Result<()> {
+async fn test_permanent_redirect_to_existing_feed_merges() -> Result<()> {
     let tc = TestBuilder::default().init_database().build()?;
     let (old_url, new_url) = serve_permanent_redirect().await?;
     let (feed_id, client, pool) = setup_feed(&tc, &old_url)?;
@@ -624,6 +624,14 @@ async fn test_permanent_redirect_to_existing_feed_keeps_url() -> Result<()> {
         "INSERT INTO feeds (title, url) VALUES ('other feed', ?1)",
         [&new_url],
     )?;
+    let other_id = conn.last_insert_rowid();
+    conn.execute_batch(&format!(
+        "INSERT INTO tags (name) VALUES ('papers');
+         INSERT INTO feed_tags (feed_id, tag_id)
+         SELECT {feed_id}, id FROM tags WHERE name = 'papers';
+         INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+         VALUES ({feed_id}, 'rss', 'old', 0, 'old', 'http://x/old');"
+    ))?;
 
     refresh_feed(
         &client,
@@ -635,17 +643,23 @@ async fn test_permanent_redirect_to_existing_feed_keeps_url() -> Result<()> {
     )
     .await?;
 
-    let url: String = conn.query_row("SELECT url FROM feeds WHERE id = ?1", [feed_id], |row| {
-        row.get(0)
-    })?;
-    assert_eq!(url, old_url);
-    let (error, _) = read_stored_error(&conn, feed_id)?;
-    assert_eq!(error, None);
-    let entries: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM entries WHERE feed_id = ?1",
-        [feed_id],
-        |row| row.get(0),
-    )?;
-    assert_eq!(entries, 1);
+    let feeds: Vec<i64> = conn
+        .prepare("SELECT id FROM feeds")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(feeds, [other_id]);
+    let tags: Vec<String> = conn
+        .prepare(
+            "SELECT t.name FROM feed_tags ft JOIN tags t ON t.id = ft.tag_id
+             WHERE ft.feed_id = ?1",
+        )?
+        .query_map([other_id], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(tags, ["papers"]);
+    let entries: Vec<String> = conn
+        .prepare("SELECT guid FROM entries WHERE feed_id = ?1")?
+        .query_map([other_id], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(entries, ["old"]);
     Ok(())
 }

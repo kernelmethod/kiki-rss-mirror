@@ -316,7 +316,7 @@ expressions or come from given feeds.
 | `fetch.success`  | `{ feed_id, status, url, content_length }` | Fires after a successful (2xx) feed fetch, once the response body has been read. |
 | `fetch.error`    | `{ feed_id, kind, status, message, retry_after }` | Fires when a feed fetch fails. `kind` is one of `"http"`, `"timeout"`, `"network"`, `"too_many_redirects"`, `"body_too_large"`, `"parse"`, or `"fetcher"` (the isolated feed fetcher itself failed, e.g. its worker crashed while handling this feed). `status` and `retry_after` are populated only when available. |
 | `feed.added`     | `{ id, url, title }`                       | Fires after a feed is created via the HTTP API. |
-| `feed.removed`   | `{ id, url, title }`                       | Fires after a feed is deleted via the HTTP API. `id`, `url`, `title` reflect the feed's state immediately before deletion. |
+| `feed.removed`   | `{ id, url, title }`                       | Fires after a feed is deleted via the HTTP API, or merged into another feed because it permanently redirected to that feed's URL (its entries then belong to the other feed). `id`, `url`, `title` reflect the feed's state immediately before deletion. |
 | `plugin.load`    | none                                       | Fires once plugins have loaded: when the server starts, and after every reload. Where to start a [scan](#stored-entries) of stored entries. |
 
 Only `entry.ingest` is a **transform** event — its handlers can modify or
@@ -502,7 +502,9 @@ end)
 
 Each lookup is a call to the server, so a plugin that looks feeds up for
 every entry is best off remembering the answers, as above. A feed's URL
-changes when fetching it is permanently redirected, and a removed feed's id
+changes when fetching it is permanently redirected (or, if another feed has
+the new URL already, the feed is merged into that one and removed), and a
+removed feed's id
 may be given to a feed added later (listen for `feed.removed` to forget it).
 
 ## Calls to the server

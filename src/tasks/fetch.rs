@@ -1,4 +1,5 @@
 use crate::config::Settings;
+use crate::db::feeds::merge_feed_into;
 use crate::db::{Pool, PooledConnection};
 use crate::fetcher::{
     FeedHints, FetchReply, FetchSpec, FetchedBody, Fetcher, ParseOutcome, ParsedFeed,
@@ -624,26 +625,37 @@ fn record_fetch_reply(
     metrics.record_feed_redirects(redirects);
     let headers = headers.to_header_map();
 
-    // If we followed a permanent redirect, update the stored URL in the
-    // database, unless another feed has that URL already: feed URLs are
-    // unique, and the other feed fetches the same content anyway.
+    // If we followed a permanent redirect, the feed now lives at
+    // `final_url`. If another feed has that URL already, the two are the
+    // same feed, so this one is merged into it and there is nothing left
+    // to store. Otherwise the stored URL is updated to match.
     if permanent_redirect && final_url != feed_url {
-        let updated = conn.execute(
-            "UPDATE feeds SET url = ?1 WHERE id = ?2
-               AND NOT EXISTS (SELECT 1 FROM feeds WHERE url = ?1)",
+        if let Some(merged) = merge_feed_into(&conn, feed_id, &final_url)? {
+            info!(
+                "{} permanently redirected to {}, the URL of feed {}; merged it into that feed",
+                rec.label, final_url, merged.into
+            );
+            if let Some(runner) = rec.script_runner {
+                runner.dispatch_observe(
+                    crate::scripting::Event::FeedRemoved,
+                    crate::scripting::EventPayload::Feed {
+                        id: feed_id,
+                        url: merged.url,
+                        title: merged.title,
+                    },
+                );
+            }
+            rec.outcome("merged");
+            return Ok(None);
+        }
+        info!(
+            "{} permanently redirected to {}; updating stored URL",
+            rec.label, final_url
+        );
+        conn.execute(
+            "UPDATE feeds SET url = ?1 WHERE id = ?2",
             (&final_url, feed_id),
         )?;
-        if updated > 0 {
-            info!(
-                "{} permanently redirected to {}; updated stored URL",
-                rec.label, final_url
-            );
-        } else {
-            warn!(
-                "{} permanently redirected to {}, which another feed has already; keeping the stored URL",
-                rec.label, final_url
-            );
-        }
     }
 
     let now_ts = Utc::now().timestamp();

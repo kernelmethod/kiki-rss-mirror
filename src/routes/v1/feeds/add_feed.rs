@@ -41,7 +41,9 @@ pub struct AddFeedResponse {
 ///
 /// Register a new feed from which to fetch content. Each feed must have its
 /// own URL: adding a feed with the URL of an existing one fails with
-/// `409 Conflict`.
+/// `409 Conflict`. A feed whose URL turns out to permanently redirect to the
+/// URL of an existing feed is merged into that feed when it is fetched, and
+/// its id then no longer exists.
 #[utoipa::path(
     post,
     path = "/v1/feeds/create",
