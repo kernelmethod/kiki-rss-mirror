@@ -1,8 +1,8 @@
 use crate::config::Settings;
 use crate::db::feeds::merge_feed_into;
-use crate::db::{Pool, PooledConnection};
+use crate::db::Db;
 use crate::fetcher::{
-    FeedHints, FetchReply, FetchSpec, FetchedBody, Fetcher, ParseOutcome, ParsedFeed,
+    FeedHints, FetchReply, FetchSpec, FetchedBody, Fetcher, FetcherError, ParseOutcome, ParsedFeed,
 };
 use crate::http::{FeedAuth, FeedAuthType};
 use crate::metrics::Metrics;
@@ -24,6 +24,7 @@ use crate::tasks::scripting::{fire_fetch_error, fire_fetch_success};
 use anyhow::Result;
 use chrono::Utc;
 use reqwest::header::HeaderMap;
+use rusqlite::Connection;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -50,7 +51,7 @@ struct FeedFetchRow {
     feed_hints: FeedHints,
 }
 
-fn load_feed_fetch_row(conn: &PooledConnection, feed_id: i64) -> Result<FeedFetchRow> {
+fn load_feed_fetch_row(conn: &Connection, feed_id: i64) -> Result<FeedFetchRow> {
     let row = conn.query_row(
         "SELECT
             url,
@@ -179,7 +180,7 @@ pub(crate) async fn refresh_feed(
     fetcher: &Fetcher,
     feed_id: i64,
     manual: bool,
-    pool: Pool,
+    db: Db,
     settings: &Settings,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
@@ -188,8 +189,9 @@ pub(crate) async fn refresh_feed(
     let fetch_start = Instant::now();
     let fetch_settings = &settings.feed_fetch;
 
-    let conn = pool.get()?;
-    let row = load_feed_fetch_row(&conn, feed_id)?;
+    let row = db
+        .read(move |conn| load_feed_fetch_row(conn, feed_id))
+        .await??;
 
     let cfg = SchedulerConfig {
         min_cadence: fetch_settings.min_polling_cadence_seconds,
@@ -198,7 +200,7 @@ pub(crate) async fn refresh_feed(
         force_refresh_after: fetch_settings.force_refresh_after_seconds,
     };
     let rec = Recorder {
-        pool: &pool,
+        db: &db,
         feed_id,
         label: feed_label(feed_id, &row.title, &row.url),
         cfg,
@@ -247,14 +249,15 @@ pub(crate) async fn refresh_feed(
 
     // file:// feeds are read here, because the fetcher has no filesystem
     // access, and only the parse is handed off.
-    // Set when the server answers 304 Not Modified.
-    let mut not_modified = false;
-    let fetched = if row.url.starts_with("file://") {
-        match retrieve_file_feed(&row.url, feed_id, pool.clone(), cfg) {
-            Ok((content, schedule)) => fetcher
-                .parse(feed_id, content)
-                .await
-                .map(|parsed| Some((parsed, schedule))),
+    let retrieved = if row.url.starts_with("file://") {
+        let read = crate::db::blocking(|| retrieve_file_feed(&row.url, feed_id, &db, cfg));
+        match read {
+            Ok((content, schedule)) => Retrieved::File(
+                fetcher
+                    .parse(feed_id, content)
+                    .await
+                    .map(|parsed| (parsed, schedule)),
+            ),
             Err(e) => {
                 rec.outcome("other");
                 return Err(e);
@@ -288,19 +291,60 @@ pub(crate) async fn refresh_feed(
             max_feed_bytes: fetch_settings.max_feed_bytes,
             proxy: settings.effective_proxy(),
         };
-        match fetcher.fetch(spec).await {
-            Ok(reply) => {
-                not_modified = matches!(reply, FetchReply::NotModified { .. });
-                match record_fetch_reply(&rec, &row, reply, force_conditionals_off) {
-                    Ok(parsed) => Ok(parsed),
-                    Err(e) => {
-                        rec.outcome("other");
-                        return Err(e);
-                    }
+        Retrieved::Http(fetcher.fetch(spec).await)
+    };
+
+    crate::db::blocking(|| {
+        store_refresh(
+            &rec,
+            &row,
+            retrieved,
+            force_conditionals_off,
+            settings,
+            task_tx,
+        )
+    })
+}
+
+/// What a refresh got back from the fetcher, before anything is stored.
+enum Retrieved {
+    /// A `file://` feed, read (and its row rescheduled) by
+    /// [`retrieve_file_feed`], and then parsed.
+    File(Result<(ParseOutcome, Schedule), FetcherError>),
+    /// The fetcher's reply for an HTTP(S) feed.
+    Http(Result<FetchReply, FetcherError>),
+}
+
+/// Record what a refresh retrieved: update the feed's row, store its
+/// entries, and queue the follow-up work.
+///
+/// Blocks on the database and on scripts, so async callers run it under
+/// [`crate::db::blocking`].
+fn store_refresh(
+    rec: &Recorder,
+    row: &FeedFetchRow,
+    retrieved: Retrieved,
+    force_conditionals_off: bool,
+    settings: &Settings,
+    task_tx: &async_channel::Sender<TaskManagerCommand>,
+) -> Result<()> {
+    let (feed_id, metrics) = (rec.feed_id, rec.metrics);
+
+    // Set when the server answers 304 Not Modified.
+    let mut not_modified = false;
+    let fetched = match retrieved {
+        Retrieved::File(parsed) => parsed.map(Some),
+        Retrieved::Http(Ok(reply)) => {
+            not_modified = matches!(reply, FetchReply::NotModified { .. });
+            match record_fetch_reply(rec, row, reply, force_conditionals_off) {
+                Ok(parsed) => Ok(parsed),
+                Err(e) => {
+                    rec.outcome("other");
+                    return Err(e);
                 }
             }
-            Err(e) => Err(e),
         }
+        Retrieved::Http(Err(e)) => Err(e),
     };
 
     let (parsed, schedule) = match fetched {
@@ -312,7 +356,9 @@ pub(crate) async fn refresh_feed(
         // one after its content changed.
         Ok(None) => {
             if not_modified {
-                queue_favicon_if_due(settings, &conn, task_tx, metrics, feed_id);
+                rec.db.read_blocking(|conn| {
+                    queue_favicon_if_due(settings, conn, task_tx, metrics, feed_id)
+                })?;
             }
             return Ok(());
         }
@@ -347,22 +393,24 @@ pub(crate) async fn refresh_feed(
             site_url,
             *feed,
             entries,
-            pool.get()?,
-            script_runner,
+            rec.db,
+            rec.script_runner,
             metrics,
         )?,
         ParsedFeed::Rss { entries, .. } => process_rss_feed(
             feed_id,
             site_url,
             entries,
-            pool.get()?,
-            script_runner,
+            rec.db,
+            rec.script_runner,
             metrics,
         )?,
     };
     enqueue_asset_caching(task_tx, metrics, &inserted.cache_assets);
-    queue_favicon_if_due(settings, &conn, task_tx, metrics, feed_id);
-    clear_feed_error(&conn, feed_id);
+    rec.db
+        .read_blocking(|conn| queue_favicon_if_due(settings, conn, task_tx, metrics, feed_id))?;
+    rec.db
+        .write_blocking(|conn| clear_feed_error(conn, feed_id))?;
     debug!(
         "{} refreshed with {} entries, {} new; next fetch {}",
         rec.label,
@@ -399,7 +447,7 @@ fn favicon_is_due(conn: &rusqlite::Connection, feed_id: i64) -> bool {
 
 /// Everything the outcome of one refresh is recorded against.
 struct Recorder<'a> {
-    pool: &'a Pool,
+    db: &'a Db,
     feed_id: i64,
     /// The feed as named in the logs; see [`feed_label`].
     label: String,
@@ -425,6 +473,7 @@ impl Recorder<'_> {
 
     /// Record a failed fetch: store `err` against the feed and reschedule
     /// it, fire `fetch.error` with `kind`, and count it under `outcome`.
+    ///
     fn fail_with(
         &self,
         err: FetchError,
@@ -434,9 +483,9 @@ impl Recorder<'_> {
         retry_after_ts: Option<i64>,
         stale_if_error: Option<u64>,
     ) {
-        let schedule = match self.pool.get() {
-            Ok(conn) => set_feed_error_with_schedule(
-                &conn,
+        let schedule = match self.db.write_blocking(|conn| {
+            set_feed_error_with_schedule(
+                conn,
                 self.feed_id,
                 &err,
                 retry_after_ts,
@@ -445,7 +494,9 @@ impl Recorder<'_> {
                 self.cfg.max_backoff,
                 self.cfg.min_fetch_interval,
                 self.metrics,
-            ),
+            )
+        }) {
+            Ok(schedule) => schedule,
             Err(e) => {
                 warn!("{}: could not record the error: {}", self.label, e);
                 None
@@ -485,7 +536,6 @@ fn record_fetch_reply(
     force_conditionals_off: bool,
 ) -> Result<Option<(ParseOutcome, Schedule)>> {
     let (feed_id, cfg, metrics) = (rec.feed_id, rec.cfg, rec.metrics);
-    let conn = rec.pool.get()?;
     let feed_url = row.url.as_str();
 
     let body = match reply {
@@ -530,8 +580,9 @@ fn record_fetch_reply(
             )
             .with_hint_source(hint_source(&headers, hints.hint_secs, &row.feed_hints));
             let next_fetch_at = schedule.next_fetch_at;
-            conn.execute(
-                "UPDATE feeds SET
+            rec.db.write_blocking(|conn| {
+                conn.execute(
+                    "UPDATE feeds SET
                     header_etag = ?1,
                     header_last_modified = ?2,
                     header_expires = ?3,
@@ -541,16 +592,17 @@ fn record_fetch_reply(
                     consecutive_failures = 0,
                     retry_after_at = NULL
                  WHERE id = ?7",
-                rusqlite::params![
-                    cache.etag,
-                    cache.last_modified,
-                    cache.expires,
-                    cache.immutable_until,
-                    now_ts,
-                    next_fetch_at,
-                    feed_id,
-                ],
-            )?;
+                    rusqlite::params![
+                        cache.etag,
+                        cache.last_modified,
+                        cache.expires,
+                        cache.immutable_until,
+                        now_ts,
+                        next_fetch_at,
+                        feed_id,
+                    ],
+                )
+            })??;
             debug!("{} was not modified; next fetch {}", rec.label, schedule);
             metrics.record_feed_cache_hit("not_modified");
             metrics.record_feed_retry_scheduled(
@@ -624,13 +676,22 @@ fn record_fetch_reply(
     } = *body;
     metrics.record_feed_redirects(redirects);
     let headers = headers.to_header_map();
-
     // If we followed a permanent redirect, the feed now lives at
     // `final_url`. If another feed has that URL already, the two are the
     // same feed, so this one is merged into it and there is nothing left
     // to store. Otherwise the stored URL is updated to match.
     if permanent_redirect && final_url != feed_url {
-        if let Some(merged) = merge_feed_into(&conn, feed_id, &final_url)? {
+        let merged = rec.db.write_blocking(|conn| -> Result<_> {
+            let merged = merge_feed_into(conn, feed_id, &final_url)?;
+            if merged.is_none() {
+                conn.execute(
+                    "UPDATE feeds SET url = ?1 WHERE id = ?2",
+                    (&final_url, feed_id),
+                )?;
+            }
+            Ok(merged)
+        })??;
+        if let Some(merged) = merged {
             info!(
                 "{} permanently redirected to {}, the URL of feed {}; merged it into that feed",
                 rec.label, final_url, merged.into
@@ -649,13 +710,9 @@ fn record_fetch_reply(
             return Ok(None);
         }
         info!(
-            "{} permanently redirected to {}; updating stored URL",
+            "{} permanently redirected to {}; updated the stored URL",
             rec.label, final_url
         );
-        conn.execute(
-            "UPDATE feeds SET url = ?1 WHERE id = ?2",
-            (&final_url, feed_id),
-        )?;
     }
 
     let now_ts = Utc::now().timestamp();
@@ -729,8 +786,9 @@ fn record_fetch_reply(
         metrics.record_feed_forced_refresh(if body_changed { "mismatch" } else { "match" });
     }
 
-    conn.execute(
-        "UPDATE feeds SET
+    rec.db.write_blocking(|conn| {
+        conn.execute(
+            "UPDATE feeds SET
             header_etag = ?,
             header_last_modified = ?,
             header_expires = ?,
@@ -746,22 +804,23 @@ fn record_fetch_reply(
             feed_skip_hours = ?,
             feed_skip_days = ?
          WHERE id = ?",
-        rusqlite::params![
-            etag.as_deref(),
-            last_modified.as_deref(),
-            expires,
-            immutable_until,
-            body_hash.as_deref(),
-            now_ts,
-            now_ts,
-            next_fetch_at,
-            feed_hints.ttl_secs.map(saturating_i64),
-            feed_hints.update_interval_secs.map(saturating_i64),
-            feed_hints.skip_hours,
-            feed_hints.skip_days,
-            feed_id,
-        ],
-    )?;
+            rusqlite::params![
+                etag.as_deref(),
+                last_modified.as_deref(),
+                expires,
+                immutable_until,
+                body_hash.as_deref(),
+                now_ts,
+                now_ts,
+                next_fetch_at,
+                feed_hints.ttl_secs.map(saturating_i64),
+                feed_hints.update_interval_secs.map(saturating_i64),
+                feed_hints.skip_hours,
+                feed_hints.skip_days,
+                feed_id,
+            ],
+        )
+    })??;
 
     metrics.record_feed_retry_scheduled(
         schedule.reason.metric_source(),
@@ -908,11 +967,9 @@ fn schedule_success(
 fn retrieve_file_feed(
     feed_url: &str,
     feed_id: i64,
-    pool: Pool,
+    db: &Db,
     cfg: SchedulerConfig,
 ) -> Result<(Vec<u8>, Schedule)> {
-    let conn = pool.get()?;
-
     // Extract the file path from the URL
     let file_path = feed_url.strip_prefix("file://").unwrap_or(feed_url);
 
@@ -933,15 +990,17 @@ fn retrieve_file_feed(
         cfg.min_fetch_interval,
     );
     let next_fetch_at = schedule.next_fetch_at;
-    conn.execute(
-        "UPDATE feeds SET
+    db.write_blocking(|conn| {
+        conn.execute(
+            "UPDATE feeds SET
             last_checked = ?1,
             next_fetch_at = ?2,
             consecutive_failures = 0,
             retry_after_at = NULL
          WHERE id = ?3",
-        (now_ts, next_fetch_at, feed_id),
-    )?;
+            (now_ts, next_fetch_at, feed_id),
+        )
+    })??;
 
     Ok((content, schedule))
 }

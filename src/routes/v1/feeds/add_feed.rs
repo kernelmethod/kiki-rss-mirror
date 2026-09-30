@@ -7,7 +7,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use tokio::task;
 use tracing::{event, Level};
 
 struct AddFeedQueryResult(i64);
@@ -71,14 +70,6 @@ pub async fn add_feed(
         return (StatusCode::BAD_REQUEST, format!("{e}")).into_response();
     }
 
-    let conn = match state.conn_pool.get() {
-        Ok(conn) => conn,
-        Err(e) => {
-            event!(Level::ERROR, "failed to get database connection: {:?}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
-        }
-    };
-
     let title = payload.title;
     let url = payload.url;
     let fetch_interval = state
@@ -91,29 +82,31 @@ pub async fn add_feed(
 
     // The rusqlite interface is synchronous so we must run the INSERT statement
     // on a blocking thread.
-    let task_result = task::spawn_blocking(move || -> Result<i64, rusqlite::Error> {
-        let mut stmt = conn.prepare(
-            "INSERT INTO feeds
+    let task_result = state
+        .db
+        .write(move |conn| -> Result<i64, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "INSERT INTO feeds
                 (title, url, auth_type, auth_username, auth_password, auth_bearer_token,
                  min_fetch_interval_seconds)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              RETURNING id",
-        )?;
-        stmt.query_row(
-            rusqlite::params![
-                title,
-                url,
-                auth.auth_type.as_db(),
-                auth.username,
-                auth.password,
-                auth.bearer_token,
-                fetch_interval,
-            ],
-            |row| Ok(AddFeedQueryResult(row.get(0)?)),
-        )
-        .map(|r| r.0)
-    })
-    .await;
+            )?;
+            stmt.query_row(
+                rusqlite::params![
+                    title,
+                    url,
+                    auth.auth_type.as_db(),
+                    auth.username,
+                    auth.password,
+                    auth.bearer_token,
+                    fetch_interval,
+                ],
+                |row| Ok(AddFeedQueryResult(row.get(0)?)),
+            )
+            .map(|r| r.0)
+        })
+        .await;
 
     let id = match task_result {
         Ok(Ok(id)) => id,

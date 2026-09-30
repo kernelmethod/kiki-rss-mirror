@@ -8,7 +8,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task;
 use tracing::{event, Level};
 
 const SECTION: &str = "feed_fetch";
@@ -154,18 +153,19 @@ pub async fn put_feed_fetch_settings(
 /// rather than reported: the new cap still applies from each feed's next
 /// fetch.
 async fn cap_scheduled_fetches(state: &AppState, max_backoff_seconds: u64) {
-    let pool = state.conn_pool.clone();
+    let db = state.db.clone();
     let latest = chrono::Utc::now()
         .timestamp()
         .saturating_add(i64::try_from(max_backoff_seconds).unwrap_or(i64::MAX));
-    let result = task::spawn_blocking(move || {
-        pool.get()?.execute(
-            "UPDATE feeds SET next_fetch_at = ?1 WHERE next_fetch_at > ?1",
-            [latest],
-        )?;
-        Ok::<(), anyhow::Error>(())
-    })
-    .await;
+    let result = db
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE feeds SET next_fetch_at = ?1 WHERE next_fetch_at > ?1",
+                [latest],
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => event!(Level::WARN, "failed to apply the new backoff cap: {:#}", e),

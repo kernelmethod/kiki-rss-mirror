@@ -5,22 +5,17 @@ use super::super::*;
 use crate::scripting::ScriptRunner;
 use crate::test::TestBuilder;
 use anyhow::Result;
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::OpenFlags;
 
-fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
-    let manager = SqliteConnectionManager::file(path)
-        .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-        .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager.into())?)
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Db> {
+    crate::db::Db::open(path, Default::default())
 }
 
 /// Insert a feed and install a Lua plugin, then return the feed id, an
-/// HTTP client, and a connection pool ready to call [`refresh_feed`].
+/// HTTP client, and a database handle ready to call [`refresh_feed`].
 async fn setup_feed_with_script(
     tc: &crate::test::TestConfig,
     script_text: &str,
-) -> Result<(i64, reqwest::Client, crate::db::Pool)> {
+) -> Result<(i64, reqwest::Client, crate::db::Db)> {
     setup_feed_with_configured_script(tc, script_text, serde_json::json!({})).await
 }
 
@@ -29,7 +24,7 @@ async fn setup_feed_with_configured_script(
     tc: &crate::test::TestConfig,
     script_text: &str,
     config: serde_json::Value,
-) -> Result<(i64, reqwest::Client, crate::db::Pool)> {
+) -> Result<(i64, reqwest::Client, crate::db::Db)> {
     let conn = tc.database_conn()?;
     conn.execute(
         "INSERT INTO feeds (title, url) VALUES ('test feed', ?1)",

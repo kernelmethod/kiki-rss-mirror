@@ -7,7 +7,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task;
 use tracing::{event, Level};
 
 #[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
@@ -39,28 +38,25 @@ pub async fn get_tag(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
-
-    let result = task::spawn_blocking(move || {
-        conn.prepare("SELECT id, name, kind FROM tags WHERE id = ?1")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| {
-                Ok(GetTagResponse {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    kind: row.get(2)?,
+    let result = state
+        .db
+        .read(move |conn| {
+            conn.prepare("SELECT id, name, kind FROM tags WHERE id = ?1")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([id], |row| {
+                    Ok(GetTagResponse {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        kind: row.get(2)?,
+                    })
                 })
-            })
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in get_tag: {:?}", e);
-    });
+        })
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in get_tag: {:?}", e);
+        });
 
     match result {
         Ok(Ok(tag)) => Ok(Json(tag).into_response()),

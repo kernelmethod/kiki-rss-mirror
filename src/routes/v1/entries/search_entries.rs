@@ -9,7 +9,6 @@ use axum::{
 use rusqlite::types::ToSqlOutput;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::task;
 use tracing::{event, Level};
 
 /// A tag filter expression supporting AND/OR combinations.
@@ -323,181 +322,180 @@ pub async fn search_entries(
         }
     }
 
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
-
     let offset = payload.offset.unwrap_or(0);
     let limit = payload.limit.unwrap_or(DEFAULT_LIMIT);
 
-    let result = task::spawn_blocking(move || {
-        let mut conditions: Vec<String> = Vec::new();
-        let mut params: Vec<SqlParam> = Vec::new();
-        let mut next_idx: usize = 1;
+    let result = state
+        .db
+        .read(move |conn| {
+            let mut conditions: Vec<String> = Vec::new();
+            let mut params: Vec<SqlParam> = Vec::new();
+            let mut next_idx: usize = 1;
 
-        let use_fts = payload.query.is_some();
+            let use_fts = payload.query.is_some();
 
-        // FTS5 MATCH condition
-        if let Some(ref query) = payload.query {
-            conditions.push(format!("entries_fts MATCH ?{}", next_idx));
-            params.push(SqlParam::from_string(query.clone()));
-            next_idx += 1;
-        }
+            // FTS5 MATCH condition
+            if let Some(ref query) = payload.query {
+                conditions.push(format!("entries_fts MATCH ?{}", next_idx));
+                params.push(SqlParam::from_string(query.clone()));
+                next_idx += 1;
+            }
 
-        // Tag filter
-        if let Some(ref tag_filter) = payload.tags {
-            let (cond, new_idx) = build_tag_condition(tag_filter, &mut params, next_idx)?;
-            conditions.push(cond);
-            next_idx = new_idx;
-        }
+            // Tag filter
+            if let Some(ref tag_filter) = payload.tags {
+                let (cond, new_idx) = build_tag_condition(tag_filter, &mut params, next_idx)?;
+                conditions.push(cond);
+                next_idx = new_idx;
+            }
 
-        // Feed filter
-        if let Some(feed_id) = payload.feed_id {
-            conditions.push(format!("e.feed_id = ?{}", next_idx));
-            params.push(SqlParam::from_i64(feed_id));
-            next_idx += 1;
-        }
+            // Feed filter
+            if let Some(feed_id) = payload.feed_id {
+                conditions.push(format!("e.feed_id = ?{}", next_idx));
+                params.push(SqlParam::from_i64(feed_id));
+                next_idx += 1;
+            }
 
-        // Date filters
-        if let Some(ref after) = payload.published_after {
-            let ts = parse_rfc3339_to_timestamp(after)?;
-            conditions.push(format!("e.published_at >= ?{}", next_idx));
-            params.push(SqlParam::from_i64(ts));
-            next_idx += 1;
-        }
-        if let Some(ref before) = payload.published_before {
-            let ts = parse_rfc3339_to_timestamp(before)?;
-            conditions.push(format!("e.published_at < ?{}", next_idx));
-            params.push(SqlParam::from_i64(ts));
-            next_idx += 1;
-        }
+            // Date filters
+            if let Some(ref after) = payload.published_after {
+                let ts = parse_rfc3339_to_timestamp(after)?;
+                conditions.push(format!("e.published_at >= ?{}", next_idx));
+                params.push(SqlParam::from_i64(ts));
+                next_idx += 1;
+            }
+            if let Some(ref before) = payload.published_before {
+                let ts = parse_rfc3339_to_timestamp(before)?;
+                conditions.push(format!("e.published_at < ?{}", next_idx));
+                params.push(SqlParam::from_i64(ts));
+                next_idx += 1;
+            }
 
-        // GLOB filters
-        if let Some(ref glob) = payload.title_glob {
-            conditions.push(format!("e.title GLOB ?{}", next_idx));
-            params.push(SqlParam::from_string(glob.clone()));
-            next_idx += 1;
-        }
-        if let Some(ref glob) = payload.content_glob {
-            conditions.push(format!("COALESCE(e.content, '') GLOB ?{}", next_idx));
-            params.push(SqlParam::from_string(glob.clone()));
-            next_idx += 1;
-        }
-        if let Some(ref glob) = payload.url_glob {
-            conditions.push(format!("e.url GLOB ?{}", next_idx));
-            params.push(SqlParam::from_string(glob.clone()));
-            next_idx += 1;
-        }
+            // GLOB filters
+            if let Some(ref glob) = payload.title_glob {
+                conditions.push(format!("e.title GLOB ?{}", next_idx));
+                params.push(SqlParam::from_string(glob.clone()));
+                next_idx += 1;
+            }
+            if let Some(ref glob) = payload.content_glob {
+                conditions.push(format!("COALESCE(e.content, '') GLOB ?{}", next_idx));
+                params.push(SqlParam::from_string(glob.clone()));
+                next_idx += 1;
+            }
+            if let Some(ref glob) = payload.url_glob {
+                conditions.push(format!("e.url GLOB ?{}", next_idx));
+                params.push(SqlParam::from_string(glob.clone()));
+                next_idx += 1;
+            }
 
-        // REGEXP filters
-        if let Some(ref pat) = payload.title_regex {
-            conditions.push(format!("e.title REGEXP ?{}", next_idx));
-            params.push(SqlParam::from_string(pat.clone()));
-            next_idx += 1;
-        }
-        if let Some(ref pat) = payload.content_regex {
-            conditions.push(format!("COALESCE(e.content, '') REGEXP ?{}", next_idx));
-            params.push(SqlParam::from_string(pat.clone()));
-            next_idx += 1;
-        }
-        if let Some(ref pat) = payload.url_regex {
-            conditions.push(format!("e.url REGEXP ?{}", next_idx));
-            params.push(SqlParam::from_string(pat.clone()));
-            next_idx += 1;
-        }
+            // REGEXP filters
+            if let Some(ref pat) = payload.title_regex {
+                conditions.push(format!("e.title REGEXP ?{}", next_idx));
+                params.push(SqlParam::from_string(pat.clone()));
+                next_idx += 1;
+            }
+            if let Some(ref pat) = payload.content_regex {
+                conditions.push(format!("COALESCE(e.content, '') REGEXP ?{}", next_idx));
+                params.push(SqlParam::from_string(pat.clone()));
+                next_idx += 1;
+            }
+            if let Some(ref pat) = payload.url_regex {
+                conditions.push(format!("e.url REGEXP ?{}", next_idx));
+                params.push(SqlParam::from_string(pat.clone()));
+                next_idx += 1;
+            }
 
-        let from_clause = if use_fts {
-            "entries e JOIN entries_fts ON e.id = entries_fts.rowid"
-        } else {
-            "entries e"
-        };
-
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", conditions.join(" AND "))
-        };
-
-        // Count query
-        let count_sql = format!("SELECT COUNT(*) FROM {}{}", from_clause, where_clause);
-        let count: usize = conn
-            .prepare(&count_sql)
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row(rusqlite::params_from_iter(params.iter()), |row| row.get(0))?;
-
-        // Determine rank column and order clause
-        let (rank_expr, order_clause) = if use_fts {
-            let sort = payload.sort.as_deref().unwrap_or("published_at");
-            let order = if sort == "relevance" {
-                "bm25(entries_fts)".to_string()
+            let from_clause = if use_fts {
+                "entries e JOIN entries_fts ON e.id = entries_fts.rowid"
             } else {
-                "e.published_at DESC, e.id DESC".to_string()
+                "entries e"
             };
-            ("bm25(entries_fts)", order)
-        } else {
-            ("NULL", "e.published_at DESC, e.id DESC".to_string())
-        };
 
-        // Data query
-        let data_sql = format!(
-            "SELECT e.id, e.feed_id, e.source_id, e.syndication_format, \
+            let where_clause = if conditions.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", conditions.join(" AND "))
+            };
+
+            // Count query
+            let count_sql = format!("SELECT COUNT(*) FROM {}{}", from_clause, where_clause);
+            let count: usize = conn
+                .prepare(&count_sql)
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row(rusqlite::params_from_iter(params.iter()), |row| row.get(0))?;
+
+            // Determine rank column and order clause
+            let (rank_expr, order_clause) = if use_fts {
+                let sort = payload.sort.as_deref().unwrap_or("published_at");
+                let order = if sort == "relevance" {
+                    "bm25(entries_fts)".to_string()
+                } else {
+                    "e.published_at DESC, e.id DESC".to_string()
+                };
+                ("bm25(entries_fts)", order)
+            } else {
+                ("NULL", "e.published_at DESC, e.id DESC".to_string())
+            };
+
+            // Data query
+            let data_sql = format!(
+                "SELECT e.id, e.feed_id, e.source_id, e.syndication_format, \
              e.guid, e.published_at, e.title, e.url, e.content, {}, \
              {} \
              FROM {}{} ORDER BY {} LIMIT ?{} OFFSET ?{}",
-            crate::db::favicons::favicon_hash_sql("e.feed_id"),
-            rank_expr,
-            from_clause,
-            where_clause,
-            order_clause,
-            next_idx,
-            next_idx + 1
-        );
-        params.push(SqlParam::from_usize(limit));
-        params.push(SqlParam::from_usize(offset));
+                crate::db::favicons::favicon_hash_sql("e.feed_id"),
+                rank_expr,
+                from_clause,
+                where_clause,
+                order_clause,
+                next_idx,
+                next_idx + 1
+            );
+            params.push(SqlParam::from_usize(limit));
+            params.push(SqlParam::from_usize(offset));
 
-        let entries = conn
-            .prepare(&data_sql)
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                let rank: Option<f64> = row.get(10)?;
-                Ok(SearchEntriesResponseEntry {
-                    entry: ListEntriesResponseEntry {
-                        id: row.get(0)?,
-                        feed_id: row.get(1)?,
-                        source_id: row.get(2)?,
-                        syndication_format: row.get(3)?,
-                        guid: row.get(4)?,
-                        published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
-                            .map(|d| d.to_rfc3339()),
-                        title: row.get(6)?,
-                        url: row.get(7)?,
-                        content: row.get(8)?,
-                        feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
-                    },
-                    rank,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .inspect_err(|e| {
-                event!(Level::ERROR, "failed to collect search results: {:?}", e);
-            })?;
+            let entries = conn
+                .prepare(&data_sql)
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                    let rank: Option<f64> = row.get(10)?;
+                    Ok(SearchEntriesResponseEntry {
+                        entry: ListEntriesResponseEntry {
+                            id: row.get(0)?,
+                            feed_id: row.get(1)?,
+                            source_id: row.get(2)?,
+                            syndication_format: row.get(3)?,
+                            guid: row.get(4)?,
+                            published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
+                                .map(|d| d.to_rfc3339()),
+                            title: row.get(6)?,
+                            url: row.get(7)?,
+                            content: row.get(8)?,
+                            feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(
+                                row, 9,
+                            )?,
+                        },
+                        rank,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "failed to collect search results: {:?}", e);
+                })?;
 
-        Ok::<SearchEntriesResponse, SearchEntriesError>(SearchEntriesResponse {
-            count,
-            offset,
-            limit,
-            entries,
+            Ok::<SearchEntriesResponse, SearchEntriesError>(SearchEntriesResponse {
+                count,
+                offset,
+                limit,
+                entries,
+            })
         })
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in search_entries: {:?}", e);
-    });
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in search_entries: {:?}", e);
+        });
 
     match result {
         Ok(Ok(response)) => Ok(Json(response).into_response()),

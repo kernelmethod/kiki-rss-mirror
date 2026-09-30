@@ -20,7 +20,7 @@
 //! where to look, and stores what is found.
 use crate::config::ProxySettings;
 use crate::db::favicons;
-use crate::db::Pool;
+use crate::db::Db;
 use crate::fetcher::assets::{resolve_http_url, AssetKind, PageProblem, PageSpec};
 use crate::fetcher::Fetcher;
 use crate::tasks::assets::{self, AssetCache};
@@ -55,7 +55,7 @@ pub(crate) fn resolve_site_url(raw: &str, feed_url: &str) -> Option<Url> {
 pub(crate) async fn cache_feed_favicon(
     fetcher: &Fetcher,
     proxy: &ProxySettings,
-    pool: &Pool,
+    db: &Db,
     data_dir: &std::path::Path,
     settings: &crate::config::AssetCacheSettings,
     feed_id: i64,
@@ -66,17 +66,16 @@ pub(crate) async fn cache_feed_favicon(
     let cache = AssetCache {
         fetcher,
         proxy,
-        pool,
+        db,
         data_dir,
         max_bytes: settings.max_bytes,
     };
 
-    let (feed_url, site_url, atom_icon) = {
-        let conn = pool.get()?;
-        if !is_due(&conn, feed_id)? {
-            return Ok(());
+    let row = db.read_blocking(|conn| -> Result<_> {
+        if !is_due(conn, feed_id)? {
+            return Ok(None);
         }
-        let row = conn
+        Ok(conn
             .query_row(
                 "SELECT f.url, f.site_url, ai.uri
                  FROM feeds f
@@ -95,11 +94,10 @@ pub(crate) async fn cache_feed_favicon(
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
-            })?;
-        match row {
-            Some(r) => r,
-            None => return Ok(()),
-        }
+            })?)
+    })??;
+    let Some((feed_url, site_url, atom_icon)) = row else {
+        return Ok(());
     };
 
     let feed_url = feed_url.as_deref().and_then(|u| Url::parse(u).ok());
@@ -156,7 +154,7 @@ pub(crate) async fn cache_feed_favicon(
         feed_id,
         candidates.len()
     );
-    favicons::record_check(&*pool.get()?, feed_id, None)?;
+    db.write_blocking(|conn| favicons::record_check(conn, feed_id, None))??;
     Ok(())
 }
 

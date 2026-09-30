@@ -133,9 +133,13 @@ where
 
     let runtime = state.plugins.clone();
     let result = task::spawn_blocking(move || {
-        let mut conn = runtime.pool().get()?;
-        let overrides = op(&mut conn, &name).map_err(anyhow::Error::from)?;
-        drop(conn);
+        // The connection is returned before the reload, which reads the
+        // config overrides on a connection of its own.
+        let overrides = match access {
+            Access::Read => runtime.db().read_blocking(|conn| op(conn, &name)),
+            Access::Write => runtime.db().write_blocking(|conn| op(conn, &name)),
+        }?
+        .map_err(anyhow::Error::from)?;
         let reload_error = match access {
             Access::Read => None,
             Access::Write => runtime.reload().err().map(|e| {

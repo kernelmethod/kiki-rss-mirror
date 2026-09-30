@@ -7,16 +7,11 @@ use super::super::*;
 use crate::test::TestBuilder;
 use anyhow::Result;
 use axum::{response::IntoResponse, routing::get, Router};
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::OpenFlags;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
-    let manager = SqliteConnectionManager::file(path)
-        .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-        .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager.into())?)
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Db> {
+    crate::db::Db::open(path, Default::default())
 }
 
 /// One-pixel PNG.
@@ -144,7 +139,7 @@ async fn start_server(site: Site) -> Result<Server> {
 /// A test database with one feed, whose favicon tasks are run by hand.
 struct Harness {
     tc: crate::test::TestConfig,
-    pool: crate::db::Pool,
+    pool: crate::db::Db,
     client: reqwest::Client,
     feed_id: i64,
     cache: crate::config::AssetCacheSettings,

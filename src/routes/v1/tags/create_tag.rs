@@ -8,7 +8,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::task;
 use tracing::{event, Level};
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
@@ -56,38 +55,35 @@ pub async fn create_tag(
         return Err(reserved_name_response());
     }
 
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let result = state
+        .db
+        .write(move |conn| {
+            let result = conn
+                .prepare("INSERT INTO tags (name, kind) VALUES (?1, 'user') RETURNING id, name")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([&payload.name], |row| {
+                    Ok(CreateTagResponse {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                    })
+                });
 
-    let result = task::spawn_blocking(move || {
-        let result = conn
-            .prepare("INSERT INTO tags (name, kind) VALUES (?1, 'user') RETURNING id, name")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([&payload.name], |row| {
-                Ok(CreateTagResponse {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                })
-            });
-
-        match result {
-            Ok(tag) => Ok(tag),
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                Err(CreateTagTaskError::AlreadyExists)
+            match result {
+                Ok(tag) => Ok(tag),
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    Err(CreateTagTaskError::AlreadyExists)
+                }
+                Err(e) => Err(CreateTagTaskError::Database(e)),
             }
-            Err(e) => Err(CreateTagTaskError::Database(e)),
-        }
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in create_tag: {:?}", e);
-    });
+        })
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in create_tag: {:?}", e);
+        });
 
     match result {
         Ok(Ok(tag)) => Ok((StatusCode::CREATED, Json(tag)).into_response()),

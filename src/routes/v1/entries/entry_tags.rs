@@ -8,7 +8,6 @@ use axum::{
 use rusqlite::TransactionBehavior;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::task;
 use tracing::{event, Level};
 
 use crate::db::tags::{SystemTag, TagKind};
@@ -65,32 +64,29 @@ pub async fn get_entry_tags(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let result = state
+        .db
+        .read(move |conn| {
+            // Check if entry exists
+            let exists: bool = conn
+                .prepare("SELECT EXISTS(SELECT 1 FROM entries WHERE id = ?1)")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([id], |row| row.get(0))?;
 
-    let result = task::spawn_blocking(move || {
-        // Check if entry exists
-        let exists: bool = conn
-            .prepare("SELECT EXISTS(SELECT 1 FROM entries WHERE id = ?1)")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| row.get(0))?;
+            if !exists {
+                return Err(EntryTagsTaskError::EntryNotFound);
+            }
 
-        if !exists {
-            return Err(EntryTagsTaskError::EntryNotFound);
-        }
+            let tags = load_entry_tags(conn, id)?;
 
-        let tags = load_entry_tags(&conn, id)?;
-
-        Ok::<GetEntryTagsResponse, EntryTagsTaskError>(GetEntryTagsResponse { tags })
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in get_entry_tags: {:?}", e);
-    });
+            Ok::<GetEntryTagsResponse, EntryTagsTaskError>(GetEntryTagsResponse { tags })
+        })
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in get_entry_tags: {:?}", e);
+        });
 
     match result {
         Ok(Ok(response)) => Ok(Json(response).into_response()),
@@ -130,85 +126,82 @@ pub async fn set_entry_tags(
     Path(id): Path<i64>,
     Json(payload): Json<SetEntryTagsRequest>,
 ) -> Result<Response, Response> {
-    let mut conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let result = state
+        .db
+        .write(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to begin transaction: {:?}", e);
+                })?;
 
-    let result = task::spawn_blocking(move || {
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to begin transaction: {:?}", e);
-            })?;
-
-        // Check if entry exists
-        let exists: bool = tx
-            .prepare("SELECT EXISTS(SELECT 1 FROM entries WHERE id = ?1)")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| row.get(0))?;
-
-        if !exists {
-            return Err(EntryTagsTaskError::EntryNotFound);
-        }
-
-        // Validate all tag IDs exist and are user tags
-        for &tag_id in &payload.tag_ids {
-            let kind = tx
-                .prepare("SELECT kind FROM tags WHERE id = ?1")
+            // Check if entry exists
+            let exists: bool = tx
+                .prepare("SELECT EXISTS(SELECT 1 FROM entries WHERE id = ?1)")
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
                 })?
-                .query_row([tag_id], |row| row.get::<_, TagKind>(0));
+                .query_row([id], |row| row.get(0))?;
 
-            match kind {
-                Ok(TagKind::User) => {}
-                Ok(TagKind::System) => return Err(EntryTagsTaskError::SystemTag(tag_id)),
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    return Err(EntryTagsTaskError::TagNotFound(tag_id))
-                }
-                Err(e) => return Err(e.into()),
+            if !exists {
+                return Err(EntryTagsTaskError::EntryNotFound);
             }
-        }
 
-        // Delete existing user tag associations
-        tx.prepare(
-            "DELETE FROM entry_tags WHERE entry_id = ?1
-             AND tag_id IN (SELECT id FROM tags WHERE kind = 'user')",
-        )
-        .inspect_err(|e| {
-            event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-        })?
-        .execute([id])?;
-
-        // Insert new associations
-        {
-            let mut stmt = tx
-                .prepare("INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)")
-                .inspect_err(|e| {
-                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-                })?;
-
+            // Validate all tag IDs exist and are user tags
             for &tag_id in &payload.tag_ids {
-                stmt.execute(rusqlite::params![id, tag_id])?;
+                let kind = tx
+                    .prepare("SELECT kind FROM tags WHERE id = ?1")
+                    .inspect_err(|e| {
+                        event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                    })?
+                    .query_row([tag_id], |row| row.get::<_, TagKind>(0));
+
+                match kind {
+                    Ok(TagKind::User) => {}
+                    Ok(TagKind::System) => return Err(EntryTagsTaskError::SystemTag(tag_id)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        return Err(EntryTagsTaskError::TagNotFound(tag_id))
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
-        }
 
-        // Return the updated tags
-        let tags = load_entry_tags(&tx, id)?;
+            // Delete existing user tag associations
+            tx.prepare(
+                "DELETE FROM entry_tags WHERE entry_id = ?1
+             AND tag_id IN (SELECT id FROM tags WHERE kind = 'user')",
+            )
+            .inspect_err(|e| {
+                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+            })?
+            .execute([id])?;
 
-        tx.commit().inspect_err(|e| {
-            event!(Level::ERROR, "unable to commit transaction: {:?}", e);
-        })?;
+            // Insert new associations
+            {
+                let mut stmt = tx
+                    .prepare("INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)")
+                    .inspect_err(|e| {
+                        event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                    })?;
 
-        Ok::<GetEntryTagsResponse, EntryTagsTaskError>(GetEntryTagsResponse { tags })
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in set_entry_tags: {:?}", e);
-    });
+                for &tag_id in &payload.tag_ids {
+                    stmt.execute(rusqlite::params![id, tag_id])?;
+                }
+            }
+
+            // Return the updated tags
+            let tags = load_entry_tags(&tx, id)?;
+
+            tx.commit().inspect_err(|e| {
+                event!(Level::ERROR, "unable to commit transaction: {:?}", e);
+            })?;
+
+            Ok::<GetEntryTagsResponse, EntryTagsTaskError>(GetEntryTagsResponse { tags })
+        })
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in set_entry_tags: {:?}", e);
+        });
 
     match result {
         Ok(Ok(response)) => Ok(Json(response).into_response()),
@@ -297,50 +290,47 @@ async fn update_entry_system_tag(
     name: String,
     add: bool,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let result = state
+        .db
+        .write(move |conn| {
+            let system_tag: SystemTag = name
+                .parse()
+                .map_err(|_| EntryTagsTaskError::UnknownSystemTag(name))?;
 
-    let result = task::spawn_blocking(move || {
-        let system_tag: SystemTag = name
-            .parse()
-            .map_err(|_| EntryTagsTaskError::UnknownSystemTag(name))?;
+            let exists: bool = conn
+                .prepare("SELECT EXISTS(SELECT 1 FROM entries WHERE id = ?1)")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([id], |row| row.get(0))?;
 
-        let exists: bool = conn
-            .prepare("SELECT EXISTS(SELECT 1 FROM entries WHERE id = ?1)")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| row.get(0))?;
+            if !exists {
+                return Err(EntryTagsTaskError::EntryNotFound);
+            }
 
-        if !exists {
-            return Err(EntryTagsTaskError::EntryNotFound);
-        }
+            let tag_id = system_tag.id(conn)?;
+            let sql = if add {
+                "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)"
+            } else {
+                "DELETE FROM entry_tags WHERE entry_id = ?1 AND tag_id = ?2"
+            };
+            conn.prepare(sql)
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .execute([id, tag_id])?;
 
-        let tag_id = system_tag.id(&conn)?;
-        let sql = if add {
-            "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)"
-        } else {
-            "DELETE FROM entry_tags WHERE entry_id = ?1 AND tag_id = ?2"
-        };
-        conn.prepare(sql)
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .execute([id, tag_id])?;
-
-        let tags = load_entry_tags(&conn, id)?;
-        Ok::<GetEntryTagsResponse, EntryTagsTaskError>(GetEntryTagsResponse { tags })
-    })
-    .await
-    .inspect_err(|e| {
-        event!(
-            Level::ERROR,
-            "task error in update_entry_system_tag: {:?}",
-            e
-        );
-    });
+            let tags = load_entry_tags(conn, id)?;
+            Ok::<GetEntryTagsResponse, EntryTagsTaskError>(GetEntryTagsResponse { tags })
+        })
+        .await
+        .inspect_err(|e| {
+            event!(
+                Level::ERROR,
+                "task error in update_entry_system_tag: {:?}",
+                e
+            );
+        });
 
     match result {
         Ok(Ok(response)) => Ok(Json(response).into_response()),

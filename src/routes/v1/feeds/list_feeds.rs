@@ -7,7 +7,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use tokio::task;
 use tracing::{event, Level};
 
 const DEFAULT_LIMIT: usize = 50;
@@ -60,15 +59,10 @@ pub async fn list_feeds(
     State(state): State<AppState>,
     Query(params): Query<ListFeedsQueryParams>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        let error = ListFeedsError::default();
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response()
-    })?;
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
 
-    let result = task::spawn_blocking(move || {
+    let result = state.db.read(move |conn| {
         let count = conn
             .prepare("SELECT COUNT(*) FROM feeds")
             .inspect_err(|e| {

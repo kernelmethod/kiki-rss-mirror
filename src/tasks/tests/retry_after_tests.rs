@@ -11,22 +11,17 @@ use axum::{
     Router,
 };
 use chrono::Utc;
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::OpenFlags;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn make_pool(path: &std::path::Path) -> Result<crate::db::Pool> {
-    let manager = SqliteConnectionManager::file(path)
-        .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-        .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager.into())?)
+fn make_pool(path: &std::path::Path) -> Result<crate::db::Db> {
+    crate::db::Db::open(path, Default::default())
 }
 
 fn setup_feed(
     tc: &crate::test::TestConfig,
     feed_url: &str,
-) -> Result<(i64, reqwest::Client, crate::db::Pool)> {
+) -> Result<(i64, reqwest::Client, crate::db::Db)> {
     let conn = tc.database_conn()?;
     conn.execute(
         "INSERT INTO feeds (title, url) VALUES ('retry-after test feed', ?1)",

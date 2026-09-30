@@ -1,5 +1,5 @@
 use crate::config::ProxySettings;
-use crate::db::Pool;
+use crate::db::Db;
 use crate::fetcher::Fetcher;
 use crate::tasks::assets::{self, AssetCache};
 use anyhow::Result;
@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 pub(crate) async fn cache_entry_assets(
     fetcher: &Fetcher,
     proxy: &ProxySettings,
-    pool: &Pool,
+    db: &Db,
     data_dir: &std::path::Path,
     settings: &crate::config::AssetCacheSettings,
     entry_id: i64,
@@ -32,7 +32,7 @@ pub(crate) async fn cache_entry_assets(
     let cache = AssetCache {
         fetcher,
         proxy,
-        pool,
+        db,
         data_dir,
         max_bytes: settings.max_bytes,
     };
@@ -44,41 +44,38 @@ pub(crate) async fn cache_entry_assets(
         enclosure_url: Option<String>,
     }
 
-    let ctx = {
-        let conn = pool.get()?;
-        let row = conn
-            .query_row(
-                "SELECT e.content, f.url, e.url, red.enclosure_url
+    let ctx = db.read_blocking(|conn| {
+        conn.query_row(
+            "SELECT e.content, f.url, e.url, red.enclosure_url
                  FROM entries e
                  LEFT JOIN feeds f ON f.id = e.feed_id
                  LEFT JOIN rss_entry_data red ON red.entry_id = e.id
                  WHERE e.id = ?1",
-                [entry_id],
-                |row| {
-                    let content: Option<String> = row.get(0)?;
-                    let feed_url: Option<String> = row.get(1)?;
-                    let entry_url: Option<String> = row.get(2)?;
-                    let enclosure_url: Option<String> = row.get(3)?;
-                    // Prefer the entry URL as the resolution base; fall back
-                    // to the feed URL so relative URLs still work when the
-                    // entry URL is empty.
-                    let base = entry_url.filter(|s| !s.is_empty()).or(feed_url);
-                    Ok(EntryCtx {
-                        content,
-                        base,
-                        enclosure_url,
-                    })
-                },
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other),
-            })?;
-        match row {
-            Some(r) => r,
-            None => return Ok(()),
-        }
+            [entry_id],
+            |row| {
+                let content: Option<String> = row.get(0)?;
+                let feed_url: Option<String> = row.get(1)?;
+                let entry_url: Option<String> = row.get(2)?;
+                let enclosure_url: Option<String> = row.get(3)?;
+                // Prefer the entry URL as the resolution base; fall back
+                // to the feed URL so relative URLs still work when the
+                // entry URL is empty.
+                let base = entry_url.filter(|s| !s.is_empty()).or(feed_url);
+                Ok(EntryCtx {
+                    content,
+                    base,
+                    enclosure_url,
+                })
+            },
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+    })??;
+    let Some(ctx) = ctx else {
+        return Ok(());
     };
 
     let base = match ctx.base.as_deref().and_then(|s| Url::parse(s).ok()) {

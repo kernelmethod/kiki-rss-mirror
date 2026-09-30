@@ -7,7 +7,6 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Redirect, Response},
 };
-use tokio::task;
 use tracing::{event, Level};
 
 /// Get a feed's favicon
@@ -32,20 +31,20 @@ pub async fn feed_favicon(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, Response> {
-    let pool = state.conn_pool.clone();
-    let hash = task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
-        let conn = pool.get()?;
-        crate::db::favicons::favicon_hash(&conn, id)
-    })
-    .await
-    .map_err(|e| {
-        event!(Level::ERROR, "task error in feed_favicon: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?
-    .map_err(|e| {
-        event!(Level::ERROR, "db error in feed_favicon: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let db = state.db.clone();
+    let hash = db
+        .read(move |conn| -> anyhow::Result<Option<String>> {
+            crate::db::favicons::favicon_hash(conn, id)
+        })
+        .await
+        .map_err(|e| {
+            event!(Level::ERROR, "task error in feed_favicon: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })?
+        .map_err(|e| {
+            event!(Level::ERROR, "db error in feed_favicon: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })?;
 
     match hash {
         Some(hash) => Ok(Redirect::to(&asset_url(&hash)).into_response()),

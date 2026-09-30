@@ -9,7 +9,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::task;
 use tracing::{event, Level};
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
@@ -71,57 +70,54 @@ pub async fn update_tag(
         return Err(reserved_name_response());
     }
 
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let result = state
+        .db
+        .write(move |conn| {
+            // Check that the tag exists and is a user tag
+            let kind = conn
+                .prepare("SELECT kind FROM tags WHERE id = ?1")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([id], |row| row.get::<_, TagKind>(0));
 
-    let result = task::spawn_blocking(move || {
-        // Check that the tag exists and is a user tag
-        let kind = conn
-            .prepare("SELECT kind FROM tags WHERE id = ?1")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| row.get::<_, TagKind>(0));
-
-        match kind {
-            Ok(TagKind::User) => {}
-            Ok(TagKind::System) => return Err(UpdateTagTaskError::SystemTag),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err(UpdateTagTaskError::TagNotFound)
+            match kind {
+                Ok(TagKind::User) => {}
+                Ok(TagKind::System) => return Err(UpdateTagTaskError::SystemTag),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    return Err(UpdateTagTaskError::TagNotFound)
+                }
+                Err(e) => return Err(UpdateTagTaskError::Database(e)),
             }
-            Err(e) => return Err(UpdateTagTaskError::Database(e)),
-        }
 
-        // Update the tag name
-        let update_result = conn
-            .prepare("UPDATE tags SET name = ?1 WHERE id = ?2")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .execute(rusqlite::params![&payload.name, id]);
+            // Update the tag name
+            let update_result = conn
+                .prepare("UPDATE tags SET name = ?1 WHERE id = ?2")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .execute(rusqlite::params![&payload.name, id]);
 
-        match update_result {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                return Err(UpdateTagTaskError::AlreadyExists);
+            match update_result {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    return Err(UpdateTagTaskError::AlreadyExists);
+                }
+                Err(e) => return Err(UpdateTagTaskError::Database(e)),
             }
-            Err(e) => return Err(UpdateTagTaskError::Database(e)),
-        }
 
-        Ok(UpdateTagResponse {
-            id,
-            name: payload.name,
-            kind: TagKind::User,
+            Ok(UpdateTagResponse {
+                id,
+                name: payload.name,
+                kind: TagKind::User,
+            })
         })
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in update_tag: {:?}", e);
-    });
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in update_tag: {:?}", e);
+        });
 
     match result {
         Ok(Ok(tag)) => Ok(Json(tag).into_response()),

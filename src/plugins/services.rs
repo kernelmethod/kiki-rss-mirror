@@ -49,11 +49,11 @@ const MAX_TAG_NAME_BYTES: usize = 255;
 /// tag entries with existing user tags past this, but not add new ones.
 pub const MAX_USER_TAGS: i64 = 10_000;
 
-type Pool = crate::db::Pool;
+use crate::db::Db;
 
 /// Answers the calls plugins make. See the [module documentation](self).
 pub struct ServerServices {
-    pool: Pool,
+    db: Db,
     /// The names of the plugins loaded into the script runner.
     loaded: ArcSwap<HashSet<String>>,
     scans: Arc<ScanState>,
@@ -61,7 +61,7 @@ pub struct ServerServices {
 
 /// What the scan threads share.
 struct ScanState {
-    pool: Pool,
+    db: Db,
     runner: ScriptRunnerHandle,
     cancel: CancellationToken,
     next_id: AtomicU64,
@@ -73,16 +73,16 @@ impl ServerServices {
     /// Answers calls from plugins, dispatching scans to the runner in
     /// `runner`. Scans stop when `cancel` fires. No calls are answered
     /// until [`Self::set_loaded`] names the plugins that are loaded.
-    pub fn new(pool: Pool, runner: ScriptRunnerHandle, cancel: CancellationToken) -> Self {
+    pub fn new(db: Db, runner: ScriptRunnerHandle, cancel: CancellationToken) -> Self {
         Self {
             scans: Arc::new(ScanState {
-                pool: pool.clone(),
+                db: db.clone(),
                 runner,
                 cancel,
                 next_id: AtomicU64::new(1),
                 running: Mutex::new(HashMap::new()),
             }),
-            pool,
+            db,
             loaded: ArcSwap::from_pointee(HashSet::new()),
         }
     }
@@ -94,9 +94,17 @@ impl ServerServices {
         self.loaded.swap(Arc::new(names))
     }
 
-    fn conn(&self) -> Result<crate::db::PooledConnection, String> {
-        self.pool
-            .get()
+    /// Runs `f` with a read-only connection.
+    fn read<T>(&self, f: impl FnOnce(&Connection) -> T) -> Result<T, String> {
+        self.db
+            .read_blocking(|conn| f(conn))
+            .map_err(|e| format!("database unavailable: {e}"))
+    }
+
+    /// Runs `f` with the writer connection.
+    fn write<T>(&self, f: impl FnOnce(&Connection) -> T) -> Result<T, String> {
+        self.db
+            .write_blocking(|conn| f(conn))
             .map_err(|e| format!("database unavailable: {e}"))
     }
 }
@@ -111,7 +119,9 @@ impl ScriptServices for ServerServices {
 
         match call {
             ServiceCall::StoreGet { key } => {
-                let value = store_get(&*self.conn()?, plugin, &key).map_err(|e| e.to_string())?;
+                let value = self
+                    .read(|conn| store_get(conn, plugin, &key))?
+                    .map_err(|e| e.to_string())?;
                 Ok(ServiceReply::Value(value.map(|v| v.to_string())))
             }
             ServiceCall::StoreSet { key, value } => {
@@ -119,7 +129,7 @@ impl ScriptServices for ServerServices {
                     .map(|text| serde_json::from_str(&text))
                     .transpose()
                     .map_err(|e| format!("invalid value: {e}"))?;
-                store_set(&*self.conn()?, plugin, &key, value.as_ref())
+                self.write(|conn| store_set(conn, plugin, &key, value.as_ref()))?
                     .map_err(|e| e.to_string())?;
                 Ok(ServiceReply::Done)
             }
@@ -128,15 +138,15 @@ impl ScriptServices for ServerServices {
                 tag,
                 present,
             } => {
-                let changed = set_entry_tag(&*self.conn()?, entry_id, &tag, present)?;
+                let changed = self.write(|conn| set_entry_tag(conn, entry_id, &tag, present))??;
                 Ok(ServiceReply::Changed(changed))
             }
             ServiceCall::StartScan { options } => {
                 Ok(ServiceReply::ScanStarted(self.scans.start(plugin, options)))
             }
-            ServiceCall::GetFeed { feed_id } => {
-                Ok(ServiceReply::Feed(get_feed(&*self.conn()?, feed_id)?))
-            }
+            ServiceCall::GetFeed { feed_id } => Ok(ServiceReply::Feed(
+                self.read(|conn| get_feed(conn, feed_id))??,
+            )),
         }
     }
 }
@@ -276,7 +286,7 @@ impl ScanState {
     /// `on_done` callback if it went through every entry.
     fn run(&self, plugin: &str, id: u64, options: &ScanOptions, cancel: &CancellationToken) {
         let mut summary = ScanSummary::default();
-        let result = scan(&self.pool, &self.runner, id, options, cancel, |s, u| {
+        let result = scan(&self.db, &self.runner, id, options, cancel, |s, u| {
             summary.scanned += s;
             summary.updated += u;
         });
@@ -328,20 +338,20 @@ impl ScanState {
 /// entries cannot be dispatched. The batches written before then stay
 /// written.
 pub(crate) fn scan(
-    pool: &Pool,
+    db: &Db,
     runner: &ScriptRunnerHandle,
     scan_id: u64,
     options: &ScanOptions,
     cancel: &CancellationToken,
     mut progress: impl FnMut(u64, u64),
 ) -> anyhow::Result<bool> {
-    let hidden = SystemTag::Hidden.id(&*pool.get()?)?;
+    let hidden = db.read_blocking(|conn| SystemTag::Hidden.id(conn))??;
     let mut after_id = 0;
     loop {
         if cancel.is_cancelled() {
             return Ok(false);
         }
-        let batch = load_batch(&*pool.get()?, options, hidden, after_id)?;
+        let batch = db.read_blocking(|conn| load_batch(conn, options, hidden, after_id))??;
         let Some((last_id, _)) = batch.last() else {
             return Ok(true);
         };
@@ -394,7 +404,7 @@ pub(crate) fn scan(
         let updated = if to_tag.is_empty() {
             0
         } else {
-            apply_system_tags(&mut *pool.get()?, &to_tag)?
+            db.write_blocking(|conn| apply_system_tags(conn, &to_tag))??
         };
         progress(scanned, updated);
         if stopped {
@@ -537,13 +547,12 @@ mod tests {
     use super::*;
     use crate::scripting::lua::LuaScriptRunner;
     use crate::scripting::{Event, EventPayload, ScriptRunner, ScriptSource};
-    use r2d2_sqlite::SqliteConnectionManager;
     use rusqlite::params;
     use std::time::{Duration, Instant};
 
     /// A database in a temporary directory, with a pool on it. The
     /// directory is kept for the rest of the test process.
-    fn pool() -> Pool {
+    fn pool() -> Db {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("kiki.db");
         crate::db::ConnectionBuilder::default()
@@ -552,7 +561,7 @@ mod tests {
             .build()
             .unwrap();
         std::mem::forget(td);
-        r2d2::Pool::new(SqliteConnectionManager::file(path).into()).unwrap()
+        Db::open(&path, Default::default()).unwrap()
     }
 
     fn insert_feed(conn: &Connection) -> i64 {
@@ -584,13 +593,13 @@ mod tests {
     /// A plugin named `p`, running `text`, loaded into an in-process runner
     /// whose calls `services` answers, as the server wires them up.
     struct Harness {
-        pool: Pool,
+        pool: Db,
         runner: ScriptRunnerHandle,
         services: Arc<ServerServices>,
     }
 
     impl Harness {
-        fn new(pool: Pool, text: &str) -> Self {
+        fn new(pool: Db, text: &str) -> Self {
             let runner = ScriptRunnerHandle::empty();
             let services = Arc::new(ServerServices::new(
                 pool.clone(),
@@ -649,7 +658,7 @@ mod tests {
     #[test]
     fn scans_apply_only_system_tags() {
         let pool = pool();
-        let conn = pool.get().unwrap();
+        let conn = pool.connect();
         let feed = insert_feed(&conn);
         let ham = insert_entry(&conn, feed, "rss", "ham");
         let spam = insert_entry(&conn, feed, "rss", "spam");
@@ -672,7 +681,7 @@ mod tests {
     #[test]
     fn scans_cover_every_batch_and_skip_hidden_entries() {
         let pool = pool();
-        let conn = pool.get().unwrap();
+        let conn = pool.connect();
         let feed = insert_feed(&conn);
         let total = READ_BATCH * 2 + 5;
         for i in 0..total {
@@ -724,7 +733,7 @@ mod tests {
     #[test]
     fn scans_can_be_limited() {
         let pool = pool();
-        let conn = pool.get().unwrap();
+        let conn = pool.connect();
         let a = insert_feed(&conn);
         let b = insert_feed(&conn);
         let in_a = insert_entry(&conn, a, "rss", "spam-a");
@@ -754,7 +763,7 @@ mod tests {
     #[test]
     fn scanned_entries_carry_their_ids_authors_and_categories() {
         let pool = pool();
-        let conn = pool.get().unwrap();
+        let conn = pool.connect();
         let feed = insert_feed(&conn);
         let rss = insert_entry(&conn, feed, "rss", "r");
         conn.execute(
@@ -820,7 +829,7 @@ mod tests {
             "#,
         );
         h.load();
-        let conn = pool.get().unwrap();
+        let conn = pool.connect();
         assert_eq!(
             store_get(&conn, "p", "done").unwrap(),
             Some(serde_json::json!(true))
@@ -830,7 +839,7 @@ mod tests {
     #[test]
     fn tagging_validates_tags_and_entries() {
         let pool = pool();
-        let conn = pool.get().unwrap();
+        let conn = pool.connect();
         let feed = insert_feed(&conn);
         let entry = insert_entry(&conn, feed, "rss", "e");
 
@@ -848,7 +857,7 @@ mod tests {
     #[test]
     fn plugins_can_look_up_feeds() {
         let pool = pool();
-        let conn = pool.get().unwrap();
+        let conn = pool.connect();
         conn.execute(
             "INSERT INTO feeds (id, title, url) VALUES (4, 'Feed', 'https://example.com/f')",
             [],
@@ -904,7 +913,7 @@ mod tests {
     #[test]
     fn on_done_runs_only_when_a_scan_completes() {
         let pool = pool();
-        let conn = pool.get().unwrap();
+        let conn = pool.connect();
         let feed = insert_feed(&conn);
         for i in 0..(READ_BATCH + 3) {
             insert_entry(&conn, feed, "rss", &format!("spam-{i}"));
@@ -944,7 +953,7 @@ mod tests {
     #[test]
     fn plugins_cannot_create_tags_past_the_limit() {
         let pool = pool();
-        let mut conn = pool.get().unwrap();
+        let mut conn = pool.connect();
         let feed = insert_feed(&conn);
         let entry = insert_entry(&conn, feed, "rss", "e");
         {

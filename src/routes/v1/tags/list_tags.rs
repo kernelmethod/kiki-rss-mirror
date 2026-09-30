@@ -7,7 +7,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task;
 use tracing::{event, Level};
 
 const DEFAULT_LIMIT: usize = 50;
@@ -69,44 +68,42 @@ pub async fn list_tags(
     State(state): State<AppState>,
     Query(params): Query<ListTagsQueryParams>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
     let kind = params.kind.map(TagKind::as_str);
 
-    let result = task::spawn_blocking(move || {
-        let count = conn
-            .prepare("SELECT COUNT(*) FROM tags WHERE ?1 IS NULL OR kind = ?1")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([kind], |count| count.get(0))?;
+    let result = state
+        .db
+        .read(move |conn| {
+            let count = conn
+                .prepare("SELECT COUNT(*) FROM tags WHERE ?1 IS NULL OR kind = ?1")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([kind], |count| count.get(0))?;
 
-        let tags = conn
-            .prepare(
-                "SELECT id, name, kind FROM tags WHERE ?1 IS NULL OR kind = ?1
+            let tags = conn
+                .prepare(
+                    "SELECT id, name, kind FROM tags WHERE ?1 IS NULL OR kind = ?1
                  ORDER BY id LIMIT ?2 OFFSET ?3",
-            )
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_map(
-                rusqlite::params![kind, limit, offset],
-                TagResponse::from_row,
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
+                )
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_map(
+                    rusqlite::params![kind, limit, offset],
+                    TagResponse::from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
 
-        Ok::<ListTagsResponse, rusqlite::Error>(ListTagsResponse {
-            count,
-            offset,
-            limit,
-            tags,
+            Ok::<ListTagsResponse, rusqlite::Error>(ListTagsResponse {
+                count,
+                offset,
+                limit,
+                tags,
+            })
         })
-    })
-    .await;
+        .await;
 
     match result {
         Ok(Ok(response)) => Ok(Json(response).into_response()),

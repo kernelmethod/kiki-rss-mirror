@@ -8,7 +8,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task;
 use tracing::{event, Level};
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
@@ -52,27 +51,23 @@ pub async fn import_opml(
         return Ok((StatusCode::OK, Json(ImportOpmlResponse { imported: 0 })).into_response());
     }
 
-    let mut conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        internal_error()
-    })?;
-
     let fetch_interval = state
         .config
         .current()
         .feed_fetch
         .default_fetch_interval_seconds;
-    let summary =
-        task::spawn_blocking(move || opml::import_feeds(&mut conn, &feeds, fetch_interval))
-            .await
-            .map_err(|e| {
-                event!(Level::ERROR, "task error in import_opml: {:?}", e);
-                internal_error()
-            })?
-            .map_err(|e| {
-                event!(Level::ERROR, "failed to import OPML: {:?}", e);
-                internal_error()
-            })?;
+    let summary = state
+        .db
+        .write(move |conn| opml::import_feeds(conn, &feeds, fetch_interval))
+        .await
+        .map_err(|e| {
+            event!(Level::ERROR, "task error in import_opml: {:?}", e);
+            internal_error()
+        })?
+        .map_err(|e| {
+            event!(Level::ERROR, "failed to import OPML: {:?}", e);
+            internal_error()
+        })?;
 
     // Queue fetches for all new feeds
     for &id in &summary.imported {

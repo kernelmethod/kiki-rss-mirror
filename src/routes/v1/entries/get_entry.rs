@@ -8,7 +8,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task;
 use tracing::{event, Level};
 
 #[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
@@ -56,68 +55,61 @@ pub async fn get_entry(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal server error",
-        )
-            .into_response()
-    })?;
-
-    let result = task::spawn_blocking(move || {
-        let entry = conn
-            .prepare(&format!(
-                "SELECT id, feed_id, source_id, syndication_format,
+    let result = state
+        .db
+        .read(move |conn| {
+            let entry = conn
+                .prepare(&format!(
+                    "SELECT id, feed_id, source_id, syndication_format,
                     guid, published_at, title, url, content, {}
                 FROM entries WHERE id = ?1 LIMIT 1",
-                crate::db::favicons::favicon_hash_sql("entries.feed_id")
-            ))
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| {
-                Ok(GetEntryResponse {
-                    id: row.get(0)?,
-                    feed_id: row.get(1)?,
-                    source_id: row.get(2)?,
-                    syndication_format: row.get(3)?,
-                    guid: row.get(4)?,
-                    published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
-                        .map(|d| d.to_rfc3339()),
-                    title: row.get(6)?,
-                    url: row.get(7)?,
-                    content: row.get(8)?,
-                    feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
-                    rss: None,
-                    atom: None,
+                    crate::db::favicons::favicon_hash_sql("entries.feed_id")
+                ))
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([id], |row| {
+                    Ok(GetEntryResponse {
+                        id: row.get(0)?,
+                        feed_id: row.get(1)?,
+                        source_id: row.get(2)?,
+                        syndication_format: row.get(3)?,
+                        guid: row.get(4)?,
+                        published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
+                            .map(|d| d.to_rfc3339()),
+                        title: row.get(6)?,
+                        url: row.get(7)?,
+                        content: row.get(8)?,
+                        feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
+                        rss: None,
+                        atom: None,
+                    })
                 })
-            })
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                _ => Err(e),
-            })
-            .inspect_err(|e| {
-                event!(Level::ERROR, "failed to get entry: {:?}", e);
-            })?;
-
-        let entry = match entry {
-            Some(mut e) => {
-                e.rss = load_rss_entry_data(&conn, e.id).inspect_err(|err| {
-                    event!(Level::ERROR, "failed to load rss_entry_data: {:?}", err);
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    _ => Err(e),
+                })
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "failed to get entry: {:?}", e);
                 })?;
-                e.atom = load_atom_entry_data(&conn, e.id).inspect_err(|err| {
-                    event!(Level::ERROR, "failed to load atom_entry_data: {:?}", err);
-                })?;
-                Some(e)
-            }
-            None => None,
-        };
 
-        Ok::<Option<GetEntryResponse>, rusqlite::Error>(entry)
-    })
-    .await;
+            let entry = match entry {
+                Some(mut e) => {
+                    e.rss = load_rss_entry_data(conn, e.id).inspect_err(|err| {
+                        event!(Level::ERROR, "failed to load rss_entry_data: {:?}", err);
+                    })?;
+                    e.atom = load_atom_entry_data(conn, e.id).inspect_err(|err| {
+                        event!(Level::ERROR, "failed to load atom_entry_data: {:?}", err);
+                    })?;
+                    Some(e)
+                }
+                None => None,
+            };
+
+            Ok::<Option<GetEntryResponse>, rusqlite::Error>(entry)
+        })
+        .await;
 
     match result {
         Ok(Ok(Some(entry))) => Ok((axum::http::StatusCode::OK, Json(entry)).into_response()),
