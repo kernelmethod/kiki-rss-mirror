@@ -68,6 +68,9 @@ pub struct Usage {
     /// that are still running.
     pub cpu_seconds: f64,
     /// Total resident memory of the role's processes, in bytes.
+    ///
+    /// This is the kernel's running count, which may lag the actual figure
+    /// slightly, so it is not exactly comparable with `proportional_bytes`.
     pub resident_bytes: u64,
     /// Total proportional memory of the role's processes, in bytes: their
     /// resident memory with each shared page divided among the processes
@@ -262,8 +265,10 @@ mod tests {
         let server = usage.get(&Role::Server).expect("the server's own usage");
         assert!(server.processes >= 1);
         assert!(server.resident_bytes > 0);
-        let pss = server.proportional_bytes.expect("the server's own PSS");
-        assert!(pss > 0 && pss <= server.resident_bytes);
+        // PSS isn't compared with RSS: `stat`'s RSS comes from per-CPU
+        // counters that can lag the page tables `smaps_rollup` walks, by
+        // megabytes on a machine with many CPUs.
+        assert!(server.proportional_bytes.expect("the server's own PSS") > 0);
     }
 
     #[test]
