@@ -2,7 +2,7 @@ use crate::config::Settings;
 use crate::db::feeds::merge_feed_into;
 use crate::db::{Pool, PooledConnection};
 use crate::fetcher::{
-    FeedHints, FetchReply, FetchSpec, FetchedBody, Fetcher, ParseOutcome, ParsedFeed,
+    FeedHints, FetchReply, FetchSpec, FetchedBody, Fetcher, FetcherError, ParseOutcome, ParsedFeed,
 };
 use crate::http::{FeedAuth, FeedAuthType};
 use crate::metrics::Metrics;
@@ -188,8 +188,14 @@ pub(crate) async fn refresh_feed(
     let fetch_start = Instant::now();
     let fetch_settings = &settings.feed_fetch;
 
-    let conn = pool.get()?;
-    let row = load_feed_fetch_row(&conn, feed_id)?;
+    // The connection goes back to the pool before the fetch: a refresh
+    // must never hold one while it waits on the network or asks the pool
+    // for another, or enough concurrent refreshes exhaust the pool and
+    // wait on each other until they time out.
+    let row = {
+        let pool = pool.clone();
+        tokio::task::spawn_blocking(move || load_feed_fetch_row(&pool.get()?, feed_id)).await??
+    };
 
     let cfg = SchedulerConfig {
         min_cadence: fetch_settings.min_polling_cadence_seconds,
@@ -247,14 +253,15 @@ pub(crate) async fn refresh_feed(
 
     // file:// feeds are read here, because the fetcher has no filesystem
     // access, and only the parse is handed off.
-    // Set when the server answers 304 Not Modified.
-    let mut not_modified = false;
-    let fetched = if row.url.starts_with("file://") {
-        match retrieve_file_feed(&row.url, feed_id, pool.clone(), cfg) {
-            Ok((content, schedule)) => fetcher
-                .parse(feed_id, content)
-                .await
-                .map(|parsed| Some((parsed, schedule))),
+    let retrieved = if row.url.starts_with("file://") {
+        let read = crate::db::blocking(|| retrieve_file_feed(&row.url, feed_id, &pool, cfg));
+        match read {
+            Ok((content, schedule)) => Retrieved::File(
+                fetcher
+                    .parse(feed_id, content)
+                    .await
+                    .map(|parsed| (parsed, schedule)),
+            ),
             Err(e) => {
                 rec.outcome("other");
                 return Err(e);
@@ -288,19 +295,61 @@ pub(crate) async fn refresh_feed(
             max_feed_bytes: fetch_settings.max_feed_bytes,
             proxy: settings.effective_proxy(),
         };
-        match fetcher.fetch(spec).await {
-            Ok(reply) => {
-                not_modified = matches!(reply, FetchReply::NotModified { .. });
-                match record_fetch_reply(&rec, &row, reply, force_conditionals_off) {
-                    Ok(parsed) => Ok(parsed),
-                    Err(e) => {
-                        rec.outcome("other");
-                        return Err(e);
-                    }
+        Retrieved::Http(fetcher.fetch(spec).await)
+    };
+
+    crate::db::blocking(|| {
+        store_refresh(
+            &rec,
+            &row,
+            retrieved,
+            force_conditionals_off,
+            settings,
+            task_tx,
+        )
+    })
+}
+
+/// What a refresh got back from the fetcher, before anything is stored.
+enum Retrieved {
+    /// A `file://` feed, read (and its row rescheduled) by
+    /// [`retrieve_file_feed`], and then parsed.
+    File(Result<(ParseOutcome, Schedule), FetcherError>),
+    /// The fetcher's reply for an HTTP(S) feed.
+    Http(Result<FetchReply, FetcherError>),
+}
+
+/// Record what a refresh retrieved: update the feed's row, store its
+/// entries, and queue the follow-up work.
+///
+/// Blocks on the database, so async callers run it under
+/// [`crate::db::blocking`]. It holds at most one pooled connection at a
+/// time, so it cannot wait on the pool for a connection it holds itself.
+fn store_refresh(
+    rec: &Recorder,
+    row: &FeedFetchRow,
+    retrieved: Retrieved,
+    force_conditionals_off: bool,
+    settings: &Settings,
+    task_tx: &async_channel::Sender<TaskManagerCommand>,
+) -> Result<()> {
+    let (feed_id, metrics) = (rec.feed_id, rec.metrics);
+
+    // Set when the server answers 304 Not Modified.
+    let mut not_modified = false;
+    let fetched = match retrieved {
+        Retrieved::File(parsed) => parsed.map(Some),
+        Retrieved::Http(Ok(reply)) => {
+            not_modified = matches!(reply, FetchReply::NotModified { .. });
+            match record_fetch_reply(rec, row, reply, force_conditionals_off) {
+                Ok(parsed) => Ok(parsed),
+                Err(e) => {
+                    rec.outcome("other");
+                    return Err(e);
                 }
             }
-            Err(e) => Err(e),
         }
+        Retrieved::Http(Err(e)) => Err(e),
     };
 
     let (parsed, schedule) = match fetched {
@@ -312,6 +361,7 @@ pub(crate) async fn refresh_feed(
         // one after its content changed.
         Ok(None) => {
             if not_modified {
+                let conn = rec.pool.get()?;
                 queue_favicon_if_due(settings, &conn, task_tx, metrics, feed_id);
             }
             return Ok(());
@@ -347,20 +397,21 @@ pub(crate) async fn refresh_feed(
             site_url,
             *feed,
             entries,
-            pool.get()?,
-            script_runner,
+            rec.pool.get()?,
+            rec.script_runner,
             metrics,
         )?,
         ParsedFeed::Rss { entries, .. } => process_rss_feed(
             feed_id,
             site_url,
             entries,
-            pool.get()?,
-            script_runner,
+            rec.pool.get()?,
+            rec.script_runner,
             metrics,
         )?,
     };
     enqueue_asset_caching(task_tx, metrics, &inserted.cache_assets);
+    let conn = rec.pool.get()?;
     queue_favicon_if_due(settings, &conn, task_tx, metrics, feed_id);
     clear_feed_error(&conn, feed_id);
     debug!(
@@ -425,6 +476,9 @@ impl Recorder<'_> {
 
     /// Record a failed fetch: store `err` against the feed and reschedule
     /// it, fire `fetch.error` with `kind`, and count it under `outcome`.
+    ///
+    /// Checks out a connection of its own, so the caller must not be
+    /// holding one.
     fn fail_with(
         &self,
         err: FetchError,
@@ -485,7 +539,6 @@ fn record_fetch_reply(
     force_conditionals_off: bool,
 ) -> Result<Option<(ParseOutcome, Schedule)>> {
     let (feed_id, cfg, metrics) = (rec.feed_id, rec.cfg, rec.metrics);
-    let conn = rec.pool.get()?;
     let feed_url = row.url.as_str();
 
     let body = match reply {
@@ -530,7 +583,7 @@ fn record_fetch_reply(
             )
             .with_hint_source(hint_source(&headers, hints.hint_secs, &row.feed_hints));
             let next_fetch_at = schedule.next_fetch_at;
-            conn.execute(
+            rec.pool.get()?.execute(
                 "UPDATE feeds SET
                     header_etag = ?1,
                     header_last_modified = ?2,
@@ -624,6 +677,9 @@ fn record_fetch_reply(
     } = *body;
     metrics.record_feed_redirects(redirects);
     let headers = headers.to_header_map();
+    // Taken only now: the failures above record themselves through
+    // `rec.fail`, which checks out a connection of its own.
+    let conn = rec.pool.get()?;
 
     // If we followed a permanent redirect, the feed now lives at
     // `final_url`. If another feed has that URL already, the two are the
@@ -908,11 +964,9 @@ fn schedule_success(
 fn retrieve_file_feed(
     feed_url: &str,
     feed_id: i64,
-    pool: Pool,
+    pool: &Pool,
     cfg: SchedulerConfig,
 ) -> Result<(Vec<u8>, Schedule)> {
-    let conn = pool.get()?;
-
     // Extract the file path from the URL
     let file_path = feed_url.strip_prefix("file://").unwrap_or(feed_url);
 
@@ -933,7 +987,7 @@ fn retrieve_file_feed(
         cfg.min_fetch_interval,
     );
     let next_fetch_at = schedule.next_fetch_at;
-    conn.execute(
+    pool.get()?.execute(
         "UPDATE feeds SET
             last_checked = ?1,
             next_fetch_at = ?2,

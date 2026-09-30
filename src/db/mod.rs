@@ -15,7 +15,7 @@ pub mod retention;
 pub mod tags;
 pub mod task_queue;
 
-pub use pool::{ConnectionManager, Pool, PooledConnection};
+pub use pool::{blocking, ConnectionManager, Pool, PooledConnection};
 
 enum ConnectionType<'a> {
     DefaultConnection,

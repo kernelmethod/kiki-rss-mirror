@@ -249,11 +249,12 @@ async fn maintenance_commands_end_to_end_via_worker() -> Result<()> {
             }
             panic!("not all maintenance commands were processed within the timeout");
         }
-        let conn = pool.get()?;
-        let all_advanced = baselines
-            .iter()
-            .all(|(t, b)| last_run_at(&conn, t).map(|a| a > *b).unwrap_or(false));
-        drop(conn);
+        let all_advanced = {
+            let conn = pool.get()?;
+            baselines
+                .iter()
+                .all(|(t, b)| last_run_at(&conn, t).map(|a| a > *b).unwrap_or(false))
+        };
         if all_advanced {
             break;
         }

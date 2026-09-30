@@ -193,8 +193,9 @@ async fn run_worker(worker_id: usize, w: Worker) {
                             "An error occurred while refreshing feed {}: {:?}",
                             feed_id, e
                         );
-                        if let Ok(conn) = w.pool.get() {
-                            if let Some(schedule) = set_feed_error(
+                        let schedule = crate::db::blocking(|| {
+                            let conn = w.pool.get().ok()?;
+                            set_feed_error(
                                 &conn,
                                 feed_id,
                                 &FetchError::Other {
@@ -202,9 +203,10 @@ async fn run_worker(worker_id: usize, w: Worker) {
                                 },
                                 &settings.feed_fetch,
                                 &w.metrics,
-                            ) {
-                                info!("Feed {}: next attempt {}", feed_id, schedule);
-                            }
+                            )
+                        });
+                        if let Some(schedule) = schedule {
+                            info!("Feed {}: next attempt {}", feed_id, schedule);
                         }
                         "error"
                     }

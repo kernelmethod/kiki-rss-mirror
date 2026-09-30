@@ -618,8 +618,13 @@ async fn check_feeds_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = check_feeds(&task_manager_tx, &pool, &metrics) {
-                    tracing::error!("Error checking feeds: {:?}", e);
+                // Off the runtime's threads: waiting on the pool can take
+                // as long as its connection timeout.
+                let (tx, pool, metrics) = (task_manager_tx.clone(), pool.clone(), metrics.clone());
+                match tokio::task::spawn_blocking(move || check_feeds(&tx, &pool, &metrics)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::error!("Error checking feeds: {:?}", e),
+                    Err(e) => tracing::error!("Feed check task failed: {:?}", e),
                 }
             }
             _ = cancel_token.cancelled() => {

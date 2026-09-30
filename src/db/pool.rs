@@ -19,6 +19,39 @@ pub type Pool = r2d2::Pool<ConnectionManager>;
 /// A connection checked out of a [`Pool`].
 pub type PooledConnection = r2d2::PooledConnection<ConnectionManager>;
 
+/// Run blocking database work from async code without stalling the runtime.
+///
+/// Checking a connection out of a [`Pool`] can block for the pool's whole
+/// connection timeout, and queries block for as long as SQLite takes. Done
+/// directly on a Tokio worker thread, that stops every other task scheduled
+/// on the thread, including tasks that would return a connection to the
+/// pool. On a multi-threaded runtime `f` therefore runs under
+/// [`tokio::task::block_in_place`], which first moves this thread's other
+/// tasks to another thread. On a current-thread runtime, or outside any
+/// runtime, `f` simply runs, since there is nowhere else to move them.
+///
+/// Unlike [`tokio::task::spawn_blocking`], `f` may borrow from the caller.
+/// Prefer `spawn_blocking` when the work owns everything it uses.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::db::{self, Pool};
+/// use r2d2_sqlite::SqliteConnectionManager;
+///
+/// let pool: Pool = r2d2::Pool::new(SqliteConnectionManager::memory().into())?;
+/// let one: i64 = db::blocking(|| pool.get()?.query_row("SELECT 1", [], |r| r.get(0)).map_err(anyhow::Error::from))?;
+/// assert_eq!(one, 1);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 /// SQLite's default page size, used until a connection reports the real one.
 const DEFAULT_PAGE_SIZE: u64 = 4096;
 
