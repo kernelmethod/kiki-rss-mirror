@@ -19,6 +19,7 @@ pub mod fetcher;
 pub mod http;
 pub mod memory;
 pub mod metrics;
+pub mod notify;
 pub mod opml;
 pub mod plugins;
 pub mod process;

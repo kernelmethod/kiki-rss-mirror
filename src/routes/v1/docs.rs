@@ -53,6 +53,7 @@ use utoipa::OpenApi;
         schemas(
             crate::routes::v1::root::RootResponse,
             crate::routes::v1::health::HealthResponse,
+            crate::server::ComponentState,
             crate::routes::v1::feeds::add_feed::AddFeedRequest,
             crate::routes::v1::feeds::add_feed::AddFeedResponse,
             crate::routes::v1::feeds::list_feeds::ListFeedsResponse,

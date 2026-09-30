@@ -50,6 +50,10 @@ pub struct SharedAppState {
     /// The server's settings, backed by the config file. The settings
     /// routes write through it; everything else reads snapshots from it.
     pub config: ConfigHandle,
+
+    /// Whether the server's other parts are still running, for the health
+    /// check.
+    pub liveness: Liveness,
 }
 
 pub type AppState = Arc<SharedAppState>;
@@ -64,6 +68,7 @@ pub struct ServerBuilder<'a> {
     worker_count: Option<usize>,
     script_host: crate::process::ScriptHostHandle,
     feed_fetcher: crate::process::FeedFetcherHandle,
+    notifier: Option<Arc<crate::notify::Notifier>>,
 }
 
 impl<'a> ServerBuilder<'a> {
@@ -78,6 +83,7 @@ impl<'a> ServerBuilder<'a> {
             worker_count: None,
             script_host: None,
             feed_fetcher: None,
+            notifier: None,
         }
     }
 
@@ -139,6 +145,13 @@ impl<'a> ServerBuilder<'a> {
         self
     }
 
+    /// Tell a service manager such as systemd when the server is ready,
+    /// that it is still alive, and when it stops; see [`crate::notify`].
+    pub fn notifier(mut self, notifier: Option<crate::notify::Notifier>) -> Self {
+        self.notifier = notifier.map(Arc::new);
+        self
+    }
+
     pub fn build(self) -> Server {
         let socket_path = self
             .socket_path
@@ -172,6 +185,7 @@ impl<'a> ServerBuilder<'a> {
             worker_count: self.worker_count,
             script_host: self.script_host,
             feed_fetcher: self.feed_fetcher,
+            notifier: self.notifier,
             cancel_token: CancellationToken::new(),
         }
     }
@@ -234,6 +248,10 @@ pub struct Server {
     /// Sandboxed feed fetcher to retrieve and parse feeds in, if one was
     /// spawned. `None` fetches in this process.
     feed_fetcher: crate::process::FeedFetcherHandle,
+
+    /// Where to tell a service manager how the server is doing, if one
+    /// asked to be told.
+    notifier: Option<Arc<crate::notify::Notifier>>,
 
     /// A [`CancellationToken`] used to indicate that the server should
     /// be killed.
@@ -408,7 +426,22 @@ impl Server {
             script_runner.clone(),
             fetcher,
         );
-        let workers_exited = wait_for_workers(worker_handles);
+        let (workers_live, workers_exited) = watch_workers(worker_handles);
+        let liveness = Liveness {
+            feed_fetcher: self.feed_fetcher.clone(),
+            script_host: self.script_host.clone(),
+            workers: workers_live,
+        };
+
+        if let Some(interval) = self.notifier.as_ref().and_then(|n| n.watchdog_interval()) {
+            tokio::spawn(watchdog_loop(
+                self.notifier.clone(),
+                interval,
+                liveness.clone(),
+                db.clone(),
+                self.cancel_token.clone(),
+            ));
+        }
 
         tokio::spawn(metrics_sampler_loop(
             tx.clone(),
@@ -475,6 +508,8 @@ impl Server {
             plugins,
             script_runner.clone(),
             config,
+            liveness,
+            self.notifier.clone(),
         ));
 
         // Without workers nothing queued is ever run — feeds included — so
@@ -482,7 +517,12 @@ impl Server {
         // with an error rather than carry on without them.
         tokio::select! {
             biased;
-            _ = self.cancel_token.cancelled() => Ok(()),
+            _ = self.cancel_token.cancelled() => {
+                if let Some(n) = &self.notifier {
+                    n.stopping();
+                }
+                Ok(())
+            }
             _ = workers_exited => {
                 self.cancel_token.cancel();
                 bail!("all task workers exited; stopping the server")
@@ -720,13 +760,133 @@ async fn fetcher_lost(_: crate::process::FeedFetcherHandle) {
     std::future::pending().await
 }
 
-/// Wait for every task worker in `handles` to finish, logging any that
-/// panicked.
-async fn wait_for_workers(handles: Vec<tokio::task::JoinHandle<()>>) {
+/// Keep count of the task workers in `handles` that are still running,
+/// logging each as it finishes, and whether it panicked.
+///
+/// Returns the count, and a future that completes once every worker has
+/// finished.
+fn watch_workers(
+    handles: Vec<tokio::task::JoinHandle<()>>,
+) -> (
+    tokio::sync::watch::Receiver<usize>,
+    impl std::future::Future<Output = ()>,
+) {
+    let (tx, rx) = tokio::sync::watch::channel(handles.len());
+    let tx = Arc::new(tx);
     for (worker_id, handle) in handles.into_iter().enumerate() {
-        match handle.await {
-            Ok(()) => debug!("task worker {worker_id} exited"),
-            Err(e) => tracing::error!("task worker {worker_id} failed: {e}"),
+        let tx = Arc::clone(&tx);
+        tokio::spawn(async move {
+            match handle.await {
+                Ok(()) => debug!("task worker {worker_id} exited"),
+                Err(e) => tracing::error!("task worker {worker_id} failed: {e}"),
+            }
+            tx.send_modify(|live| *live = live.saturating_sub(1));
+        });
+    }
+    let mut all = rx.clone();
+    (rx, async move {
+        // Only fails once every sender is gone, and the last one to go
+        // has counted the last worker out first.
+        let _ = all.wait_for(|live| *live == 0).await;
+    })
+}
+
+/// The state of one of the server's parts, as the health check reports it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentState {
+    /// Running in a process of its own, and reachable.
+    Ok,
+    /// Its process has gone, and will not be back until the server
+    /// restarts.
+    Gone,
+    /// Not isolated in a process of its own: its work is done in the
+    /// server process, if at all.
+    InProcess,
+}
+
+/// Whether the parts of a running server that can fail independently of
+/// it are still running, for the health check and the watchdog.
+#[derive(Clone)]
+pub struct Liveness {
+    feed_fetcher: crate::process::FeedFetcherHandle,
+    script_host: crate::process::ScriptHostHandle,
+    workers: tokio::sync::watch::Receiver<usize>,
+}
+
+impl Liveness {
+    /// The state of the isolated feed fetcher.
+    pub fn feed_fetcher(&self) -> ComponentState {
+        #[cfg(unix)]
+        if let Some(host) = &self.feed_fetcher {
+            return if host.is_alive() {
+                ComponentState::Ok
+            } else {
+                ComponentState::Gone
+            };
+        }
+        ComponentState::InProcess
+    }
+
+    /// The state of the isolated script host.
+    pub fn script_host(&self) -> ComponentState {
+        #[cfg(all(unix, feature = "lua"))]
+        if let Some(host) = &self.script_host {
+            return if host.is_alive() {
+                ComponentState::Ok
+            } else {
+                ComponentState::Gone
+            };
+        }
+        ComponentState::InProcess
+    }
+
+    /// How many task workers are still running.
+    pub fn workers(&self) -> usize {
+        *self.workers.borrow()
+    }
+
+    /// Whether the server can still do its job: fetch feeds, and run the
+    /// tasks that do. The script host is not needed for that: without it,
+    /// feeds are stored as they come.
+    pub fn is_serviceable(&self) -> bool {
+        self.feed_fetcher() != ComponentState::Gone && self.workers() > 0
+    }
+}
+
+/// Ping the service manager's watchdog every `interval` for as long as the
+/// server is serviceable and the database answers, so that a server that
+/// hangs, or loses what it needs to do its job, is restarted.
+async fn watchdog_loop(
+    notifier: Option<Arc<crate::notify::Notifier>>,
+    interval: Duration,
+    liveness: Liveness,
+    db: crate::db::Db,
+    cancel_token: CancellationToken,
+) {
+    let Some(notifier) = notifier else { return };
+    let mut tick = tokio::time::interval(interval);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = cancel_token.cancelled() => return,
+        }
+        if !liveness.is_serviceable() {
+            tracing::warn!("not pinging the watchdog: the server cannot fetch feeds");
+            continue;
+        }
+        let answered = tokio::time::timeout(
+            interval,
+            db.read(|conn| conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))),
+        )
+        .await;
+        match answered {
+            Ok(Ok(Ok(_))) => notifier.watchdog(),
+            Ok(Ok(Err(e))) => tracing::warn!("not pinging the watchdog: database error: {e}"),
+            Ok(Err(e)) => tracing::warn!("not pinging the watchdog: database error: {e}"),
+            Err(_) => tracing::warn!("not pinging the watchdog: the database did not answer"),
         }
     }
 }
@@ -968,6 +1128,8 @@ async fn uds_server(
     plugins: Arc<plugins::runtime::PluginRuntime>,
     script_runner: ScriptRunnerHandle,
     config: ConfigHandle,
+    liveness: Liveness,
+    notifier: Option<Arc<crate::notify::Notifier>>,
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
         task_manager_tx: tx,
@@ -978,6 +1140,7 @@ async fn uds_server(
         plugins,
         script_runner,
         config,
+        liveness,
     });
     let app = routes::create_router(metrics).with_state(shared_state);
 
@@ -993,6 +1156,9 @@ async fn uds_server(
 
     let absolute_path = fs::canonicalize(&socket_path).unwrap_or(socket_path.clone());
     tracing::info!("Listening on {}", absolute_path.display());
+    if let Some(n) = &notifier {
+        n.ready();
+    }
 
     span!(Level::TRACE, "web-worker");
     axum::serve(listener, app)
@@ -1127,6 +1293,100 @@ mod test {
             .expect_err("losing the fetcher should be an error");
         assert!(format!("{err:#}").contains("feed fetcher"), "{err:#}");
         Ok(())
+    }
+
+    /// Under a service manager, the server says when it is ready, pings
+    /// the watchdog while it is healthy, and says when it stops; and the
+    /// health check reports on its parts.
+    #[cfg(unix)]
+    #[test]
+    fn the_service_manager_is_kept_informed() -> Result<()> {
+        use crate::process::feed_fetcher::FeedFetcherHost;
+        use std::os::unix::net::UnixDatagram;
+
+        let tc = TestBuilder::default().init_database().build()?;
+        let notify_path = tc.config_dir().join("notify");
+        let manager = UnixDatagram::bind(&notify_path)?;
+        manager.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let notifier =
+            crate::notify::Notifier::for_socket(&notify_path, Some(Duration::from_millis(50)))?;
+        let socket = tc.config_dir().join("notify-test.sock");
+        // Kept, so that the fetcher stays up.
+        let (host, _far_end) = FeedFetcherHost::with_far_end();
+        let server = ServerBuilder::new(&tc.database_path())
+            .socket_path(&socket)
+            .worker_count(2)
+            .feed_fetcher(Some(Arc::new(host)))
+            .notifier(Some(notifier))
+            .build();
+        let token = server.cancel_token();
+        let handle = std::thread::spawn(move || server.run());
+
+        let mut buf = [0u8; 256];
+        let mut recv = || -> Result<String> {
+            let n = manager.recv(&mut buf)?;
+            Ok(String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned())
+        };
+        let mut seen = Vec::new();
+        while !(seen.iter().any(|m: &String| m.starts_with("READY=1"))
+            && seen.iter().any(|m| m == "WATCHDOG=1"))
+        {
+            seen.push(recv()?);
+        }
+
+        let rt = tokio::runtime::Runtime::new()?;
+        let health: crate::routes::v1::health::HealthResponse = rt.block_on(async {
+            let client = reqwest::Client::builder().unix_socket(socket).build()?;
+            let resp = client.get("http://localhost/v1/health").send().await?;
+            anyhow::ensure!(resp.status() == reqwest::StatusCode::OK);
+            Ok::<_, anyhow::Error>(resp.json().await?)
+        })?;
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.feed_fetcher, ComponentState::Ok);
+        assert_eq!(health.script_host, ComponentState::InProcess);
+        assert_eq!(health.workers, 2);
+        assert!(health.database_writable);
+
+        token.cancel();
+        while recv()? != "STOPPING=1" {}
+        handle.join().expect("panic in server thread")?;
+        Ok(())
+    }
+
+    /// Losing the fetcher, or every worker, leaves the server unable to do
+    /// its job; losing the script host does not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn liveness_reflects_the_server_parts() {
+        use crate::process::feed_fetcher::FeedFetcherHost;
+
+        let (host, far_end) = FeedFetcherHost::with_far_end();
+        let host = Arc::new(host);
+        let (workers_tx, workers) = tokio::sync::watch::channel(1usize);
+        let liveness = Liveness {
+            feed_fetcher: Some(Arc::clone(&host)),
+            script_host: None,
+            workers,
+        };
+        assert_eq!(liveness.feed_fetcher(), ComponentState::Ok);
+        assert!(liveness.is_serviceable());
+
+        workers_tx.send_replace(0);
+        assert!(!liveness.is_serviceable());
+        workers_tx.send_replace(1);
+
+        drop(far_end);
+        host.closed().await;
+        assert_eq!(liveness.feed_fetcher(), ComponentState::Gone);
+        assert!(!liveness.is_serviceable());
+
+        let in_process = Liveness {
+            feed_fetcher: None,
+            script_host: None,
+            workers: tokio::sync::watch::channel(1usize).1,
+        };
+        assert_eq!(in_process.feed_fetcher(), ComponentState::InProcess);
+        assert!(in_process.is_serviceable());
     }
 
     #[test]

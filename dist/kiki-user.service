@@ -11,7 +11,11 @@ Description=Kiki RSS feed aggregator (user)
 After=default.target
 
 [Service]
-Type=simple
+Type=notify
+# Kiki says when it is ready, and pings the watchdog while it can still
+# fetch feeds; a server that hangs is restarted.
+NotifyAccess=main
+WatchdogSec=60
 WorkingDirectory=%h/.local/share/kiki
 
 # With no $KIKI_HOME set, `kiki serve` resolves the platform data directory
