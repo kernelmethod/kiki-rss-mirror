@@ -165,3 +165,52 @@ async fn cached_entry_assets_are_no_longer_pending() -> Result<()> {
     }
     Ok(())
 }
+
+/// The integrity check runs, and is recorded so that its daily schedule
+/// survives restarts.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_integrity_check_runs_and_is_recorded() -> Result<()> {
+    use crate::db::task_queue::TASK_INTEGRITY_CHECK;
+
+    let tc = TestBuilder::default().init_database().build()?;
+    let db = crate::db::Db::open(&tc.database_path(), Default::default())?;
+    let conn = tc.database_conn()?;
+    ensure_task(&conn, TASK_INTEGRITY_CHECK)?;
+    let baseline = backdate_task(&conn, TASK_INTEGRITY_CHECK, 10)?;
+
+    let (tx, rx) = async_channel::bounded(16);
+    let token = CancellationToken::new();
+    let handles = spawn_workers(
+        rx,
+        tx.clone(),
+        db,
+        token.clone(),
+        1,
+        Arc::new(super::test_metrics()),
+        tc.config_dir().to_path_buf(),
+        Arc::new(crate::config::ConfigStore::open(
+            tc.database_path()
+                .with_file_name(crate::config::CONFIG_FILE_NAME),
+        )?),
+        ScriptRunnerHandle::empty(),
+        crate::fetcher::Fetcher::in_process()?,
+    );
+    tx.send(TaskManagerCommand::IntegrityCheck).await?;
+
+    wait_for("the integrity check to be recorded", || {
+        let ran: i64 = conn.query_row(
+            "SELECT last_run_at FROM task_queue WHERE task_type = ?1",
+            [TASK_INTEGRITY_CHECK],
+            |row| row.get(0),
+        )?;
+        Ok(ran > baseline)
+    })
+    .await?;
+
+    token.cancel();
+    drop(tx);
+    for h in handles {
+        h.await?;
+    }
+    Ok(())
+}

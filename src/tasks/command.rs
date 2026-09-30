@@ -24,6 +24,8 @@ pub enum TaskManagerCommand {
     WalCheckpointAnalyze,
     /// Reclaim free pages via `PRAGMA incremental_vacuum`.
     IncrementalVacuum,
+    /// Look for corruption in the database with `PRAGMA quick_check`.
+    IntegrityCheck,
 }
 
 impl TaskManagerCommand {
@@ -38,6 +40,7 @@ impl TaskManagerCommand {
             TaskManagerCommand::OptimizeFts => "optimize_fts",
             TaskManagerCommand::WalCheckpointAnalyze => "wal_checkpoint_analyze",
             TaskManagerCommand::IncrementalVacuum => "incremental_vacuum",
+            TaskManagerCommand::IntegrityCheck => "integrity_check",
         }
     }
 }

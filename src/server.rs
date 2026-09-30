@@ -495,6 +495,15 @@ impl Server {
                 crate::db::task_queue::TASK_FTS_OPTIMIZE,
                 metrics.clone(),
             ));
+            tokio::spawn(periodic_command_loop(
+                tx.clone(),
+                db.clone(),
+                self.cancel_token.clone(),
+                Duration::from_secs(86400),
+                TaskManagerCommand::IntegrityCheck,
+                crate::db::task_queue::TASK_INTEGRITY_CHECK,
+                metrics.clone(),
+            ));
         }
 
         claim_socket_path(&self.socket_path)?;

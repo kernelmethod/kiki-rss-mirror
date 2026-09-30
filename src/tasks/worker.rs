@@ -511,5 +511,42 @@ async fn handle_command(
                 task_start.elapsed().as_secs_f64(),
             );
         }
+        TaskManagerCommand::IntegrityCheck => {
+            let outcome = match crate::db::integrity::quick_check(&w.db) {
+                Ok(problems) if problems.is_empty() => {
+                    info!("database integrity check found no problems");
+                    w.metrics.set_db_integrity_ok(true);
+                    "ok"
+                }
+                Ok(problems) => {
+                    error!(
+                        "database integrity check found problems; restore a backup, or \
+                         run `sqlite3 kiki.db .recover` on a copy: {}",
+                        problems.join("; ")
+                    );
+                    w.metrics.set_db_integrity_ok(false);
+                    "error"
+                }
+                Err(e) => {
+                    warn!("database integrity check could not run: {:?}", e);
+                    "error"
+                }
+            };
+            // Counted as run either way: a failed check is reported, not
+            // retried in a loop.
+            let recorded = w.db.write_blocking(|conn| {
+                crate::db::task_queue::record_run(conn, crate::db::task_queue::TASK_INTEGRITY_CHECK)
+            });
+            match recorded {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Failed to record integrity check run: {:?}", e),
+                Err(e) => warn!("Failed to record integrity check run: {:?}", e),
+            }
+            w.metrics.record_task_processed(
+                "integrity_check",
+                outcome,
+                task_start.elapsed().as_secs_f64(),
+            );
+        }
     }
 }

@@ -7,6 +7,7 @@ pub mod assets;
 pub mod favicons;
 pub mod feeds;
 mod handle;
+pub mod integrity;
 pub mod log;
 pub mod migrations;
 pub mod pending_assets;
