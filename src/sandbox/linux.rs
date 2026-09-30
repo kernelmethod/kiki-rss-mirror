@@ -317,6 +317,28 @@ const DENIED_COMMON: &[i64] = &[
     libc::SYS_migrate_pages,
     libc::SYS_move_pages,
     libc::SYS_uselib,
+    // io_uring performs I/O on the process's behalf without passing
+    // through seccomp at all, and has been a steady source of kernel
+    // exploits; userfaultfd is the classic primitive for widening kernel
+    // race windows. Tokio and SQLite use neither.
+    libc::SYS_io_uring_setup,
+    libc::SYS_io_uring_enter,
+    libc::SYS_io_uring_register,
+    libc::SYS_userfaultfd,
+    // Reaching into, or comparing, another process's resources:
+    // ptrace-adjacent, and never needed.
+    libc::SYS_pidfd_getfd,
+    libc::SYS_process_madvise,
+    libc::SYS_kcmp,
+    // Opening files by handle sidesteps path-based checks.
+    libc::SYS_name_to_handle_at,
+    libc::SYS_open_by_handle_at,
+    // Host administration.
+    libc::SYS_fanotify_init,
+    libc::SYS_syslog,
+    libc::SYS_vhangup,
+    libc::SYS_sethostname,
+    libc::SYS_setdomainname,
     // No Kiki process spawns children after its sandbox is installed —
     // the server spawns the script host *before* calling `apply`.
     // Blocking exec means an attacker who gains code execution still
@@ -348,6 +370,27 @@ const DENIED_SCRIPT_HOST: &[i64] = &[
 /// otherwise need to bind a netlink socket.
 const DENIED_FEED_FETCHER: &[i64] = &[libc::SYS_bind, libc::SYS_listen, libc::SYS_accept4];
 
+/// The only address families the server may create sockets in: Unix, for
+/// its API listener and for resolvers that answer over a local socket
+/// (nscd, sssd, systemd-resolved), and IPv4/IPv6, for DNS queries sent
+/// straight to a name server. Everything else — netlink, packet, `AF_ALG`,
+/// Bluetooth, and the rest of the long tail of rarely-exercised kernel
+/// protocol code — is refused.
+///
+/// glibc's `getaddrinfo` also opens a netlink socket to learn which
+/// address families the host has configured; when that fails it assumes
+/// both, and resolution carries on. The systemd unit's
+/// `RestrictAddressFamilies=` makes the same choice.
+const SERVER_SOCKET_FAMILIES: &[i32] = &[libc::AF_UNIX, libc::AF_INET, libc::AF_INET6];
+
+/// Which `socket(2)` address families a profile may use.
+enum SocketDomains {
+    /// Refuse these families and allow every other.
+    Deny(&'static [i32]),
+    /// Allow only these families and refuse every other.
+    AllowOnly(&'static [i32]),
+}
+
 /// Extra syscalls denied to the web UI: binding an address and listening.
 /// Its listener is bound and listening before the sandbox goes up, and it
 /// only ever accepts on that one, so `accept4` stays allowed.
@@ -355,8 +398,7 @@ const DENIED_WEB_UI: &[i64] = &[libc::SYS_bind, libc::SYS_listen];
 
 fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
     use seccompiler::{
-        apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpOp, SeccompFilter,
-        SeccompRule,
+        apply_filter_all_threads, BpfProgram, SeccompAction, SeccompFilter, SeccompRule,
     };
     use std::collections::BTreeMap;
 
@@ -414,16 +456,18 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
     let program: BpfProgram = filter.try_into().context("compiling seccomp BPF program")?;
     apply_filter_all_threads(&program).context("installing seccomp BPF program")?;
 
-    match config.profile {
+    let domains = match config.profile {
+        // Unix, IPv4 and IPv6 sockets only.
+        SandboxProfile::Server { .. } => Some(SocketDomains::AllowOnly(SERVER_SOCKET_FAMILIES)),
         // Internet sockets only: no Unix ones.
-        SandboxProfile::FeedFetcher => {
-            apply_socket_domain_filter(arch, SeccompCmpOp::Eq, config.log_only)?;
-        }
+        SandboxProfile::FeedFetcher => Some(SocketDomains::Deny(&[libc::AF_UNIX])),
         // Unix sockets only: no Internet (or netlink, or packet) ones.
-        SandboxProfile::WebUi => {
-            apply_socket_domain_filter(arch, SeccompCmpOp::Ne, config.log_only)?;
-        }
-        SandboxProfile::Server { .. } | SandboxProfile::ScriptHost => {}
+        SandboxProfile::WebUi => Some(SocketDomains::AllowOnly(&[libc::AF_UNIX])),
+        // Every socket call is already denied outright.
+        SandboxProfile::ScriptHost => None,
+    };
+    if let Some(domains) = domains {
+        apply_socket_domain_filter(arch, &domains, config.log_only)?;
     }
 
     if config.log_only {
@@ -443,19 +487,21 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
 }
 
 /// Refuse with `EACCES` every `socket(domain, ...)` call whose `domain`
-/// compares to `AF_UNIX` by `op`.
+/// `domains` does not allow.
 ///
-/// With [`SeccompCmpOp::Eq`] this refuses Unix sockets, for the feed
-/// fetcher: it needs Internet sockets but has no use for Unix ones — its
-/// channel to the server is inherited, and the supervisor makes its
-/// worker channels with `socketpair`, which this does not touch. Without
-/// it, a compromised fetcher could connect to the server's API socket,
-/// which carries no authentication of its own.
+/// For the feed fetcher this refuses Unix sockets: it needs Internet
+/// sockets but has no use for Unix ones — its channel to the server is
+/// inherited, and the supervisor makes its worker channels with
+/// `socketpair`, which this does not touch. Without it, a compromised
+/// fetcher could connect to the server's API socket, which carries no
+/// authentication of its own.
 ///
-/// With [`SeccompCmpOp::Ne`] it refuses everything *but* Unix sockets, for
-/// the web UI: it talks to the API over the server's Unix socket and to
-/// browsers over a listener it bound before the sandbox went up, so a new
-/// Internet socket could only be a compromised web UI reaching out.
+/// For the web UI it refuses everything *but* Unix sockets: it talks to
+/// the API over the server's Unix socket and to browsers over a listener
+/// it bound before the sandbox went up, so a new Internet socket could
+/// only be a compromised web UI reaching out.
+///
+/// For the server it allows [`SERVER_SOCKET_FAMILIES`] alone.
 ///
 /// The call fails with an error rather than killing the process: nothing
 /// should try, but a library that probes for a local service (as glibc's
@@ -464,23 +510,39 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
 /// installed filter and takes the most severe verdict.
 fn apply_socket_domain_filter(
     arch: seccompiler::TargetArch,
-    op: seccompiler::SeccompCmpOp,
+    domains: &SocketDomains,
     log_only: bool,
 ) -> Result<()> {
     use seccompiler::{
-        apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCondition,
-        SeccompFilter, SeccompRule,
+        apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
+        SeccompCondition, SeccompFilter, SeccompRule,
     };
     use std::collections::BTreeMap;
 
-    let domain = SeccompCondition::new(0, SeccompCmpArgLen::Dword, op, libc::AF_UNIX as u64)
-        .context("building the socket domain condition")?;
-    let rules: BTreeMap<i64, Vec<SeccompRule>> = [(
-        libc::SYS_socket,
-        vec![SeccompRule::new(vec![domain]).context("building the socket domain rule")?],
-    )]
-    .into_iter()
-    .collect();
+    let domain_is = |op: SeccompCmpOp, family: i32| {
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, op, family as u64)
+            .context("building a socket domain condition")
+    };
+    // A syscall matches when any one rule does, and a rule when all of
+    // its conditions do.
+    let socket_rules: Vec<SeccompRule> = match domains {
+        SocketDomains::Deny(families) => families
+            .iter()
+            .map(|&f| {
+                SeccompRule::new(vec![domain_is(SeccompCmpOp::Eq, f)?])
+                    .context("building a socket domain rule")
+            })
+            .collect::<Result<_>>()?,
+        SocketDomains::AllowOnly(families) => {
+            let conditions = families
+                .iter()
+                .map(|&f| domain_is(SeccompCmpOp::Ne, f))
+                .collect::<Result<_>>()?;
+            vec![SeccompRule::new(conditions).context("building the socket domain rule")?]
+        }
+    };
+    let rules: BTreeMap<i64, Vec<SeccompRule>> =
+        [(libc::SYS_socket, socket_rules)].into_iter().collect();
 
     let match_action = if log_only {
         SeccompAction::Log
@@ -676,6 +738,24 @@ mod tests {
         assert!(!DENIED_WEB_UI.contains(&libc::SYS_accept4));
         assert!(!DENIED_WEB_UI.contains(&libc::SYS_socket));
         assert!(!DENIED_WEB_UI.contains(&libc::SYS_connect));
+    }
+
+    /// The server keeps the families its API listener and the system
+    /// resolver need, and nothing else.
+    #[test]
+    fn the_server_may_only_create_unix_and_internet_sockets() {
+        for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
+            assert!(SERVER_SOCKET_FAMILIES.contains(&family));
+        }
+        for family in [libc::AF_NETLINK, libc::AF_PACKET, libc::AF_ALG] {
+            assert!(!SERVER_SOCKET_FAMILIES.contains(&family));
+        }
+    }
+
+    #[test]
+    fn every_profile_denies_io_uring_and_userfaultfd() {
+        assert!(DENIED_COMMON.contains(&libc::SYS_io_uring_setup));
+        assert!(DENIED_COMMON.contains(&libc::SYS_userfaultfd));
     }
 
     #[test]

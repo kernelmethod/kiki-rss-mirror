@@ -21,10 +21,11 @@
 //!   to TCP ports and from reaching abstract Unix sockets.
 //! * **seccomp-bpf** blocks a denylist of syscalls the profile never uses
 //!   (`ptrace`, `mount`, `unshare`, `bpf`, `kexec_load`, module loading,
-//!   and friends; plus, for the script host, every socket call; for
-//!   the feed fetcher, binding, listening, accepting, and creating Unix
-//!   sockets; and for the web UI, binding, listening, and creating any
-//!   socket but a Unix one).
+//!   `io_uring`, `userfaultfd`, and friends; plus, for the server,
+//!   creating any socket but a Unix, IPv4 or IPv6 one; for the script
+//!   host, every socket call; for the feed fetcher, binding, listening,
+//!   accepting, and creating Unix sockets; and for the web UI, binding,
+//!   listening, and creating any socket but a Unix one).
 //!   The default action for unmatched syscalls is `Allow` — this is a
 //!   defence-in-depth layer that eliminates the most dangerous escape
 //!   primitives without risking that a benign syscall we forgot about
@@ -49,7 +50,8 @@ use std::path::PathBuf;
 pub enum SandboxProfile {
     /// The main `kiki serve` process: owns the SQLite database, the asset
     /// cache, and the listening socket, and resolves hostnames for the
-    /// feed fetcher. It makes no HTTP(S) requests of its own.
+    /// feed fetcher. It makes no HTTP(S) requests of its own, and may
+    /// create only Unix, IPv4 and IPv6 sockets.
     Server {
         /// Directory containing the SQLite database, its WAL/SHM
         /// companions, and the cached assets tree. Granted read-write
