@@ -554,3 +554,112 @@ async fn test_body_within_configured_cap_is_ingested() -> Result<()> {
 
     Ok(())
 }
+
+/// Serve `/old`, which permanently redirects to `/new`, a small RSS feed,
+/// and return the URLs of both.
+async fn serve_permanent_redirect() -> Result<(String, String)> {
+    let app = Router::new()
+        .route(
+            "/old",
+            get(|| async {
+                (
+                    axum::http::StatusCode::MOVED_PERMANENTLY,
+                    [("location", "/new")],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/new",
+            get(|| async {
+                (
+                    [("content-type", "application/rss+xml")],
+                    r#"<rss version="2.0"><channel><title>t</title><link>http://x/</link>
+                    <description>d</description><item><title>hi</title><link>http://x/1</link><guid>g1</guid>
+                    </item></channel></rss>"#,
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+    Ok((format!("http://{addr}/old"), format!("http://{addr}/new")))
+}
+
+/// A permanent redirect moves the feed's stored URL to the redirect's
+/// target.
+#[tokio::test]
+async fn test_permanent_redirect_updates_url() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let (old_url, new_url) = serve_permanent_redirect().await?;
+    let (feed_id, client, pool) = setup_feed(&tc, &old_url)?;
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let url: String = conn.query_row("SELECT url FROM feeds WHERE id = ?1", [feed_id], |row| {
+        row.get(0)
+    })?;
+    assert_eq!(url, new_url);
+    Ok(())
+}
+
+/// A permanent redirect to the URL of another feed merges the redirected
+/// feed into that one: its tags and entries move over and it is deleted.
+#[tokio::test]
+async fn test_permanent_redirect_to_existing_feed_merges() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let (old_url, new_url) = serve_permanent_redirect().await?;
+    let (feed_id, client, pool) = setup_feed(&tc, &old_url)?;
+    let conn = tc.database_conn()?;
+    conn.execute(
+        "INSERT INTO feeds (title, url) VALUES ('other feed', ?1)",
+        [&new_url],
+    )?;
+    let other_id = conn.last_insert_rowid();
+    conn.execute_batch(&format!(
+        "INSERT INTO tags (name) VALUES ('papers');
+         INSERT INTO feed_tags (feed_id, tag_id)
+         SELECT {feed_id}, id FROM tags WHERE name = 'papers';
+         INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+         VALUES ({feed_id}, 'rss', 'old', 0, 'old', 'http://x/old');"
+    ))?;
+
+    refresh_feed(
+        &client,
+        feed_id,
+        pool,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let feeds: Vec<i64> = conn
+        .prepare("SELECT id FROM feeds")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(feeds, [other_id]);
+    let tags: Vec<String> = conn
+        .prepare(
+            "SELECT t.name FROM feed_tags ft JOIN tags t ON t.id = ft.tag_id
+             WHERE ft.feed_id = ?1",
+        )?
+        .query_map([other_id], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(tags, ["papers"]);
+    let entries: Vec<String> = conn
+        .prepare("SELECT guid FROM entries WHERE feed_id = ?1")?
+        .query_map([other_id], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(entries, ["old"]);
+    Ok(())
+}

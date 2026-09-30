@@ -80,6 +80,67 @@ document.addEventListener("change", (event) => {
   }
 });
 
+// Search boxes: submitting one loads the search page for what was typed. Pages
+// may not submit forms themselves (their `Content-Security-Policy` says
+// `form-action 'none'`), so the script goes there instead.
+document.addEventListener("submit", (event) => {
+  const form = event.target.closest("form.search");
+  if (!form) {
+    return;
+  }
+  event.preventDefault();
+  const query = new FormData(form).get("q").trim();
+  if (query) {
+    // Close the search popup first, so that it is not still open if the
+    // browser comes back to this page from its cache.
+    form.closest("dialog")?.close();
+    window.location.href = `/search?q=${encodeURIComponent(query)}`;
+  }
+});
+
+// Search popup: on narrow screens, where the nav has no room for the search
+// box, a button opens it in a popup instead. Its "Cancel" button, or a tap
+// outside it, closes it again; so does Escape, as with any modal dialog.
+// Closing it puts back what the box said before it was opened.
+document.addEventListener("click", (event) => {
+  if (event.target.closest("button.search-open")) {
+    const dialog = document.querySelector("dialog.search-dialog");
+    dialog.showModal();
+    // Select what the box says, as on the search page, so that typing
+    // replaces it rather than going in front of it.
+    dialog.querySelector("input[name=q]").select();
+    return;
+  }
+  const dialog = event.target.closest("dialog.search-dialog");
+  // A tap on the backdrop is a click on the dialog itself; the form fills
+  // the dialog, so taps inside it land on the form or its children.
+  if (dialog && (event.target === dialog || event.target.closest("button.search-close"))) {
+    dialog.close();
+  }
+});
+
+// Escape closes the popup at once. Left to itself, a search box that has
+// text in it — as it does on the search page — would clear it instead, and
+// only a second Escape would close the popup.
+document.addEventListener("keydown", (event) => {
+  const dialog = event.target.closest?.("dialog.search-dialog");
+  if (dialog && event.key === "Escape") {
+    event.preventDefault();
+    dialog.close();
+  }
+});
+
+// `close` does not bubble, so it is caught on its way down instead.
+document.addEventListener(
+  "close",
+  (event) => {
+    if (event.target.matches("dialog.search-dialog")) {
+      event.target.querySelector("form").reset();
+    }
+  },
+  true,
+);
+
 // "Mark all as read" buttons: clicking one, once confirmed, marks every entry
 // (or every entry from the button's feed) as read, and reloads the page.
 document.addEventListener("click", async (event) => {
@@ -135,21 +196,24 @@ document.addEventListener("click", async (event) => {
 });
 
 // "Copy feed URL" buttons: clicking one copies the feed's full URL to the
-// clipboard, and briefly shows that it did.
+// clipboard, and briefly shows a "Copied!" popup above the button.
 document.addEventListener("click", async (event) => {
   const button = event.target.closest("button.copy-url");
   if (!button) {
     return;
   }
-  const title = button.title;
+  clearTimeout(button.copyStatusTimer);
   try {
     await navigator.clipboard.writeText(button.dataset.url);
-    button.title = "Copied!";
+    button.dataset.status = "Copied!";
+    delete button.dataset.statusError;
   } catch (e) {
     console.error("failed to copy feed URL:", e);
-    button.title = "Could not copy the URL";
+    button.dataset.status = "Could not copy the URL";
+    button.dataset.statusError = "";
   }
-  setTimeout(() => {
-    button.title = title;
+  button.copyStatusTimer = setTimeout(() => {
+    delete button.dataset.status;
+    delete button.dataset.statusError;
   }, 2000);
 });

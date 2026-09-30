@@ -5,6 +5,7 @@ use std::path::Path;
 
 pub mod assets;
 pub mod favicons;
+pub mod feeds;
 pub mod log;
 pub mod migrations;
 pub mod plugins;
