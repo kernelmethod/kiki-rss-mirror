@@ -429,6 +429,12 @@ impl Server {
                 self.cancel_token.clone(),
                 metrics.clone(),
             ));
+            tokio::spawn(retry_entry_assets_loop(
+                tx.clone(),
+                db.clone(),
+                self.cancel_token.clone(),
+                metrics.clone(),
+            ));
             tokio::spawn(periodic_command_loop(
                 tx.clone(),
                 db.clone(),
@@ -618,6 +624,83 @@ async fn cleanup_loop(
         }
     }
 
+    Ok(())
+}
+
+/// How often [`retry_entry_assets_loop`] looks for asset caching to retry.
+const ENTRY_ASSETS_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// The most entries [`retry_entry_assets_loop`] queues at once, so that a
+/// backlog is worked off a batch at a time rather than filling the queue.
+const ENTRY_ASSETS_RETRY_BATCH: usize = 128;
+
+/// Periodically queue [`TaskManagerCommand::CacheEntryAssets`] again for
+/// new entries whose assets were never cached: those whose task was
+/// dropped from a full queue, failed, or was lost to a restart. See
+/// [`crate::db::pending_assets`].
+async fn retry_entry_assets_loop(
+    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    db: crate::db::Db,
+    cancel_token: CancellationToken,
+    metrics: Arc<crate::metrics::Metrics>,
+) {
+    let mut interval = tokio::time::interval(ENTRY_ASSETS_RETRY_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if let Err(e) = retry_entry_assets(&task_manager_tx, &db, &metrics).await {
+                    tracing::warn!("Failed to retry caching entry assets: {:?}", e);
+                }
+            }
+            _ = cancel_token.cancelled() => break,
+        }
+    }
+}
+
+/// Queue one batch of the entries whose asset caching has fallen due.
+async fn retry_entry_assets(
+    task_manager_tx: &async_channel::Sender<TaskManagerCommand>,
+    db: &crate::db::Db,
+    metrics: &crate::metrics::Metrics,
+) -> Result<()> {
+    // Leave room in the queue for feed refreshes.
+    let room = task_manager_tx
+        .capacity()
+        .map_or(ENTRY_ASSETS_RETRY_BATCH, |cap| {
+            (cap / 2).saturating_sub(task_manager_tx.len())
+        })
+        .min(ENTRY_ASSETS_RETRY_BATCH);
+    if room == 0 {
+        return Ok(());
+    }
+    let due = db
+        .write(move |conn| crate::db::pending_assets::take_due(conn, room))
+        .await??;
+    if !due.abandoned.is_empty() {
+        tracing::warn!(
+            "Gave up caching the assets of {} entries after {} attempts: {:?}",
+            due.abandoned.len(),
+            crate::db::pending_assets::MAX_ATTEMPTS,
+            due.abandoned
+        );
+    }
+    if !due.retry.is_empty() {
+        tracing::info!(
+            "Retrying asset caching for {} entries whose caching was lost or failed",
+            due.retry.len()
+        );
+    }
+    for entry_id in due.retry {
+        // Should the queue be full after all, the entry is simply due
+        // again later.
+        match task_manager_tx.try_send(TaskManagerCommand::CacheEntryAssets { entry_id }) {
+            Ok(()) => metrics.record_task_enqueued("cache_entry_assets"),
+            Err(e) => debug!(
+                "Failed to requeue asset caching for entry {}: {:?}",
+                entry_id, e
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -1108,6 +1191,47 @@ mod test {
         }
         queued.sort();
         assert_eq!(queued, vec![never, due]);
+        Ok(())
+    }
+
+    /// Entries whose asset caching fell due are queued again, and counted
+    /// as another attempt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_entry_assets_are_queued_again_once_due() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        let pool = make_pool(&tc.database_path())?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (NULL, 'rss', 'g', 0, 't', 'https://example.com/')",
+            [],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+        crate::db::pending_assets::add(&conn, entry_id)?;
+        let metrics = crate::metrics::Metrics::new()?;
+        let (tx, rx) = async_channel::bounded(16);
+
+        // Not yet due: the task queued alongside it may still be running.
+        retry_entry_assets(&tx, &pool, &metrics).await?;
+        assert!(rx.try_recv().is_err());
+
+        conn.execute(
+            "UPDATE pending_entry_assets SET next_attempt_at = unixepoch() - 1",
+            [],
+        )?;
+        retry_entry_assets(&tx, &pool, &metrics).await?;
+        match rx.try_recv()? {
+            TaskManagerCommand::CacheEntryAssets { entry_id: queued } => {
+                assert_eq!(queued, entry_id)
+            }
+            other => anyhow::bail!("unexpected command {other:?}"),
+        }
+        let attempts: i64 = conn.query_row(
+            "SELECT attempts FROM pending_entry_assets WHERE entry_id = ?1",
+            [entry_id],
+            |r| r.get(0),
+        )?;
+        assert_eq!(attempts, 1);
         Ok(())
     }
 

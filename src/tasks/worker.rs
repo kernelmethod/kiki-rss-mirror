@@ -407,7 +407,21 @@ async fn handle_command(
             )
             .await;
             let outcome = match result {
-                Ok(()) => "ok",
+                Ok(()) => {
+                    // Otherwise the entry is queued again once it falls
+                    // due; see `crate::db::pending_assets`.
+                    let done =
+                        w.db.write_blocking(|conn| crate::db::pending_assets::done(conn, entry_id))
+                            .map_err(anyhow::Error::from)
+                            .and_then(|r| r.map_err(anyhow::Error::from));
+                    if let Err(e) = done {
+                        warn!(
+                            "could not mark the assets of entry {} cached: {:?}",
+                            entry_id, e
+                        );
+                    }
+                    "ok"
+                }
                 Err(e) => {
                     warn!("failed caching assets for entry {}: {:?}", entry_id, e);
                     "error"

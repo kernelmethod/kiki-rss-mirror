@@ -113,3 +113,55 @@ async fn a_panicking_refresh_is_recorded_and_the_worker_survives() -> Result<()>
     }
     Ok(())
 }
+
+/// Once an entry's assets have been cached, it is no longer pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_entry_assets_are_no_longer_pending() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let db = crate::db::Db::open(&tc.database_path(), Default::default())?;
+    let conn = tc.database_conn()?;
+    conn.execute(
+        "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+         VALUES (NULL, 'rss', 'g', 0, 't', 'https://example.com/')",
+        [],
+    )?;
+    let entry_id = conn.last_insert_rowid();
+    crate::db::pending_assets::add(&conn, entry_id)?;
+
+    let (tx, rx) = async_channel::bounded(16);
+    let token = CancellationToken::new();
+    let handles = spawn_workers(
+        rx,
+        tx.clone(),
+        db,
+        token.clone(),
+        1,
+        Arc::new(super::test_metrics()),
+        tc.config_dir().to_path_buf(),
+        Arc::new(crate::config::ConfigStore::open(
+            tc.database_path()
+                .with_file_name(crate::config::CONFIG_FILE_NAME),
+        )?),
+        ScriptRunnerHandle::empty(),
+        crate::fetcher::Fetcher::in_process()?,
+    );
+    tx.send(TaskManagerCommand::CacheEntryAssets { entry_id })
+        .await?;
+
+    wait_for("the entry to stop being pending", || {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_entry_assets WHERE entry_id = ?1",
+            [entry_id],
+            |row| row.get(0),
+        )?;
+        Ok(n == 0)
+    })
+    .await?;
+
+    token.cancel();
+    drop(tx);
+    for h in handles {
+        h.await?;
+    }
+    Ok(())
+}
