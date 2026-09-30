@@ -17,6 +17,7 @@ mod retry_after_tests;
 mod server_hints_tests;
 #[cfg(feature = "extra-tests")]
 mod stress_tests;
+mod worker_tests;
 
 /// Build a throwaway [`Metrics`] recorder for tests that need to call
 /// instrumented code paths without caring about the emitted samples.

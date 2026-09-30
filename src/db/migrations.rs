@@ -53,6 +53,10 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0008_unique_feed_urls",
         sql: include_str!("include/migrations/0008_unique_feed_urls.sql"),
     },
+    Migration {
+        name: "0009_pending_entry_assets",
+        sql: include_str!("include/migrations/0009_pending_entry_assets.sql"),
+    },
 ];
 
 /// The migration that drops the `scripts` table in favour of plugins.

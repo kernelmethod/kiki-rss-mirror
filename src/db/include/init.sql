@@ -504,6 +504,20 @@ CREATE TABLE feed_favicons (
 );
 CREATE INDEX idx_feed_favicons_asset ON feed_favicons(asset_id);
 
+-- New entries whose assets have yet to be cached, so that caching them
+-- survives a full task queue, a failed task, or a restart. A row is added
+-- when the entry is first stored and removed once its assets have been
+-- cached; one still here at `next_attempt_at` is queued again, up to a
+-- limit on `attempts`. See src/db/pending_assets.rs.
+CREATE TABLE pending_entry_assets (
+    entry_id         INTEGER PRIMARY KEY,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at  INTEGER NOT NULL,
+
+    FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_pending_entry_assets_next ON pending_entry_assets(next_attempt_at);
+
 ---------------------------------------------------------------------------------
 -- Full-text search index over entries (FTS5, external content)
 ---------------------------------------------------------------------------------

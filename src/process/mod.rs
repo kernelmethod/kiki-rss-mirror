@@ -47,7 +47,9 @@
 //!   VM to whatever caused the last one to die is the safer default.
 //! * The **feed fetcher** is a supervisor that `fork`s (allowed, unlike
 //!   `exec`) a replacement worker whenever the last one dies, because
-//!   fetching is Kiki's core job; see [`feed_fetcher`].
+//!   fetching is Kiki's core job; see [`feed_fetcher`]. Should the
+//!   supervisor itself go, the server stops with an error, so that
+//!   whatever supervises it (systemd, say) can start both afresh.
 //!
 //! # Transport
 //!
