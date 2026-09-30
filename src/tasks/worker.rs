@@ -1,9 +1,8 @@
 use crate::config::ConfigHandle;
 use crate::db::Pool;
-use crate::fetcher::{Fetcher, ProxiedClient};
+use crate::fetcher::Fetcher;
 use crate::metrics::Metrics;
 use crate::scripting::{ScriptRunner, ScriptRunnerHandle};
-use crate::tasks::assets::{asset_client_builder, AssetTimeouts};
 use crate::tasks::command::TaskManagerCommand;
 use crate::tasks::entry_assets::cache_entry_assets;
 use crate::tasks::error::FetchError;
@@ -11,7 +10,6 @@ use crate::tasks::error_recording::set_feed_error;
 use crate::tasks::favicons::cache_feed_favicon;
 use crate::tasks::fetch::refresh_feed;
 use crate::tasks::maintenance::run_maintenance;
-use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -77,9 +75,8 @@ struct Worker {
     data_dir: PathBuf,
     config: ConfigHandle,
     script_runner: ScriptRunnerHandle,
+    /// Retrieves feeds and downloads their assets.
     fetcher: Fetcher,
-    /// Client for asset caching; feed fetches go through `fetcher`.
-    asset_client: ProxiedClient,
 }
 
 /// Determine the number of worker tasks to spawn.
@@ -93,15 +90,9 @@ pub fn worker_count() -> usize {
 ///
 /// All workers share a single [`ScriptRunnerHandle`], installed when the server starts.
 /// They also share one [`Fetcher`], through which every feed refresh
-/// retrieves and parses its feed, and read settings from `config` afresh
-/// for every command, so a settings change applies to the next one.
-///
-/// # Errors
-///
-/// Returns an error, before spawning any worker, if the HTTP client used
-/// for asset caching cannot be built — for instance when no TLS trust
-/// store is readable. Building it once here makes that a startup failure
-/// rather than every worker exiting as soon as it starts.
+/// retrieves and parses its feed and every asset is downloaded, and read
+/// settings from `config` afresh for every command, so a settings change
+/// applies to the next one.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_workers(
     rx: async_channel::Receiver<TaskManagerCommand>,
@@ -114,10 +105,7 @@ pub fn spawn_workers(
     config: ConfigHandle,
     script_runner: ScriptRunnerHandle,
     fetcher: Fetcher,
-) -> Result<Vec<tokio::task::JoinHandle<()>>> {
-    let asset_client = ProxiedClient::new(|| asset_client_builder(AssetTimeouts::DEFAULT))
-        .context("failed to build the HTTP client for asset caching")?;
-
+) -> Vec<tokio::task::JoinHandle<()>> {
     let worker = Worker {
         rx,
         tx,
@@ -130,7 +118,6 @@ pub fn spawn_workers(
         config,
         script_runner,
         fetcher,
-        asset_client,
     };
     let mut handles = Vec::with_capacity(num_workers);
 
@@ -140,7 +127,7 @@ pub fn spawn_workers(
         handles.push(tokio::spawn(run_worker(worker_id, worker)));
     }
 
-    Ok(handles)
+    handles
 }
 
 /// A single worker loop that pulls commands from the shared channel.
@@ -327,21 +314,15 @@ async fn run_worker(worker_id: usize, w: Worker) {
             }
 
             TaskManagerCommand::CacheEntryAssets { entry_id } => {
-                let result = match w.asset_client.get(&settings.effective_proxy()) {
-                    Ok(client) => {
-                        cache_entry_assets(
-                            &client,
-                            &w.pool,
-                            &w.data_dir,
-                            &settings.asset_cache,
-                            entry_id,
-                        )
-                        .await
-                    }
-                    Err(_) => Err(anyhow::anyhow!(
-                        "could not configure the HTTP client for the proxy"
-                    )),
-                };
+                let result = cache_entry_assets(
+                    &w.fetcher,
+                    &settings.effective_proxy(),
+                    &w.pool,
+                    &w.data_dir,
+                    &settings.asset_cache,
+                    entry_id,
+                )
+                .await;
                 let outcome = match result {
                     Ok(()) => "ok",
                     Err(e) => {
@@ -357,21 +338,15 @@ async fn run_worker(worker_id: usize, w: Worker) {
             }
 
             TaskManagerCommand::CacheFeedFavicon { feed_id } => {
-                let result = match w.asset_client.get(&settings.effective_proxy()) {
-                    Ok(client) => {
-                        cache_feed_favicon(
-                            &client,
-                            &w.pool,
-                            &w.data_dir,
-                            &settings.asset_cache,
-                            feed_id,
-                        )
-                        .await
-                    }
-                    Err(_) => Err(anyhow::anyhow!(
-                        "could not configure the HTTP client for the proxy"
-                    )),
-                };
+                let result = cache_feed_favicon(
+                    &w.fetcher,
+                    &settings.effective_proxy(),
+                    &w.pool,
+                    &w.data_dir,
+                    &settings.asset_cache,
+                    feed_id,
+                )
+                .await;
                 let outcome = match result {
                     Ok(()) => "ok",
                     Err(e) => {

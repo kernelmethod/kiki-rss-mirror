@@ -30,23 +30,22 @@ const RO_RESOLVER_PATHS: &[&str] = &[
 
 /// Read-only paths needed to verify TLS certificates: the common
 /// CA-certificate locations on Debian/Ubuntu, Fedora/RHEL, Arch, and
-/// musl-based systems, and the entropy devices. Missing paths are
-/// silently skipped.
+/// musl-based systems. Missing paths are silently skipped.
 ///
-/// Granted to both the server (which still fetches assets) and the feed
-/// fetcher.
+/// Granted only to the feed fetcher, which makes every one of Kiki's
+/// outbound HTTP(S) requests: feeds, assets and favicons alike.
 const RO_TLS_PATHS: &[&str] = &[
-    // TLS trust stores
     "/etc/ssl",
     "/etc/pki",
     "/etc/ca-certificates",
     "/usr/share/ca-certificates",
     "/usr/local/share/ca-certificates",
     "/usr/lib/ssl",
-    // Entropy
-    "/dev/urandom",
-    "/dev/random",
 ];
+
+/// The entropy devices, read-only, for anything that reads them rather
+/// than calling `getrandom`. Granted to the server and the feed fetcher.
+const RO_ENTROPY_PATHS: &[&str] = &["/dev/urandom", "/dev/random"];
 
 /// Read-only introspection paths granted to the server only: CPU
 /// topology, limits, and cgroup info that tokio, num_cpus, and friends
@@ -134,10 +133,12 @@ fn collect_symlink_targets(dir: &Path, depth: usize, roots: &[PathBuf], out: &mu
 }
 
 /// Read-only paths for the TLS trust stores, including those named by
-/// `SSL_CERT_FILE`/`SSL_CERT_DIR` and wherever their symlinks lead.
+/// `SSL_CERT_FILE`/`SSL_CERT_DIR` and wherever their symlinks lead, and
+/// the entropy devices.
 fn tls_paths() -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = existing(RO_TLS_PATHS).chain(tls_env_paths()).collect();
     paths.extend(symlink_targets(&paths));
+    paths.extend(existing(RO_ENTROPY_PATHS));
     paths
 }
 
@@ -178,9 +179,11 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
             if !rw_paths.iter().any(|p| path_within(temp_dir, p)) {
                 rw_paths.push(temp_dir.clone());
             }
+            // No TLS trust stores: the server makes no HTTP(S) requests
+            // of its own, as the feed fetcher downloads assets too.
             let ro_paths: Vec<PathBuf> = resolver_paths()
                 .into_iter()
-                .chain(tls_paths())
+                .chain(existing(RO_ENTROPY_PATHS))
                 .chain(existing(RO_INTROSPECTION_PATHS))
                 .collect();
             (rw_paths, ro_paths)
@@ -590,8 +593,29 @@ mod tests {
         let env_paths = tls_env_paths();
         for p in &ro {
             assert!(
-                RO_TLS_PATHS.iter().any(|allowed| Path::new(allowed) == p) || env_paths.contains(p),
+                RO_TLS_PATHS
+                    .iter()
+                    .chain(RO_ENTROPY_PATHS)
+                    .any(|allowed| Path::new(allowed) == p)
+                    || env_paths.contains(p),
                 "unexpected read-only path for the feed fetcher: {p:?}"
+            );
+        }
+    }
+
+    /// Every HTTP(S) request is made by the feed fetcher, so the server has
+    /// no use for the TLS trust stores.
+    #[test]
+    fn server_gets_no_tls_trust_stores() {
+        let (_, ro) = landlock_paths(&SandboxProfile::Server {
+            data_dir: PathBuf::from("/var/lib/kiki"),
+            socket_dir: PathBuf::from("/var/lib/kiki"),
+            temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
+        });
+        for p in &ro {
+            assert!(
+                !RO_TLS_PATHS.iter().any(|tls| p.starts_with(tls)),
+                "the server must not be granted a TLS trust store: {p:?}"
             );
         }
     }

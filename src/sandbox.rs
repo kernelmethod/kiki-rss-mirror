@@ -11,10 +11,10 @@
 //!   actually needs — for the server that is the data directory holding
 //!   the SQLite DB and cached assets, the Unix socket's parent directory,
 //!   SQLite's temp directory (normally inside the data directory), and a
-//!   small read-only set of system paths needed for DNS and TLS
-//!   trust stores. The feed fetcher gets only the TLS trust stores (it
-//!   has the server resolve hostnames for it), and the script host gets
-//!   *nothing at all*. Where the kernel
+//!   small read-only set of system paths needed for DNS. The feed fetcher,
+//!   which makes all of Kiki's HTTP(S) requests, gets only the TLS trust
+//!   stores (it has the server resolve hostnames for it), and the script
+//!   host gets *nothing at all*. Where the kernel
 //!   supports it, the feed fetcher is also barred from binding TCP ports
 //!   and from reaching abstract Unix sockets or signalling processes
 //!   outside its own sandbox.
@@ -45,7 +45,8 @@ use std::path::PathBuf;
 /// set of privileges to inherit by accident.
 pub enum SandboxProfile {
     /// The main `kiki serve` process: owns the SQLite database, the asset
-    /// cache, the listening socket, and all outbound feed fetches.
+    /// cache, and the listening socket, and resolves hostnames for the
+    /// feed fetcher. It makes no HTTP(S) requests of its own.
     Server {
         /// Directory containing the SQLite database, its WAL/SHM
         /// companions, and the cached assets tree. Granted read-write
@@ -73,7 +74,8 @@ pub enum SandboxProfile {
     ScriptHost,
 
     /// The feed fetcher: retrieves feeds over HTTP(S) and parses them,
-    /// and talks to the server over an inherited socket pair.
+    /// downloads their assets and favicons, and talks to the server over an
+    /// inherited socket pair.
     ///
     /// This profile grants read-only access to the TLS trust stores and
     /// nothing else — no data directory, no resolver configuration, no

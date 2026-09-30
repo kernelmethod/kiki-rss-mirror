@@ -124,7 +124,8 @@ async fn asset_cache_refresh_ingests_inline_and_enclosure() -> Result<()> {
     while let Ok(cmd) = rx.try_recv() {
         if let TaskManagerCommand::CacheEntryAssets { entry_id } = cmd {
             super::super::cache_entry_assets(
-                &client,
+                &test_fetcher(&client),
+                &Default::default(),
                 &pool,
                 &data_dir,
                 &crate::config::Settings::default().asset_cache,
@@ -212,7 +213,15 @@ async fn asset_cache_disabled_skips_fetches() -> Result<()> {
 
     while let Ok(cmd) = rx.try_recv() {
         if let TaskManagerCommand::CacheEntryAssets { entry_id } = cmd {
-            super::super::cache_entry_assets(&client, &pool, &data_dir, &cache, entry_id).await?;
+            super::super::cache_entry_assets(
+                &test_fetcher(&client),
+                &Default::default(),
+                &pool,
+                &data_dir,
+                &cache,
+                entry_id,
+            )
+            .await?;
         }
     }
 
@@ -293,7 +302,8 @@ async fn asset_cache_rejects_disallowed_content_type() -> Result<()> {
     while let Ok(cmd) = rx.try_recv() {
         if let TaskManagerCommand::CacheEntryAssets { entry_id } = cmd {
             super::super::cache_entry_assets(
-                &client,
+                &test_fetcher(&client),
+                &Default::default(),
                 &pool,
                 &data_dir,
                 &crate::config::Settings::default().asset_cache,
@@ -347,7 +357,15 @@ async fn asset_cache_evicts_when_over_cap() -> Result<()> {
     .await?;
     while let Ok(cmd) = rx.try_recv() {
         if let TaskManagerCommand::CacheEntryAssets { entry_id } = cmd {
-            super::super::cache_entry_assets(&client, &pool, &data_dir, &cache, entry_id).await?;
+            super::super::cache_entry_assets(
+                &test_fetcher(&client),
+                &Default::default(),
+                &pool,
+                &data_dir,
+                &cache,
+                entry_id,
+            )
+            .await?;
         }
     }
 
@@ -430,20 +448,29 @@ async fn start_stalling_server(stall: Stall) -> Result<SocketAddr> {
 /// Try to cache the image at `addr` with a client limited by `timeouts`,
 /// returning whether it was cached and how long that took to decide.
 async fn cache_with_timeouts(
-    timeouts: super::super::assets::AssetTimeouts,
+    timeouts: crate::fetcher::assets::AssetTimeouts,
     addr: SocketAddr,
 ) -> Result<(bool, std::time::Duration)> {
     let tc = TestBuilder::default().init_database().build()?;
     let pool = make_pool(&tc.database_path())?;
-    let client = super::super::assets::asset_client_builder(timeouts).build()?;
+    let fetcher = crate::fetcher::Fetcher::InProcess {
+        feeds: crate::fetcher::ProxiedClient::new(crate::fetcher::client_builder)?,
+        assets: crate::fetcher::ProxiedClient::new(move || {
+            crate::fetcher::assets::asset_client_builder(timeouts)
+        })?,
+    };
+    let cache = super::super::assets::AssetCache {
+        fetcher: &fetcher,
+        proxy: &Default::default(),
+        pool: &pool,
+        data_dir: tc.config_dir(),
+        max_bytes: i64::MAX,
+    };
     let url = reqwest::Url::parse(&format!("http://{addr}/img.png"))?;
 
     let start = std::time::Instant::now();
     let cached = super::super::assets::store_asset(
-        &client,
-        &pool,
-        tc.config_dir(),
-        i64::MAX,
+        &cache,
         &url,
         super::super::assets::AssetKind::InlineImg,
         |_, _| Ok(()),
@@ -456,7 +483,7 @@ async fn cache_with_timeouts(
 /// the body, is given up on once it has been quiet for the read timeout.
 #[tokio::test]
 async fn asset_downloads_time_out_when_the_server_stalls() -> Result<()> {
-    let timeouts = super::super::assets::AssetTimeouts {
+    let timeouts = crate::fetcher::assets::AssetTimeouts {
         connect: std::time::Duration::from_secs(5),
         read: std::time::Duration::from_millis(300),
         total: std::time::Duration::from_secs(60),
@@ -474,7 +501,7 @@ async fn asset_downloads_time_out_when_the_server_stalls() -> Result<()> {
 /// firing is cut off by the overall timeout.
 #[tokio::test]
 async fn asset_downloads_time_out_when_the_server_drips() -> Result<()> {
-    let timeouts = super::super::assets::AssetTimeouts {
+    let timeouts = crate::fetcher::assets::AssetTimeouts {
         connect: std::time::Duration::from_secs(5),
         read: std::time::Duration::from_secs(5),
         total: std::time::Duration::from_millis(500),
@@ -489,8 +516,55 @@ async fn asset_downloads_time_out_when_the_server_drips() -> Result<()> {
 /// The limits Kiki runs with leave room for a full-size enclosure.
 #[test]
 fn default_asset_timeouts_allow_large_downloads() {
-    let t = super::super::assets::AssetTimeouts::DEFAULT;
+    let t = crate::fetcher::assets::AssetTimeouts::DEFAULT;
     assert!(t.connect < t.total && t.read < t.total);
     let bits = super::super::assets::MAX_ASSET_BYTES * 8;
     assert!(bits / t.total.as_secs() <= 1_000_000);
+}
+
+/// The server does not take the fetcher's word for what it downloaded: an
+/// asset of a type not allowed for its kind is refused even when the
+/// fetcher claims it is fine, as a compromised fetcher might.
+#[cfg(unix)]
+#[tokio::test]
+async fn assets_the_fetcher_should_have_refused_are_not_stored() -> Result<()> {
+    use crate::fetcher::assets::{AssetReply, FetchedAsset};
+    use crate::process::feed_fetcher::{FeedFetcherHost, Job, JobResult};
+
+    let tc = TestBuilder::default().init_database().build()?;
+    let pool = make_pool(&tc.database_path())?;
+    let host = FeedFetcherHost::with_fake_worker(|job| match job {
+        Job::FetchAsset(_) => JobResult::Asset(AssetReply::Fetched(Box::new(FetchedAsset {
+            content_type: "text/html".into(),
+            etag: None,
+            last_modified: None,
+            bytes: b"<script>alert(1)</script>".to_vec(),
+        }))),
+        _ => JobResult::Failed {
+            message: "unexpected job".into(),
+        },
+    });
+    let fetcher = crate::fetcher::Fetcher::Isolated(Arc::new(host));
+    let cache = super::super::assets::AssetCache {
+        fetcher: &fetcher,
+        proxy: &Default::default(),
+        pool: &pool,
+        data_dir: tc.config_dir(),
+        max_bytes: i64::MAX,
+    };
+    let url = reqwest::Url::parse("http://example.invalid/img.png")?;
+
+    let stored = super::super::assets::store_asset(
+        &cache,
+        &url,
+        super::super::assets::AssetKind::InlineImg,
+        |_, _| Ok(()),
+    )
+    .await?;
+    assert!(!stored);
+    let n: i64 = tc
+        .database_conn()?
+        .query_row("SELECT COUNT(*) FROM feed_assets", [], |r| r.get(0))?;
+    assert_eq!(n, 0);
+    Ok(())
 }
