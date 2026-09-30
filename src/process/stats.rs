@@ -5,6 +5,16 @@
 //! server's own usage says little about where Kiki spends its resources.
 //! [`sample`] reads `/proc` for the server and every process descended from
 //! it, and totals them up by the job each one does (see [`Role`]).
+//!
+//! Memory is reported two ways. Resident memory (RSS) counts every page a
+//! process has mapped, including pages it shares with others — and Kiki's
+//! processes share a lot: each child is the same executable as the server,
+//! and the feed fetcher's worker is forked from its supervisor, so its
+//! copy-on-write pages are the supervisor's until either writes to them.
+//! Summing RSS across processes counts those pages once per process.
+//! Proportional memory (PSS) instead splits each shared page evenly among
+//! the processes that map it, so it adds up across processes to the memory
+//! Kiki actually occupies.
 
 use std::collections::HashMap;
 use std::fs;
@@ -58,7 +68,17 @@ pub struct Usage {
     /// that are still running.
     pub cpu_seconds: f64,
     /// Total resident memory of the role's processes, in bytes.
+    ///
+    /// This is the kernel's running count, which may lag the actual figure
+    /// slightly, so it is not exactly comparable with `proportional_bytes`.
     pub resident_bytes: u64,
+    /// Total proportional memory of the role's processes, in bytes: their
+    /// resident memory with each shared page divided among the processes
+    /// sharing it.
+    ///
+    /// `None` if it could not be read for one of the role's processes, as
+    /// on kernels older than 4.14, which lack `/proc/<pid>/smaps_rollup`.
+    pub proportional_bytes: Option<u64>,
     /// How many processes the role has.
     pub processes: u64,
 }
@@ -121,6 +141,16 @@ pub fn sample() -> io::Result<HashMap<Role, Usage>> {
             let u = usage.entry(role).or_default();
             u.cpu_seconds += stat.cpu_ticks as f64 / ticks_per_second;
             u.resident_bytes += stat.rss_pages * page_size;
+            // Once one process's PSS is missing, the role's total would
+            // undercount, so it stays missing.
+            let so_far = if u.processes == 0 {
+                Some(0)
+            } else {
+                u.proportional_bytes
+            };
+            u.proportional_bytes = so_far
+                .zip(proportional_bytes(pid))
+                .map(|(total, pss)| total + pss);
             u.processes += 1;
         }
         for &child in children.get(&pid).into_iter().flatten() {
@@ -142,6 +172,24 @@ fn child_role(pid: u32) -> Role {
         .ok()
         .and_then(|cmdline| cmdline.split(|&b| b == 0).nth(1).map(Role::of_child))
         .unwrap_or(Role::Other)
+}
+
+/// The proportional memory of `pid`, in bytes, if it can be read.
+///
+/// Reading it walks the process's page tables, so it costs more than
+/// reading its `stat`; [`sample`] is meant to run only every so often.
+fn proportional_bytes(pid: u32) -> Option<u64> {
+    fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+        .ok()
+        .and_then(|s| parse_pss(&s))
+}
+
+/// The `Pss` of a `/proc/<pid>/smaps_rollup` file, in bytes.
+fn parse_pss(rollup: &str) -> Option<u64> {
+    rollup.lines().find_map(|line| {
+        let kib = line.strip_prefix("Pss:")?.trim().strip_suffix("kB")?;
+        kib.trim().parse::<u64>().ok().map(|kib| kib * 1024)
+    })
 }
 
 /// The fields of `/proc/<pid>/stat` that [`sample`] uses.
@@ -193,6 +241,17 @@ mod tests {
     }
 
     #[test]
+    fn pss_is_read_from_smaps_rollup() {
+        let rollup = "55ccc0599000-7ffc222ad000 ---p 00000000 00:00 0    [rollup]\n\
+                      Rss:                1632 kB\n\
+                      Pss:                 451 kB\n\
+                      Pss_Dirty:           108 kB\n\
+                      Pss_Anon:            108 kB\n";
+        assert_eq!(parse_pss(rollup), Some(451 * 1024));
+        assert_eq!(parse_pss("Rss: 1632 kB\n"), None);
+    }
+
+    #[test]
     fn subcommands_name_the_role_of_the_servers_children() {
         assert_eq!(Role::of_child(b"__feed-fetcher"), Role::FeedFetcher);
         #[cfg(feature = "lua")]
@@ -206,6 +265,10 @@ mod tests {
         let server = usage.get(&Role::Server).expect("the server's own usage");
         assert!(server.processes >= 1);
         assert!(server.resident_bytes > 0);
+        // PSS isn't compared with RSS: `stat`'s RSS comes from per-CPU
+        // counters that can lag the page tables `smaps_rollup` walks, by
+        // megabytes on a machine with many CPUs.
+        assert!(server.proportional_bytes.expect("the server's own PSS") > 0);
     }
 
     #[test]
