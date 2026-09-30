@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::super::*;
 use crate::test::TestBuilder;
@@ -703,6 +703,62 @@ async fn a_gone_fetcher_is_not_charged_to_the_feed() -> Result<()> {
     assert!(
         next_fetch_at.is_some_and(|t| t >= before + min_cadence),
         "the feed should be put off, got {next_fetch_at:?}"
+    );
+    Ok(())
+}
+
+/// A feed that kills the fetcher's worker even on its own is recorded as
+/// doing so, and waits the full backoff cap like any permanent error.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_feed_that_crashes_the_fetcher_is_a_permanent_error() -> Result<()> {
+    use crate::process::feed_fetcher::{FeedFetcherHost, JobResult};
+    use std::sync::Arc;
+
+    let tc = TestBuilder::default().init_database().build()?;
+    let url = "http://example.invalid/feed.xml";
+    let (feed_id, _client, pool) = setup_feed(&tc, url)?;
+    let host = FeedFetcherHost::with_fake_worker(|_| JobResult::WorkerExited {
+        in_flight: 1,
+        why: "the fetcher worker died (killed by signal 11)".into(),
+    });
+    let fetcher = crate::fetcher::Fetcher::Isolated(Arc::new(host));
+
+    let settings = crate::config::Settings::default();
+    let before = Utc::now().timestamp();
+    super::super::fetch::refresh_feed(
+        &fetcher,
+        feed_id,
+        false,
+        pool,
+        &settings,
+        None,
+        &super::test_metrics(),
+        &super::test_tx(),
+    )
+    .await?;
+
+    let conn = tc.database_conn()?;
+    let (error, _) = read_stored_error(&conn, feed_id)?;
+    let next_fetch_at: Option<i64> = conn.query_row(
+        "SELECT next_fetch_at FROM feeds WHERE id = ?1",
+        [feed_id],
+        |row| row.get(0),
+    )?;
+    match error {
+        Some(FetchError::FetcherCrashed {
+            url: stored,
+            message,
+        }) => {
+            assert_eq!(stored, url);
+            assert!(message.contains("signal 11"), "{message}");
+        }
+        other => panic!("expected a fetcher_crashed error, got {other:?}"),
+    }
+    let max_backoff = settings.feed_fetch.max_backoff_seconds as i64;
+    assert!(
+        next_fetch_at.is_some_and(|t| t >= before + max_backoff),
+        "expected the full backoff cap, got {next_fetch_at:?}"
     );
     Ok(())
 }

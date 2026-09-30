@@ -439,6 +439,12 @@ pub enum FetcherError {
     #[error("the feed fetcher process is no longer running")]
     Gone,
 
+    /// The isolated fetcher's worker died while serving this request and
+    /// nothing else, even when it was retried on its own: the request
+    /// itself is what kills it. Carries how the worker died.
+    #[error("{0} while handling only this request")]
+    Crashed(String),
+
     /// The isolated fetcher did not answer within its deadline.
     #[error("feed fetcher did not answer within {0:?}")]
     Timeout(Duration),

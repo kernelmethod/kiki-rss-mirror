@@ -48,9 +48,12 @@
 //! for fetching, which is Kiki's core job. `fork` is not denied, so the
 //! supervisor — single-threaded, and never touching untrusted input —
 //! forks a fresh worker whenever the last one dies. The supervisor tracks
-//! which requests were in flight, answers each of them with a failure, and
-//! the server records those feeds as transiently failed so they back off
-//! rather than crashing the next worker straight away.
+//! which requests were in flight and answers each of them with
+//! [`JobResult::WorkerExited`]. Any of them may be what killed the worker,
+//! so the server retries them one at a time: a request that kills the
+//! worker again while it is alone is to blame, and its feed is recorded as
+//! crashing the fetcher, while the others are served as if nothing had
+//! happened.
 //!
 //! # Protocol
 //!
@@ -97,6 +100,13 @@ pub const SUBCOMMAND: &str = "__feed-fetcher";
 /// As for the script host, purely informational: it lets a hand-run
 /// `kiki __feed-fetcher` refuse with a clear message.
 pub const HOST_FD_ENV: &str = "KIKI_FEED_FETCHER_FD";
+
+/// How many times the server sends a job that was in hand when a worker
+/// died, one suspect at a time, before giving up on it.
+///
+/// A job that kills the worker when it is the only one in hand is to
+/// blame; one that is not alone when the worker dies again is retried.
+const ISOLATED_ATTEMPTS: usize = 3;
 
 /// Largest frame either side will write or accept.
 ///
@@ -221,11 +231,22 @@ pub enum JobResult {
     PageIcons(PageIcons),
     Images(Vec<String>),
 
-    /// The job could not be completed: the worker crashed while serving
-    /// it, the task serving it panicked, or the reply was too large to
-    /// send.
+    /// The job could not be completed: the task serving it panicked, or
+    /// the reply was too large to send.
     Failed {
         message: String,
+    },
+
+    /// The worker died while it had this job, and `in_flight - 1` others,
+    /// in hand; `why` says how it died. Sent by the supervisor, not the
+    /// worker.
+    ///
+    /// Any one of those jobs may be what killed it, so this alone blames
+    /// none of them: the server retries the job on its own to find out
+    /// (see `FeedFetcherHost::request`).
+    WorkerExited {
+        in_flight: u32,
+        why: String,
     },
 }
 
@@ -302,9 +323,16 @@ impl<T> Pending<T> {
     /// Allocate an id and a receiver for its answer, or `None` if closed.
     fn register(&self) -> Option<(u64, oneshot::Receiver<T>)> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.register_as(id).map(|rx| (id, rx))
+    }
+
+    /// A receiver for the answer to `id` once more, for a request resent
+    /// under the id it was first given, or `None` if closed. `id` must
+    /// have been allocated by [`Self::register`] and answered since.
+    fn register_as(&self, id: u64) -> Option<oneshot::Receiver<T>> {
         let (tx, rx) = oneshot::channel();
         self.lock().as_mut()?.insert(id, tx);
-        Some((id, rx))
+        Some(rx)
     }
 
     /// Deliver the answer to `id`. Late answers, whose waiter has given
@@ -368,6 +396,9 @@ pub struct FeedFetcherHost {
     /// wakes the reader thread and tells the supervisor to exit.
     control: UnixStream,
     child: Mutex<Option<Child>>,
+    /// Held while a job that was in hand when a worker died is retried,
+    /// so that suspects are retried one at a time; see [`Self::request`].
+    suspects: tokio::sync::Mutex<()>,
 }
 
 impl FeedFetcherHost {
@@ -442,6 +473,7 @@ impl FeedFetcherHost {
             writer: Mutex::new(Some(tx)),
             control,
             child: Mutex::new(child),
+            suspects: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -568,12 +600,50 @@ impl FeedFetcherHost {
         self.pending.closed().await
     }
 
+    /// Send `job` to the fetcher and wait up to `deadline` for its result.
+    ///
+    /// When the worker dies with the job in hand, the job is sent again,
+    /// holding [`Self::suspects`] so that no other suspect is retried
+    /// alongside it. A worker may die of any of the jobs it was given, so
+    /// the job is only blamed ([`FetcherError::Crashed`]) if it kills the
+    /// worker while it is the only job in hand. The others it was in hand
+    /// with are then served as usual, rather than all failing together.
     async fn request(&self, job: Job, deadline: Duration) -> Result<JobResult, FetcherError> {
-        let gone = || FetcherError::Gone;
-        let (id, rx) = self.pending.register().ok_or_else(gone)?;
+        let (id, rx) = self.pending.register().ok_or(FetcherError::Gone)?;
+        // Kept whole, to be sent again, under the same id, if need be.
+        let msg = ToFetcher::Request(Request { id, job });
+        let why = match self.send_and_wait(id, rx, &msg, deadline).await? {
+            JobResult::WorkerExited { why, .. } => why,
+            result => return finish(result),
+        };
+        debug!(id, reason = %why, "feed fetcher: retrying a job the worker died with");
 
+        let _alone = self.suspects.lock().await;
+        let mut why = why;
+        for _ in 0..ISOLATED_ATTEMPTS {
+            let rx = self.pending.register_as(id).ok_or(FetcherError::Gone)?;
+            match self.send_and_wait(id, rx, &msg, deadline).await? {
+                JobResult::WorkerExited { in_flight, why } if in_flight <= 1 => {
+                    return Err(FetcherError::Crashed(why));
+                }
+                JobResult::WorkerExited { why: again, .. } => why = again,
+                result => return finish(result),
+            }
+        }
+        Err(FetcherError::Crashed(why))
+    }
+
+    /// Send `msg`, the request `id`, and wait up to `deadline` on `rx` for
+    /// its answer.
+    async fn send_and_wait(
+        &self,
+        id: u64,
+        rx: oneshot::Receiver<JobResult>,
+        msg: &ToFetcher,
+        deadline: Duration,
+    ) -> Result<JobResult, FetcherError> {
         // Refused before it reaches the wire, so the channel is fine.
-        let encoded = encode_to(&ToFetcher::Request(Request { id, job })).and_then(|v| {
+        let encoded = encode_to(msg).and_then(|v| {
             if v.len() > MAX_FRAME_BYTES {
                 Err(FetcherError::Unavailable(format!(
                     "request of {} bytes exceeds the {} byte frame limit",
@@ -600,13 +670,12 @@ impl FeedFetcherHost {
             .is_some_and(|w| w.send(encoded).is_ok());
         if !sent {
             self.pending.forget(id);
-            return Err(gone());
+            return Err(FetcherError::Gone);
         }
 
         match tokio::time::timeout(deadline, rx).await {
-            Ok(Ok(JobResult::Failed { message })) => Err(FetcherError::Unavailable(message)),
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Err(gone()),
+            Ok(Err(_)) => Err(FetcherError::Gone),
             Err(_) => {
                 // Not fatal: the worker may just be slow on this one feed,
                 // and every other request is independent of it.
@@ -614,6 +683,15 @@ impl FeedFetcherHost {
                 Err(FetcherError::Timeout(deadline))
             }
         }
+    }
+}
+
+/// The result of a request, with a job the fetcher could not complete
+/// turned into an error.
+fn finish(result: JobResult) -> Result<JobResult, FetcherError> {
+    match result {
+        JobResult::Failed { message } => Err(FetcherError::Unavailable(message)),
+        result => Ok(result),
     }
 }
 
@@ -781,13 +859,16 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
         };
 
         // Answer everything the dead worker had accepted, so the server
-        // records those feeds as failed (and backs them off) now, instead
-        // of waiting out their deadlines.
+        // can retry each of them now, and find which one killed it,
+        // instead of waiting out their deadlines.
+        let count = u32::try_from(in_flight.len()).unwrap_or(u32::MAX);
+        let why = format!("the fetcher worker died ({})", describe_wait_status(status));
         for id in in_flight {
             let response = FromFetcher::Response(Response {
                 id,
-                result: JobResult::Failed {
-                    message: "the fetcher worker exited while handling this feed".into(),
+                result: JobResult::WorkerExited {
+                    in_flight: count,
+                    why: why.clone(),
                 },
             });
             let encoded = encode(&response).context("encoding a failure response")?;
@@ -1318,6 +1399,103 @@ mod tests {
         assert!(matches!(err, FetcherError::Gone), "got {err:?}");
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(!host.is_alive());
+    }
+
+    /// A host whose far end stands in for a supervisor over a worker that
+    /// dies whenever it is given a `Parse` job whose body is `CRASH`,
+    /// answering every job it then had in hand with
+    /// [`JobResult::WorkerExited`]. Other jobs are held until no frame has
+    /// arrived for a while, so that they can be in hand together with a
+    /// crashing one, and are then answered as parsing to nothing.
+    fn host_with_fragile_worker() -> FeedFetcherHost {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        std::thread::spawn(move || {
+            let mut held: Vec<u64> = Vec::new();
+            let answer = |theirs: &mut UnixStream, id, result| {
+                let reply = encode_response(id, result);
+                write_frame_limited(theirs, &reply, MAX_FRAME_BYTES).is_ok()
+            };
+            loop {
+                match read_frame_limited(&mut theirs, MAX_FRAME_BYTES) {
+                    Ok(frame) => {
+                        let Ok(ToFetcher::Request(Request { id, job })) = decode(&frame) else {
+                            continue;
+                        };
+                        held.push(id);
+                        if matches!(&job, Job::Parse { body, .. } if body == b"CRASH") {
+                            let in_flight = held.len() as u32;
+                            for id in std::mem::take(&mut held) {
+                                let why = "the fetcher worker died (test)".to_string();
+                                if !answer(
+                                    &mut theirs,
+                                    id,
+                                    JobResult::WorkerExited { in_flight, why },
+                                ) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        for id in std::mem::take(&mut held) {
+                            let parsed = JobResult::Parsed(ParseOutcome {
+                                feed: None,
+                                seconds: 0.0,
+                            });
+                            if !answer(&mut theirs, id, parsed) {
+                                return;
+                            }
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        FeedFetcherHost::from_stream(ours, None).unwrap()
+    }
+
+    /// When a worker dies with several jobs in hand, only the one that
+    /// killed it is blamed: the others are retried and served.
+    #[tokio::test]
+    async fn only_the_job_that_kills_the_worker_is_blamed() {
+        let host = Arc::new(host_with_fragile_worker());
+        let innocent = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move { host.parse(1, RSS.to_vec()).await })
+        };
+        // Let the innocent job reach the worker first.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let culprit = host.parse(2, b"CRASH".to_vec()).await;
+
+        assert!(
+            matches!(culprit, Err(FetcherError::Crashed(_))),
+            "got {culprit:?}"
+        );
+        let innocent = innocent.await.unwrap();
+        assert!(innocent.is_ok(), "got {innocent:?}");
+        assert!(host.is_alive());
+    }
+
+    /// A job that kills the worker on its own is blamed, with how the
+    /// worker died.
+    #[tokio::test]
+    async fn a_job_that_kills_the_worker_alone_is_blamed() {
+        let host = host_with_fragile_worker();
+        let err = host.parse(1, b"CRASH".to_vec()).await.unwrap_err();
+        match err {
+            FetcherError::Crashed(why) => assert!(why.contains("died"), "{why}"),
+            other => panic!("got {other:?}"),
+        }
+        // The fetcher is still there for everything else.
+        assert!(host.parse(1, RSS.to_vec()).await.is_ok());
     }
 
     /// Whoever waits on [`FeedFetcherHost::closed`] learns the channel has

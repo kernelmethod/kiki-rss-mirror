@@ -373,10 +373,21 @@ fn store_refresh(
             rec.outcome("fetcher_gone");
             return Ok(());
         }
+        // The feed is what kills the fetcher's worker: it waits the full
+        // backoff cap, like any other permanent error, rather than
+        // crashing the worker again at the next opportunity.
+        Err(FetcherError::Crashed(message)) => {
+            let url = row.url.clone();
+            rec.fail(
+                FetchError::FetcherCrashed { url, message },
+                "fetcher",
+                "fetcher_crashed",
+            );
+            return Ok(());
+        }
         // The fetcher itself failed, not the feed server. Recorded as a
-        // transient error so the feed backs off: if its content is what
-        // crashed the fetcher, retrying on the next tick would only crash
-        // it again.
+        // transient error so the feed backs off rather than being retried
+        // on the next tick.
         Err(e) => {
             let message = format!("{}", e);
             rec.fail(FetchError::Other { message }, "fetcher", "fetcher_error");
