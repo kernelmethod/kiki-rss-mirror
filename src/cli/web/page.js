@@ -12,7 +12,7 @@ document.addEventListener("click", async (event) => {
   const save = button.getAttribute("aria-pressed") !== "true";
   button.disabled = true;
   try {
-    const resp = await fetch(`/entries/${button.dataset.entry}/saved`, {
+    const resp = await fetch(`/entries/${button.dataset.entry}/system-tags/saved`, {
       method: save ? "PUT" : "DELETE",
     });
     if (!resp.ok) {
@@ -217,3 +217,225 @@ document.addEventListener("click", async (event) => {
     delete button.dataset.statusError;
   }, 2000);
 });
+
+// Swiping an unread entry left marks it as read: the row follows the finger,
+// uncovering a "Read" panel, and once dragged far enough it slides away,
+// collapses, and is tagged `system:read`. A popup at the bottom of the page
+// offers to undo it. Only touches swipe; a mouse drag does nothing.
+const SWIPE_START = 10; // px moved before deciding between swipe and scroll
+const SWIPE_COMMIT = 0.35; // fraction of the row's width that marks it read
+const SWIPE_FLICK = 0.5; // px per ms: a flick this fast marks it read too
+const UNDO_TIMEOUT = 5000;
+
+let swipe = null;
+let lastSwipeEnd = 0;
+
+function reducedMotion() {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+document.addEventListener("pointerdown", (event) => {
+  const row = event.target.closest("li.swipe-read");
+  if (!row || event.pointerType !== "touch" || !event.isPrimary || swipe || row.swipeAnimations) {
+    return;
+  }
+  swipe = { row, id: event.pointerId, x: event.clientX, y: event.clientY, dragging: false };
+});
+
+document.addEventListener("pointermove", (event) => {
+  if (!swipe || event.pointerId !== swipe.id) {
+    return;
+  }
+  const dx = event.clientX - swipe.x;
+  const dy = event.clientY - swipe.y;
+  if (!swipe.dragging) {
+    if (Math.abs(dx) < SWIPE_START && Math.abs(dy) < SWIPE_START) {
+      return;
+    }
+    // A mostly vertical move is a scroll, and one to the right is not a
+    // swipe we act on; either way, leave it to the browser.
+    if (Math.abs(dy) >= Math.abs(dx) || dx > 0) {
+      swipe = null;
+      return;
+    }
+    swipe.dragging = true;
+    swipe.row.setPointerCapture(event.pointerId);
+    swipe.row.classList.add("swiping");
+  }
+  const offset = Math.min(0, dx);
+  if (swipe.time !== undefined) {
+    swipe.speed = (offset - swipe.offset) / Math.max(1, event.timeStamp - swipe.time);
+  }
+  swipe.offset = offset;
+  swipe.time = event.timeStamp;
+  swipe.row.style.transform = `translateX(${offset}px)`;
+});
+
+function endSwipe(event) {
+  if (!swipe || event.pointerId !== swipe.id) {
+    return;
+  }
+  const { row, dragging, offset = 0, speed = 0 } = swipe;
+  swipe = null;
+  if (!dragging) {
+    return;
+  }
+  lastSwipeEnd = Date.now();
+  const commit =
+    event.type === "pointerup" &&
+    (-offset > row.offsetWidth * SWIPE_COMMIT || (-speed > SWIPE_FLICK && -offset > SWIPE_START * 3));
+  if (commit) {
+    markRead(row, offset);
+  } else {
+    snapBack(row, offset);
+  }
+}
+document.addEventListener("pointerup", endSwipe);
+document.addEventListener("pointercancel", endSwipe);
+
+// A swipe that ends over the entry's link or save button must not also
+// follow or press it.
+document.addEventListener(
+  "click",
+  (event) => {
+    if (Date.now() - lastSwipeEnd < 400 && event.target.closest("li.swipe-read")) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  },
+  true,
+);
+
+async function snapBack(row, offset) {
+  row.style.transform = "";
+  const animation = row.animate(
+    [{ transform: `translateX(${offset}px)` }, { transform: "translateX(0)" }],
+    { duration: reducedMotion() ? 0 : 150, easing: "ease-out" },
+  );
+  await animation.finished.catch(() => {});
+  row.classList.remove("swiping");
+}
+
+// Slide `row` the rest of the way out and collapse the gap it leaves, while
+// telling the server it is read. If that fails, the row comes back.
+async function markRead(row, offset) {
+  const duration = reducedMotion() ? 0 : 150;
+  const style = getComputedStyle(row);
+  row.style.transform = "";
+  const slide = row.animate(
+    [{ transform: `translateX(${offset}px)` }, { transform: "translateX(-100%)" }],
+    { duration, easing: "ease-out", fill: "forwards" },
+  );
+  row.swipeAnimations = [slide];
+  const request = setRead(row, true);
+  adjustUnreadCount(-1);
+  showUndo(row, request);
+
+  await slide.finished.catch(() => {});
+  if (!row.swipeAnimations) {
+    return; // Undone already.
+  }
+  const collapse = row.animate(
+    [
+      {
+        height: `${row.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)}px`,
+        paddingTop: style.paddingTop,
+        paddingBottom: style.paddingBottom,
+        borderBottomWidth: style.borderBottomWidth,
+      },
+      { height: "0px", paddingTop: "0px", paddingBottom: "0px", borderBottomWidth: "0px" },
+    ],
+    { duration, easing: "ease-in", fill: "forwards" },
+  );
+  row.swipeAnimations.push(collapse);
+  await collapse.finished.catch(() => {});
+  if (!row.swipeAnimations) {
+    return;
+  }
+  row.hidden = true;
+
+  // Undoing puts the row back itself, whether or not this worked.
+  if (!(await request) && row.swipeAnimations) {
+    restoreRow(row);
+    adjustUnreadCount(1);
+    row.title = "Could not mark this entry as read";
+    showToast("Could not mark the entry as read.");
+  }
+}
+
+// Put back a row that was swiped away.
+function restoreRow(row) {
+  row.swipeAnimations?.forEach((animation) => animation.cancel());
+  row.swipeAnimations = null;
+  row.hidden = false;
+  row.classList.remove("swiping");
+}
+
+// Add (`read`) or remove the entry's `system:read` tag; resolves to whether
+// that worked.
+async function setRead(row, read) {
+  try {
+    const resp = await fetch(`/entries/${row.dataset.entry}/system-tags/read`, {
+      method: read ? "PUT" : "DELETE",
+    });
+    if (!resp.ok) {
+      throw new Error(`${resp.status} ${resp.statusText}`);
+    }
+    return true;
+  } catch (e) {
+    console.error(`failed to mark entry as ${read ? "read" : "unread"}:`, e);
+    return false;
+  }
+}
+
+// Keep the "N unread entries" count above the list in step with swipes.
+function adjustUnreadCount(delta) {
+  const count = document.querySelector(".list-header .count");
+  const n = parseInt(count?.textContent, 10);
+  if (Number.isNaN(n)) {
+    return;
+  }
+  const total = Math.max(0, n + delta);
+  count.textContent = `${total} unread ${total === 1 ? "entry" : "entries"}`;
+}
+
+// The popup at the bottom of the page. Only the latest swipe can be undone.
+function showToast(message, undo) {
+  let toast = document.querySelector(".toast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.className = "toast";
+    toast.setAttribute("role", "status");
+    document.body.append(toast);
+  }
+  clearTimeout(toast.timer);
+  toast.replaceChildren(message);
+  if (undo) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Undo";
+    button.addEventListener("click", () => {
+      toast.hidden = true;
+      undo();
+    });
+    toast.append(" ", button);
+  }
+  toast.hidden = false;
+  toast.timer = setTimeout(() => {
+    toast.hidden = true;
+  }, UNDO_TIMEOUT);
+}
+
+function showUndo(row, request) {
+  showToast("Marked as read.", async () => {
+    restoreRow(row);
+    adjustUnreadCount(1);
+    // Wait for the entry to be marked read, so that the two requests
+    // cannot pass each other; if it never was, there is nothing to undo.
+    if ((await request) && !(await setRead(row, false))) {
+      row.hidden = true;
+      adjustUnreadCount(-1);
+      showToast("Could not mark the entry as unread.");
+    }
+  });
+}

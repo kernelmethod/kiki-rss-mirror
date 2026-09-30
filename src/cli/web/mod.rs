@@ -306,7 +306,10 @@ async fn serve_ui(
         .route("/", get(index))
         .route("/entries/{id}", get(entry_page))
         .route("/entries/read", post(mark_entries_read))
-        .route("/entries/{id}/saved", put(save_entry).delete(unsave_entry))
+        .route(
+            "/entries/{id}/system-tags/{name}",
+            put(add_entry_system_tag).delete(remove_entry_system_tag),
+        )
         .route("/feeds", get(feeds_page))
         .route("/feeds/{id}", get(feed_page))
         .route("/tags", get(tags_page))
@@ -660,54 +663,65 @@ async fn entry_page(
     )
 }
 
-/// Save entry `id`, giving it the `system:saved` tag. Called by the save
-/// buttons' script; see [`set_entry_saved`].
-async fn save_entry(
+/// Give entry `id` the system tag `name`. Called by the save buttons' and
+/// swipe-to-read gestures' script; see [`set_entry_system_tag`].
+async fn add_entry_system_tag(
     State(api): State<reqwest::Client>,
-    UrlPath(id): UrlPath<i64>,
+    UrlPath((id, name)): UrlPath<(i64, String)>,
     headers: HeaderMap,
 ) -> Response {
-    set_entry_saved(&api, id, &headers, true).await
+    set_entry_system_tag(&api, id, &name, &headers, true).await
 }
 
-/// Unsave entry `id`, removing its `system:saved` tag. Called by the save
-/// buttons' script; see [`set_entry_saved`].
-async fn unsave_entry(
+/// Remove the system tag `name` from entry `id`. Called by the save
+/// buttons' script, and to undo a swipe; see [`set_entry_system_tag`].
+async fn remove_entry_system_tag(
     State(api): State<reqwest::Client>,
-    UrlPath(id): UrlPath<i64>,
+    UrlPath((id, name)): UrlPath<(i64, String)>,
     headers: HeaderMap,
 ) -> Response {
-    set_entry_saved(&api, id, &headers, false).await
+    set_entry_system_tag(&api, id, &name, &headers, false).await
 }
 
-/// Add (`saved == true`) or remove the `system:saved` tag on entry `id`,
-/// responding with `204 No Content` once it is done.
+/// Add (`add == true`) or remove the system tag `name` on entry `id`,
+/// through `PUT`/`DELETE /v1/entries/id/{id}/system-tags/{name}` on the
+/// Kiki API, responding with `204 No Content` once it is done. `name` is
+/// the tag's name with or without its `system:` prefix, e.g. `read`.
 ///
-/// Responds with `404 Not Found` if there is no such entry, `502 Bad
-/// Gateway` if the Kiki server cannot make the change, and `403 Forbidden`
-/// to requests from other sites, going by `headers`; see
+/// Responds with `404 Not Found` if there is no such entry or system tag,
+/// `502 Bad Gateway` if the Kiki server cannot make the change, and `403
+/// Forbidden` to requests from other sites, going by `headers`; see
 /// [`is_same_origin`].
-async fn set_entry_saved(
+async fn set_entry_system_tag(
     api: &reqwest::Client,
     id: i64,
+    name: &str,
     headers: &HeaderMap,
-    saved: bool,
+    add: bool,
 ) -> Response {
     if !is_same_origin(headers) {
         return (
             StatusCode::FORBIDDEN,
-            "Entries may only be saved from the web UI's own pages.",
+            "Entries may only be changed from the web UI's own pages.",
         )
             .into_response();
     }
+    // Only a known tag's own name goes into the API's URL, so that `name`
+    // cannot reach another of its routes, as `..%2F..` would.
+    let Ok(tag) = name.parse::<SystemTag>() else {
+        return (StatusCode::NOT_FOUND, "System tag not found.").into_response();
+    };
 
-    let url = format!("{API_BASE}/v1/entries/id/{id}/system-tags/saved");
-    let req = if saved { api.put(url) } else { api.delete(url) };
+    let url = format!(
+        "{API_BASE}/v1/entries/id/{id}/system-tags/{}",
+        tag.short_name()
+    );
+    let req = if add { api.put(url) } else { api.delete(url) };
     match req.send().await.map(|resp| resp.status()) {
         Ok(StatusCode::OK) => StatusCode::NO_CONTENT.into_response(),
         Ok(StatusCode::NOT_FOUND) => (StatusCode::NOT_FOUND, "Entry not found.").into_response(),
         Ok(status) => {
-            tracing::warn!(%status, entry_id = id, saved, "failed to update saved entry");
+            tracing::warn!(%status, entry_id = id, %tag, add, "failed to update entry's system tag");
             (StatusCode::BAD_GATEWAY, "The entry could not be updated.").into_response()
         }
         Err(e) => {
@@ -1717,11 +1731,21 @@ fn render_entries(
             _ => "<p>No entries on this page.</p>\n",
         });
     } else {
+        // Where read entries are left out, an unread entry can be swiped
+        // away to mark it as read; the script in `page.js` does the rest.
+        let swipeable = !listing.show_read && !searching;
         html.push_str("<ol class=\"entries\">\n");
         for entry in entries {
             let feed = entry.feed_id.and_then(|id| feeds.get(&id));
             let tags = tags.get(&entry.id).map_or(&[][..], Vec::as_slice);
-            html.push_str("<li>");
+            if swipeable && !has_system_tag(tags, SystemTag::Read) {
+                html.push_str(&format!(
+                    "<li class=\"swipe-read\" data-entry=\"{}\">",
+                    entry.id
+                ));
+            } else {
+                html.push_str("<li>");
+            }
             html.push_str(&render_entry(
                 entry,
                 feed.map(String::as_str),
@@ -1828,16 +1852,21 @@ const SAVE_ICON: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusab
 
 /// Render the button that saves entry `id`, or unsaves it if its `tags`
 /// include `system:saved`. The button does nothing on its own: the script
-/// in `page.js` sends the change to [`save_entry`] or [`unsave_entry`].
+/// in `page.js` sends the change to [`add_entry_system_tag`] or
+/// [`remove_entry_system_tag`].
 fn render_save_button(id: i64, tags: &[TagResponse]) -> String {
-    let saved = tags
-        .iter()
-        .any(|tag| tag.kind == TagKind::System && tag.name == SystemTag::Saved.name());
+    let saved = has_system_tag(tags, SystemTag::Saved);
     format!(
         "<button type=\"button\" class=\"save\" data-entry=\"{id}\" aria-pressed=\"{saved}\" \
          aria-label=\"Save\" title=\"{}\">{SAVE_ICON}</button>",
         if saved { "Unsave" } else { "Save" }
     )
+}
+
+/// Whether an entry's `tags` include the system tag `tag`.
+fn has_system_tag(tags: &[TagResponse], tag: SystemTag) -> bool {
+    tags.iter()
+        .any(|t| t.kind == TagKind::System && t.name == tag.name())
 }
 
 /// Render `tags`, the tags attached to an entry, as a list, or nothing if
@@ -2858,7 +2887,10 @@ mod tests {
 
     /// Titles of the entries listed on `body`, in order.
     fn listed_titles(body: &str) -> Vec<String> {
-        let re = regex::Regex::new(r#"<li><a href="[^"]*">([^<]*)</a>"#).unwrap();
+        let re = regex::Regex::new(
+            r#"<li(?: class="swipe-read" data-entry="\d+")?><a href="[^"]*">([^<]*)</a>"#,
+        )
+        .unwrap();
         re.captures_iter(body).map(|c| c[1].to_owned()).collect()
     }
 
@@ -3406,8 +3438,8 @@ mod tests {
         )?)
     }
 
-    /// `PUT /entries/{id}/saved` saves an entry and `DELETE` unsaves it,
-    /// each any number of times; an unknown entry is not found.
+    /// `PUT /entries/{id}/system-tags/saved` saves an entry and `DELETE`
+    /// unsaves it, each any number of times; an unknown entry is not found.
     #[tokio::test]
     async fn entries_can_be_saved_and_unsaved() -> Result<()> {
         let tc = TestBuilder::all().build()?;
@@ -3418,7 +3450,7 @@ mod tests {
             let status = send_request(
                 tc.client()?,
                 reqwest::Method::PUT,
-                "/entries/1/saved",
+                "/entries/1/system-tags/saved",
                 &same_origin,
             )
             .await?;
@@ -3429,7 +3461,7 @@ mod tests {
             let status = send_request(
                 tc.client()?,
                 reqwest::Method::DELETE,
-                "/entries/1/saved",
+                "/entries/1/system-tags/saved",
                 &same_origin,
             )
             .await?;
@@ -3438,8 +3470,13 @@ mod tests {
         }
 
         for method in [reqwest::Method::PUT, reqwest::Method::DELETE] {
-            let status =
-                send_request(tc.client()?, method, "/entries/99/saved", &same_origin).await?;
+            let status = send_request(
+                tc.client()?,
+                method,
+                "/entries/99/system-tags/saved",
+                &same_origin,
+            )
+            .await?;
             assert_eq!(status, StatusCode::NOT_FOUND);
         }
         Ok(())
@@ -3458,13 +3495,77 @@ mod tests {
             &[("Origin", "http://evil.example")],
         ] {
             for (method, id) in [(reqwest::Method::PUT, 1), (reqwest::Method::DELETE, 2)] {
-                let path = format!("/entries/{id}/saved");
+                let path = format!("/entries/{id}/system-tags/saved");
                 let status = send_request(tc.client()?, method, &path, headers).await?;
                 assert_eq!(status, StatusCode::FORBIDDEN, "{path} {headers:?}");
             }
         }
         assert!(!is_saved(&tc, 1)?);
         assert!(is_saved(&tc, 2)?);
+        Ok(())
+    }
+
+    /// `PUT /entries/{id}/system-tags/read` marks an entry as read and
+    /// `DELETE` marks it unread again, by either of the tag's names. Only
+    /// system tags can be changed this way: other names, including ones
+    /// that would reach other API routes, are not found.
+    #[tokio::test]
+    async fn entries_can_be_marked_read_and_unread() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 2)?;
+        let same_origin = [("Sec-Fetch-Site", "same-origin")];
+
+        for name in ["read", "system:read"] {
+            let path = format!("/entries/2/system-tags/{name}");
+            let status =
+                send_request(tc.client()?, reqwest::Method::PUT, &path, &same_origin).await?;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{path}");
+            assert_eq!(read_entries(&tc)?, [2], "{path}");
+            let status =
+                send_request(tc.client()?, reqwest::Method::DELETE, &path, &same_origin).await?;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{path}");
+            assert!(read_entries(&tc)?.is_empty(), "{path}");
+        }
+
+        tag_entry(&tc, 1, "news")?;
+        for path in [
+            "/entries/1/system-tags/news",
+            "/entries/1/system-tags/starred",
+            "/entries/1/system-tags/..%2F..%2F..%2Ftags%2Fid%2F1",
+        ] {
+            for method in [reqwest::Method::PUT, reqwest::Method::DELETE] {
+                let status = send_request(tc.client()?, method, path, &same_origin).await?;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            }
+        }
+        assert_eq!(
+            tc.database_conn()?.query_row(
+                "SELECT COUNT(*) FROM tags WHERE name = 'news'",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    /// Unread entries can be swiped away where read entries are left out:
+    /// not once read entries are shown, nor in search results.
+    #[tokio::test]
+    async fn unread_entries_can_be_swiped_where_read_ones_are_hidden() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        insert_entries(&tc, 2)?;
+        tag_entry(&tc, 2, "system:read")?;
+        let swipeable = |id| format!(r#"<li class="swipe-read" data-entry="{id}">"#);
+
+        let (_, body) = get_index(tc.client()?).await?;
+        assert!(body.contains(&swipeable(1)), "{body}");
+        let (_, body) = get_page(tc.client()?, "/?show_read=true").await?;
+        assert_eq!(listed_titles(&body).len(), 2, "{body}");
+        assert!(!body.contains(r#"class="swipe-read""#), "{body}");
+        let (_, body) = get_page(tc.client()?, "/search?q=entry").await?;
+        assert_eq!(listed_titles(&body).len(), 2, "{body}");
+        assert!(!body.contains(r#"class="swipe-read""#), "{body}");
         Ok(())
     }
 
