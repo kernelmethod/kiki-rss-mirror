@@ -1532,7 +1532,16 @@ mod tests {
             )
             .route(
                 "/evil.svg",
-                get(|| async { ([("content-type", "image/svg+xml")], "<svg/>") }),
+                get(|| async {
+                    (
+                        [("content-type", "image/svg+xml")],
+                        r#"<svg onload="alert(1)"><script>alert(2)</script><rect/></svg>"#,
+                    )
+                }),
+            )
+            .route(
+                "/not.svg",
+                get(|| async { ([("content-type", "image/svg+xml")], "<html/>") }),
             )
             .route(
                 "/",
@@ -1566,8 +1575,26 @@ mod tests {
             }
             other => panic!("expected the image, got {other:?}"),
         }
-        let reply = host
+        match host
             .fetch_asset(asset("/evil.svg", AssetKind::InlineImg))
+            .await
+            .unwrap()
+        {
+            AssetReply::Fetched(a) => {
+                assert_eq!(a.content_type, "image/svg+xml");
+                let svg = String::from_utf8(a.bytes).unwrap();
+                assert!(svg.contains("<rect/>"), "{svg}");
+                assert!(!svg.contains("script") && !svg.contains("onload"), "{svg}");
+            }
+            other => panic!("expected the sanitized SVG, got {other:?}"),
+        }
+        let reply = host
+            .fetch_asset(asset("/not.svg", AssetKind::InlineImg))
+            .await
+            .unwrap();
+        assert!(matches!(reply, AssetReply::UnsafeSvg), "got {reply:?}");
+        let reply = host
+            .fetch_asset(asset("/evil.svg", AssetKind::Enclosure))
             .await
             .unwrap();
         assert!(

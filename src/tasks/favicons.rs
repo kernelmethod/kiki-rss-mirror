@@ -1,8 +1,9 @@
 //! Finding and caching the favicons of the websites feeds belong to.
 //!
 //! [`cache_feed_favicon`] looks for a feed's favicon in these places, in
-//! order, and caches the first one that downloads as a safe raster image
-//! (see [`assets::is_allowed_content_type`]; SVG icons are never cached):
+//! order, and caches the first one that downloads as an allowed image (see
+//! [`assets::is_allowed_content_type`]; SVG icons are cached only after
+//! being sanitized, and are tried after raster ones):
 //!
 //! 1. The Atom feed's `<icon>`.
 //! 2. The `<link rel="icon">` (and `apple-touch-icon`) elements on the

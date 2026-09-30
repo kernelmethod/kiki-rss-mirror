@@ -10,6 +10,7 @@
 //! return is plain data: the server hashes, stores and indexes it
 //! ([`crate::tasks::assets`]), after checking it again.
 
+use super::svg::{sanitize_svg, SVG_CONTENT_TYPE};
 use super::ProxiedClient;
 use crate::config::ProxySettings;
 use crate::http::{read_body_capped, CappedBody};
@@ -98,9 +99,11 @@ impl AssetKind {
     }
 }
 
-/// Image MIME types we're willing to cache and serve. Deliberately excludes
-/// `image/svg+xml`: SVG is XML and can embed executable script, which would
-/// run when a browser navigates directly to the asset URL.
+/// Raster image MIME types we're willing to cache and serve as they are.
+/// Deliberately excludes `image/svg+xml`: SVG is XML and can embed
+/// executable script, which would run when a browser navigates directly to
+/// the asset URL. SVG images are cached too, but only after
+/// [`sanitize_svg`] has rebuilt them (see [`is_allowed_content_type`]).
 const SAFE_IMAGE_TYPES: &[&str] = &[
     "image/png",
     "image/jpeg",
@@ -142,14 +145,15 @@ pub fn normalize_content_type(raw: &str) -> Option<String> {
 /// Whether a normalized MIME type is acceptable to cache for the given kind.
 ///
 /// Inline images and favicons must match one of the safe raster image
-/// types. Enclosures additionally accept audio and video types plus a
-/// handful of common podcast-adjacent `application/*` types.
+/// types, or be SVG, which is accepted only because [`fetch_asset`]
+/// sanitizes it. Enclosures additionally accept audio and video types plus a
+/// handful of common podcast-adjacent `application/*` types, but not SVG.
 pub fn is_allowed_content_type(normalized: &str, kind: AssetKind) -> bool {
     if SAFE_IMAGE_TYPES.contains(&normalized) {
         return true;
     }
     match kind {
-        AssetKind::InlineImg | AssetKind::Favicon => false,
+        AssetKind::InlineImg | AssetKind::Favicon => normalized == SVG_CONTENT_TYPE,
         AssetKind::Enclosure => {
             normalized.starts_with("audio/")
                 || normalized.starts_with("video/")
@@ -249,6 +253,10 @@ pub enum AssetReply {
     /// The body exceeded [`MAX_ASSET_BYTES`].
     TooLarge { seen: u64 },
 
+    /// An SVG image that could not be made safe to serve: it was not a
+    /// well-formed SVG document, or it was over [`super::svg::MAX_SVG_BYTES`].
+    UnsafeSvg,
+
     /// The body could not be read to the end.
     Failed { message: String },
 }
@@ -327,12 +335,23 @@ pub async fn fetch_asset(clients: &ProxiedClient, spec: &AssetSpec) -> AssetRepl
     // calling `bytes()` would still buffer the whole body for a server
     // that lies about (or omits) the header.
     match read_body_capped(resp, MAX_ASSET_BYTES).await {
-        Ok(CappedBody::Complete(bytes)) => AssetReply::Fetched(Box::new(FetchedAsset {
-            content_type,
-            etag,
-            last_modified,
-            bytes,
-        })),
+        Ok(CappedBody::Complete(bytes)) => {
+            // What is served is the rebuilt SVG, never the original.
+            let bytes = if content_type == SVG_CONTENT_TYPE {
+                match sanitize_svg(&bytes) {
+                    Some(clean) => clean,
+                    None => return AssetReply::UnsafeSvg,
+                }
+            } else {
+                bytes
+            };
+            AssetReply::Fetched(Box::new(FetchedAsset {
+                content_type,
+                etag,
+                last_modified,
+                bytes,
+            }))
+        }
         Ok(CappedBody::TooLarge { seen }) => AssetReply::TooLarge { seen },
         Err(e) => AssetReply::Failed {
             message: e.to_string(),
@@ -472,9 +491,10 @@ struct IconLink {
 /// `<link rel="apple-touch-icon">`, best first, resolving them against
 /// `page_url` or the page's `<base href>`.
 ///
-/// Icons declared as SVG are left out, since they would not be cached.
-/// Among the rest, `rel="icon"` comes before touch icons, and the smallest
-/// icon at least 32 pixels wide is preferred.
+/// `rel="icon"` comes before touch icons, and the smallest icon at least 32
+/// pixels wide is preferred. Icons declared as SVG, which are sanitized
+/// before they are cached, rank last among those of the same `rel`, as a
+/// fallback for when a raster icon cannot be had.
 pub(crate) fn extract_icon_links(html: &[u8], page_url: &Url) -> Vec<Url> {
     let base = RefCell::new(page_url.clone());
     let icons: RefCell<Vec<IconLink>> = RefCell::new(Vec::new());
@@ -508,21 +528,21 @@ pub(crate) fn extract_icon_links(html: &[u8], page_url: &Url) -> Vec<Url> {
                         } else {
                             return Ok(());
                         };
-                        let is_svg = el
+                        let declared_svg = el
                             .get_attribute("type")
                             .and_then(|t| normalize_content_type(&t))
-                            .is_some_and(|t| t == "image/svg+xml");
-                        if is_svg {
-                            return Ok(());
-                        }
+                            .is_some_and(|t| t == SVG_CONTENT_TYPE);
                         let href = el.get_attribute("href").unwrap_or_default();
                         let Some(url) = resolve_http_url(&href, &base.borrow()) else {
                             return Ok(());
                         };
-                        if url.path().to_ascii_lowercase().ends_with(".svg") {
-                            return Ok(());
-                        }
-                        let size_rank = size_rank(el.get_attribute("sizes").as_deref());
+                        let is_svg =
+                            declared_svg || url.path().to_ascii_lowercase().ends_with(".svg");
+                        let size_rank = if is_svg {
+                            u32::MAX
+                        } else {
+                            size_rank(el.get_attribute("sizes").as_deref())
+                        };
                         icons.borrow_mut().push(IconLink {
                             url,
                             rel_rank,
@@ -650,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_img_allowlist_rejects_html_and_svg() {
+    fn inline_img_allowlist_rejects_html_but_not_sanitized_svg() {
         assert!(is_allowed_content_type("image/png", AssetKind::InlineImg));
         assert!(is_allowed_content_type("image/jpeg", AssetKind::InlineImg));
         assert!(is_allowed_content_type("image/webp", AssetKind::InlineImg));
@@ -659,7 +679,7 @@ mod tests {
             "application/javascript",
             AssetKind::InlineImg
         ));
-        assert!(!is_allowed_content_type(
+        assert!(is_allowed_content_type(
             "image/svg+xml",
             AssetKind::InlineImg
         ));
@@ -667,17 +687,14 @@ mod tests {
     }
 
     #[test]
-    fn favicon_allowlist_is_raster_images_only() {
+    fn favicon_allowlist_is_images_only() {
         assert!(is_allowed_content_type("image/x-icon", AssetKind::Favicon));
         assert!(is_allowed_content_type(
             "image/vnd.microsoft.icon",
             AssetKind::Favicon
         ));
         assert!(is_allowed_content_type("image/png", AssetKind::Favicon));
-        assert!(!is_allowed_content_type(
-            "image/svg+xml",
-            AssetKind::Favicon
-        ));
+        assert!(is_allowed_content_type("image/svg+xml", AssetKind::Favicon));
         assert!(!is_allowed_content_type("text/html", AssetKind::Favicon));
         assert!(!is_allowed_content_type("audio/mpeg", AssetKind::Favicon));
     }
@@ -758,15 +775,21 @@ mod tests {
     }
 
     #[test]
-    fn skips_svg_icons() {
+    fn ranks_svg_icons_last() {
         assert_eq!(
             icons(
                 r#"<link rel="icon" type="image/svg+xml" href="/icon">
                 <link rel="icon" href="/icon.SVG">
                 <link rel="mask-icon" href="/mask.png">
+                <link rel="apple-touch-icon" href="/touch.png">
                 <link rel="icon" href="/icon.png">"#
             ),
-            ["https://example.com/icon.png"]
+            [
+                "https://example.com/icon.png",
+                "https://example.com/icon",
+                "https://example.com/icon.SVG",
+                "https://example.com/touch.png",
+            ]
         );
     }
 
