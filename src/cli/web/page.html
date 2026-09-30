@@ -96,6 +96,12 @@
     .copy-url[data-status-error]::after { background: #900; }
     .save[aria-pressed=true] { color: #b8860b; }
     .save[aria-pressed=true] path { fill: currentColor; }
+    .entries { overflow-x: clip; }
+    .entries > li.swipe-read { position: relative; background: #fff; touch-action: pan-y pinch-zoom; }
+    .entries > li.swiping::after { content: "Read"; position: absolute; top: 0; bottom: 0; left: 100%; width: 100%; display: flex; align-items: center; padding-left: 1.5rem; background: #2e7d32; color: #fff; font-weight: 600; }
+    .toast { position: fixed; left: 50%; bottom: 1rem; z-index: 2; transform: translateX(-50%); display: flex; align-items: center; gap: 1rem; padding: 0.5rem 0.75rem 0.5rem 1rem; border-radius: 0.25rem; background: #333; color: #fff; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3); white-space: nowrap; }
+    .toast[hidden] { display: none; }
+    .toast button { padding: 0.25rem 0.5rem; border: none; background: none; color: #9cf; font: inherit; font-weight: 600; cursor: pointer; }
   </style>
 </head>
 <body>
