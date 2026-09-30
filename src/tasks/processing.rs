@@ -1,5 +1,5 @@
 use crate::db::tags::{is_reserved_tag_name, SystemTag};
-use crate::db::PooledConnection;
+use crate::db::Db;
 use crate::fetcher::{AtomEntry, AtomFeedIngestData, RssEntry};
 use crate::metrics::Metrics;
 use crate::scripting::{FeedEntry, ScriptRunner};
@@ -56,7 +56,7 @@ pub(super) fn process_atom_feed(
     site_url: Option<&str>,
     feed_data: AtomFeedIngestData,
     entries: Vec<AtomEntry>,
-    mut conn: PooledConnection,
+    db: &Db,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
 ) -> Result<StoredEntries> {
@@ -77,28 +77,32 @@ pub(super) fn process_atom_feed(
         )
         .collect();
 
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute(
-        "UPDATE feeds SET syndication_format = 'atom' WHERE id = ?1",
-        [feed_id],
-    )?;
-    crate::db::favicons::set_site_url(&tx, feed_id, site_url)?;
-    upsert_atom_feed_data(&tx, feed_id, &feed_data)?;
+    // Only now, with the scripts run, is the writer taken.
+    let stored = db.write_blocking(|conn| -> Result<StoredEntries> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE feeds SET syndication_format = 'atom' WHERE id = ?1",
+            [feed_id],
+        )?;
+        crate::db::favicons::set_site_url(&tx, feed_id, site_url)?;
+        upsert_atom_feed_data(&tx, feed_id, &feed_data)?;
 
-    let mut stored = StoredEntries::with_capacity(entries.len());
-    let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
-    for (feed_entry, ingest) in entries {
-        let (entry_id, is_new) = upsert_entry(&tx, feed_id, "atom", &feed_entry)?;
-        insert_atom_entry_data(&tx, entry_id, &ingest)?;
-        if !feed_entry.tags.is_empty() {
-            sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
+        let mut stored = StoredEntries::with_capacity(entries.len());
+        let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
+        for (feed_entry, ingest) in entries {
+            let (entry_id, is_new) = upsert_entry(&tx, feed_id, "atom", &feed_entry)?;
+            insert_atom_entry_data(&tx, entry_id, &ingest)?;
+            if !feed_entry.tags.is_empty() {
+                sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
+            }
+            stored.push(entry_id, &feed_entry);
+            seen_guids.push(feed_entry.guid);
         }
-        stored.push(entry_id, &feed_entry);
-        seen_guids.push(feed_entry.guid);
-    }
 
-    mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
-    tx.commit()?;
+        mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
+        tx.commit()?;
+        Ok(stored)
+    })??;
     for _ in &stored.ids {
         metrics.record_feed_entry_upserted("atom");
     }
@@ -116,7 +120,7 @@ pub(super) fn process_rss_feed(
     feed_id: i64,
     site_url: Option<&str>,
     entries: Vec<RssEntry>,
-    mut conn: PooledConnection,
+    db: &Db,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
 ) -> Result<StoredEntries> {
@@ -137,27 +141,31 @@ pub(super) fn process_rss_feed(
         )
         .collect();
 
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute(
-        "UPDATE feeds SET syndication_format = 'rss' WHERE id = ?1",
-        [feed_id],
-    )?;
-    crate::db::favicons::set_site_url(&tx, feed_id, site_url)?;
+    // Only now, with the scripts run, is the writer taken.
+    let stored = db.write_blocking(|conn| -> Result<StoredEntries> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE feeds SET syndication_format = 'rss' WHERE id = ?1",
+            [feed_id],
+        )?;
+        crate::db::favicons::set_site_url(&tx, feed_id, site_url)?;
 
-    let mut stored = StoredEntries::with_capacity(entries.len());
-    let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
-    for (feed_entry, ingest) in entries {
-        let (entry_id, is_new) = upsert_entry(&tx, feed_id, "rss", &feed_entry)?;
-        insert_rss_entry_data(&tx, entry_id, &ingest, feed_entry.content.as_deref())?;
-        if !feed_entry.tags.is_empty() {
-            sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
+        let mut stored = StoredEntries::with_capacity(entries.len());
+        let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
+        for (feed_entry, ingest) in entries {
+            let (entry_id, is_new) = upsert_entry(&tx, feed_id, "rss", &feed_entry)?;
+            insert_rss_entry_data(&tx, entry_id, &ingest, feed_entry.content.as_deref())?;
+            if !feed_entry.tags.is_empty() {
+                sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
+            }
+            stored.push(entry_id, &feed_entry);
+            seen_guids.push(feed_entry.guid);
         }
-        stored.push(entry_id, &feed_entry);
-        seen_guids.push(feed_entry.guid);
-    }
 
-    mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
-    tx.commit()?;
+        mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
+        tx.commit()?;
+        Ok(stored)
+    })??;
     for _ in &stored.ids {
         metrics.record_feed_entry_upserted("rss");
     }

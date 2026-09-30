@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 /// r2d2 event handler that records connection acquisition into [`Metrics`].
 ///
-/// Installed on the server's connection pool so every `pool.get()` reports
+/// Installed on the database's connection pools so every checkout reports
 /// how long it waited for a connection, and every checkout that times out
 /// counts as an acquisition error, without instrumenting each call site.
 pub struct PoolMetrics(pub Arc<Metrics>);
@@ -316,17 +316,23 @@ mod imp {
             r.describe_gauge(
                 KeyName::from_const_str("kiki_db_pool_connections"),
                 None,
-                SharedString::const_str("Total connections in the database connection pool."),
+                SharedString::const_str(
+                    "Total connections in the database connection pools, readers and writer.",
+                ),
             );
             r.describe_gauge(
                 KeyName::from_const_str("kiki_db_pool_connections_idle"),
                 None,
-                SharedString::const_str("Idle connections in the database connection pool."),
+                SharedString::const_str(
+                    "Idle connections in the database connection pools, readers and writer.",
+                ),
             );
             r.describe_gauge(
                 KeyName::from_const_str("kiki_db_pool_connections_in_use"),
                 None,
-                SharedString::const_str("In-use connections in the database connection pool."),
+                SharedString::const_str(
+                    "In-use connections in the database connection pools, readers and writer.",
+                ),
             );
             r.describe_histogram(
                 KeyName::from_const_str("kiki_db_pool_acquire_duration_seconds"),

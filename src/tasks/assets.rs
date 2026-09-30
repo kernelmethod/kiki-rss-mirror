@@ -34,7 +34,8 @@ pub struct AssetCache<'a> {
     pub fetcher: &'a Fetcher,
     /// The proxy to download through.
     pub proxy: &'a ProxySettings,
-    pub pool: &'a crate::db::Pool,
+    /// The database the assets are recorded in.
+    pub db: &'a crate::db::Db,
     /// Kiki's data directory, holding the `assets/` tree.
     pub data_dir: &'a Path,
     /// Evict the least recently used assets once the cache is larger.
@@ -150,13 +151,19 @@ where
 {
     // Fast path: we've already fetched this exact URL before. Just link the
     // existing asset row.
-    {
-        let conn = cache.pool.get()?;
-        if let Some(existing) = crate::db::assets::lookup_by_url(&conn, asset_url.as_str())? {
-            link(&conn, existing.id)?;
-            return Ok(true);
+    // `link` is taken only if it is called.
+    let mut link = Some(link);
+    cache.db.write_blocking(|conn| -> Result<()> {
+        if let Some(existing) = crate::db::assets::lookup_by_url(conn, asset_url.as_str())? {
+            if let Some(link) = link.take() {
+                link(conn, existing.id)?;
+            }
         }
-    }
+        Ok(())
+    })??;
+    let Some(link) = link else {
+        return Ok(true);
+    };
 
     let reply = cache
         .fetcher
@@ -228,42 +235,42 @@ where
     // Check again by hash — a different URL may have yielded the same bytes.
     let url_str = asset_url.as_str().to_string();
     let data_dir = cache.data_dir.to_path_buf();
-    let pool = cache.pool.clone();
     let max_cache_bytes = cache.max_bytes;
 
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = pool.get()?;
-        let asset_id = if let Some(existing) = crate::db::assets::lookup_by_hash(&conn, &hash)? {
-            existing.id
-        } else {
-            write_asset_file(&data_dir, &hash, &bytes)?;
-            crate::db::assets::insert_asset(
-                &conn,
-                &hash,
-                &url_str,
-                Some(content_type.as_str()),
-                size,
-                etag.as_deref(),
-                last_modified.as_deref(),
-            )?
-        };
-        link(&conn, asset_id)?;
+    cache
+        .db
+        .write(move |conn| -> Result<()> {
+            let asset_id = if let Some(existing) = crate::db::assets::lookup_by_hash(conn, &hash)? {
+                existing.id
+            } else {
+                write_asset_file(&data_dir, &hash, &bytes)?;
+                crate::db::assets::insert_asset(
+                    conn,
+                    &hash,
+                    &url_str,
+                    Some(content_type.as_str()),
+                    size,
+                    etag.as_deref(),
+                    last_modified.as_deref(),
+                )?
+            };
+            link(conn, asset_id)?;
 
-        // Enforce cache cap inline. Cheap: one SUM and, in the common case
-        // where we're under the cap, no deletes.
-        if crate::db::assets::total_cache_size(&conn).unwrap_or(0) > max_cache_bytes {
-            match crate::db::assets::evict_to(&mut conn, max_cache_bytes) {
-                Ok(deleted) => {
-                    for h in deleted {
-                        unlink_asset_file(&data_dir, &h);
+            // Enforce cache cap inline. Cheap: one SUM and, in the common case
+            // where we're under the cap, no deletes.
+            if crate::db::assets::total_cache_size(conn).unwrap_or(0) > max_cache_bytes {
+                match crate::db::assets::evict_to(conn, max_cache_bytes) {
+                    Ok(deleted) => {
+                        for h in deleted {
+                            unlink_asset_file(&data_dir, &h);
+                        }
                     }
+                    Err(e) => warn!("asset eviction failed: {}", e),
                 }
-                Err(e) => warn!("asset eviction failed: {}", e),
             }
-        }
-        Ok(())
-    })
-    .await??;
+            Ok(())
+        })
+        .await??;
 
     Ok(true)
 }

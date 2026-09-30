@@ -6,6 +6,7 @@ use std::path::Path;
 pub mod assets;
 pub mod favicons;
 pub mod feeds;
+mod handle;
 pub mod log;
 pub mod migrations;
 pub mod plugins;
@@ -15,7 +16,8 @@ pub mod retention;
 pub mod tags;
 pub mod task_queue;
 
-pub use pool::{blocking, ConnectionManager, Pool, PooledConnection};
+pub use handle::{Db, DbError, DbOptions, DEFAULT_READERS};
+pub use pool::{blocking, ConnectionManager};
 
 enum ConnectionType<'a> {
     DefaultConnection,

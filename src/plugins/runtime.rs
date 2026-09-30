@@ -52,7 +52,7 @@ pub enum ReloadError {
 
     /// No database connection could be had.
     #[error("failed to get a database connection: {0}")]
-    Pool(#[from] r2d2::Error),
+    Db(#[from] crate::db::DbError),
 
     /// The plugins failed to compile, or their top-level chunks failed.
     #[error("{0}")]
@@ -78,7 +78,7 @@ pub struct PluginRuntime {
     /// The sources the script runner was last built from, to tell whether a
     /// reload changes anything. `None` until plugins first load.
     sources: Mutex<Option<Vec<ScriptSource>>>,
-    pool: crate::db::Pool,
+    db: crate::db::Db,
     metrics: Arc<Metrics>,
     script_runner: ScriptRunnerHandle,
     script_host: crate::process::ScriptHostHandle,
@@ -101,7 +101,7 @@ impl PluginRuntime {
     /// quietly change what it does.
     pub fn start(
         dir: PathBuf,
-        pool: crate::db::Pool,
+        db: crate::db::Db,
         metrics: Arc<Metrics>,
         script_runner: ScriptRunnerHandle,
         script_host: crate::process::ScriptHostHandle,
@@ -109,7 +109,7 @@ impl PluginRuntime {
     ) -> Result<Self, ReloadError> {
         let discovery = ArcSwap::from_pointee(Discovery::default());
         let services = Arc::new(ServerServices::new(
-            pool.clone(),
+            db.clone(),
             script_runner.clone(),
             cancel,
         ));
@@ -121,7 +121,7 @@ impl PluginRuntime {
             dir,
             discovery,
             sources: Mutex::new(None),
-            pool,
+            db,
             metrics,
             script_runner,
             script_host,
@@ -144,8 +144,8 @@ impl PluginRuntime {
     }
 
     /// The database the plugins' config overrides are read from.
-    pub fn pool(&self) -> &crate::db::Pool {
-        &self.pool
+    pub fn db(&self) -> &crate::db::Db {
+        &self.db
     }
 
     /// Discovers the plugins again, applies their config overrides, and
@@ -167,7 +167,9 @@ impl PluginRuntime {
         for e in &discovery.errors {
             warn!(dir = %e.dir.display(), "skipping plugin: {}", e.error);
         }
-        let overrides = crate::db::plugins::all_config_overrides(&*self.pool.get()?)?;
+        let overrides = self
+            .db
+            .read_blocking(|conn| crate::db::plugins::all_config_overrides(conn))??;
         discovery.apply_config_overrides(overrides);
 
         let sources = super::load_sources(&discovery, super::PluginEngine::Lua);

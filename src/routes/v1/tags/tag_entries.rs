@@ -8,7 +8,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::task;
 use tracing::{event, Level};
 
 const DEFAULT_LIMIT: usize = 50;
@@ -61,78 +60,76 @@ pub async fn tag_entries(
     Path(id): Path<i64>,
     Query(params): Query<TagEntriesQueryParams>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
 
-    let result = task::spawn_blocking(move || {
-        // Check if tag exists
-        let exists: bool = conn
-            .prepare("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| row.get(0))?;
+    let result = state
+        .db
+        .read(move |conn| {
+            // Check if tag exists
+            let exists: bool = conn
+                .prepare("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([id], |row| row.get(0))?;
 
-        if !exists {
-            return Err(TagEntriesTaskError::TagNotFound);
-        }
+            if !exists {
+                return Err(TagEntriesTaskError::TagNotFound);
+            }
 
-        let count: usize = conn
-            .prepare(
-                "SELECT COUNT(*) FROM entries e
+            let count: usize = conn
+                .prepare(
+                    "SELECT COUNT(*) FROM entries e
                  INNER JOIN entry_tags et ON et.entry_id = e.id
                  WHERE et.tag_id = ?1",
-            )
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| row.get(0))?;
+                )
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([id], |row| row.get(0))?;
 
-        let entries = conn
-            .prepare(&format!(
-                "SELECT e.id, e.feed_id, e.source_id, e.syndication_format,
+            let entries = conn
+                .prepare(&format!(
+                    "SELECT e.id, e.feed_id, e.source_id, e.syndication_format,
                         e.guid, e.published_at, e.title, e.url, e.content, {}
                  FROM entries e
                  INNER JOIN entry_tags et ON et.entry_id = e.id
                  WHERE et.tag_id = ?1
                  LIMIT ?2 OFFSET ?3",
-                crate::db::favicons::favicon_hash_sql("e.feed_id")
-            ))
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_map(rusqlite::params![id, limit, offset], |row| {
-                Ok(ListEntriesResponseEntry {
-                    id: row.get(0)?,
-                    feed_id: row.get(1)?,
-                    source_id: row.get(2)?,
-                    syndication_format: row.get(3)?,
-                    guid: row.get(4)?,
-                    published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
-                        .map(|d| d.to_rfc3339()),
-                    title: row.get(6)?,
-                    url: row.get(7)?,
-                    content: row.get(8)?,
-                    feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+                    crate::db::favicons::favicon_hash_sql("e.feed_id")
+                ))
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_map(rusqlite::params![id, limit, offset], |row| {
+                    Ok(ListEntriesResponseEntry {
+                        id: row.get(0)?,
+                        feed_id: row.get(1)?,
+                        source_id: row.get(2)?,
+                        syndication_format: row.get(3)?,
+                        guid: row.get(4)?,
+                        published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
+                            .map(|d| d.to_rfc3339()),
+                        title: row.get(6)?,
+                        url: row.get(7)?,
+                        content: row.get(8)?,
+                        feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
 
-        Ok::<TagEntriesResponse, TagEntriesTaskError>(TagEntriesResponse {
-            entries,
-            count,
-            offset,
-            limit,
+            Ok::<TagEntriesResponse, TagEntriesTaskError>(TagEntriesResponse {
+                entries,
+                count,
+                offset,
+                limit,
+            })
         })
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in tag_entries: {:?}", e);
-    });
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in tag_entries: {:?}", e);
+        });
 
     match result {
         Ok(Ok(response)) => Ok(Json(response).into_response()),
@@ -189,40 +186,37 @@ pub async fn add_tag_entries(
     Path(id): Path<i64>,
     Json(request): Json<AddTagEntriesRequest>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let result = state
+        .db
+        .write(move |conn| {
+            let exists: bool = conn
+                .prepare("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([id], |row| row.get(0))?;
 
-    let result = task::spawn_blocking(move || {
-        let exists: bool = conn
-            .prepare("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| row.get(0))?;
+            if !exists {
+                return Err(TagEntriesTaskError::TagNotFound);
+            }
 
-        if !exists {
-            return Err(TagEntriesTaskError::TagNotFound);
-        }
-
-        let tagged = conn
-            .prepare(
-                "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id)
+            let tagged = conn
+                .prepare(
+                    "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id)
                  SELECT id, ?1 FROM entries
                  WHERE (?2 IS NULL OR id <= ?2) AND (?3 IS NULL OR feed_id = ?3)",
-            )
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .execute(rusqlite::params![id, request.up_to_id, request.feed_id])?;
+                )
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .execute(rusqlite::params![id, request.up_to_id, request.feed_id])?;
 
-        Ok::<AddTagEntriesResponse, TagEntriesTaskError>(AddTagEntriesResponse { tagged })
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in add_tag_entries: {:?}", e);
-    });
+            Ok::<AddTagEntriesResponse, TagEntriesTaskError>(AddTagEntriesResponse { tagged })
+        })
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in add_tag_entries: {:?}", e);
+        });
 
     match result {
         Ok(Ok(response)) => Ok(Json(response).into_response()),

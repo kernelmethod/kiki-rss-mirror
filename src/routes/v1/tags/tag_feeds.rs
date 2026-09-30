@@ -9,7 +9,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::task;
 use tracing::{event, Level};
 
 const DEFAULT_LIMIT: usize = 50;
@@ -62,14 +61,10 @@ pub async fn tag_feeds(
     Path(id): Path<i64>,
     Query(params): Query<TagFeedsQueryParams>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
 
-    let result = task::spawn_blocking(move || {
+    let result = state.db.read(move |conn| {
         // Check if tag exists
         let exists: bool = conn
             .prepare("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)")

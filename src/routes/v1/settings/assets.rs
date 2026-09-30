@@ -10,7 +10,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task;
 use tracing::{event, Level};
 
 const SECTION: &str = "asset_cache";
@@ -31,12 +30,10 @@ pub struct AssetCacheSettingsRequest {
 /// Builds the response from `settings` plus the cache's current size,
 /// which lives in the database.
 async fn respond(state: &AppState, settings: &AssetCacheSettings) -> Result<Response, Response> {
-    let pool = state.conn_pool.clone();
-    let res = task::spawn_blocking(move || -> anyhow::Result<i64> {
-        let conn = pool.get()?;
-        db_assets::total_cache_size(&conn)
-    })
-    .await;
+    let db = state.db.clone();
+    let res = db
+        .read(move |conn| -> anyhow::Result<i64> { db_assets::total_cache_size(conn) })
+        .await;
 
     match res {
         Ok(Ok(current_bytes)) => Ok(Json(AssetCacheSettingsResponse {

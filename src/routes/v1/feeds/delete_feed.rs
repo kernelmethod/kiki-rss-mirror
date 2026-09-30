@@ -6,7 +6,6 @@ use axum::{
 };
 use rusqlite::TransactionBehavior;
 use serde::Deserialize;
-use tokio::task;
 use tracing::{event, Level};
 
 #[derive(Deserialize, utoipa::IntoParams)]
@@ -38,47 +37,44 @@ pub async fn delete_feed(
     Path(id): Path<i64>,
     Query(params): Query<DeleteFeedParams>,
 ) -> Result<Response, Response> {
-    let mut conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
-
     let delete_entries = params.delete_entries.unwrap_or(true);
 
-    let result = task::spawn_blocking(move || {
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to begin transaction: {:?}", e);
-            })?;
+    let result = state
+        .db
+        .write(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to begin transaction: {:?}", e);
+                })?;
 
-        // Capture the pre-delete feed identity so we can report it in the
-        // `feed.removed` event after the transaction commits.
-        let feed_identity = tx
-            .query_row("SELECT url, title FROM feeds WHERE id = ?1", [id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .ok();
+            // Capture the pre-delete feed identity so we can report it in the
+            // `feed.removed` event after the transaction commits.
+            let feed_identity = tx
+                .query_row("SELECT url, title FROM feeds WHERE id = ?1", [id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .ok();
 
-        if delete_entries {
-            tx.execute("DELETE FROM entries WHERE feed_id = ?1", [id])?;
-        }
+            if delete_entries {
+                tx.execute("DELETE FROM entries WHERE feed_id = ?1", [id])?;
+            }
 
-        let affected_rows = tx
-            .prepare("DELETE FROM feeds WHERE id = ?1")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .execute([id])?;
+            let affected_rows = tx
+                .prepare("DELETE FROM feeds WHERE id = ?1")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .execute([id])?;
 
-        tx.commit()?;
+            tx.commit()?;
 
-        Ok::<(usize, Option<(String, String)>), rusqlite::Error>((affected_rows, feed_identity))
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in delete_feed: {:?}", e);
-    });
+            Ok::<(usize, Option<(String, String)>), rusqlite::Error>((affected_rows, feed_identity))
+        })
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in delete_feed: {:?}", e);
+        });
 
     match result {
         Ok(Ok((0, _))) => Ok((StatusCode::NOT_FOUND, "Feed not found").into_response()),

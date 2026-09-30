@@ -6,8 +6,6 @@ use crate::{
     tasks::{self, TaskManagerCommand},
 };
 use anyhow::{bail, Context, Error, Result};
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::OpenFlags;
 use std::{
     fs, io,
     os::unix::{
@@ -27,9 +25,8 @@ pub struct SharedAppState {
     /// to worker tasks used to fetch and process feeds.
     pub task_manager_tx: async_channel::Sender<TaskManagerCommand>,
 
-    /// A [`r2d2::Pool`] instance that intermediates connections to the
-    /// SQLite database.
-    pub conn_pool: crate::db::Pool,
+    /// The SQLite database; see [`crate::db::Db`].
+    pub db: crate::db::Db,
 
     /// A [`CancellationToken`] that can be used to trigger a graceful
     /// server shutdown.
@@ -273,59 +270,23 @@ impl Server {
         // value, which is rendered by the `/metrics` handler.
         let metrics = Arc::new(crate::metrics::Metrics::new()?);
 
-        // Create a pool of connections that can be shared between all of
-        // the threads that we spawn.
-        let statement_metrics = metrics.clone();
-        let manager = SqliteConnectionManager::file(&self.db_path)
-            .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-            .with_init(move |c| {
-                // Time every statement, including the pragmas below.
-                crate::db::profile::install(c, statement_metrics.clone())?;
-                // busy_timeout goes first so that the other pragmas wait
-                // for a lock too. synchronous=NORMAL is safe in WAL mode
-                // (a power loss can drop the last commits, never corrupt
-                // the database) and saves an fsync on every commit, which
-                // keeps the write lock free for other workers.
-                c.execute_batch(
-                    "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; \
-                     PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
-                )?;
-                {
-                    use rusqlite::functions::FunctionFlags;
-                    c.create_scalar_function(
-                        "regexp",
-                        2,
-                        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                        |ctx| {
-                            let pattern = ctx.get_raw(0).as_str()?;
-                            let text = ctx.get_raw(1).as_str().unwrap_or("");
-                            let re = regex::Regex::new(pattern)
-                                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                            Ok(re.is_match(text))
-                        },
-                    )?;
-                }
-                Ok(())
-            });
-        // SQLite allows one writer at a time, so more connections mostly
-        // add readers, each holding a page cache of its own.
-        let pool = r2d2::Pool::builder()
-            .max_size(5)
-            .event_handler(Box::new(crate::metrics::PoolMetrics(metrics.clone())))
-            .build(crate::db::ConnectionManager::new(manager).with_metrics(metrics.clone()))
-            .with_context(|| {
-                format!(
-                    "Unable to open connection pool to database at {:?}",
-                    self.db_path
-                )
-            })?;
+        // One writer connection and a pool of readers, shared by all of the
+        // threads that we spawn.
+        let db = crate::db::Db::open(
+            &self.db_path,
+            crate::db::DbOptions {
+                metrics: Some(metrics.clone()),
+                ..Default::default()
+            },
+        )
+        .with_context(|| format!("Unable to open the database at {:?}", self.db_path))?;
 
         // Check for pending migrations before starting the server
         {
-            let conn = pool
-                .get()
-                .with_context(|| "failed to get connection for migration check")?;
-            let pending = migrations::pending_migrations(&conn)?;
+            let pending = db
+                .read(|conn| migrations::pending_migrations(conn))
+                .await
+                .with_context(|| "failed to get connection for migration check")??;
             if !pending.is_empty() {
                 let names: Vec<&str> = pending.iter().map(|m| m.name).collect();
                 bail!(
@@ -392,7 +353,7 @@ impl Server {
         let plugins = Arc::new(
             plugins::runtime::PluginRuntime::start(
                 self.plugins_dir.clone(),
-                pool.clone(),
+                db.clone(),
                 metrics.clone(),
                 script_runner.clone(),
                 self.script_host.clone(),
@@ -436,7 +397,7 @@ impl Server {
         let worker_handles = tasks::spawn_workers(
             rx,
             tx.clone(),
-            pool.clone(),
+            db.clone(),
             self.cancel_token.clone(),
             num_workers,
             metrics.clone(),
@@ -449,7 +410,7 @@ impl Server {
 
         tokio::spawn(metrics_sampler_loop(
             tx.clone(),
-            pool.clone(),
+            db.clone(),
             self.cancel_token.clone(),
             metrics.clone(),
         ));
@@ -457,7 +418,7 @@ impl Server {
         if self.autofetch {
             tokio::spawn(check_feeds_loop(
                 tx.clone(),
-                pool.clone(),
+                db.clone(),
                 self.cancel_token.clone(),
                 metrics.clone(),
             ));
@@ -468,7 +429,7 @@ impl Server {
             ));
             tokio::spawn(periodic_command_loop(
                 tx.clone(),
-                pool.clone(),
+                db.clone(),
                 self.cancel_token.clone(),
                 Duration::from_secs(86400),
                 TaskManagerCommand::WalCheckpointAnalyze,
@@ -477,7 +438,7 @@ impl Server {
             ));
             tokio::spawn(periodic_command_loop(
                 tx.clone(),
-                pool.clone(),
+                db.clone(),
                 self.cancel_token.clone(),
                 Duration::from_secs(86400),
                 TaskManagerCommand::IncrementalVacuum,
@@ -486,7 +447,7 @@ impl Server {
             ));
             tokio::spawn(periodic_command_loop(
                 tx.clone(),
-                pool.clone(),
+                db.clone(),
                 self.cancel_token.clone(),
                 Duration::from_secs(604800),
                 TaskManagerCommand::OptimizeFts,
@@ -499,7 +460,7 @@ impl Server {
         tokio::spawn(uds_server(
             self.socket_path,
             tx.clone(),
-            pool.clone(),
+            db.clone(),
             self.cancel_token.clone(),
             metrics.clone(),
             self.data_dir.clone(),
@@ -533,7 +494,7 @@ impl Server {
 /// and the CPU and memory used by kiki's processes.
 async fn metrics_sampler_loop(
     task_manager_tx: async_channel::Sender<TaskManagerCommand>,
-    pool: crate::db::Pool,
+    db: crate::db::Db,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
 ) {
@@ -543,17 +504,14 @@ async fn metrics_sampler_loop(
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let state = pool.state();
-                metrics.set_db_pool_state(
-                    state.connections as f64,
-                    state.idle_connections as f64,
-                );
+                let (connections, idle) = db.connections();
+                metrics.set_db_pool_state(connections as f64, idle as f64);
                 metrics.set_task_queue_depth(task_manager_tx.len() as f64);
 
                 // Sample domain totals less frequently to avoid running
                 // COUNT(*) against the database every 5s. 30s cadence.
                 if iterations.is_multiple_of(6) {
-                    let pool = pool.clone();
+                    let db = db.clone();
                     let metrics = metrics.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         #[cfg(target_os = "linux")]
@@ -571,10 +529,7 @@ async fn metrics_sampler_loop(
                             Err(e) => debug!("failed to sample process usage: {e}"),
                         }
 
-                        let conn = match pool.get() {
-                            Ok(c) => c,
-                            Err(_) => return,
-                        };
+                        let _ = db.read_blocking(|conn| {
                         if let Ok(n) = conn
                             .query_row::<i64, _, _>("SELECT COUNT(*) FROM feeds", [], |row| row.get(0))
                         {
@@ -594,9 +549,10 @@ async fn metrics_sampler_loop(
                         ) {
                             metrics.set_feeds_with_fetch_error(n as f64);
                         }
-                        if let Ok(n) = crate::db::size_bytes(&conn) {
+                        if let Ok(n) = crate::db::size_bytes(conn) {
                             metrics.set_db_size_bytes(n as f64);
                         }
+                        });
                     })
                     .await;
                 }
@@ -610,7 +566,7 @@ async fn metrics_sampler_loop(
 
 async fn check_feeds_loop(
     task_manager_tx: async_channel::Sender<TaskManagerCommand>,
-    pool: crate::db::Pool,
+    db: crate::db::Db,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
@@ -618,13 +574,8 @@ async fn check_feeds_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                // Off the runtime's threads: waiting on the pool can take
-                // as long as its connection timeout.
-                let (tx, pool, metrics) = (task_manager_tx.clone(), pool.clone(), metrics.clone());
-                match tokio::task::spawn_blocking(move || check_feeds(&tx, &pool, &metrics)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::error!("Error checking feeds: {:?}", e),
-                    Err(e) => tracing::error!("Feed check task failed: {:?}", e),
+                if let Err(e) = check_feeds(&task_manager_tx, &db, &metrics).await {
+                    tracing::error!("Error checking feeds: {:?}", e);
                 }
             }
             _ = cancel_token.cancelled() => {
@@ -693,7 +644,7 @@ fn compute_initial_delay(period: Duration, last_run_at: i64, now: i64) -> Durati
 #[allow(clippy::too_many_arguments)]
 async fn periodic_command_loop(
     task_manager_tx: async_channel::Sender<TaskManagerCommand>,
-    pool: crate::db::Pool,
+    db: crate::db::Db,
     cancel_token: CancellationToken,
     period: Duration,
     cmd: TaskManagerCommand,
@@ -701,8 +652,11 @@ async fn periodic_command_loop(
     metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
     let last_run_at = {
-        let conn = match pool.get() {
-            Ok(c) => c,
+        let ensured = db
+            .write(move |conn| crate::db::task_queue::ensure_task(conn, task_type))
+            .await;
+        let ensured = match ensured {
+            Ok(ensured) => ensured,
             Err(e) => {
                 tracing::error!(
                     "Failed to get DB connection for task_queue {}: {:?}",
@@ -712,7 +666,7 @@ async fn periodic_command_loop(
                 return Ok(());
             }
         };
-        match crate::db::task_queue::ensure_task(&conn, task_type) {
+        match ensured {
             Ok(ts) => ts,
             Err(e) => {
                 tracing::error!("Failed to initialize task_queue for {}: {:?}", task_type, e);
@@ -748,18 +702,19 @@ async fn periodic_command_loop(
 ///
 /// This is the same test `refresh_feed` applies before fetching, so feeds
 /// that are not due are left out rather than queued only to be skipped.
-fn check_feeds(
+async fn check_feeds(
     task_manager_tx: &async_channel::Sender<TaskManagerCommand>,
-    pool: &crate::db::Pool,
+    db: &crate::db::Db,
     metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
-    let conn = pool.get()?;
     let now_ts = chrono::Utc::now().timestamp();
-
-    let feed_ids: Vec<i64> = conn
-        .prepare("SELECT id FROM feeds WHERE next_fetch_at IS NULL OR next_fetch_at <= ?1")?
-        .query_map([now_ts], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+    let feed_ids: Vec<i64> = db
+        .read(move |conn| {
+            conn.prepare("SELECT id FROM feeds WHERE next_fetch_at IS NULL OR next_fetch_at <= ?1")?
+                .query_map([now_ts], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()
+        })
+        .await??;
     if !feed_ids.is_empty() {
         debug!(
             "Sending RefreshFeed commands for {} due feeds",
@@ -898,7 +853,7 @@ fn claim_socket_path(socket_path: &Path) -> Result<()> {
 async fn uds_server(
     socket_path: PathBuf,
     tx: async_channel::Sender<TaskManagerCommand>,
-    pool: crate::db::Pool,
+    db: crate::db::Db,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
     data_dir: PathBuf,
@@ -908,7 +863,7 @@ async fn uds_server(
 ) -> Result<()> {
     let shared_state = Arc::new(SharedAppState {
         task_manager_tx: tx,
-        conn_pool: pool,
+        db,
         cancel_token: cancel_token.clone(),
         metrics: metrics.clone(),
         data_dir,
@@ -955,14 +910,10 @@ mod test {
     use crate::tasks::TaskManagerCommand;
     use crate::test::TestBuilder;
     use anyhow::Result;
-    use rusqlite::OpenFlags;
     use std::path::Path;
 
-    fn make_pool(path: &Path) -> Result<crate::db::Pool> {
-        let manager = SqliteConnectionManager::file(path)
-            .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-            .with_init(|c| c.execute_batch("PRAGMA foreign_keys=ON;"));
-        Ok(r2d2::Pool::new(manager.into())?)
+    fn make_pool(path: &Path) -> Result<crate::db::Db> {
+        crate::db::Db::open(path, Default::default())
     }
 
     /// Nothing at the path means nothing to clean up.
@@ -1065,13 +1016,13 @@ mod test {
         assert_eq!(delay, Duration::from_secs(3600));
     }
 
-    #[test]
-    fn check_feeds_queues_only_due_feeds() -> Result<()> {
+    #[tokio::test]
+    async fn check_feeds_queues_only_due_feeds() -> Result<()> {
         let tc = TestBuilder::default().init_database().build()?;
         let pool = make_pool(&tc.database_path())?;
         let now = chrono::Utc::now().timestamp();
 
-        let conn = pool.get()?;
+        let conn = pool.connect();
         let insert = |url: &str, next_fetch_at: Option<i64>| -> Result<i64> {
             conn.execute(
                 "INSERT INTO feeds (title, url, next_fetch_at) VALUES ('feed', ?1, ?2)",
@@ -1085,7 +1036,7 @@ mod test {
         drop(conn);
 
         let (tx, rx) = async_channel::bounded(16);
-        check_feeds(&tx, &pool, &crate::metrics::Metrics::new()?)?;
+        check_feeds(&tx, &pool, &crate::metrics::Metrics::new()?).await?;
 
         let mut queued = Vec::new();
         while let Ok(cmd) = rx.try_recv() {
@@ -1107,7 +1058,7 @@ mod test {
 
         // Anchor an ancient last_run_at so the task is obviously overdue.
         {
-            let conn = pool.get()?;
+            let conn = pool.connect();
             conn.execute(
                 "INSERT INTO task_queue (task_type, last_run_at) VALUES ('test_overdue', 0)",
                 [],
@@ -1141,7 +1092,7 @@ mod test {
 
         // Anchor last_run_at to now so the next tick is ~60s away.
         {
-            let conn = pool.get()?;
+            let conn = pool.connect();
             conn.execute(
                 "INSERT INTO task_queue (task_type, last_run_at)
                  VALUES ('test_recent', unixepoch())",
@@ -1180,7 +1131,7 @@ mod test {
 
         // Confirm no row exists yet.
         {
-            let conn = pool.get()?;
+            let conn = pool.connect();
             let n: i64 = conn.query_row(
                 "SELECT count(*) FROM task_queue WHERE task_type = 'test_fresh'",
                 [],
@@ -1205,7 +1156,7 @@ mod test {
         // Wait for the loop to call ensure_task.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let ts: i64 = loop {
-            let row = pool.get()?.query_row(
+            let row = pool.connect().query_row(
                 "SELECT last_run_at FROM task_queue WHERE task_type = 'test_fresh'",
                 [],
                 |r| r.get(0),

@@ -9,8 +9,6 @@ use anyhow::Result;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{routing::get, Router};
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::OpenFlags;
 use std::time::Duration;
 
 const RSS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -19,21 +17,19 @@ const RSS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   <item><title>One</title><link>http://example.com/1</link><guid>one</guid></item>
 </channel></rss>"#;
 
-/// A pool of `size` connections that gives up on a checkout after a
-/// second, so a refresh that waits on a connection it holds fails quickly
-/// instead of hanging for r2d2's default 30 seconds.
-fn small_pool(path: &std::path::Path, size: u32) -> Result<crate::db::Pool> {
-    let manager = SqliteConnectionManager::file(path)
-        .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-        .with_init(|c| {
-            c.execute_batch(
-                "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;",
-            )
-        });
-    Ok(r2d2::Pool::builder()
-        .max_size(size)
-        .connection_timeout(Duration::from_secs(1))
-        .build(manager.into())?)
+/// A database with `readers` read connections (and, as always, one
+/// writer) that gives up on a checkout after a second, so a refresh that
+/// waits on a connection it holds fails quickly instead of hanging for
+/// r2d2's default 30 seconds.
+fn small_db(path: &std::path::Path, readers: u32) -> Result<crate::db::Db> {
+    crate::db::Db::open(
+        path,
+        crate::db::DbOptions {
+            readers: Some(readers),
+            connection_timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        },
+    )
 }
 
 fn client() -> Result<reqwest::Client> {
@@ -91,7 +87,7 @@ async fn refresh_needs_only_one_connection() -> Result<()> {
     let error = add_feed(&conn, &format!("{base}/error"))?;
     let html = add_feed(&conn, &format!("{base}/html"))?;
 
-    let pool = small_pool(&tc.database_path(), 1)?;
+    let pool = small_db(&tc.database_path(), 1)?;
     let (client, metrics, tx) = (client()?, super::test_metrics(), super::test_tx());
 
     refresh_feed(&client, rss, pool.clone(), None, &metrics, &tx).await?;
@@ -137,7 +133,7 @@ async fn concurrent_refreshes_outnumbering_the_pool() -> Result<()> {
         .map(|n| add_feed(&conn, &format!("{base}/rss/{n}")))
         .collect::<Result<Vec<_>>>()?;
 
-    let pool = small_pool(&tc.database_path(), 2)?;
+    let pool = small_db(&tc.database_path(), 2)?;
     let client = client()?;
     let metrics = std::sync::Arc::new(super::test_metrics());
     let tx = super::test_tx();

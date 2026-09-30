@@ -7,7 +7,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task;
 use tracing::{event, Level};
 
 pub const DEFAULT_LIMIT: usize = 50;
@@ -104,71 +103,65 @@ pub async fn list_entries(
     State(state): State<AppState>,
     Query(params): Query<ListEntriesQueryParams>,
 ) -> Response {
-    let conn = match state.conn_pool.get() {
-        Ok(conn) => conn,
-        Err(e) => {
-            event!(Level::ERROR, "failed to get database connection: {:?}", e);
-            let error = ListEntriesError::default();
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response();
-        }
-    };
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
     let include_hidden = params.include_hidden.unwrap_or(false);
 
-    let result = task::spawn_blocking(move || {
-        let count = conn
-            .prepare(&format!(
-                "SELECT COUNT(*) FROM entries e WHERE {}",
-                not_hidden_unless(1)
-            ))
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([include_hidden], |count| count.get(0))?;
+    let result = state
+        .db
+        .read(move |conn| {
+            let count = conn
+                .prepare(&format!(
+                    "SELECT COUNT(*) FROM entries e WHERE {}",
+                    not_hidden_unless(1)
+                ))
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([include_hidden], |count| count.get(0))?;
 
-        let entries = conn
-            .prepare(&format!(
-                "SELECT id, feed_id, source_id, syndication_format,
+            let entries = conn
+                .prepare(&format!(
+                    "SELECT id, feed_id, source_id, syndication_format,
                     guid, published_at, title, url, content, {}
                 FROM entries e
                 WHERE {}
                 ORDER BY published_at DESC, id DESC
                 LIMIT ?1 OFFSET ?2",
-                favicon_hash_sql("e.feed_id"),
-                not_hidden_unless(3)
-            ))
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_map(rusqlite::params![limit, offset, include_hidden], |row| {
-                Ok(ListEntriesResponseEntry {
-                    id: row.get(0)?,
-                    feed_id: row.get(1)?,
-                    source_id: row.get(2)?,
-                    syndication_format: row.get(3)?,
-                    guid: row.get(4)?,
-                    published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
-                        .map(|d| d.to_rfc3339()),
-                    title: row.get(6)?,
-                    url: row.get(7)?,
-                    content: row.get(8)?,
-                    feed_favicon_url: read_asset_url_column(row, 9)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .inspect_err(|e| {
-                event!(Level::ERROR, "failed to create entry list: {:?}", e);
-            })?;
+                    favicon_hash_sql("e.feed_id"),
+                    not_hidden_unless(3)
+                ))
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_map(rusqlite::params![limit, offset, include_hidden], |row| {
+                    Ok(ListEntriesResponseEntry {
+                        id: row.get(0)?,
+                        feed_id: row.get(1)?,
+                        source_id: row.get(2)?,
+                        syndication_format: row.get(3)?,
+                        guid: row.get(4)?,
+                        published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
+                            .map(|d| d.to_rfc3339()),
+                        title: row.get(6)?,
+                        url: row.get(7)?,
+                        content: row.get(8)?,
+                        feed_favicon_url: read_asset_url_column(row, 9)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "failed to create entry list: {:?}", e);
+                })?;
 
-        Ok::<ListEntriesResponse, rusqlite::Error>(ListEntriesResponse {
-            count,
-            offset,
-            limit,
-            entries,
+            Ok::<ListEntriesResponse, rusqlite::Error>(ListEntriesResponse {
+                count,
+                offset,
+                limit,
+                entries,
+            })
         })
-    })
-    .await;
+        .await;
 
     match result {
         Ok(Ok(response)) => Json(response).into_response(),

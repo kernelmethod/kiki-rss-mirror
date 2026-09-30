@@ -6,7 +6,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task;
 use tracing::{event, Level};
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
@@ -30,36 +29,33 @@ pub struct HealthResponse {
 )]
 #[axum::debug_handler]
 pub async fn health(State(state): State<AppState>) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::SERVICE_UNAVAILABLE, "Database unavailable").into_response()
-    })?;
+    let result = state
+        .db
+        .read(move |conn| {
+            let feed_count: usize = conn
+                .prepare("SELECT COUNT(*) FROM feeds")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([], |row| row.get(0))?;
 
-    let result = task::spawn_blocking(move || {
-        let feed_count: usize = conn
-            .prepare("SELECT COUNT(*) FROM feeds")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([], |row| row.get(0))?;
+            let entry_count: usize = conn
+                .prepare("SELECT COUNT(*) FROM entries")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([], |row| row.get(0))?;
 
-        let entry_count: usize = conn
-            .prepare("SELECT COUNT(*) FROM entries")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([], |row| row.get(0))?;
-
-        Ok::<HealthResponse, rusqlite::Error>(HealthResponse {
-            status: "ok".to_string(),
-            feed_count,
-            entry_count,
+            Ok::<HealthResponse, rusqlite::Error>(HealthResponse {
+                status: "ok".to_string(),
+                feed_count,
+                entry_count,
+            })
         })
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in health: {:?}", e);
-    });
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in health: {:?}", e);
+        });
 
     match result {
         Ok(Ok(response)) => Ok(Json(response).into_response()),

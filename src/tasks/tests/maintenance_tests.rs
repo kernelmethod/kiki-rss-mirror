@@ -7,19 +7,14 @@ use crate::db::task_queue::{
 use crate::tasks::{run_maintenance, spawn_workers, TaskManagerCommand};
 use crate::test::TestBuilder;
 use anyhow::Result;
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::OpenFlags;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// Build a connection pool using the same PRAGMA settings the server uses
-/// in production, so WAL-related PRAGMAs behave the same way under test.
-fn make_pool(path: &Path) -> Result<crate::db::Pool> {
-    let manager = SqliteConnectionManager::file(path)
-        .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-        .with_init(|c| c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;"));
-    Ok(r2d2::Pool::new(manager.into())?)
+/// Open the database the way the server does, so WAL-related PRAGMAs
+/// behave the same way under test.
+fn make_pool(path: &Path) -> Result<crate::db::Db> {
+    crate::db::Db::open(path, Default::default())
 }
 
 fn insert_entry(conn: &rusqlite::Connection, i: i64, body_size: usize) -> Result<()> {
@@ -53,13 +48,13 @@ fn optimize_fts_success_records_run_and_merges_segments() -> Result<()> {
 
     // Each individual INSERT commits as its own FTS5 segment.
     {
-        let conn = pool.get()?;
+        let conn = pool.connect();
         for i in 0..60 {
             insert_entry(&conn, i, 50)?;
         }
     }
 
-    let conn = pool.get()?;
+    let conn = pool.connect();
     let segments_before: i64 =
         conn.query_row("SELECT count(*) FROM entries_fts_data", [], |r| r.get(0))?;
     assert!(
@@ -97,13 +92,13 @@ fn wal_checkpoint_analyze_success_records_run_and_populates_stats() -> Result<()
     let pool = make_pool(&tc.database_path())?;
 
     {
-        let conn = pool.get()?;
+        let conn = pool.connect();
         for i in 0..20 {
             insert_entry(&conn, i, 50)?;
         }
     }
 
-    let conn = pool.get()?;
+    let conn = pool.connect();
     ensure_task(&conn, TASK_WAL_CHECKPOINT_ANALYZE)?;
     let before = backdate_task(&conn, TASK_WAL_CHECKPOINT_ANALYZE, 10)?;
 
@@ -137,14 +132,14 @@ fn incremental_vacuum_success_records_run_and_reclaims_pages() -> Result<()> {
     // Insert bulky rows then delete them all, producing free pages for
     // incremental_vacuum to reclaim.
     {
-        let conn = pool.get()?;
+        let conn = pool.connect();
         for i in 0..300 {
             insert_entry(&conn, i, 500)?;
         }
         conn.execute("DELETE FROM entries", [])?;
     }
 
-    let conn = pool.get()?;
+    let conn = pool.connect();
     let free_before: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
     assert!(
         free_before > 0,
@@ -175,7 +170,7 @@ fn run_maintenance_failure_does_not_record_run() -> Result<()> {
     let tc = TestBuilder::default().init_database().build()?;
     let pool = make_pool(&tc.database_path())?;
 
-    let conn = pool.get()?;
+    let conn = pool.connect();
     ensure_task(&conn, "synthetic_task")?;
     // Backdate so that a (wrongly) recorded run would be observable.
     let before = backdate_task(&conn, "synthetic_task", 10)?;
@@ -196,7 +191,7 @@ async fn maintenance_commands_end_to_end_via_worker() -> Result<()> {
 
     // Seed a handful of entries so each command has something to work on.
     {
-        let conn = pool.get()?;
+        let conn = pool.connect();
         for i in 0..10 {
             insert_entry(&conn, i, 100)?;
         }
@@ -204,7 +199,7 @@ async fn maintenance_commands_end_to_end_via_worker() -> Result<()> {
 
     // Backdate each task so that its next run is observable.
     let baselines: Vec<(&'static str, i64)> = {
-        let conn = pool.get()?;
+        let conn = pool.connect();
         [
             TASK_FTS_OPTIMIZE,
             TASK_WAL_CHECKPOINT_ANALYZE,
@@ -250,7 +245,7 @@ async fn maintenance_commands_end_to_end_via_worker() -> Result<()> {
             panic!("not all maintenance commands were processed within the timeout");
         }
         let all_advanced = {
-            let conn = pool.get()?;
+            let conn = pool.connect();
             baselines
                 .iter()
                 .all(|(t, b)| last_run_at(&conn, t).map(|a| a > *b).unwrap_or(false))

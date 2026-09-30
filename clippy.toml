@@ -13,8 +13,8 @@ disallowed-methods = [
 # A pooled connection held across an `.await` stays checked out for as long
 # as the task is suspended (e.g. a whole feed fetch), and a task that then
 # asks the pool for another can deadlock with the tasks holding the rest.
-# Check connections out inside the blocking work instead; see
-# `kiki_rss::db::blocking`.
+# Only `kiki_rss::db::Db` checks connections out, and never across an await;
+# this keeps it that way.
 await-holding-invalid-types = [
-    { path = "r2d2::PooledConnection", reason = "don't hold a pooled connection across an await; do the database work under db::blocking or spawn_blocking" },
+    { path = "r2d2::PooledConnection", reason = "don't hold a pooled connection across an await; go through db::Db" },
 ]

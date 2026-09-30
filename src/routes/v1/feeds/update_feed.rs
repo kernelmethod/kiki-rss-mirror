@@ -8,7 +8,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::task;
 use tracing::{event, Level};
 
 #[derive(Default, Serialize, Deserialize, utoipa::ToSchema)]
@@ -162,222 +161,222 @@ pub async fn update_feed(
     Path(id): Path<i64>,
     Json(payload): Json<UpdateFeedRequest>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
-
-    let result = task::spawn_blocking(move || {
-        // First, check if the feed exists
-        let exists: bool = conn
-            .prepare("SELECT EXISTS(SELECT 1 FROM feeds WHERE id = ?1)")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| row.get(0))?;
-
-        if !exists {
-            return Err(UpdateFeedTaskError::FeedNotFound);
-        }
-
-        // Build the update query dynamically based on what fields are provided
-        let mut updates = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
-
-        if let Some(title) = &payload.title {
-            updates.push("title = ?".to_string());
-            params.push(Box::new(title.clone()));
-        }
-
-        if let Some(url) = &payload.url {
-            updates.push("url = ?".to_string());
-            params.push(Box::new(url.clone()));
-        }
-
-        if let Some(description) = &payload.description {
-            updates.push("description = ?".to_string());
-            params.push(Box::new(description.clone()));
-        }
-
-        if let Some(min_fetch_interval_seconds) = payload.min_fetch_interval_seconds {
-            if min_fetch_interval_seconds <= 0 {
-                return Err(UpdateFeedTaskError::InvalidFetchInterval);
-            }
-            updates.push("min_fetch_interval_seconds = ?".to_string());
-            params.push(Box::new(min_fetch_interval_seconds));
-        }
-
-        // Authentication updates. When `auth_type` is provided we always
-        // rewrite the full set of auth columns so a caller that changes
-        // schemes (e.g. basic → bearer) doesn't leave stale credentials
-        // from the previous scheme behind. When `auth_type` is absent but
-        // an individual credential field is set, just patch that field.
-        if let Some(new_type) = payload.auth_type {
-            let auth = FeedAuth {
-                auth_type: new_type,
-                username: payload.auth_username.clone(),
-                password: payload.auth_password.clone(),
-                bearer_token: payload.auth_bearer_token.clone(),
-            };
-            auth.validate()?;
-
-            updates.push("auth_type = ?".to_string());
-            params.push(Box::new(auth.auth_type.as_db().map(str::to_string)));
-
-            // Clear credentials not used by this scheme so we never leave
-            // the previous scheme's secrets sitting in the database.
-            match auth.auth_type {
-                FeedAuthType::None => {
-                    updates.push("auth_username = NULL".to_string());
-                    updates.push("auth_password = NULL".to_string());
-                    updates.push("auth_bearer_token = NULL".to_string());
-                }
-                FeedAuthType::Basic => {
-                    updates.push("auth_username = ?".to_string());
-                    params.push(Box::new(auth.username));
-                    updates.push("auth_password = ?".to_string());
-                    params.push(Box::new(auth.password));
-                    updates.push("auth_bearer_token = NULL".to_string());
-                }
-                FeedAuthType::Bearer => {
-                    updates.push("auth_username = NULL".to_string());
-                    updates.push("auth_password = NULL".to_string());
-                    updates.push("auth_bearer_token = ?".to_string());
-                    params.push(Box::new(auth.bearer_token));
-                }
-            }
-        } else if payload.auth_username.is_some()
-            || payload.auth_password.is_some()
-            || payload.auth_bearer_token.is_some()
-        {
-            // Patching individual credentials is only allowed for fields used
-            // by the feed's current scheme; otherwise we'd store secrets that
-            // are never sent and never cleared.
-            let current = conn
-                .prepare(
-                    "SELECT auth_type, auth_username, auth_password, auth_bearer_token
-                    FROM feeds WHERE id = ?1",
-                )
+    let result = state
+        .db
+        .write(move |conn| {
+            // First, check if the feed exists
+            let exists: bool = conn
+                .prepare("SELECT EXISTS(SELECT 1 FROM feeds WHERE id = ?1)")
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
                 })?
+                .query_row([id], |row| row.get(0))?;
+
+            if !exists {
+                return Err(UpdateFeedTaskError::FeedNotFound);
+            }
+
+            // Build the update query dynamically based on what fields are provided
+            let mut updates = Vec::new();
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+            if let Some(title) = &payload.title {
+                updates.push("title = ?".to_string());
+                params.push(Box::new(title.clone()));
+            }
+
+            if let Some(url) = &payload.url {
+                updates.push("url = ?".to_string());
+                params.push(Box::new(url.clone()));
+            }
+
+            if let Some(description) = &payload.description {
+                updates.push("description = ?".to_string());
+                params.push(Box::new(description.clone()));
+            }
+
+            if let Some(min_fetch_interval_seconds) = payload.min_fetch_interval_seconds {
+                if min_fetch_interval_seconds <= 0 {
+                    return Err(UpdateFeedTaskError::InvalidFetchInterval);
+                }
+                updates.push("min_fetch_interval_seconds = ?".to_string());
+                params.push(Box::new(min_fetch_interval_seconds));
+            }
+
+            // Authentication updates. When `auth_type` is provided we always
+            // rewrite the full set of auth columns so a caller that changes
+            // schemes (e.g. basic → bearer) doesn't leave stale credentials
+            // from the previous scheme behind. When `auth_type` is absent but
+            // an individual credential field is set, just patch that field.
+            if let Some(new_type) = payload.auth_type {
+                let auth = FeedAuth {
+                    auth_type: new_type,
+                    username: payload.auth_username.clone(),
+                    password: payload.auth_password.clone(),
+                    bearer_token: payload.auth_bearer_token.clone(),
+                };
+                auth.validate()?;
+
+                updates.push("auth_type = ?".to_string());
+                params.push(Box::new(auth.auth_type.as_db().map(str::to_string)));
+
+                // Clear credentials not used by this scheme so we never leave
+                // the previous scheme's secrets sitting in the database.
+                match auth.auth_type {
+                    FeedAuthType::None => {
+                        updates.push("auth_username = NULL".to_string());
+                        updates.push("auth_password = NULL".to_string());
+                        updates.push("auth_bearer_token = NULL".to_string());
+                    }
+                    FeedAuthType::Basic => {
+                        updates.push("auth_username = ?".to_string());
+                        params.push(Box::new(auth.username));
+                        updates.push("auth_password = ?".to_string());
+                        params.push(Box::new(auth.password));
+                        updates.push("auth_bearer_token = NULL".to_string());
+                    }
+                    FeedAuthType::Bearer => {
+                        updates.push("auth_username = NULL".to_string());
+                        updates.push("auth_password = NULL".to_string());
+                        updates.push("auth_bearer_token = ?".to_string());
+                        params.push(Box::new(auth.bearer_token));
+                    }
+                }
+            } else if payload.auth_username.is_some()
+                || payload.auth_password.is_some()
+                || payload.auth_bearer_token.is_some()
+            {
+                // Patching individual credentials is only allowed for fields used
+                // by the feed's current scheme; otherwise we'd store secrets that
+                // are never sent and never cleared.
+                let current = conn
+                    .prepare(
+                        "SELECT auth_type, auth_username, auth_password, auth_bearer_token
+                    FROM feeds WHERE id = ?1",
+                    )
+                    .inspect_err(|e| {
+                        event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                    })?
+                    .query_row([id], |row| {
+                        let auth_type_raw: Option<String> = row.get(0)?;
+                        Ok(FeedAuth {
+                            auth_type: FeedAuthType::from_db(auth_type_raw.as_deref())
+                                .unwrap_or_default(),
+                            username: row.get(1)?,
+                            password: row.get(2)?,
+                            bearer_token: row.get(3)?,
+                        })
+                    })?;
+
+                let allowed: &[&'static str] = match current.auth_type {
+                    FeedAuthType::None => &[],
+                    FeedAuthType::Basic => &["auth_username", "auth_password"],
+                    FeedAuthType::Bearer => &["auth_bearer_token"],
+                };
+                let provided = [
+                    ("auth_username", payload.auth_username.is_some()),
+                    ("auth_password", payload.auth_password.is_some()),
+                    ("auth_bearer_token", payload.auth_bearer_token.is_some()),
+                ];
+                if let Some((field, _)) = provided
+                    .iter()
+                    .find(|(field, set)| *set && !allowed.contains(field))
+                {
+                    return Err(UpdateFeedTaskError::CredentialSchemeMismatch {
+                        field,
+                        auth_type: current.auth_type,
+                    });
+                }
+
+                // Make sure the patched credentials still form a valid
+                // configuration (e.g. a basic username isn't blanked out).
+                let patched = FeedAuth {
+                    auth_type: current.auth_type,
+                    username: payload.auth_username.clone().or(current.username),
+                    password: payload.auth_password.clone().or(current.password),
+                    bearer_token: payload.auth_bearer_token.clone().or(current.bearer_token),
+                };
+                patched.validate()?;
+
+                if let Some(username) = payload.auth_username {
+                    updates.push("auth_username = ?".to_string());
+                    params.push(Box::new(username));
+                }
+                if let Some(password) = payload.auth_password {
+                    updates.push("auth_password = ?".to_string());
+                    params.push(Box::new(password));
+                }
+                if let Some(token) = payload.auth_bearer_token {
+                    updates.push("auth_bearer_token = ?".to_string());
+                    params.push(Box::new(token));
+                }
+            }
+
+            if updates.is_empty() {
+                // No updates provided
+                return Err(UpdateFeedTaskError::InvalidUpdate);
+            }
+
+            // Construct the full query
+            params.push(Box::new(id));
+            let query = format!("UPDATE feeds SET {} WHERE id = ?", updates.join(", "));
+
+            // Execute the update, and bring the feed's schedule in line with it,
+            // in one transaction. It takes the write lock up front: a deferred
+            // transaction that reads and then writes fails at once with
+            // SQLITE_BUSY (no busy_timeout wait) if a worker commits a write in
+            // between, e.g. the refresh queued when the feed was added.
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let before = read_fetch_config(&tx, id)?;
+            let params = rusqlite::params_from_iter(params);
+            match tx.execute(&query, params) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    return Err(UpdateFeedTaskError::DuplicateUrl);
+                }
+                Err(e) => {
+                    event!(Level::ERROR, "unable to execute update statement: {:?}", e);
+                    return Err(e.into());
+                }
+            }
+            let after = read_fetch_config(&tx, id)?;
+            reschedule_after_update(&tx, id, &before, &after)?;
+            tx.commit()?;
+
+            // Retrieve the updated feed data
+            let feed = conn
+                .prepare(
+                    "SELECT id, title, url, description, min_fetch_interval_seconds, auth_type
+                FROM feeds WHERE id = ?1 LIMIT 1",
+                )
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare select statement: {:?}", e);
+                })?
                 .query_row([id], |row| {
-                    let auth_type_raw: Option<String> = row.get(0)?;
-                    Ok(FeedAuth {
-                        auth_type: FeedAuthType::from_db(auth_type_raw.as_deref())
-                            .unwrap_or_default(),
-                        username: row.get(1)?,
-                        password: row.get(2)?,
-                        bearer_token: row.get(3)?,
+                    let auth_type_raw: Option<String> = row.get(5)?;
+                    let auth_type =
+                        FeedAuthType::from_db(auth_type_raw.as_deref()).unwrap_or_default();
+                    Ok(UpdateFeedResponse {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        url: row.get(2)?,
+                        description: row.get(3)?,
+                        min_fetch_interval_seconds: row.get(4)?,
+                        auth_type,
                     })
                 })?;
 
-            let allowed: &[&'static str] = match current.auth_type {
-                FeedAuthType::None => &[],
-                FeedAuthType::Basic => &["auth_username", "auth_password"],
-                FeedAuthType::Bearer => &["auth_bearer_token"],
-            };
-            let provided = [
-                ("auth_username", payload.auth_username.is_some()),
-                ("auth_password", payload.auth_password.is_some()),
-                ("auth_bearer_token", payload.auth_bearer_token.is_some()),
-            ];
-            if let Some((field, _)) = provided
-                .iter()
-                .find(|(field, set)| *set && !allowed.contains(field))
-            {
-                return Err(UpdateFeedTaskError::CredentialSchemeMismatch {
-                    field,
-                    auth_type: current.auth_type,
-                });
-            }
-
-            // Make sure the patched credentials still form a valid
-            // configuration (e.g. a basic username isn't blanked out).
-            let patched = FeedAuth {
-                auth_type: current.auth_type,
-                username: payload.auth_username.clone().or(current.username),
-                password: payload.auth_password.clone().or(current.password),
-                bearer_token: payload.auth_bearer_token.clone().or(current.bearer_token),
-            };
-            patched.validate()?;
-
-            if let Some(username) = payload.auth_username {
-                updates.push("auth_username = ?".to_string());
-                params.push(Box::new(username));
-            }
-            if let Some(password) = payload.auth_password {
-                updates.push("auth_password = ?".to_string());
-                params.push(Box::new(password));
-            }
-            if let Some(token) = payload.auth_bearer_token {
-                updates.push("auth_bearer_token = ?".to_string());
-                params.push(Box::new(token));
-            }
-        }
-
-        if updates.is_empty() {
-            // No updates provided
-            return Err(UpdateFeedTaskError::InvalidUpdate);
-        }
-
-        // Construct the full query
-        params.push(Box::new(id));
-        let query = format!("UPDATE feeds SET {} WHERE id = ?", updates.join(", "));
-
-        // Execute the update, and bring the feed's schedule in line with it,
-        // in one transaction. It takes the write lock up front: a deferred
-        // transaction that reads and then writes fails at once with
-        // SQLITE_BUSY (no busy_timeout wait) if a worker commits a write in
-        // between, e.g. the refresh queued when the feed was added.
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-        let before = read_fetch_config(&tx, id)?;
-        let params = rusqlite::params_from_iter(params);
-        match tx.execute(&query, params) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                return Err(UpdateFeedTaskError::DuplicateUrl);
-            }
-            Err(e) => {
-                event!(Level::ERROR, "unable to execute update statement: {:?}", e);
-                return Err(e.into());
-            }
-        }
-        let after = read_fetch_config(&tx, id)?;
-        reschedule_after_update(&tx, id, &before, &after)?;
-        tx.commit()?;
-
-        // Retrieve the updated feed data
-        let feed = conn
-            .prepare(
-                "SELECT id, title, url, description, min_fetch_interval_seconds, auth_type
-                FROM feeds WHERE id = ?1 LIMIT 1",
-            )
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare select statement: {:?}", e);
-            })?
-            .query_row([id], |row| {
-                let auth_type_raw: Option<String> = row.get(5)?;
-                let auth_type = FeedAuthType::from_db(auth_type_raw.as_deref()).unwrap_or_default();
-                Ok(UpdateFeedResponse {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    url: row.get(2)?,
-                    description: row.get(3)?,
-                    min_fetch_interval_seconds: row.get(4)?,
-                    auth_type,
-                })
-            })?;
-
-        Ok::<UpdateFeedResponse, UpdateFeedTaskError>(feed)
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in update_feed: {:?}", e);
-    });
+            Ok::<UpdateFeedResponse, UpdateFeedTaskError>(feed)
+        })
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in update_feed: {:?}", e);
+        });
 
     match result {
         Ok(Ok(feed)) => Ok(Json(feed).into_response()),

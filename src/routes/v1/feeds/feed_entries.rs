@@ -9,7 +9,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::task;
 use tracing::{event, Level};
 
 const DEFAULT_LIMIT: usize = 50;
@@ -71,81 +70,81 @@ pub async fn feed_entries(
     Path(id): Path<i64>,
     Query(params): Query<FeedEntriesQueryParams>,
 ) -> Result<Response, Response> {
-    let conn = state.conn_pool.get().map_err(|e| {
-        event!(Level::ERROR, "failed to get database connection: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let include_hidden = params.include_hidden.unwrap_or(false);
 
-    let result = task::spawn_blocking(move || {
-        // Check if feed exists
-        let exists: bool = conn
-            .prepare("SELECT EXISTS(SELECT 1 FROM feeds WHERE id = ?1)")
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row([id], |row| row.get(0))?;
+    let result = state
+        .db
+        .read(move |conn| {
+            // Check if feed exists
+            let exists: bool = conn
+                .prepare("SELECT EXISTS(SELECT 1 FROM feeds WHERE id = ?1)")
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row([id], |row| row.get(0))?;
 
-        if !exists {
-            return Err(FeedEntriesTaskError::FeedNotFound);
-        }
+            if !exists {
+                return Err(FeedEntriesTaskError::FeedNotFound);
+            }
 
-        let count: usize = conn
-            .prepare(&format!(
-                "SELECT COUNT(*) FROM entries e WHERE feed_id = ?1 AND {}",
-                not_hidden_unless(2)
-            ))
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_row(rusqlite::params![id, include_hidden], |row| row.get(0))?;
+            let count: usize = conn
+                .prepare(&format!(
+                    "SELECT COUNT(*) FROM entries e WHERE feed_id = ?1 AND {}",
+                    not_hidden_unless(2)
+                ))
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_row(rusqlite::params![id, include_hidden], |row| row.get(0))?;
 
-        let entries = conn
-            .prepare(&format!(
-                "SELECT id, feed_id, source_id, syndication_format,
+            let entries = conn
+                .prepare(&format!(
+                    "SELECT id, feed_id, source_id, syndication_format,
                         guid, published_at, title, url, content, {}
                  FROM entries e WHERE feed_id = ?1 AND {}
                  ORDER BY published_at DESC, id DESC
                  LIMIT ?2 OFFSET ?3",
-                crate::db::favicons::favicon_hash_sql("e.feed_id"),
-                not_hidden_unless(4)
-            ))
-            .inspect_err(|e| {
-                event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-            })?
-            .query_map(
-                rusqlite::params![id, limit, offset, include_hidden],
-                |row| {
-                    Ok(ListEntriesResponseEntry {
-                        id: row.get(0)?,
-                        feed_id: row.get(1)?,
-                        source_id: row.get(2)?,
-                        syndication_format: row.get(3)?,
-                        guid: row.get(4)?,
-                        published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
-                            .map(|d| d.to_rfc3339()),
-                        title: row.get(6)?,
-                        url: row.get(7)?,
-                        content: row.get(8)?,
-                        feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(row, 9)?,
-                    })
-                },
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
+                    crate::db::favicons::favicon_hash_sql("e.feed_id"),
+                    not_hidden_unless(4)
+                ))
+                .inspect_err(|e| {
+                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
+                })?
+                .query_map(
+                    rusqlite::params![id, limit, offset, include_hidden],
+                    |row| {
+                        Ok(ListEntriesResponseEntry {
+                            id: row.get(0)?,
+                            feed_id: row.get(1)?,
+                            source_id: row.get(2)?,
+                            syndication_format: row.get(3)?,
+                            guid: row.get(4)?,
+                            published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
+                                .map(|d| d.to_rfc3339()),
+                            title: row.get(6)?,
+                            url: row.get(7)?,
+                            content: row.get(8)?,
+                            feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(
+                                row, 9,
+                            )?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
 
-        Ok::<FeedEntriesResponse, FeedEntriesTaskError>(FeedEntriesResponse {
-            entries,
-            count,
-            offset,
-            limit,
+            Ok::<FeedEntriesResponse, FeedEntriesTaskError>(FeedEntriesResponse {
+                entries,
+                count,
+                offset,
+                limit,
+            })
         })
-    })
-    .await
-    .inspect_err(|e| {
-        event!(Level::ERROR, "task error in feed_entries: {:?}", e);
-    });
+        .await
+        .inspect_err(|e| {
+            event!(Level::ERROR, "task error in feed_entries: {:?}", e);
+        });
 
     match result {
         Ok(Ok(response)) => Ok(Json(response).into_response()),

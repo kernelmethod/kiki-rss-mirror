@@ -13,15 +13,13 @@ use std::os::raw::c_int;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// A pool of connections to the kiki database.
-pub type Pool = r2d2::Pool<ConnectionManager>;
-
-/// A connection checked out of a [`Pool`].
-pub type PooledConnection = r2d2::PooledConnection<ConnectionManager>;
+/// A pool of connections to the kiki database. Only [`super::Db`] holds
+/// one; everything else goes through it.
+pub(super) type Pool = r2d2::Pool<ConnectionManager>;
 
 /// Run blocking database work from async code without stalling the runtime.
 ///
-/// Checking a connection out of a [`Pool`] can block for the pool's whole
+/// Checking a connection out of a pool can block for the pool's whole
 /// connection timeout, and queries block for as long as SQLite takes. Done
 /// directly on a Tokio worker thread, that stops every other task scheduled
 /// on the thread, including tasks that would return a connection to the
@@ -36,11 +34,10 @@ pub type PooledConnection = r2d2::PooledConnection<ConnectionManager>;
 /// # Examples
 ///
 /// ```
-/// use kiki_rss::db::{self, Pool};
-/// use r2d2_sqlite::SqliteConnectionManager;
-///
-/// let pool: Pool = r2d2::Pool::new(SqliteConnectionManager::memory().into())?;
-/// let one: i64 = db::blocking(|| pool.get()?.query_row("SELECT 1", [], |r| r.get(0)).map_err(anyhow::Error::from))?;
+/// let (tx, rx) = std::sync::mpsc::channel();
+/// tx.send(1)?;
+/// // Stands in for work that would stall the runtime.
+/// let one = kiki_rss::db::blocking(|| rx.recv())?;
 /// assert_eq!(one, 1);
 /// # Ok::<(), anyhow::Error>(())
 /// ```
@@ -63,14 +60,14 @@ const DEFAULT_PAGE_SIZE: u64 = 4096;
 /// # Examples
 ///
 /// ```
-/// use kiki_rss::db::{ConnectionManager, Pool};
+/// use kiki_rss::db::ConnectionManager;
 /// use kiki_rss::metrics::Metrics;
 /// use r2d2_sqlite::SqliteConnectionManager;
 /// use std::sync::Arc;
 ///
 /// let metrics = Arc::new(Metrics::new()?);
 /// let manager = ConnectionManager::new(SqliteConnectionManager::memory()).with_metrics(metrics);
-/// let pool: Pool = r2d2::Pool::new(manager)?;
+/// let pool = r2d2::Pool::new(manager)?;
 /// pool.get()?.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
