@@ -1,4 +1,7 @@
 use crate::routes::v1::entries::list_entries::not_hidden_unless;
+use crate::routes::v1::entries::rows::{
+    attach_tags, entry_columns, entry_from_row, id_range, EntrySort,
+};
 use crate::routes::v1::entries::ListEntriesResponseEntry;
 use crate::server::AppState;
 use axum::{
@@ -25,6 +28,14 @@ pub struct FeedEntriesQueryParams {
     /// Also list entries tagged `system:hidden`, which are left out by
     /// default (default: false).
     pub include_hidden: Option<bool>,
+    /// Only list entries with an ID greater than this. With `sort=id`, pass
+    /// the last ID of one page to get the next.
+    pub since_id: Option<i64>,
+    /// Only list entries with an ID less than this. With `sort=id_desc`,
+    /// pass the last ID of one page to get the next.
+    pub max_id: Option<i64>,
+    /// The order to list entries in (default: `published_at`).
+    pub sort: Option<EntrySort>,
 }
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
@@ -46,10 +57,10 @@ enum FeedEntriesTaskError {
 
 /// List entries
 ///
-/// List all of the entries belonging to a specific feed, newest first. Entries
-/// with the same publication time are ordered by descending ID. Entries tagged
-/// `system:hidden` are left out, and not counted, unless `include_hidden` is
-/// true.
+/// List all of the entries belonging to a specific feed, newest first, or in the
+/// order given by `sort`. Entries with the same publication time are ordered by
+/// descending ID. Entries tagged `system:hidden` are left out, and not counted,
+/// unless `include_hidden` is true.
 #[utoipa::path(
     get,
     path = "/v1/feeds/id/{id}/entries",
@@ -73,6 +84,8 @@ pub async fn feed_entries(
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let include_hidden = params.include_hidden.unwrap_or(false);
+    let (since_id, max_id) = (params.since_id, params.max_id);
+    let sort = params.sort.unwrap_or_default();
 
     let result = state
         .db
@@ -91,48 +104,35 @@ pub async fn feed_entries(
 
             let count: usize = conn
                 .prepare(&format!(
-                    "SELECT COUNT(*) FROM entries e WHERE feed_id = ?1 AND {}",
-                    not_hidden_unless(2)
+                    "SELECT COUNT(*) FROM entries e WHERE feed_id = ?1 AND {} AND {}",
+                    not_hidden_unless(2),
+                    id_range(since_id, max_id)
                 ))
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
                 })?
                 .query_row(rusqlite::params![id, include_hidden], |row| row.get(0))?;
 
-            let entries = conn
+            let mut entries = conn
                 .prepare(&format!(
-                    "SELECT id, feed_id, source_id, syndication_format,
-                        guid, published_at, title, url, content, {}
-                 FROM entries e WHERE feed_id = ?1 AND {}
-                 ORDER BY published_at DESC, id DESC
+                    "SELECT {}
+                 FROM entries e WHERE feed_id = ?1 AND {} AND {}
+                 ORDER BY {}
                  LIMIT ?2 OFFSET ?3",
-                    crate::db::favicons::favicon_hash_sql("e.feed_id"),
-                    not_hidden_unless(4)
+                    entry_columns(),
+                    not_hidden_unless(4),
+                    id_range(since_id, max_id),
+                    sort.order_by()
                 ))
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
                 })?
                 .query_map(
                     rusqlite::params![id, limit, offset, include_hidden],
-                    |row| {
-                        Ok(ListEntriesResponseEntry {
-                            id: row.get(0)?,
-                            feed_id: row.get(1)?,
-                            source_id: row.get(2)?,
-                            syndication_format: row.get(3)?,
-                            guid: row.get(4)?,
-                            published_at: chrono::DateTime::from_timestamp_secs(row.get(5)?)
-                                .map(|d| d.to_rfc3339()),
-                            title: row.get(6)?,
-                            url: row.get(7)?,
-                            content: row.get(8)?,
-                            feed_favicon_url: crate::routes::v1::assets::read_asset_url_column(
-                                row, 9,
-                            )?,
-                        })
-                    },
+                    entry_from_row,
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
+            attach_tags(conn, &mut entries)?;
 
             Ok::<FeedEntriesResponse, FeedEntriesTaskError>(FeedEntriesResponse {
                 entries,

@@ -637,7 +637,10 @@ mod test {
         .await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<UpdateFeedResponse>().await?;
-        assert_eq!(body.min_fetch_interval_seconds, 10800);
+        assert_eq!(
+            body.min_fetch_interval_seconds as u64,
+            crate::config::DEFAULT_FETCH_INTERVAL_SECONDS
+        );
 
         Ok(())
     }

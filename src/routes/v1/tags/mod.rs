@@ -10,7 +10,7 @@ use create_tag::create_tag;
 use delete_tag::delete_tag;
 use get_tag::get_tag;
 use list_tags::list_tags;
-use tag_entries::{add_tag_entries, tag_entries};
+use tag_entries::{add_tag_entries, remove_tag_entries, tag_entries};
 use tag_feeds::tag_feeds;
 use update_tag::update_tag;
 
@@ -26,7 +26,12 @@ pub fn create_router() -> Router<AppState> {
         .route("/create", post(create_tag))
         .route("/id/{id}", get(get_tag).put(update_tag).delete(delete_tag))
         .route("/id/{id}/feeds", get(tag_feeds))
-        .route("/id/{id}/entries", get(tag_entries).post(add_tag_entries))
+        .route(
+            "/id/{id}/entries",
+            get(tag_entries)
+                .post(add_tag_entries)
+                .delete(remove_tag_entries),
+        )
 }
 
 #[cfg(test)]
@@ -416,6 +421,151 @@ mod test {
 
         // Unknown tag
         let resp = add(999, serde_json::json!({})).await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        Ok(())
+    }
+
+    /// `GET /id/{id}/entries` lists newest first by default, and pages by
+    /// ID with `sort`, `since_id` and `max_id`, with each entry's tags.
+    #[tokio::test]
+    async fn test_tag_entries_order_and_sync() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        populate_tags(&tc)?;
+        populate_feeds_and_entries(&tc)?;
+        {
+            let conn = tc.database_conn()?;
+            conn.execute(
+                "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+                 VALUES (1, 'rss', 'guid-3', 1699999999, 'Entry 3', 'http://example.com/3')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO entry_tags (entry_id, tag_id) VALUES (1, 5), (2, 5), (3, 5), (3, 6)",
+                [],
+            )?;
+        }
+
+        let list = |query: &'static str| {
+            let client = client.clone();
+            async move {
+                let resp = client
+                    .get(format!("http://localhost/v1/tags/id/5/entries{query}"))
+                    .send()
+                    .await?;
+                assert_eq!(resp.status(), StatusCode::OK, "{query}");
+                anyhow::Ok(resp.json::<tag_entries::TagEntriesResponse>().await?)
+            }
+        };
+        let ids = |body: &tag_entries::TagEntriesResponse| -> Vec<i64> {
+            body.entries.iter().map(|e| e.id).collect()
+        };
+
+        let body = list("").await?;
+        assert_eq!(ids(&body), [2, 1, 3]);
+        let names: Vec<&str> = body.entries[2]
+            .tags
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names, ["tech", "science"]);
+
+        let body = list("?sort=id&since_id=1").await?;
+        assert_eq!((ids(&body), body.count), (vec![2, 3], 2));
+        let body = list("?sort=id_desc&max_id=3").await?;
+        assert_eq!((ids(&body), body.count), (vec![2, 1], 2));
+        Ok(())
+    }
+
+    /// `POST /id/{id}/entries` can pick entries by ID, combined with the
+    /// other filters, and `DELETE /id/{id}/entries` removes a tag from the
+    /// entries picked the same way.
+    #[tokio::test]
+    async fn test_bulk_tag_by_id_and_remove() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+
+        populate_tags(&tc)?;
+        populate_feeds_and_entries(&tc)?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (1, 'rss', 'guid-3', 1700000002, 'Entry 3', 'http://example.com/3')",
+            [],
+        )?;
+
+        let tagged_entries = |tag_id: i64| -> Result<Vec<i64>> {
+            let mut stmt = conn
+                .prepare("SELECT entry_id FROM entry_tags WHERE tag_id = ?1 ORDER BY entry_id")?;
+            let ids = stmt
+                .query_map([tag_id], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(ids)
+        };
+        let send = |method: reqwest::Method, tag_id: i64, body: serde_json::Value| {
+            client
+                .request(
+                    method,
+                    format!("http://localhost/v1/tags/id/{tag_id}/entries"),
+                )
+                .json(&body)
+                .send()
+        };
+        let add = |tag_id, body| send(reqwest::Method::POST, tag_id, body);
+        let remove = |tag_id, body| send(reqwest::Method::DELETE, tag_id, body);
+        let tagged = |resp: reqwest::Response| async move {
+            assert_eq!(resp.status(), StatusCode::OK);
+            anyhow::Ok(
+                resp.json::<tag_entries::AddTagEntriesResponse>()
+                    .await?
+                    .tagged,
+            )
+        };
+        let untagged = |resp: reqwest::Response| async move {
+            assert_eq!(resp.status(), StatusCode::OK);
+            anyhow::Ok(
+                resp.json::<tag_entries::RemoveTagEntriesResponse>()
+                    .await?
+                    .untagged,
+            )
+        };
+
+        // Entries by ID; unknown IDs are ignored, and an empty list picks none
+        let resp = add(5, serde_json::json!({"entry_ids": [1, 3, 999]})).await?;
+        assert_eq!(tagged(resp).await?, 2);
+        assert_eq!(tagged_entries(5)?, [1, 3]);
+        let resp = add(5, serde_json::json!({"entry_ids": []})).await?;
+        assert_eq!(tagged(resp).await?, 0);
+
+        // Every filter given must hold: of entries 1 and 2, only 2 is in feed 2
+        let resp = add(6, serde_json::json!({"entry_ids": [1, 2], "feed_id": 2})).await?;
+        assert_eq!(tagged(resp).await?, 1);
+        assert_eq!(tagged_entries(6)?, [2]);
+
+        // Removing, by ID and by feed
+        let resp = remove(5, serde_json::json!({"entry_ids": [1, 2]})).await?;
+        assert_eq!(untagged(resp).await?, 1);
+        assert_eq!(tagged_entries(5)?, [3]);
+        let resp = remove(5, serde_json::json!({"feed_id": 2})).await?;
+        assert_eq!(untagged(resp).await?, 0);
+        assert_eq!(tagged_entries(5)?, [3]);
+
+        // Marking everything read, then entries 2 and up unread again
+        let read = SystemTag::Read.id(&conn)?;
+        let resp = add(read, serde_json::json!({})).await?;
+        assert_eq!(tagged(resp).await?, 3);
+        let resp = remove(read, serde_json::json!({"entry_ids": [2, 3]})).await?;
+        assert_eq!(untagged(resp).await?, 2);
+        assert_eq!(tagged_entries(read)?, [1]);
+        let resp = remove(read, serde_json::json!({})).await?;
+        assert_eq!(untagged(resp).await?, 1);
+        assert_eq!(tagged_entries(read)?, Vec::<i64>::new());
+        assert_eq!(tagged_entries(6)?, [2]);
+
+        // Unknown tag
+        let resp = remove(999, serde_json::json!({})).await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         Ok(())

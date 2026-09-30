@@ -136,9 +136,11 @@ CREATE TABLE feeds (
     -- longer max-age, we will refresh at least this often. Also used as
     -- the fallback interval when the server sends no cache hint.
     -- New feeds are given `feed_fetch.default_fetch_interval_seconds` from
-    -- the config; the column default of 3 hours (10800 seconds) only
-    -- covers rows inserted without it.
-    min_fetch_interval_seconds  INTEGER NOT NULL DEFAULT 10800,
+    -- the config; the column default of 24 hours (86400 seconds) only
+    -- covers rows inserted without it. Databases created before the default
+    -- changed from 3 hours keep the old column default: SQLite cannot alter
+    -- it without rebuilding the table.
+    min_fetch_interval_seconds  INTEGER NOT NULL DEFAULT 86400,
 
     -- Unix timestamp (seconds) of the earliest moment this feed is
     -- eligible for the next fetch. NULL means "fetch immediately" and is
@@ -224,11 +226,30 @@ CREATE TABLE entries (
     -- entry; cleared if it reappears. Retention only deletes entries that
     -- have been dropped for longer than `retention.max_age_days`.
     dropped_at      INTEGER,
+
+    -- Unix timestamp of when Kiki first stored the entry. Set explicitly by
+    -- the entry insert, since databases migrated from before this column
+    -- existed have no default for it.
+    ingested_at     INTEGER NOT NULL DEFAULT (unixepoch()),
     FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE SET NULL,
     FOREIGN KEY(source_id) REFERENCES entry_sources(id) ON DELETE SET NULL
 );
 CREATE UNIQUE INDEX idx_entry_guids ON entries(feed_id, guid);
 CREATE INDEX idx_entry_dropped_at ON entries(dropped_at) WHERE dropped_at IS NOT NULL;
+CREATE INDEX idx_entry_ingested_at ON entries(ingested_at);
+
+-- The highest entry id ever used, so that new entries never reuse the id of
+-- a deleted one: clients that sync by id would take the new entry for one
+-- they had already seen. New entries take the next id after this; see
+-- `upsert_entry` in src/tasks/processing.rs. (AUTOINCREMENT would do the
+-- same, but cannot be added to the entries table of an existing database.)
+CREATE TABLE entry_id_high_water (id INTEGER NOT NULL);
+INSERT INTO entry_id_high_water (id) VALUES (0);
+CREATE TRIGGER entries_id_high_water AFTER INSERT ON entries
+WHEN NEW.id > (SELECT id FROM entry_id_high_water)
+BEGIN
+    UPDATE entry_id_high_water SET id = NEW.id;
+END;
 
 -- Table mapping entries to the tags that they belong to
 CREATE TABLE entry_tags (
