@@ -151,8 +151,10 @@ pub struct ScriptHost {
 impl ScriptHost {
     /// Spawn the script host child.
     ///
-    /// **Must be called before the caller installs its own sandbox** —
-    /// every sandbox profile denies `execve`. `log_only` and `no_sandbox`
+    /// **Must be called before the caller installs its seccomp filter** —
+    /// every sandbox profile denies `execve` — and, for the server to see
+    /// the child's memory use, after its Landlock rules; see
+    /// [`crate::sandbox::restrict_filesystem`]. `log_only` and `no_sandbox`
     /// are forwarded so the child's sandbox matches the operator's intent
     /// for the server's.
     ///

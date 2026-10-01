@@ -32,8 +32,10 @@ const RO_RESOLVER_PATHS: &[&str] = &[
 /// CA-certificate locations on Debian/Ubuntu, Fedora/RHEL, Arch, and
 /// musl-based systems. Missing paths are silently skipped.
 ///
-/// Granted only to the feed fetcher, which makes every one of Kiki's
-/// outbound HTTP(S) requests: feeds, assets and favicons alike.
+/// Granted to the feed fetcher, which makes every one of Kiki's outbound
+/// HTTP(S) requests: feeds, assets and favicons alike. The server is
+/// granted them too, but only so that the fetcher, which it starts under
+/// its own Landlock domain, can have them: see [`server_child_paths`].
 const RO_TLS_PATHS: &[&str] = &[
     "/etc/ssl",
     "/etc/pki",
@@ -55,6 +57,14 @@ const RO_ENTROPY_PATHS: &[&str] = &["/dev/urandom", "/dev/random"];
 /// includes other same-user processes' entries — the server's among them
 /// — and everything the fetcher's runtime reads there has a fallback.
 const RO_INTROSPECTION_PATHS: &[&str] = &["/proc", "/sys"];
+
+/// The dynamic loader's cache and preload list, which it reads while
+/// loading a program but does not keep mapped.
+const RO_LOADER_PATHS: &[&str] = &["/etc/ld.so.cache", "/etc/ld.so.preload"];
+
+/// Where `Stdio::null` points a child's standard streams. The server opens
+/// it to start each child, read-only for stdin and write-only for stdout.
+const NULL_DEVICE: &str = "/dev/null";
 
 fn existing(paths: &'static [&'static str]) -> impl Iterator<Item = PathBuf> {
     paths.iter().map(PathBuf::from).filter(|p| p.exists())
@@ -151,9 +161,72 @@ fn resolver_paths() -> Vec<PathBuf> {
 }
 
 pub fn apply(config: &SandboxConfig) -> Result<()> {
-    apply_landlock(config).context("installing landlock filesystem sandbox")?;
-    apply_seccomp(config).context("installing seccomp-bpf syscall filter")?;
-    Ok(())
+    restrict_filesystem(config)?;
+    restrict_syscalls(config)
+}
+
+pub fn restrict_filesystem(config: &SandboxConfig) -> Result<()> {
+    apply_landlock(config).context("installing landlock filesystem sandbox")
+}
+
+pub fn restrict_syscalls(config: &SandboxConfig) -> Result<()> {
+    apply_seccomp(config).context("installing seccomp-bpf syscall filter")
+}
+
+/// Paths the server is granted for its children's sake, as
+/// `(executable, read_only, read_write)`.
+///
+/// The server installs its Landlock rules before it starts its children
+/// (see [`crate::sandbox::restrict_filesystem`]), so each child runs under
+/// the server's rules as well as its own, and can reach only what both
+/// allow. Between them, the children need to:
+///
+/// * be executed: the kiki executable itself, and every file the server
+///   has mapped — the dynamic loader and the shared libraries, which a
+///   child, being the same executable, loads again — plus the loader's
+///   cache and preload list;
+/// * have their standard streams pointed at `/dev/null`;
+/// * verify TLS certificates, in the feed fetcher's case.
+///
+/// The server cannot execute anything itself once its seccomp filter is
+/// up, and gains no secrets from the rest: the executable and libraries
+/// are already mapped into it, and trust stores hold public certificates.
+fn server_child_paths() -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let mut executable: Vec<PathBuf> = std::env::current_exe().into_iter().collect();
+    if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+        for path in mapped_files(&maps) {
+            if !executable.contains(&path) {
+                executable.push(path);
+            }
+        }
+    }
+    let read_only = tls_paths()
+        .into_iter()
+        .chain(existing(RO_LOADER_PATHS))
+        .collect();
+    (executable, read_only, vec![PathBuf::from(NULL_DEVICE)])
+}
+
+/// The files mapped into a process, from the contents of its
+/// `/proc/<pid>/maps`, leaving out those deleted since they were mapped.
+fn mapped_files(maps: &str) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for line in maps.lines() {
+        // The pathname is the last field and the only one with a `/` in
+        // it; anonymous mappings have none, or a pseudo-path like `[heap]`.
+        let Some(start) = line.find('/') else {
+            continue;
+        };
+        let path = &line[start..];
+        if path.ends_with(" (deleted)") {
+            continue;
+        }
+        let path = PathBuf::from(path);
+        if !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    files
 }
 
 /// Read-write and read-only path sets for a profile.
@@ -202,6 +275,10 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
     let read_only = AccessFs::from_read(abi);
 
     let (rw_paths, ro_paths) = landlock_paths(&config.profile);
+    let (exec_paths, child_ro_paths, child_rw_paths) = match config.profile {
+        SandboxProfile::Server { .. } => server_child_paths(),
+        _ => Default::default(),
+    };
 
     let mut ruleset = Ruleset::default().handle_access(all)?;
     if matches!(config.profile, SandboxProfile::FeedFetcher) {
@@ -230,7 +307,16 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
     let ruleset = ruleset
         .create()?
         .add_rules(path_beneath_rules(&rw_paths, all))?
-        .add_rules(path_beneath_rules(&ro_paths, read_only))?;
+        .add_rules(path_beneath_rules(&ro_paths, read_only))?
+        .add_rules(path_beneath_rules(
+            &exec_paths,
+            AccessFs::Execute | AccessFs::ReadFile,
+        ))?
+        .add_rules(path_beneath_rules(&child_ro_paths, read_only))?
+        .add_rules(path_beneath_rules(
+            &child_rw_paths,
+            AccessFs::ReadFile | AccessFs::WriteFile,
+        ))?;
 
     let status = ruleset.restrict_self()?;
     let profile = config.profile_name();
@@ -240,6 +326,7 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
                 profile,
                 rw_paths = ?rw_paths,
                 ro_paths = ?ro_paths,
+                child_paths = exec_paths.len() + child_ro_paths.len() + child_rw_paths.len(),
                 "landlock: filesystem sandbox fully enforced"
             );
         }
@@ -696,8 +783,48 @@ mod tests {
         }
     }
 
-    /// Every HTTP(S) request is made by the feed fetcher, so the server has
-    /// no use for the TLS trust stores.
+    /// The pathname is everything from the first `/`, spaces included;
+    /// anonymous and pseudo-path mappings, deleted files and repeats are
+    /// left out.
+    #[test]
+    fn mapped_files_are_read_from_proc_maps() {
+        let maps = "\
+55d0c0a00000-55d0c0a01000 r--p 00000000 fd:01 1048602                    /nix/store/abc-kiki/bin/kiki
+55d0c0a01000-55d0c0a02000 r-xp 00001000 fd:01 1048602                    /nix/store/abc-kiki/bin/kiki
+55d0c2a2c000-55d0c2a4d000 rw-p 00000000 00:00 0                          [heap]
+7f2b1c000000-7f2b1c021000 rw-p 00000000 00:00 0 
+7f2b1d000000-7f2b1d028000 r--p 00000000 fd:01 1050000                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7f2b1e000000-7f2b1e001000 r--p 00000000 fd:01 1050001                    /opt/a dir/lib.so
+7f2b1f000000-7f2b1f001000 rw-s 00000000 00:01 1050002                    /memfd:scratch (deleted)
+7ffd4a5e1000-7ffd4a602000 rw-p 00000000 00:00 0                          [stack]
+";
+        assert_eq!(
+            mapped_files(maps),
+            vec![
+                PathBuf::from("/nix/store/abc-kiki/bin/kiki"),
+                PathBuf::from("/usr/lib/x86_64-linux-gnu/libc.so.6"),
+                PathBuf::from("/opt/a dir/lib.so"),
+            ]
+        );
+    }
+
+    /// The server's children start under its Landlock rules, so it is
+    /// granted what they need to: run this executable, point their streams
+    /// at `/dev/null`, and, for the feed fetcher, read the TLS trust stores.
+    #[test]
+    fn the_server_is_granted_what_its_children_need() {
+        let (exec, ro, rw) = server_child_paths();
+        let exe = std::env::current_exe().unwrap();
+        assert!(exec.contains(&exe), "{exe:?} missing from {exec:?}");
+        for p in tls_paths() {
+            assert!(ro.contains(&p), "trust store {p:?} missing from {ro:?}");
+        }
+        assert_eq!(rw, vec![PathBuf::from(NULL_DEVICE)]);
+    }
+
+    /// Every HTTP(S) request is made by the feed fetcher, so the server's
+    /// own rules include no TLS trust stores; it is granted them only
+    /// for the fetcher's sake (see the test above).
     #[test]
     fn server_gets_no_tls_trust_stores() {
         let (_, ro) = landlock_paths(&SandboxProfile::Server {

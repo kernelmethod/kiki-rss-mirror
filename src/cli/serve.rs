@@ -106,16 +106,24 @@ impl ServeArgs {
         std::env::set_var(SQLITE_TMPDIR, &temp_dir);
         tracing::info!(path = %temp_dir.display(), "using SQLite temp directory");
 
-        // Spawn the children *before* the sandbox goes up: every profile
-        // denies `execve`, so this is the last moment at which the server
-        // can start a child process at all.
+        // The sandbox goes up in two halves, with the children started in
+        // between. Landlock first, so the children's Landlock domains nest
+        // inside the server's: Landlock only lets the server read
+        // `/proc/<pid>/smaps_rollup`, for the memory metrics, of processes
+        // in a domain nested in its own. Then seccomp, once the children
+        // are running, since it denies the `execve` that starts them.
+        let sandbox_config = (!self.no_sandbox)
+            .then(|| build_sandbox_config(&db_path, socket_dir, temp_dir.clone(), self));
+        if let Some(config) = &sandbox_config {
+            sandbox::restrict_filesystem(config).context("failed to install sandbox")?;
+        }
+
         let feed_fetcher = self.spawn_feed_fetcher()?;
         #[cfg(all(unix, feature = "lua"))]
         let script_host = self.spawn_script_host()?;
 
-        if !self.no_sandbox {
-            let config = build_sandbox_config(&db_path, socket_dir, temp_dir.clone(), self);
-            sandbox::apply(&config).context("failed to install sandbox")?;
+        if let Some(config) = &sandbox_config {
+            sandbox::restrict_syscalls(config).context("failed to install sandbox")?;
             check_temp_dir_is_writable(&temp_dir)?;
         } else {
             tracing::warn!(

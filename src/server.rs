@@ -138,7 +138,7 @@ impl<'a> ServerBuilder<'a> {
     /// fetcher process instead of in this one.
     ///
     /// As with [`Self::script_host`], the fetcher must be spawned by the
-    /// caller before it installs its own sandbox. Passing `None` fetches
+    /// caller before it installs its seccomp filter. Passing `None` fetches
     /// in-process, which is what the library-level tests use.
     pub fn feed_fetcher(mut self, fetcher: crate::process::FeedFetcherHandle) -> Self {
         self.feed_fetcher = fetcher;
@@ -551,6 +551,22 @@ impl Server {
     }
 }
 
+/// Warn, once per process, that the proportional memory of `role`'s
+/// processes could not be read, so its series is missing from the metrics.
+#[cfg(target_os = "linux")]
+fn warn_pss_unreadable(role: crate::process::stats::Role) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            process = role.as_str(),
+            "cannot read the proportional memory (PSS) of kiki's {} process from \
+             /proc/<pid>/smaps_rollup; kiki_process_proportional_memory_bytes will be \
+             missing for it",
+            role.as_str()
+        );
+    });
+}
+
 /// Periodically sample observable process state into the metrics recorder.
 ///
 /// Covers DB pool utilization, task queue depth, domain totals that are
@@ -582,6 +598,9 @@ async fn metrics_sampler_loop(
                         match crate::process::stats::sample() {
                             Ok(usage) => {
                                 for (role, u) in usage {
+                                    if u.proportional_bytes.is_none() {
+                                        warn_pss_unreadable(role);
+                                    }
                                     metrics.set_process_usage(
                                         role.as_str(),
                                         u.cpu_seconds,
