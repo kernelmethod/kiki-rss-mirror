@@ -987,6 +987,99 @@ mod test {
         Ok(())
     }
 
+    /// A page of a tag's entries is the same whether the tag is tested
+    /// entry by entry, newest first, as a common tag is, or its entries are
+    /// looked up and sorted, as a rare tag's are.
+    #[tokio::test]
+    async fn test_search_tag_pages_common_and_rare() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        {
+            let conn = tc.database_conn()?;
+            conn.execute_batch(
+                "INSERT INTO feeds (title, url) VALUES ('f', 'http://example.com/f');
+                 INSERT INTO tags (name) VALUES ('common'), ('rare');",
+            )?;
+            for i in 0..200i64 {
+                // Pairs of entries share a publication time, so the id
+                // breaks the tie.
+                conn.execute(
+                    "INSERT INTO entries (id, feed_id, syndication_format, guid, published_at, title, url)
+                     VALUES (?1, 1, 'rss', ?1, ?2, 't', 'u')",
+                    [i + 1, 1_700_000_000 + (i / 2) * 60],
+                )?;
+                let mut tags = Vec::new();
+                if i % 4 != 0 {
+                    tags.push("common");
+                }
+                if [5, 77, 150].contains(&i) {
+                    tags.push("rare");
+                }
+                if i % 3 == 0 {
+                    tags.push("system:read");
+                }
+                if i % 10 == 0 {
+                    tags.push("system:hidden");
+                }
+                for tag in tags {
+                    conn.execute(
+                        "INSERT INTO entry_tags (entry_id, tag_id)
+                         SELECT ?1, id FROM tags WHERE name = ?2",
+                        rusqlite::params![i + 1, tag],
+                    )?;
+                }
+            }
+        }
+        let conn = tc.database_conn()?;
+        let expected = |tag: &str, unread: bool, offset: i64| -> Result<(usize, Vec<i64>)> {
+            let filter = "EXISTS (SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+                                  WHERE et.entry_id = e.id AND t.name = ?1)
+                          AND (?2 = 0 OR NOT EXISTS (
+                              SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+                              WHERE et.entry_id = e.id
+                                AND t.name IN ('system:read', 'system:hidden')))";
+            let count: usize = conn.query_row(
+                &format!("SELECT COUNT(*) FROM entries e WHERE {filter}"),
+                rusqlite::params![tag, unread],
+                |row| row.get(0),
+            )?;
+            let ids = conn
+                .prepare(&format!(
+                    "SELECT e.id FROM entries e WHERE {filter}
+                     ORDER BY e.published_at DESC, e.id DESC LIMIT 25 OFFSET ?3"
+                ))?
+                .query_map(rusqlite::params![tag, unread, offset], |row| row.get(0))?
+                .collect::<Result<Vec<i64>, _>>()?;
+            Ok((count, ids))
+        };
+
+        for tag in ["common", "rare"] {
+            for unread in [false, true] {
+                for offset in [0i64, 25, 100] {
+                    let tags = if unread {
+                        serde_json::json!({"and": [tag, {"not": {"or": ["system:hidden", "system:read"]}}]})
+                    } else {
+                        serde_json::json!(tag)
+                    };
+                    let resp = client
+                        .post("http://localhost/v1/entries/search")
+                        .json(&serde_json::json!({ "tags": tags, "offset": offset, "limit": 25 }))
+                        .send()
+                        .await?;
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+                    let ids: Vec<i64> = body.entries.iter().map(|e| e.entry.id).collect();
+                    assert_eq!(
+                        (body.count, ids),
+                        expected(tag, unread, offset)?,
+                        "{tag} unread={unread} offset={offset}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_search_tags_or_with_not() -> Result<()> {
         let tc = TestBuilder::all().build()?;

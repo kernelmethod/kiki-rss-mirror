@@ -12,6 +12,7 @@ use axum::{
 };
 use rusqlite::types::ToSqlOutput;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use thiserror::Error;
 use tracing::{event, Level};
 
@@ -181,8 +182,22 @@ fn tag_filter_to_sql(
     filter: &TagFilter,
     params: &mut Vec<SqlParam>,
     idx: usize,
+    walked: &HashSet<String>,
 ) -> Result<(String, usize), SearchEntriesError> {
     match filter {
+        // A tag in `walked` is tested entry by entry, so that a page sorted
+        // by date can walk the date index and stop once it is full; any
+        // other is looked up once, its entries then fetched by id. See
+        // [`walked_tags`].
+        TagFilter::Single(name) if walked.contains(name) => {
+            let sql = format!(
+                "EXISTS (SELECT 1 FROM entry_tags et JOIN tags t ON et.tag_id = t.id \
+                 WHERE et.entry_id = e.id AND t.name = ?{})",
+                idx
+            );
+            params.push(SqlParam::from_string(name.clone()));
+            Ok((sql, idx + 1))
+        }
         TagFilter::Single(name) => {
             let sql = format!(
                 "e.id IN (SELECT et.entry_id FROM entry_tags et \
@@ -221,7 +236,7 @@ fn tag_filter_to_sql(
                 let mut conditions = Vec::new();
                 let mut current_idx = idx;
                 for f in filters {
-                    let (cond, next_idx) = build_tag_condition(f, params, current_idx)?;
+                    let (cond, next_idx) = build_tag_condition(f, params, current_idx, walked)?;
                     conditions.push(cond);
                     current_idx = next_idx;
                 }
@@ -249,11 +264,85 @@ fn tag_filter_to_sql(
                     params.extend(names.into_iter().map(SqlParam::from_string));
                     return Ok((sql, next_idx));
                 }
-                let (cond, next_idx) = build_tag_condition(inner, params, idx)?;
+                let (cond, next_idx) = build_tag_condition(inner, params, idx, walked)?;
                 let sql = format!("NOT ({})", cond);
                 Ok((sql, next_idx))
             }
         },
+    }
+}
+
+/// The most tags in one search whose entries [`walked_tags`] counts.
+const MAX_WALK_CANDIDATES: usize = 8;
+
+/// The tags in `payload`'s filter that a page of `limit` results from
+/// `offset` is found sooner by testing entry by entry, newest first, than
+/// by looking up all of the tag's entries and sorting them.
+///
+/// Walking the entries finds a page after looking at about
+/// `(offset + limit) * entries / tagged` of them, while looking up the
+/// tag's entries costs one fetch for each of its `tagged` entries, so a tag
+/// is walked when `tagged² > (offset + limit) * entries`: when it is common
+/// enough. Counting a tag's entries reads only an index.
+///
+/// Only searches sorted by date, of every feed, walk: with a full-text
+/// query or a feed, the entries come from the search index or the feed's
+/// index instead. Names under an OR of names are tested together, and are
+/// never walked.
+fn walked_tags(
+    conn: &rusqlite::Connection,
+    payload: &SearchEntriesRequest,
+    limit: usize,
+    offset: usize,
+) -> Result<HashSet<String>, SearchEntriesError> {
+    let mut walked = HashSet::new();
+    let Some(filter) = &payload.tags else {
+        return Ok(walked);
+    };
+    let sorted_by_date = !matches!(
+        payload.sort.as_deref(),
+        Some("relevance") | Some("id") | Some("id_desc")
+    );
+    if payload.query.is_some()
+        || payload.feed_id.is_some()
+        || !sorted_by_date
+        || excludes_read_and_hidden(filter)
+    {
+        return Ok(walked);
+    }
+    let mut names = Vec::new();
+    single_tags(filter, &mut names);
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return Ok(walked);
+    }
+
+    let entries: u64 = conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))?;
+    let wanted = (offset as u128 + limit as u128) * u128::from(entries);
+    let mut tagged = conn.prepare_cached(
+        "SELECT COUNT(*) FROM entry_tags et JOIN tags t ON t.id = et.tag_id WHERE t.name = ?1",
+    )?;
+    for name in names.into_iter().take(MAX_WALK_CANDIDATES) {
+        let count: u64 = tagged.query_row([&name], |row| row.get(0))?;
+        if u128::from(count) * u128::from(count) > wanted {
+            walked.insert(name);
+        }
+    }
+    Ok(walked)
+}
+
+/// Collect into `out` the tags in `filter` that are tested on their own,
+/// rather than as part of an OR of names.
+fn single_tags(filter: &TagFilter, out: &mut Vec<String>) {
+    match filter {
+        TagFilter::Single(name) => out.push(name.clone()),
+        TagFilter::Expr(TagExpr::And(filters) | TagExpr::Or(filters)) => {
+            for f in filters {
+                single_tags(f, out);
+            }
+        }
+        TagFilter::Expr(TagExpr::Not(inner)) => single_tags(inner, out),
     }
 }
 
@@ -317,6 +406,7 @@ fn build_tag_condition(
     filter: &TagFilter,
     params: &mut Vec<SqlParam>,
     idx: usize,
+    walked: &HashSet<String>,
 ) -> Result<(String, usize), SearchEntriesError> {
     // For OR with mixed children (containing AND), use per-child approach
     if let TagFilter::Expr(TagExpr::Or(filters)) = filter {
@@ -335,7 +425,7 @@ fn build_tag_condition(
             let mut conditions = Vec::new();
             let mut current_idx = idx;
             for f in filters {
-                let (cond, next_idx) = build_tag_condition(f, params, current_idx)?;
+                let (cond, next_idx) = build_tag_condition(f, params, current_idx, walked)?;
                 conditions.push(cond);
                 current_idx = next_idx;
             }
@@ -343,7 +433,7 @@ fn build_tag_condition(
             return Ok((sql, current_idx));
         }
     }
-    tag_filter_to_sql(filter, params, idx)
+    tag_filter_to_sql(filter, params, idx, walked)
 }
 
 fn parse_rfc3339_to_timestamp(s: &str) -> Result<i64, SearchEntriesError> {
@@ -400,7 +490,11 @@ fn validate_request(payload: &SearchEntriesRequest) -> Result<(), Response> {
 /// parameters 1 through `next_idx - 1`.
 struct CompiledSearch {
     from_clause: &'static str,
+    /// The conditions, for counting the matching entries.
     where_clause: String,
+    /// The same conditions, written to find one page of them; see
+    /// [`walked_tags`].
+    page_where_clause: String,
     params: Vec<SqlParam>,
     next_idx: usize,
     /// An expression for each entry's BM25 relevance, or `NULL` without a
@@ -410,8 +504,13 @@ struct CompiledSearch {
 }
 
 impl CompiledSearch {
-    /// Translate `payload`, which [`validate_request`] has accepted.
-    fn new(payload: &SearchEntriesRequest) -> Result<Self, SearchEntriesError> {
+    /// Translate `payload`, which [`validate_request`] has accepted. A page
+    /// of the results tests the tags in `walked` entry by entry, rather
+    /// than looking up their entries; see [`walked_tags`].
+    fn new(
+        payload: &SearchEntriesRequest,
+        walked: &HashSet<String>,
+    ) -> Result<Self, SearchEntriesError> {
         let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<SqlParam> = Vec::new();
         let mut next_idx: usize = 1;
@@ -500,12 +599,25 @@ impl CompiledSearch {
         // hidden entries, and nothing else, is what the web UI's lists do;
         // `entries.unread_visible` records it, and partial indexes on it list
         // and count those entries without looking at the others.
+        //
+        // Counting looks at every matching entry however the tags are
+        // tested, so it always looks up each tag's entries; only a page can
+        // be found sooner by walking the entries newest first.
+        let mut page_conditions = conditions.clone();
         if let Some(ref tag_filter) = payload.tags {
             if excludes_read_and_hidden(tag_filter) {
                 conditions.push("e.unread_visible = 1".into());
+                page_conditions.push("e.unread_visible = 1".into());
             } else {
-                let (cond, new_idx) = build_tag_condition(tag_filter, &mut params, next_idx)?;
+                let (cond, new_idx) =
+                    build_tag_condition(tag_filter, &mut params, next_idx, &HashSet::new())?;
+                let page_cond = if walked.is_empty() {
+                    cond.clone()
+                } else {
+                    build_tag_condition(tag_filter, &mut Vec::new(), next_idx, walked)?.0
+                };
                 conditions.push(cond);
+                page_conditions.push(page_cond);
                 next_idx = new_idx;
             }
         }
@@ -516,11 +628,15 @@ impl CompiledSearch {
             "entries e"
         };
 
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", conditions.join(" AND "))
+        let where_of = |conditions: &[String]| {
+            if conditions.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", conditions.join(" AND "))
+            }
         };
+        let where_clause = where_of(&conditions);
+        let page_where_clause = where_of(&page_conditions);
 
         let order_clause = match payload.sort.as_deref() {
             Some("relevance") => "bm25(entries_fts)",
@@ -532,6 +648,7 @@ impl CompiledSearch {
         Ok(CompiledSearch {
             from_clause,
             where_clause,
+            page_where_clause,
             params,
             next_idx,
             rank_expr: if use_fts { "bm25(entries_fts)" } else { "NULL" },
@@ -562,7 +679,7 @@ impl CompiledSearch {
             "SELECT {} FROM {}{} ORDER BY {} LIMIT ?{} OFFSET ?{}",
             columns,
             self.from_clause,
-            self.where_clause,
+            self.page_where_clause,
             self.order_clause,
             self.next_idx,
             self.next_idx + 1
@@ -622,7 +739,8 @@ pub async fn search_entries(
     let result = state
         .db
         .read(move |conn| {
-            let search = CompiledSearch::new(&payload)?;
+            let walked = walked_tags(conn, &payload, limit, offset)?;
+            let search = CompiledSearch::new(&payload, &walked)?;
             let count = search.count(conn)?;
             let columns = format!("{}, {}", entry_columns(), search.rank_expr);
             let (sql, params) = search.page(&columns, limit, offset);
@@ -697,7 +815,8 @@ pub async fn search_entry_ids(
     let result = state
         .db
         .read(move |conn| {
-            let search = CompiledSearch::new(&payload)?;
+            let walked = walked_tags(conn, &payload, limit, offset)?;
+            let search = CompiledSearch::new(&payload, &walked)?;
             let count = search.count(conn)?;
             let (sql, params) = search.page("e.id", limit, offset);
 
@@ -760,5 +879,63 @@ mod tests {
         ] {
             assert!(!excludes_read_and_hidden(&filter(json.clone())), "{json}");
         }
+    }
+
+    /// A tag is walked when it is common enough that a page of it turns up
+    /// sooner walking the entries than looking up all of the tag's.
+    #[test]
+    fn test_walked_tags() -> anyhow::Result<()> {
+        let conn = crate::db::ConnectionBuilder::default()
+            .in_memory()
+            .create()
+            .build()?;
+        conn.execute_batch(
+            "INSERT INTO feeds (title, url) VALUES ('f', 'http://example.com/f');
+             INSERT INTO tags (name) VALUES ('common'), ('rare');",
+        )?;
+        for i in 1..=200i64 {
+            conn.execute(
+                "INSERT INTO entries (id, feed_id, syndication_format, guid, published_at, title, url)
+                 VALUES (?1, 1, 'rss', ?1, 0, 't', 'u')",
+                [i],
+            )?;
+            conn.execute(
+                "INSERT INTO entry_tags (entry_id, tag_id)
+                 SELECT ?1, id FROM tags WHERE name = 'common'",
+                [i],
+            )?;
+            if i <= 3 {
+                conn.execute(
+                    "INSERT INTO entry_tags (entry_id, tag_id)
+                     SELECT ?1, id FROM tags WHERE name = 'rare'",
+                    [i],
+                )?;
+            }
+        }
+        let request = |json: serde_json::Value| -> SearchEntriesRequest {
+            serde_json::from_value(json).expect("a search request")
+        };
+        let walked = |json: serde_json::Value, limit: usize, offset: usize| {
+            let mut names: Vec<String> = walked_tags(&conn, &request(json), limit, offset)
+                .expect("walked tags")
+                .into_iter()
+                .collect();
+            names.sort();
+            names
+        };
+
+        let both = serde_json::json!({"tags": {"and": ["common", "rare"]}});
+        assert_eq!(walked(both.clone(), 25, 0), ["common"]);
+        // Deep enough into the results, even a common tag is looked up.
+        assert!(walked(both, 25, 175).is_empty());
+        // So is every tag of a full-text search, of a feed, or sorted by id.
+        for json in [
+            serde_json::json!({"tags": "common", "query": "t"}),
+            serde_json::json!({"tags": "common", "feed_id": 1}),
+            serde_json::json!({"tags": "common", "sort": "id"}),
+        ] {
+            assert!(walked(json.clone(), 25, 0).is_empty(), "{json}");
+        }
+        Ok(())
     }
 }
