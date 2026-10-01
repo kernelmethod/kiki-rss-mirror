@@ -332,12 +332,16 @@ async fn adaptive_fetch_setting_unwinds_feeds_that_follow_it() -> Result<()> {
     let body: serde_json::Value = resp.json().await?;
     assert_eq!(body["adaptive_fetch"], true);
 
+    // Both are due in the future, so the scheduler leaves them alone.
+    let last_checked = chrono::Utc::now().timestamp() - 10;
+    let next = last_checked + 3000;
     let conn = tc.database_conn()?;
-    conn.execute_batch(
+    conn.execute(
         "INSERT INTO feeds (id, title, url, adaptive_fetch, adaptive_fetch_level,
                             last_checked, next_fetch_at)
-         VALUES (1, 'follows', 'http://a/', NULL, 5, 1000, 3000),
-                (2, 'own setting', 'http://b/', 1, 5, 1000, 3000);",
+         VALUES (1, 'follows', 'http://a/', NULL, 5, ?1, ?2),
+                (2, 'own setting', 'http://b/', 1, 5, ?1, ?2)",
+        [last_checked, next],
     )?;
 
     let resp = client
@@ -353,6 +357,6 @@ async fn adaptive_fetch_setting_unwinds_feeds_that_follow_it() -> Result<()> {
         .prepare("SELECT id, adaptive_fetch_level, next_fetch_at FROM feeds ORDER BY id")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?;
-    assert_eq!(rows, [(1, 0, 1060), (2, 5, 3000)]);
+    assert_eq!(rows, [(1, 0, last_checked + 60), (2, 5, next)]);
     Ok(())
 }

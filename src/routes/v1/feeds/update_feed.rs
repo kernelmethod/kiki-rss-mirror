@@ -1420,13 +1420,37 @@ mod test {
         )?)
     }
 
+    /// Insert a feed last checked at `last_checked` and due at
+    /// `next_fetch_at`, at adaptive level 6, with `failures` failures in a
+    /// row. Inserted directly rather than through the API, which would
+    /// queue a refresh that could overwrite the schedule mid-test.
+    fn insert_backed_off_feed(
+        tc: &TestConfig,
+        last_checked: i64,
+        next_fetch_at: i64,
+        failures: i64,
+    ) -> Result<i64> {
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (title, url, last_checked, next_fetch_at,
+                adaptive_fetch_level, consecutive_failures)
+             VALUES ('feed', 'https://example.com/adaptive.xml', ?1, ?2, 6, ?3)",
+            [last_checked, next_fetch_at, failures],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
     /// `adaptive_fetch` is set and reported per feed, and turning it off
     /// pulls in a fetch it had put off and forgets the feed's level.
     #[tokio::test]
     async fn test_update_feed_adaptive_fetch() -> Result<()> {
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;
-        let id = create_plain_feed(&client).await?;
+        // Backed off to an hour after its last check, which is in the
+        // future, so the scheduler leaves it alone.
+        let now = chrono::Utc::now().timestamp();
+        let last_checked = now - 10;
+        let id = insert_backed_off_feed(&tc, last_checked, last_checked + 3600, 0)?;
 
         let resp = client
             .get(format!("http://localhost/v1/feeds/id/{id}"))
@@ -1434,14 +1458,6 @@ mod test {
             .await?;
         let body: serde_json::Value = resp.json().await?;
         assert_eq!(body["adaptive_fetch"], "default");
-
-        // The feed has been backed off to an hour after its last check.
-        tc.database_conn()?.execute(
-            "UPDATE feeds SET last_checked = 1000, next_fetch_at = 4600,
-                adaptive_fetch_level = 6, consecutive_failures = 0
-             WHERE id = ?1",
-            [id],
-        )?;
 
         // Turning it on for the feed changes nothing while the server has it on.
         let resp = put_feed(
@@ -1456,7 +1472,10 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<UpdateFeedResponse>().await?;
         assert_eq!(body.adaptive_fetch, AdaptiveFetch::Enabled);
-        assert_eq!(read_adaptive(&tc, id)?, (Some(true), 6, Some(4600)));
+        assert_eq!(
+            read_adaptive(&tc, id)?,
+            (Some(true), 6, Some(last_checked + 3600))
+        );
 
         // Turning it off brings the fetch in to the 60s polling floor.
         let resp = put_feed(
@@ -1471,7 +1490,10 @@ mod test {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<UpdateFeedResponse>().await?;
         assert_eq!(body.adaptive_fetch, AdaptiveFetch::Disabled);
-        assert_eq!(read_adaptive(&tc, id)?, (Some(false), 0, Some(1060)));
+        assert_eq!(
+            read_adaptive(&tc, id)?,
+            (Some(false), 0, Some(last_checked + 60))
+        );
 
         let resp = client
             .get(format!("http://localhost/v1/feeds/id/{id}"))
@@ -1492,7 +1514,7 @@ mod test {
         .await?;
         let body = resp.json::<UpdateFeedResponse>().await?;
         assert_eq!(body.adaptive_fetch, AdaptiveFetch::Default);
-        assert_eq!(read_adaptive(&tc, id)?, (None, 0, Some(1060)));
+        assert_eq!(read_adaptive(&tc, id)?, (None, 0, Some(last_checked + 60)));
 
         // Unknown values are rejected.
         let resp = client
@@ -1511,13 +1533,8 @@ mod test {
     async fn test_disabling_adaptive_fetch_keeps_error_backoff() -> Result<()> {
         let tc = TestBuilder::all().build()?;
         let client = tc.client()?;
-        let id = create_plain_feed(&client).await?;
-        tc.database_conn()?.execute(
-            "UPDATE feeds SET last_checked = 1000, next_fetch_at = 9000,
-                adaptive_fetch_level = 6, consecutive_failures = 3
-             WHERE id = ?1",
-            [id],
-        )?;
+        let now = chrono::Utc::now().timestamp();
+        let id = insert_backed_off_feed(&tc, now - 10, now + 9000, 3)?;
         let resp = put_feed(
             &client,
             id,
@@ -1528,7 +1545,7 @@ mod test {
         )
         .await?;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(read_adaptive(&tc, id)?, (Some(false), 0, Some(9000)));
+        assert_eq!(read_adaptive(&tc, id)?, (Some(false), 0, Some(now + 9000)));
         Ok(())
     }
 }
