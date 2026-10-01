@@ -1,3 +1,4 @@
+use crate::tasks::adaptive::stretched_wait;
 use chrono::{DateTime, Datelike, SecondsFormat, Timelike, Utc};
 use reqwest::Url;
 use std::fmt;
@@ -42,9 +43,18 @@ pub(super) fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<i64> 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum FetchOutcome {
     /// Fresh 200 OK or a file:// read.
-    Success { server_hint_secs: Option<u64> },
+    ///
+    /// `adaptive_level` is the feed's adaptive-fetch level after this fetch
+    /// (see [`crate::tasks::adaptive`]); zero leaves the hint as it is.
+    Success {
+        server_hint_secs: Option<u64>,
+        adaptive_level: u32,
+    },
     /// 304 Not Modified.
-    NotModified { server_hint_secs: Option<u64> },
+    NotModified {
+        server_hint_secs: Option<u64>,
+        adaptive_level: u32,
+    },
     /// Transient error — eligible for exponential backoff.
     ///
     /// `stale_if_error_secs` carries the most recent
@@ -71,6 +81,9 @@ pub(super) struct SchedulerConfig {
     /// a full `GET` so the fetcher can detect servers that keep returning
     /// unchanged validators while the body has actually changed.
     pub(super) force_refresh_after: u64,
+    /// Whether adaptive fetching is on for this feed: its own setting, or
+    /// else `feed_fetch.adaptive_fetch`.
+    pub(super) adaptive: bool,
 }
 
 /// Compute when a feed is next eligible to be fetched, and why.
@@ -78,7 +91,9 @@ pub(super) struct SchedulerConfig {
 /// Rules (all results clamped to `[now + min_cadence, now + max_backoff]`):
 /// - `Success` / `NotModified`: use `min(server_hint, min_fetch_interval)`
 ///   when a hint is present; otherwise use `min_fetch_interval`. The per-feed
-///   `min_fetch_interval` is a ceiling, so we never wait longer than it.
+///   `min_fetch_interval` is a ceiling, so we never wait longer than it. A
+///   hint shorter than the interval is stretched by the feed's adaptive
+///   level, if it has one (see [`crate::tasks::adaptive`]).
 /// - `TransientErr` with `Retry-After`: honor the server's deadline.
 /// - `TransientErr` without `Retry-After`: exponential backoff
 ///   `min_cadence * 2^(consecutive_failures - 1)`.
@@ -111,24 +126,45 @@ pub(super) fn plan_next_fetch(
     let max_backoff = max_backoff.max(min_cadence);
 
     let (raw_next_ts, reason): (i64, ScheduleReason) = match outcome {
-        FetchOutcome::Success { server_hint_secs }
-        | FetchOutcome::NotModified { server_hint_secs } => {
-            let reason = match server_hint_secs {
-                Some(hint) if hint < min_fetch_interval => ScheduleReason::FreshnessHint {
-                    secs: hint,
-                    interval_secs: min_fetch_interval,
-                },
-                hint_secs => ScheduleReason::FeedInterval {
-                    secs: min_fetch_interval,
-                    hint_secs,
-                },
-            };
-            let interval = match server_hint_secs {
-                Some(hint) => hint.min(min_fetch_interval),
-                None => min_fetch_interval,
-            };
-            (now_ts.saturating_add(interval as i64), reason)
+        FetchOutcome::Success {
+            server_hint_secs,
+            adaptive_level,
         }
+        | FetchOutcome::NotModified {
+            server_hint_secs,
+            adaptive_level,
+        } => match stretched_wait(
+            server_hint_secs,
+            adaptive_level,
+            min_cadence,
+            min_fetch_interval,
+        ) {
+            Some(secs) => (
+                now_ts.saturating_add(secs as i64),
+                ScheduleReason::Adaptive {
+                    hint_secs: server_hint_secs.unwrap_or(0),
+                    secs,
+                    level: adaptive_level,
+                },
+            ),
+            None => {
+                let reason = match server_hint_secs {
+                    Some(hint) if hint < min_fetch_interval => ScheduleReason::FreshnessHint {
+                        secs: hint,
+                        interval_secs: min_fetch_interval,
+                    },
+                    hint_secs => ScheduleReason::FeedInterval {
+                        secs: min_fetch_interval,
+                        hint_secs,
+                    },
+                };
+                let interval = match server_hint_secs {
+                    Some(hint) => hint.min(min_fetch_interval),
+                    None => min_fetch_interval,
+                };
+                (now_ts.saturating_add(interval as i64), reason)
+            }
+        },
         FetchOutcome::TransientErr {
             retry_after_ts: Some(ts),
             stale_if_error_secs,
@@ -247,6 +283,13 @@ pub(crate) enum ScheduleReason {
     /// `interval_secs`. The hint came from the HTTP cache headers or the
     /// feed's own `<ttl>` / `sy:updatePeriod`.
     FreshnessHint { secs: u64, interval_secs: u64 },
+    /// A freshness hint of `hint_secs`, stretched to `secs` because the
+    /// feed has kept turning out unchanged; `level` is its adaptive level.
+    Adaptive {
+        hint_secs: u64,
+        secs: u64,
+        level: u32,
+    },
     /// The feed's own fetch interval; either there was no freshness hint
     /// or the hint (`hint_secs`) was longer than the interval.
     FeedInterval { secs: u64, hint_secs: Option<u64> },
@@ -266,6 +309,7 @@ impl ScheduleReason {
     pub(crate) fn metric_source(&self) -> &'static str {
         match self {
             ScheduleReason::FreshnessHint { .. } => "cache_hint",
+            ScheduleReason::Adaptive { .. } => "adaptive",
             ScheduleReason::FeedInterval { .. } => "interval",
             ScheduleReason::RetryAfter => "retry_after",
             ScheduleReason::StaleIfError { .. } => "stale_if_error",
@@ -325,6 +369,7 @@ impl fmt::Display for Schedule {
         let had_hint = matches!(
             self.reason,
             ScheduleReason::FreshnessHint { .. }
+                | ScheduleReason::Adaptive { .. }
                 | ScheduleReason::FeedInterval {
                     hint_secs: Some(_),
                     ..
@@ -364,6 +409,17 @@ impl fmt::Display for ScheduleReason {
                 "freshness hint of {}, under the feed's {} interval",
                 format_duration(secs),
                 format_duration(interval_secs)
+            ),
+            ScheduleReason::Adaptive {
+                hint_secs,
+                secs,
+                level,
+            } => write!(
+                f,
+                "freshness hint of {}, stretched to {} as the feed has been changing rarely (adaptive level {})",
+                format_duration(hint_secs),
+                format_duration(secs),
+                level
             ),
             ScheduleReason::FeedInterval {
                 secs,

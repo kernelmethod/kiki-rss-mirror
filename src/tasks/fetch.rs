@@ -7,6 +7,7 @@ use crate::fetcher::{
 use crate::http::{FeedAuth, FeedAuthType};
 use crate::metrics::Metrics;
 use crate::scripting::ScriptRunner;
+use crate::tasks::adaptive::{next_level, ContentChange};
 use crate::tasks::backoff::{
     format_duration, parse_retry_after, plan_next_fetch, FetchOutcome, Schedule, SchedulerConfig,
 };
@@ -49,6 +50,10 @@ struct FeedFetchRow {
     /// Refresh hints from the last feed document that parsed, used when a
     /// response carries no body to read them from (a 304).
     feed_hints: FeedHints,
+    /// The feed's own adaptive-fetch setting; `None` follows the server's.
+    adaptive_fetch: Option<bool>,
+    /// The feed's adaptive-fetch level; see [`crate::tasks::adaptive`].
+    adaptive_level: u32,
 }
 
 fn load_feed_fetch_row(conn: &Connection, feed_id: i64) -> Result<FeedFetchRow> {
@@ -73,7 +78,9 @@ fn load_feed_fetch_row(conn: &Connection, feed_id: i64) -> Result<FeedFetchRow> 
             feed_skip_days,
             header_expires,
             title,
-            retry_after_at
+            retry_after_at,
+            adaptive_fetch,
+            adaptive_fetch_level
          FROM feeds
          WHERE id = ?1",
         [feed_id],
@@ -111,6 +118,8 @@ fn load_feed_fetch_row(conn: &Connection, feed_id: i64) -> Result<FeedFetchRow> 
                     skip_days: row.get::<_, i64>(16)? as u8,
                 },
                 header_expires: row.get(17)?,
+                adaptive_fetch: row.get(20)?,
+                adaptive_level: u32::try_from(row.get::<_, i64>(21)?).unwrap_or(0),
             })
         },
     )?;
@@ -198,6 +207,7 @@ pub(crate) async fn refresh_feed(
         max_backoff: fetch_settings.max_backoff_seconds,
         min_fetch_interval: row.min_fetch_interval.max(0) as u64,
         force_refresh_after: fetch_settings.force_refresh_after_seconds,
+        adaptive: row.adaptive_fetch.unwrap_or(fetch_settings.adaptive_fetch),
     };
     let rec = Recorder {
         db: &db,
@@ -592,9 +602,13 @@ fn record_fetch_reply(
             let headers = headers.to_header_map();
             let hints = extract_server_hints(&headers, now_ts);
             let cache = revalidated_cache_state(row, &headers, &hints, now_ts);
+            let server_hint_secs = hints.hint_secs.or(row.feed_hints.refresh_hint_secs());
+            let adaptive_level =
+                adaptive_level(row, cfg, ContentChange::Unchanged, server_hint_secs);
             let schedule = schedule_success(
                 FetchOutcome::NotModified {
-                    server_hint_secs: hints.hint_secs.or(row.feed_hints.refresh_hint_secs()),
+                    server_hint_secs,
+                    adaptive_level,
                 },
                 &row.feed_hints,
                 now_ts,
@@ -612,8 +626,9 @@ fn record_fetch_reply(
                     last_checked = ?5,
                     next_fetch_at = ?6,
                     consecutive_failures = 0,
-                    retry_after_at = NULL
-                 WHERE id = ?7",
+                    retry_after_at = NULL,
+                    adaptive_fetch_level = ?7
+                 WHERE id = ?8",
                     rusqlite::params![
                         cache.etag,
                         cache.last_modified,
@@ -621,6 +636,7 @@ fn record_fetch_reply(
                         cache.immutable_until,
                         now_ts,
                         next_fetch_at,
+                        adaptive_level,
                         feed_id,
                     ],
                 )
@@ -756,9 +772,15 @@ fn record_fetch_reply(
 
     // HTTP freshness takes precedence (RFC 9111 is specific to this
     // representation); the feed's own <ttl> / sy:update* is the fallback.
+    let server_hint_secs = hints.hint_secs.or(feed_hints.refresh_hint_secs());
+    // Whether the feed changed is judged by the body, since a server that
+    // ignores conditional requests answers 200 whether or not it has.
+    let change = ContentChange::from_hashes(row.header_body_hash.as_deref(), &body_hash);
+    let adaptive_level = adaptive_level(row, cfg, change, server_hint_secs);
     let schedule = schedule_success(
         FetchOutcome::Success {
-            server_hint_secs: hints.hint_secs.or(feed_hints.refresh_hint_secs()),
+            server_hint_secs,
+            adaptive_level,
         },
         &feed_hints,
         now_ts,
@@ -824,7 +846,8 @@ fn record_fetch_reply(
             feed_ttl_seconds = ?,
             feed_update_interval_seconds = ?,
             feed_skip_hours = ?,
-            feed_skip_days = ?
+            feed_skip_days = ?,
+            adaptive_fetch_level = ?
          WHERE id = ?",
             rusqlite::params![
                 etag.as_deref(),
@@ -839,6 +862,7 @@ fn record_fetch_reply(
                 feed_hints.update_interval_secs.map(saturating_i64),
                 feed_hints.skip_hours,
                 feed_hints.skip_days,
+                adaptive_level,
                 feed_id,
             ],
         )
@@ -968,6 +992,27 @@ fn saturating_i64(secs: u64) -> i64 {
     i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
+/// The feed's adaptive-fetch level after a 200 or 304 that found its
+/// content `change`d or not, to be scheduled with freshness hint
+/// `hint_secs`. Zero when adaptive fetching is off for the feed.
+fn adaptive_level(
+    row: &FeedFetchRow,
+    cfg: SchedulerConfig,
+    change: ContentChange,
+    hint_secs: Option<u64>,
+) -> u32 {
+    if !cfg.adaptive {
+        return 0;
+    }
+    next_level(
+        row.adaptive_level,
+        change,
+        hint_secs,
+        cfg.min_cadence,
+        cfg.min_fetch_interval,
+    )
+}
+
 /// Schedule the next fetch after a 200 or 304, then move it out of any
 /// hours or days the feed asked not to be read in.
 fn schedule_success(
@@ -1005,6 +1050,7 @@ fn retrieve_file_feed(
     let schedule = plan_next_fetch(
         FetchOutcome::Success {
             server_hint_secs: None,
+            adaptive_level: 0,
         },
         now_ts,
         cfg.min_cadence,

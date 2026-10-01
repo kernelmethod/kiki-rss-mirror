@@ -116,6 +116,13 @@ pub struct FeedFetchSettings {
     /// applied to permanent errors, in seconds.
     pub max_backoff_seconds: u64,
 
+    /// Whether to back off from feeds whose freshness hint is shorter than
+    /// their fetch interval but which keep turning out to be unchanged.
+    /// Each unchanged fetch doubles the wait, and each changed one halves
+    /// it, always between `min_polling_cadence_seconds` and the feed's own
+    /// interval. Feeds can override this individually.
+    pub adaptive_fetch: bool,
+
     /// How often, in seconds, to bypass conditional-request headers and
     /// force a full `GET` on a feed. Catches servers that keep serving the
     /// same `ETag`/`Last-Modified` while the body has changed.
@@ -272,6 +279,7 @@ impl Default for Settings {
                 min_polling_cadence_seconds: 60,
                 default_fetch_interval_seconds: DEFAULT_FETCH_INTERVAL_SECONDS,
                 max_backoff_seconds: 24 * 60 * 60,
+                adaptive_fetch: true,
                 force_refresh_after_seconds: 7 * 24 * 60 * 60,
                 max_feed_bytes: DEFAULT_MAX_FEED_BYTES,
             },

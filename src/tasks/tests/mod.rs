@@ -1,6 +1,7 @@
 #[cfg(feature = "lua")]
 mod lua_script_tests;
 
+mod adaptive_tests;
 mod asset_cache_tests;
 mod auth_tests;
 mod backoff_tests;
