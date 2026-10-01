@@ -3,8 +3,8 @@
 use super::{SandboxConfig, SandboxProfile};
 use anyhow::{Context, Result};
 use landlock::{
-    path_beneath_rules, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetCreatedAttr,
-    RulesetStatus, Scope, ABI,
+    path_beneath_rules, Access, AccessFs, AccessNet, BitFlags, LandlockStatus, Ruleset,
+    RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
 use std::path::{Path, PathBuf};
 
@@ -266,13 +266,41 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
     }
 }
 
+/// The Landlock ABI the rulesets are written against: v6 (Linux 6.12+)
+/// adds the scopes in [`landlock_scopes`] to v5's filesystem rights. The
+/// landlock crate's compatibility layer downgrades to whatever the
+/// running kernel supports rather than failing outright, and reports the
+/// downgrade as [`RulesetStatus::PartiallyEnforced`].
+const LANDLOCK_ABI: ABI = ABI::V6;
+
+/// What a profile is barred from reaching outside its own Landlock domain
+/// (and the domains nested inside it, which its children run in).
+///
+/// * Every profile but the web UI is scoped for signals. None of them
+///   signals anything but itself and its own children: the server stops
+///   the feed fetcher and the script host, which it starts after its
+///   Landlock rules are in place (see
+///   [`crate::sandbox::restrict_filesystem`]), and the fetcher kills its
+///   own forked workers. The web UI stops its `kiki serve` child with
+///   `SIGTERM`, and that child was started outside the web UI's sandbox.
+/// * Every profile is scoped for abstract Unix sockets, which no Kiki
+///   process connects to once its sandbox is up. The server's one
+///   abstract socket, the service manager's `$NOTIFY_SOCKET` when that is
+///   one, is connected before (see [`crate::notify`]), and Landlock lets a
+///   datagram socket keep sending to the peer it was already connected to.
+fn landlock_scopes(profile: &SandboxProfile) -> BitFlags<Scope> {
+    match profile {
+        SandboxProfile::WebUi => Scope::AbstractUnixSocket.into(),
+        SandboxProfile::Server { .. }
+        | SandboxProfile::ScriptHost
+        | SandboxProfile::FeedFetcher => Scope::AbstractUnixSocket | Scope::Signal,
+    }
+}
+
 fn apply_landlock(config: &SandboxConfig) -> Result<()> {
-    // ABI::V5 is supported on Linux 6.7+; the landlock crate's
-    // compatibility layer transparently downgrades on older kernels
-    // rather than failing outright.
-    let abi = ABI::V5;
-    let all = AccessFs::from_all(abi);
-    let read_only = AccessFs::from_read(abi);
+    let all = AccessFs::from_all(LANDLOCK_ABI);
+    let read_only = AccessFs::from_read(LANDLOCK_ABI);
+    let scopes = landlock_scopes(&config.profile);
 
     let (rw_paths, ro_paths) = landlock_paths(&config.profile);
     let (exec_paths, child_ro_paths, child_rw_paths) = match config.profile {
@@ -280,29 +308,20 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
         _ => Default::default(),
     };
 
-    let mut ruleset = Ruleset::default().handle_access(all)?;
+    let mut ruleset = Ruleset::default().handle_access(all)?.scope(scopes)?;
     if matches!(config.profile, SandboxProfile::FeedFetcher) {
         // Handling `BindTcp` with no rule allowing any port denies TCP
         // binds outright (Linux 6.7+, ABI v4) — redundant with seccomp's
-        // `bind` denial, but independent of it. Scoping (Linux 6.12+, ABI
-        // v6) stops the fetcher reaching abstract Unix sockets or
-        // signalling processes outside its own sandbox — the server among
-        // them. Both degrade silently on older kernels, as the filesystem
-        // rules do; seccomp covers the socket side there.
-        ruleset = ruleset
-            .handle_access(AccessNet::BindTcp)?
-            .scope(Scope::AbstractUnixSocket | Scope::Signal)?;
+        // `bind` denial, but independent of it. It degrades silently on
+        // older kernels, as the filesystem rules do.
+        ruleset = ruleset.handle_access(AccessNet::BindTcp)?;
     }
     if matches!(config.profile, SandboxProfile::WebUi) {
         // Handling both TCP rights with no rule allowing any port denies
         // every TCP bind and connect (Linux 6.7+, ABI v4). The listener was
         // bound before the sandbox went up, and the API is reached over a
-        // Unix socket, so the web UI needs neither. Signals stay unscoped:
-        // the web UI stops its `kiki serve` child with `SIGTERM`, and that
-        // child was started outside this sandbox.
-        ruleset = ruleset
-            .handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp)?
-            .scope(Scope::AbstractUnixSocket)?;
+        // Unix socket, so the web UI needs neither.
+        ruleset = ruleset.handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp)?;
     }
     let ruleset = ruleset
         .create()?
@@ -320,31 +339,50 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
 
     let status = ruleset.restrict_self()?;
     let profile = config.profile_name();
+    let effective_abi = match status.landlock {
+        LandlockStatus::Available { effective_abi, .. } => Some(effective_abi),
+        LandlockStatus::NotEnabled | LandlockStatus::NotImplemented => None,
+    };
     match status.ruleset {
         RulesetStatus::FullyEnforced => {
             tracing::info!(
                 profile,
+                abi = ?effective_abi,
                 rw_paths = ?rw_paths,
                 ro_paths = ?ro_paths,
                 child_paths = exec_paths.len() + child_ro_paths.len() + child_rw_paths.len(),
-                "landlock: filesystem sandbox fully enforced"
+                scopes = ?scopes,
+                "landlock: sandbox fully enforced"
             );
         }
         RulesetStatus::PartiallyEnforced => {
             tracing::warn!(
                 profile,
-                "landlock: filesystem sandbox only partially enforced \
-                 (kernel may not support all requested access types)"
+                abi = ?effective_abi,
+                wanted_abi = ?LANDLOCK_ABI,
+                "landlock: sandbox only partially enforced \
+                 (the kernel does not support every requested restriction)"
             );
         }
         RulesetStatus::NotEnforced => {
             tracing::warn!(
                 profile,
-                "landlock: filesystem sandbox NOT enforced \
+                "landlock: sandbox NOT enforced \
                  (requires Linux >= 5.13 with CONFIG_SECURITY_LANDLOCK=y \
                  and the landlock LSM enabled at boot)"
             );
         }
+    }
+    // Scoping arrived well after the filesystem rules, so say plainly
+    // when it is what the kernel lacks.
+    if effective_abi.is_some_and(|abi| abi < ABI::V6) {
+        tracing::warn!(
+            profile,
+            abi = ?effective_abi,
+            scopes = ?scopes,
+            "landlock: signal and abstract Unix socket scoping NOT enforced \
+             (requires Linux >= 6.12)"
+        );
     }
     Ok(())
 }
@@ -889,5 +927,30 @@ mod tests {
     fn every_profile_denies_exec() {
         assert!(DENIED_COMMON.contains(&libc::SYS_execve));
         assert!(DENIED_COMMON.contains(&libc::SYS_execveat));
+    }
+
+    /// Every profile is kept from abstract Unix sockets outside its
+    /// sandbox, and every profile but the web UI, which stops a `kiki
+    /// serve` started outside its own, from signalling outside it.
+    #[test]
+    fn every_profile_but_the_web_ui_is_scoped_for_signals() {
+        let server = SandboxProfile::Server {
+            data_dir: PathBuf::from("/var/lib/kiki"),
+            socket_dir: PathBuf::from("/var/lib/kiki"),
+            temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
+        };
+        for profile in [
+            server,
+            SandboxProfile::ScriptHost,
+            SandboxProfile::FeedFetcher,
+            SandboxProfile::WebUi,
+        ] {
+            let scopes = landlock_scopes(&profile);
+            assert!(scopes.contains(Scope::AbstractUnixSocket));
+            assert_eq!(
+                scopes.contains(Scope::Signal),
+                !matches!(profile, SandboxProfile::WebUi)
+            );
+        }
     }
 }

@@ -15,10 +15,12 @@
 //!   which makes all of Kiki's HTTP(S) requests, gets only the TLS trust
 //!   stores (it has the server resolve hostnames for it), and the script
 //!   host and the web UI get *nothing at all*. Where the kernel
-//!   supports it, the feed fetcher is also barred from binding TCP ports
-//!   and from reaching abstract Unix sockets or signalling processes
-//!   outside its own sandbox, and the web UI from binding or connecting
-//!   to TCP ports and from reaching abstract Unix sockets.
+//!   supports it (Linux 6.12+), every profile is also barred from
+//!   reaching abstract Unix sockets outside its own sandbox, and every
+//!   profile but the web UI from signalling processes outside it — its
+//!   own children, whose sandboxes nest inside its own, excepted. The
+//!   feed fetcher is barred from binding TCP ports, and the web UI from
+//!   binding or connecting to them.
 //! * **seccomp-bpf** blocks a denylist of syscalls the profile never uses
 //!   (`ptrace`, `mount`, `unshare`, `bpf`, `kexec_load`, module loading,
 //!   `io_uring`, `userfaultfd`, and friends; plus, for the server,
@@ -51,8 +53,9 @@ use std::path::PathBuf;
 pub enum SandboxProfile {
     /// The main `kiki serve` process: owns the SQLite database, the asset
     /// cache, and the listening socket, and resolves hostnames for the
-    /// feed fetcher. It makes no HTTP(S) requests of its own, and may
-    /// create only Unix, IPv4 and IPv6 sockets.
+    /// feed fetcher. It makes no HTTP(S) requests of its own, may create
+    /// only Unix, IPv4 and IPv6 sockets, and may signal no process but
+    /// itself and its children.
     ///
     /// Its children are started under its filesystem rules (see
     /// [`restrict_filesystem`]), so besides the paths below it is granted
@@ -79,8 +82,9 @@ pub enum SandboxProfile {
     /// The Lua script host: evaluates user-supplied scripts and talks to
     /// the server over an inherited socket pair, nothing else.
     ///
-    /// This profile grants **no filesystem access whatsoever** and denies
-    /// every syscall that could open a socket. The host's inherited IPC
+    /// This profile grants **no filesystem access whatsoever**, denies
+    /// every syscall that could open a socket, and may signal no process
+    /// but itself. The host's inherited IPC
     /// file descriptor already exists by the time the sandbox is applied,
     /// and is used through plain `read`/`write`.
     ScriptHost,
@@ -208,12 +212,14 @@ pub fn apply(config: &SandboxConfig) -> anyhow::Result<()> {
 }
 
 /// Install only the filesystem half of the configured sandbox: on Linux,
-/// the Landlock rules. [`restrict_syscalls`] installs the other half.
+/// the Landlock rules, which also scope signals and abstract Unix
+/// sockets. [`restrict_syscalls`] installs the other half.
 ///
 /// The server installs the two halves separately so that it can start its
 /// children in between. Landlock lets a process inspect — through
-/// `/proc/<pid>/smaps_rollup`, say — only processes in its own Landlock
-/// domain or one nested inside it, and a child's domain nests inside its
+/// `/proc/<pid>/smaps_rollup`, say — and, once scoped, signal only
+/// processes in its own Landlock domain or one nested inside it, and a
+/// child's domain nests inside its
 /// parent's only if the parent's rules were in place when the child was
 /// started. Children started before the server restricted itself would end
 /// up in domains of their own, beyond its reach. So the server restricts
