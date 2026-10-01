@@ -29,6 +29,10 @@ use tempfile::TempDir;
 
 const KIKI_BIN: &str = env!("CARGO_BIN_EXE_kiki");
 
+/// The user and group ID of `nobody`, which [`Kiki::spawn_unprivileged`]
+/// runs kiki as when the tests run as root.
+const NOBODY: u32 = 65534;
+
 // --------------------------------------------------------------------
 // Kiki subprocess harness
 // --------------------------------------------------------------------
@@ -51,9 +55,36 @@ impl Kiki {
     /// As [`Self::spawn`], calling `setup` with the data directory once
     /// it has been initialized and before the server starts.
     fn spawn_with(extra_args: &[&str], setup: impl FnOnce(&Path)) -> Self {
-        let dir = TempDir::with_prefix("kiki-sandbox-test").expect("create tempdir");
+        Self::spawn_as(extra_args, setup, None)
+    }
 
-        let init_status = Command::new(KIKI_BIN)
+    /// As [`Self::spawn`], but run kiki as an unprivileged user when the
+    /// tests run as root, for checks that root's privileges would get
+    /// around.
+    fn spawn_unprivileged(extra_args: &[&str]) -> Self {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let root = unsafe { libc::geteuid() } == 0;
+        Self::spawn_as(extra_args, |_| {}, root.then_some(NOBODY))
+    }
+
+    /// As [`Self::spawn_with`], running kiki as the user and group `id`
+    /// if one is given, with the data directory handed over to it.
+    fn spawn_as(extra_args: &[&str], setup: impl FnOnce(&Path), id: Option<u32>) -> Self {
+        use std::os::unix::process::CommandExt;
+
+        let dir = TempDir::with_prefix("kiki-sandbox-test").expect("create tempdir");
+        let command = || {
+            let mut cmd = Command::new(KIKI_BIN);
+            if let Some(id) = id {
+                cmd.uid(id).gid(id);
+            }
+            cmd
+        };
+        if let Some(id) = id {
+            std::os::unix::fs::chown(dir.path(), Some(id), Some(id)).expect("chown tempdir");
+        }
+
+        let init_status = command()
             .arg("init")
             // The tests count the plugins they load themselves.
             .arg("--no-default-plugins")
@@ -66,7 +97,7 @@ impl Kiki {
         setup(dir.path());
 
         let socket = dir.path().join("kiki.sock");
-        let mut cmd = Command::new(KIKI_BIN);
+        let mut cmd = command();
         cmd.current_dir(dir.path())
             .arg("serve")
             .arg("--uds")
@@ -485,6 +516,56 @@ fn refresh_until_entries(kiki: &mut Kiki, feed_id: i64, n: i64) {
         }
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+// --------------------------------------------------------------------
+// Process metrics
+// --------------------------------------------------------------------
+
+/// The value of the `process`-labelled sample `name{process="<process>"}`
+/// in a Prometheus exposition body.
+fn process_metric(body: &str, name: &str, process: &str) -> Option<f64> {
+    let prefix = format!("{name}{{process=\"{process}\"}}");
+    body.lines()
+        .find_map(|line| line.strip_prefix(&prefix)?.trim().parse().ok())
+}
+
+/// The sandboxed server can read its children's proportional memory.
+/// That takes their Landlock domains to be nested inside the server's,
+/// which they are only if it installed its Landlock rules before starting
+/// them; started first, they would be beyond its reach, and their series
+/// would be missing. Root could read them regardless, so the server runs
+/// unprivileged.
+#[test]
+fn the_sandboxed_server_reports_its_childrens_memory() {
+    let mut kiki = Kiki::spawn_unprivileged(&[]);
+    let mut children = vec!["feed_fetcher"];
+    if cfg!(feature = "lua") {
+        children.push("script_host");
+    }
+    // The first sample is taken as the server starts.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        kiki.assert_still_running();
+        let metrics = kiki.get("/metrics");
+        let body = String::from_utf8_lossy(&metrics.body).into_owned();
+        let missing: Vec<&str> = children
+            .iter()
+            .copied()
+            .filter(|p| {
+                process_metric(&body, "kiki_process_proportional_memory_bytes", p)
+                    .is_none_or(|bytes| bytes <= 0.0)
+            })
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("no proportional memory reported for {missing:?}; last /metrics:\n{body}");
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    kiki.shutdown();
 }
 
 // --------------------------------------------------------------------

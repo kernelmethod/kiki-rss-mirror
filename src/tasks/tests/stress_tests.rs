@@ -12,12 +12,15 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Insert N feeds pointing at `feed_url`, with `last_checked = NULL`.
 /// Returns the vector of inserted feed IDs.
+///
+/// Feed URLs must be unique, so each feed gets its own query string; the
+/// test server ignores it and serves the same document to all of them.
 fn populate_n_feeds(conn: &rusqlite::Connection, n: usize, feed_url: &str) -> Vec<i64> {
     let mut ids = Vec::with_capacity(n);
     for i in 0..n {
         conn.execute(
             "INSERT INTO feeds (title, url) VALUES (?1, ?2)",
-            rusqlite::params![format!("feed-{i}"), feed_url],
+            rusqlite::params![format!("feed-{i}"), format!("{feed_url}?feed={i}")],
         )
         .unwrap();
         ids.push(conn.last_insert_rowid());

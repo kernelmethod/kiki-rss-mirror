@@ -68,6 +68,7 @@ use utoipa::OpenApi;
             crate::tasks::FetchError,
             crate::routes::v1::feeds::update_feed::UpdateFeedRequest,
             crate::routes::v1::feeds::update_feed::UpdateFeedResponse,
+            crate::routes::v1::feeds::update_feed::AdaptiveFetch,
             crate::routes::v1::feeds::fetch_all_feeds::FetchAllFeedsResponse,
             crate::routes::v1::feeds::feed_entries::FeedEntriesResponse,
             crate::routes::v1::feeds::feed_tags::SetFeedTagsRequest,

@@ -13,6 +13,7 @@ const MIN_FETCH_INTERVAL: u64 = 10_800;
 fn success_with_hint(hint: Option<u64>) -> FetchOutcome {
     FetchOutcome::Success {
         server_hint_secs: hint,
+        adaptive_level: 0,
     }
 }
 
@@ -373,6 +374,7 @@ fn plan(outcome: FetchOutcome) -> super::super::backoff::Schedule {
 fn test_plan_zero_hint_explains_min_cadence() {
     let schedule = plan(FetchOutcome::NotModified {
         server_hint_secs: Some(0),
+        adaptive_level: 0,
     })
     .with_hint_source(Some("Cache-Control \"public, max-age=0\"".to_string()));
     assert_eq!(schedule.next_fetch_at, PLAN_NOW + 60);

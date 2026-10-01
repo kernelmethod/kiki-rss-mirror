@@ -34,8 +34,11 @@
 //!
 //! Every sandbox profile denies `execve`, so a process cannot spawn
 //! children once its own sandbox is installed. The server therefore
-//! spawns both children *first*, in [`crate::cli::serve`], and only then
-//! restricts itself.
+//! installs its sandbox in two halves, in [`crate::cli::serve`]: its
+//! Landlock rules, then both children, then its seccomp filter. Starting
+//! the children under the server's Landlock rules nests their Landlock
+//! domains inside its own, which is what lets it read their memory use
+//! from `/proc` (see [`stats`]); see [`crate::sandbox::restrict_filesystem`].
 //!
 //! The two children differ in what happens when they die:
 //!
@@ -159,7 +162,10 @@ pub(crate) fn take_parent_socket(
 /// stdin and stdout are closed; stderr is inherited so its logs land
 /// wherever the server's do.
 ///
-/// **Must be called before the caller installs its own sandbox.**
+/// **Must be called before the caller installs its seccomp filter**,
+/// which denies `execve`. Calling it after the caller's Landlock rules
+/// are in place nests the child's Landlock domain inside the caller's;
+/// see [`crate::sandbox::restrict_filesystem`].
 ///
 /// # Errors
 ///

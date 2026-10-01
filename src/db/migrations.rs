@@ -69,6 +69,10 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0012_fts_unchanged_entries",
         sql: include_str!("include/migrations/0012_fts_unchanged_entries.sql"),
     },
+    Migration {
+        name: "0013_adaptive_fetch",
+        sql: include_str!("include/migrations/0013_adaptive_fetch.sql"),
+    },
 ];
 
 /// The migration that drops the `scripts` table in favour of plugins.
@@ -639,6 +643,40 @@ mod tests {
             schema_sql(&conn, "entries_fts_au")?,
             schema_sql(&fresh, "entries_fts_au")?
         );
+        Ok(())
+    }
+
+    /// `0013_adaptive_fetch` adds the adaptive-fetch columns to `feeds`
+    /// with the same types and defaults as a freshly-initialized
+    /// database's, leaving existing feeds on the server setting.
+    #[test]
+    fn test_adaptive_fetch_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        conn.execute_batch("INSERT INTO feeds (title, url) VALUES ('f', 'http://x/');")?;
+        run_pending_migrations(&mut conn)?;
+
+        let fresh = ConnectionBuilder::default().in_memory().create().build()?;
+        // Each column as "name type notnull default".
+        let columns = |conn: &Connection| -> Result<Vec<String>> {
+            Ok(conn
+                .prepare(
+                    "SELECT name || ' ' || type || ' ' || \"notnull\" || ' ' || IFNULL(dflt_value, 'NULL')
+                     FROM pragma_table_info('feeds')
+                     WHERE name LIKE 'adaptive_fetch%' ORDER BY name",
+                )?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?)
+        };
+        assert_eq!(columns(&conn)?.len(), 2);
+        assert_eq!(columns(&conn)?, columns(&fresh)?);
+
+        let (setting, level): (Option<bool>, i64) = conn.query_row(
+            "SELECT adaptive_fetch, adaptive_fetch_level FROM feeds",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((setting, level), (None, 0));
         Ok(())
     }
 

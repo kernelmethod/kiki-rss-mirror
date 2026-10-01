@@ -15,6 +15,15 @@
 //! Proportional memory (PSS) instead splits each shared page evenly among
 //! the processes that map it, so it adds up across processes to the memory
 //! Kiki actually occupies.
+//!
+//! PSS comes from `/proc/<pid>/smaps_rollup`, which, unlike `stat`, the
+//! kernel lets a process read only if it could ptrace the target. Under
+//! Landlock that takes the target to be in the reader's Landlock domain or
+//! one nested inside it, which is why the server starts its children only
+//! after installing its own Landlock rules (see
+//! [`crate::sandbox::restrict_filesystem`]). The feed fetcher's worker,
+//! forked from the supervisor, is in a domain nested inside the
+//! supervisor's, and so inside the server's too.
 
 use std::collections::HashMap;
 use std::fs;
