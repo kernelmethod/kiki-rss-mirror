@@ -16,6 +16,49 @@ pub use imp::{handle_metrics, track_http, DbStatementSeries, Metrics};
 pub use stub::{DbStatementSeries, Metrics};
 
 use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+/// How often [`run_upkeep`] folds histogram samples into their buckets.
+///
+/// Every SQL statement records samples, so under load this bounds the
+/// buffered samples to a few seconds' worth, whatever the scrape interval.
+const UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Fold `metrics`' histogram samples into their buckets every five
+/// seconds until `cancel` fires.
+///
+/// A recorder built with `build_recorder` gets no upkeep task of its own,
+/// so this is what keeps the samples recorded between scrapes from piling
+/// up. Returns immediately when the `metrics` feature is disabled.
+///
+/// # Examples
+///
+/// ```
+/// # async fn example() -> anyhow::Result<()> {
+/// use std::sync::Arc;
+/// use tokio_util::sync::CancellationToken;
+///
+/// let metrics = Arc::new(kiki_rss::metrics::Metrics::new()?);
+/// let cancel = CancellationToken::new();
+/// tokio::spawn(kiki_rss::metrics::run_upkeep(metrics, cancel.clone()));
+/// cancel.cancel();
+/// # Ok(())
+/// # }
+/// ```
+pub async fn run_upkeep(metrics: Arc<Metrics>, cancel: CancellationToken) {
+    if !cfg!(feature = "metrics") {
+        return;
+    }
+    let mut interval = tokio::time::interval(UPKEEP_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => metrics.run_upkeep(),
+        }
+    }
+}
 
 /// r2d2 event handler that records connection acquisition into [`Metrics`].
 ///
@@ -189,6 +232,17 @@ mod imp {
         /// Render the current state in Prometheus text exposition format.
         pub fn render(&self) -> String {
             self.handle.render()
+        }
+
+        /// Fold the histogram samples recorded since the last call into
+        /// their buckets.
+        ///
+        /// The recorder keeps every histogram sample until this runs or
+        /// [`render`](Self::render) does, so without it memory grows with
+        /// the samples recorded between scrapes — without bound if nothing
+        /// scrapes. [`run_upkeep`](super::run_upkeep) calls it periodically.
+        pub fn run_upkeep(&self) {
+            self.handle.run_upkeep();
         }
 
         fn describe_all(&self) {
@@ -995,6 +1049,9 @@ mod stub {
             String::new()
         }
 
+        #[inline]
+        pub fn run_upkeep(&self) {}
+
         // ----- Feed fetching -----
 
         #[inline]
@@ -1171,6 +1228,32 @@ mod tests {
         );
         assert_eq!(sample(&metrics, "kiki_db_pool_acquire_errors_total")?, 1.0);
         drop(held);
+        Ok(())
+    }
+
+    #[test]
+    fn upkeep_keeps_histogram_samples() -> anyhow::Result<()> {
+        let metrics = Metrics::new()?;
+        let count = "kiki_db_pool_acquire_duration_seconds_count";
+
+        metrics.record_db_pool_acquire(0.01, true);
+        metrics.run_upkeep();
+        metrics.record_db_pool_acquire(0.02, true);
+        // One sample was folded in by the upkeep and one by the render;
+        // neither is lost or counted twice.
+        assert_eq!(sample(&metrics, count)?, 2.0);
+
+        metrics.run_upkeep();
+        assert_eq!(sample(&metrics, count)?, 2.0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_upkeep_stops_when_cancelled() -> anyhow::Result<()> {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(super::run_upkeep(Arc::new(Metrics::new()?), cancel.clone()));
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task).await??;
         Ok(())
     }
 }

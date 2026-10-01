@@ -81,13 +81,23 @@
           # carries, and a musl C toolchain for the -sys crates.
           craneLibStatic = crane.mkLib pkgs.pkgsStatic;
 
-          static = craneLibStatic.buildPackage {
+          staticArgs = {
             inherit (commonArgs) src strictDeps doCheck;
             # pkgsStatic adds -static to every link, including the glibc
             # build scripts, which then fail to link. rustc already links
             # musl binaries statically, so drop it.
             preBuild = "unset NIX_CFLAGS_LINK";
           };
+
+          static = craneLibStatic.buildPackage staticArgs;
+
+          # The static build with its symbols kept, like `profiling` above.
+          # nixdev runs this, so the live service can be profiled with perf.
+          staticProfiling = craneLibStatic.buildPackage (staticArgs // {
+            pname = "kiki-rss-static-profiling";
+            CARGO_PROFILE = "profiling";
+            dontStrip = true;
+          });
 
           # rustdoc for the kiki_rss crate, including the guides pulled in
           # from src/docs/*.md. The HTML lands in $out/share/doc.
@@ -164,6 +174,7 @@
             inherit docs coverage profiling;
           } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
             inherit static;
+            static-profiling = staticProfiling;
           };
 
           devShells.default = craneLib.devShell {
