@@ -8,3 +8,6 @@
 
 # cargo-mutants output
 /mutants.out*
+
+# Standalone tools build into their own target directories
+/tools/*/target

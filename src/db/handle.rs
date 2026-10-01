@@ -299,6 +299,9 @@ fn connection_manager(
 
 /// Define `regexp(pattern, text)`, which SQLite calls for `text REGEXP
 /// pattern`.
+///
+/// The compiled pattern is kept as SQLite auxiliary data, so a statement
+/// compiles it once rather than once per row it tests.
 fn add_regexp(c: &Connection) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
     c.create_scalar_function(
@@ -306,10 +309,12 @@ fn add_regexp(c: &Connection) -> rusqlite::Result<()> {
         2,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
-            let pattern = ctx.get_raw(0).as_str()?;
+            let re: Arc<regex::Regex> = ctx.get_or_create_aux(0, |pattern| {
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(regex::Regex::new(
+                    pattern.as_str()?,
+                )?)
+            })?;
             let text = ctx.get_raw(1).as_str().unwrap_or("");
-            let re = regex::Regex::new(pattern)
-                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
             Ok(re.is_match(text))
         },
     )

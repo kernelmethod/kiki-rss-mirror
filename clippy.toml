@@ -18,3 +18,11 @@ disallowed-methods = [
 await-holding-invalid-types = [
     { path = "r2d2::PooledConnection", reason = "don't hold a pooled connection across an await; go through db::Db" },
 ]
+
+# Tests may unwrap, expect, panic and index freely; production code may not
+# (see the `deny` lints at the top of src/lib.rs). This covers `#[test]`
+# functions and everything under a `#[cfg(test)]` module.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

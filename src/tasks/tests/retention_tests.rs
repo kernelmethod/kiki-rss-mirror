@@ -154,6 +154,33 @@ async fn refresh_updates_entries_in_place() -> Result<()> {
     Ok(())
 }
 
+/// A feed longer than one batch of entries is stored whole, and a refresh
+/// that stops listing some of them, across batches, marks exactly those
+/// dropped once every batch is written.
+#[tokio::test]
+async fn long_feeds_are_stored_in_batches() -> Result<()> {
+    let f = FileFeed::new()?;
+    let guids: Vec<String> = (0..250).map(|i| format!("g{i:03}")).collect();
+    let items: Vec<(&str, &str)> = guids.iter().map(|g| (g.as_str(), "T")).collect();
+    f.refresh(&items).await?;
+    assert_eq!(f.guids(), guids);
+    let ids: Vec<i64> = guids.iter().map(|g| f.entry_id(g)).collect();
+
+    // Every seventh entry leaves the feed: some from each batch.
+    let kept: Vec<(&str, &str)> = items
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 7 != 0)
+        .map(|(_, item)| *item)
+        .collect();
+    f.refresh(&kept).await?;
+    for (i, (guid, id)) in guids.iter().zip(&ids).enumerate() {
+        assert_eq!(f.dropped_at(guid).is_some(), i % 7 == 0, "{guid}");
+        assert_eq!(f.entry_id(guid), *id, "{guid}");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn entries_are_marked_dropped_and_restored() -> Result<()> {
     let f = FileFeed::new()?;

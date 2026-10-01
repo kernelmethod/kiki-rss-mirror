@@ -1,2 +1,10 @@
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+# Build the bundled SQLite without SQLITE_ENABLE_MEMORY_MANAGEMENT, which
+# libsqlite3-sys turns on: with it, every connection in the process shares
+# one page cache behind one global mutex, which Kiki's read pool contends
+# on. And without memory statistics, which take another global mutex on
+# every allocation and which Kiki never reads.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DEFAULT_MEMSTATUS=0"

@@ -6,7 +6,8 @@ use crate::scripting::{FeedEntry, ScriptRunner};
 use crate::tasks::command::TaskManagerCommand;
 use crate::tasks::parsing::{insert_atom_entry_data, insert_rss_entry_data, upsert_atom_feed_data};
 use anyhow::Result;
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use std::collections::BTreeSet;
 use std::time::Instant;
 use tracing::{debug, warn};
 
@@ -36,6 +37,17 @@ impl StoredEntries {
     }
 }
 
+/// The most entries written in one transaction by a refresh. Between
+/// batches the writer is free for other work, such as marking an entry
+/// read, so a long feed cannot hold it for its whole refresh.
+const ENTRIES_PER_TRANSACTION: usize = 100;
+
+/// How long a refresh pauses between batches of entries, so that work
+/// already waiting for the writer gets it: the writer's pool does not queue
+/// its waiters, and would otherwise hand the writer straight back to the
+/// refresh.
+const WRITER_HANDOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// Store a parsed Atom feed: its feed-level data, then each entry after
 /// it has been through the script chain.
 ///
@@ -46,11 +58,8 @@ impl StoredEntries {
 /// syndication format are re-stamped from the caller's own values before
 /// scripts or the database see them.
 ///
-/// Scripts run first, outside any transaction; everything is then written
-/// in a single `BEGIN IMMEDIATE` transaction, so a refresh takes the write
-/// lock once rather than once per entry, and waits for it (up to the busy
-/// timeout) instead of failing with "database is locked" when it would
-/// have to upgrade a read.
+/// Scripts run first, outside any transaction; the entries are then written
+/// by [`store_entries`].
 pub(super) fn process_atom_feed(
     feed_id: i64,
     site_url: Option<&str>,
@@ -77,35 +86,18 @@ pub(super) fn process_atom_feed(
         )
         .collect();
 
-    // Only now, with the scripts run, is the writer taken.
-    let stored = db.write_blocking(|conn| -> Result<StoredEntries> {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "UPDATE feeds SET syndication_format = 'atom' WHERE id = ?1",
-            [feed_id],
-        )?;
-        crate::db::favicons::set_site_url(&tx, feed_id, site_url)?;
-        upsert_atom_feed_data(&tx, feed_id, &feed_data)?;
-
-        let mut stored = StoredEntries::with_capacity(entries.len());
-        let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
-        for (feed_entry, ingest) in entries {
-            let (entry_id, is_new) = upsert_entry(&tx, feed_id, "atom", &feed_entry)?;
-            insert_atom_entry_data(&tx, entry_id, &ingest)?;
-            if is_new && feed_entry.cache_assets {
-                crate::db::pending_assets::add(&tx, entry_id)?;
-            }
-            if !feed_entry.tags.is_empty() {
-                sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
-            }
-            stored.push(entry_id, &feed_entry);
-            seen_guids.push(feed_entry.guid);
-        }
-
-        mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
-        tx.commit()?;
-        Ok(stored)
-    })??;
+    let stored = store_entries(
+        db,
+        feed_id,
+        "atom",
+        parsed_count,
+        entries,
+        |tx| {
+            crate::db::favicons::set_site_url(tx, feed_id, site_url)?;
+            upsert_atom_feed_data(tx, feed_id, &feed_data)
+        },
+        |tx, entry_id, data, _| insert_atom_entry_data(tx, entry_id, data),
+    )?;
     for _ in &stored.ids {
         metrics.record_feed_entry_upserted("atom");
     }
@@ -117,8 +109,8 @@ pub(super) fn process_atom_feed(
 ///
 /// Returns the entries that were written. As with
 /// [`process_atom_feed`], `feed_id` and the syndication format are
-/// re-stamped on every entry rather than trusted, and everything is
-/// written in one immediate transaction once the scripts have run.
+/// re-stamped on every entry rather than trusted, and the entries are
+/// written by [`store_entries`] once the scripts have run.
 pub(super) fn process_rss_feed(
     feed_id: i64,
     site_url: Option<&str>,
@@ -144,36 +136,85 @@ pub(super) fn process_rss_feed(
         )
         .collect();
 
-    // Only now, with the scripts run, is the writer taken.
-    let stored = db.write_blocking(|conn| -> Result<StoredEntries> {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "UPDATE feeds SET syndication_format = 'rss' WHERE id = ?1",
-            [feed_id],
-        )?;
-        crate::db::favicons::set_site_url(&tx, feed_id, site_url)?;
-
-        let mut stored = StoredEntries::with_capacity(entries.len());
-        let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
-        for (feed_entry, ingest) in entries {
-            let (entry_id, is_new) = upsert_entry(&tx, feed_id, "rss", &feed_entry)?;
-            insert_rss_entry_data(&tx, entry_id, &ingest, feed_entry.content.as_deref())?;
-            if is_new && feed_entry.cache_assets {
-                crate::db::pending_assets::add(&tx, entry_id)?;
-            }
-            if !feed_entry.tags.is_empty() {
-                sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
-            }
-            stored.push(entry_id, &feed_entry);
-            seen_guids.push(feed_entry.guid);
-        }
-
-        mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
-        tx.commit()?;
-        Ok(stored)
-    })??;
+    let stored = store_entries(
+        db,
+        feed_id,
+        "rss",
+        parsed_count,
+        entries,
+        |tx| crate::db::favicons::set_site_url(tx, feed_id, site_url),
+        |tx, entry_id, data, entry| {
+            insert_rss_entry_data(tx, entry_id, data, entry.content.as_deref())
+        },
+    )?;
     for _ in &stored.ids {
         metrics.record_feed_entry_upserted("rss");
+    }
+    Ok(stored)
+}
+
+/// Write a refreshed feed's `entries`, each with its format-specific data,
+/// and then mark the feed's stored entries that it no longer lists as
+/// dropped.
+///
+/// The entries are written in batches of [`ENTRIES_PER_TRANSACTION`], each
+/// in a `BEGIN IMMEDIATE` transaction of its own, which takes the write lock
+/// up front and waits for it (up to the busy timeout) instead of failing
+/// with "database is locked" when it would have to upgrade a read. The
+/// first batch also records the feed's syndication format and runs
+/// `feed_data` for the rest of its feed-level data; the last also marks
+/// dropped entries, once every entry the feed lists has been stored. A feed
+/// with no entries is one batch.
+///
+/// If a batch fails, the batches before it stay written: each entry is
+/// stored whole or not at all, and the next refresh stores the rest. No
+/// entries are marked dropped by a refresh that fails.
+fn store_entries<D>(
+    db: &Db,
+    feed_id: i64,
+    format: &'static str,
+    parsed_count: usize,
+    entries: Vec<(FeedEntry, D)>,
+    feed_data: impl FnOnce(&rusqlite::Transaction) -> Result<()>,
+    entry_data: impl Fn(&rusqlite::Transaction, i64, &D, &FeedEntry) -> Result<()>,
+) -> Result<StoredEntries> {
+    let seen_guids: Vec<String> = entries.iter().map(|(e, _)| e.guid.clone()).collect();
+    let batches = entries.len().div_ceil(ENTRIES_PER_TRANSACTION).max(1);
+    let mut stored = StoredEntries::with_capacity(entries.len());
+    let mut feed_data = Some(feed_data);
+    let mut entries = entries.into_iter();
+
+    for batch in 0..batches {
+        if batch > 0 {
+            std::thread::sleep(WRITER_HANDOFF);
+        }
+        let last = batch + 1 == batches;
+        db.write_blocking(|conn| -> Result<()> {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(feed_data) = feed_data.take() {
+                tx.execute(
+                    "UPDATE feeds SET syndication_format = ?2 WHERE id = ?1",
+                    rusqlite::params![feed_id, format],
+                )?;
+                feed_data(&tx)?;
+            }
+            for (feed_entry, data) in entries.by_ref().take(ENTRIES_PER_TRANSACTION) {
+                let (entry_id, is_new) = upsert_entry(&tx, feed_id, format, &feed_entry)?;
+                entry_data(&tx, entry_id, &data, &feed_entry)?;
+                if is_new && feed_entry.cache_assets {
+                    crate::db::pending_assets::add(&tx, entry_id)?;
+                }
+                if !feed_entry.tags.is_empty() {
+                    sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
+                }
+                stored.push(entry_id, &feed_entry);
+            }
+            if last {
+                mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })??;
     }
     Ok(stored)
 }
@@ -353,84 +394,75 @@ pub(super) fn enqueue_favicon_caching(
 ///
 /// If `tags` holds only system tags, the entry's user tags are left alone,
 /// so that a script that only hides entries does not also untag them.
-/// Otherwise, for each other (user) tag name in `tags`:
-/// - ensures the tag row exists in `tags` (`INSERT OR IGNORE`)
-/// - looks up its `id`
+/// Otherwise the entry's user tags are made to match the other (user) tag
+/// names in `tags`: user tags not among them are removed, and those missing
+/// are added, creating the tag first if it does not exist.
 ///
-/// Then removes any user-tag `entry_tags` rows for this entry whose `tag_id` is
-/// not in the script-provided set, and inserts new associations (`INSERT OR
-/// IGNORE`).
+/// This runs for every tagged entry in a feed on every refresh, and usually
+/// finds the tags already in place, so it reads the entry's current user
+/// tags first and writes only the difference. An entry whose tags are
+/// unchanged costs one indexed read and no writes.
 fn sync_entry_tags(conn: &Connection, entry_id: i64, tags: &[String], is_new: bool) -> Result<()> {
-    let has_user_tags = tags.iter().any(|name| !is_reserved_tag_name(name));
-
-    // Upsert each tag and collect its id.
-    let mut tag_ids: Vec<i64> = Vec::with_capacity(tags.len());
+    let mut wanted: BTreeSet<&str> = BTreeSet::new();
     for name in tags {
-        if is_reserved_tag_name(name) {
-            match SystemTag::ALL.into_iter().find(|tag| tag.name() == name) {
-                Some(tag) if is_new => {
-                    conn.execute(
-                        "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
-                        rusqlite::params![entry_id, tag.id(conn)?],
-                    )?;
-                }
-                Some(_) => {}
-                None => warn!(
-                    "ignoring tag {:?} set by a script on entry {}: it is not a system tag, and names starting with \"system:\" are reserved for system tags",
-                    name, entry_id
-                ),
-            }
+        if !is_reserved_tag_name(name) {
+            wanted.insert(name);
             continue;
         }
-        conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [name])?;
-        let id: i64 = conn.query_row(
-            "SELECT id FROM tags WHERE name = ?1",
-            [name.as_str()],
-            |row| row.get(0),
-        )?;
-        tag_ids.push(id);
+        match SystemTag::ALL.into_iter().find(|tag| tag.name() == name) {
+            Some(tag) if is_new => {
+                conn.prepare_cached(
+                    "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+                )?
+                .execute(rusqlite::params![entry_id, tag.id(conn)?])?;
+            }
+            Some(_) => {}
+            None => warn!(
+                "ignoring tag {:?} set by a script on entry {}: it is not a system tag, and names starting with \"system:\" are reserved for system tags",
+                name, entry_id
+            ),
+        }
     }
 
-    if !has_user_tags {
+    if wanted.is_empty() {
         return Ok(());
     }
 
-    // Remove stale user-tag entry_tags rows (those not in the script-provided
-    // set).
-    const USER_TAGS: &str = "tag_id IN (SELECT id FROM tags WHERE kind = 'user')";
-    if tag_ids.is_empty() {
-        conn.execute(
-            &format!("DELETE FROM entry_tags WHERE entry_id = ?1 AND {USER_TAGS}"),
-            [entry_id],
-        )?;
-    } else {
-        let placeholders = tag_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "DELETE FROM entry_tags WHERE entry_id = ?1 AND {USER_TAGS} \
-             AND tag_id NOT IN ({placeholders})"
-        );
-        let params: Vec<rusqlite::types::Value> =
-            std::iter::once(rusqlite::types::Value::Integer(entry_id))
-                .chain(
-                    tag_ids
-                        .iter()
-                        .map(|&id| rusqlite::types::Value::Integer(id)),
-                )
-                .collect();
-        conn.execute(&sql, rusqlite::params_from_iter(params))?;
+    // The entry's current user tags. Both tables are reached through an
+    // index, so this reads only the entry's own tags, however many tags
+    // there are in all.
+    let current = conn
+        .prepare_cached(
+            "SELECT t.id, t.name FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+             WHERE et.entry_id = ?1 AND t.kind = 'user'",
+        )?
+        .query_map([entry_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Remove the user tags the script no longer sets; whatever is left in
+    // `wanted` afterwards is missing from the entry.
+    for (tag_id, name) in current {
+        if !wanted.remove(name.as_str()) {
+            conn.prepare_cached("DELETE FROM entry_tags WHERE entry_id = ?1 AND tag_id = ?2")?
+                .execute([entry_id, tag_id])?;
+        }
     }
 
-    // Insert new tag associations.
-    for tag_id in tag_ids {
-        conn.execute(
-            "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
-            rusqlite::params![entry_id, tag_id],
-        )?;
+    for name in wanted {
+        let existing: Option<i64> = conn
+            .prepare_cached("SELECT id FROM tags WHERE name = ?1")?
+            .query_row([name], |row| row.get(0))
+            .optional()?;
+        let tag_id = match existing {
+            Some(id) => id,
+            None => conn
+                .prepare_cached("INSERT INTO tags (name) VALUES (?1) RETURNING id")?
+                .query_row([name], |row| row.get(0))?,
+        };
+        conn.prepare_cached("INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)")?
+            .execute([entry_id, tag_id])?;
     }
 
     Ok(())
@@ -532,6 +564,77 @@ mod tests {
         Ok(())
     }
 
+    /// A refresh that finds the entry's tags already in place writes
+    /// nothing; one that changes them writes only the difference, reusing
+    /// tags that already exist.
+    #[test]
+    fn sync_entry_tags_writes_only_changes() -> Result<()> {
+        let conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute(
+            "INSERT INTO entries (syndication_format, guid, published_at, title, url)
+             VALUES ('rss', 'g', 0, 't', 'u')",
+            [],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO tags (name) VALUES ('c')", [])?;
+        let c_id = conn.last_insert_rowid();
+
+        sync_entry_tags(&conn, entry_id, &["a".into(), "b".into(), "a".into()], true)?;
+        assert_eq!(entry_tag_names(&conn, entry_id)?, ["a", "b"]);
+
+        let before = conn.total_changes();
+        sync_entry_tags(&conn, entry_id, &["b".into(), "a".into()], false)?;
+        assert_eq!(conn.total_changes(), before);
+
+        // Drop `a`, keep `b`, add the existing tag `c`: one delete and one
+        // insert, and no new tag.
+        let before = conn.total_changes();
+        sync_entry_tags(&conn, entry_id, &["b".into(), "c".into()], false)?;
+        assert_eq!(conn.total_changes(), before + 2);
+        assert_eq!(entry_tag_names(&conn, entry_id)?, ["b", "c"]);
+        let c_ids: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tags WHERE name = 'c' AND id = ?1",
+            [c_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(c_ids, 1);
+
+        Ok(())
+    }
+
+    /// Syncing an entry's tags reads only that entry's tags, never the
+    /// whole tags table, however many tags there are.
+    #[test]
+    fn sync_entry_tags_does_not_scan_tags() -> Result<()> {
+        let conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute(
+            "INSERT INTO entries (syndication_format, guid, published_at, title, url)
+             VALUES ('rss', 'g', 0, 't', 'u')",
+            [],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+        for i in 0..100 {
+            conn.execute("INSERT INTO tags (name) VALUES (?1)", [format!("t{i}")])?;
+        }
+        let metrics = std::sync::Arc::new(crate::metrics::Metrics::new()?);
+        crate::db::profile::install(&conn, metrics.clone())?;
+
+        sync_entry_tags(&conn, entry_id, &["a".into(), "t1".into()], true)?;
+        sync_entry_tags(&conn, entry_id, &["a".into(), "t1".into()], false)?;
+        sync_entry_tags(&conn, entry_id, &["b".into()], false)?;
+        assert_eq!(entry_tag_names(&conn, entry_id)?, ["b"]);
+
+        let fullscan_steps: f64 = metrics
+            .render()
+            .lines()
+            .filter(|l| l.starts_with("kiki_db_statement_fullscan_steps_total{"))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum();
+        assert_eq!(fullscan_steps, 0.0);
+
+        Ok(())
+    }
+
     fn feed_entry(guid: &str, title: &str) -> FeedEntry {
         FeedEntry {
             id: None,
@@ -586,6 +689,41 @@ mod tests {
                 row.get(0)
             })?;
         assert!((chrono::Utc::now().timestamp() - ingested_at).abs() < 60);
+        Ok(())
+    }
+
+    /// Storing an entry again unchanged, as every refresh of its feed does,
+    /// leaves the full-text index alone; a changed title is reindexed.
+    #[test]
+    fn upsert_entry_reindexes_only_changes() -> Result<()> {
+        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute(
+            "INSERT INTO feeds (id, title, url) VALUES (1, 'f', 'u')",
+            [],
+        )?;
+        let upsert = |conn: &mut Connection, title: &str| -> Result<u64> {
+            let before = conn.total_changes();
+            let tx = conn.transaction()?;
+            upsert_entry(&tx, 1, "rss", &feed_entry("a", title))?;
+            tx.commit()?;
+            Ok(conn.total_changes() - before)
+        };
+        let matches = |conn: &Connection, word: &str| -> Result<i64> {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM entries_fts WHERE entries_fts MATCH ?1",
+                [word],
+                |row| row.get(0),
+            )?)
+        };
+
+        upsert(&mut conn, "apples")?;
+        // Only the entry's own row changes: no trigger writes to the index.
+        assert_eq!(upsert(&mut conn, "apples")?, 1);
+        assert_eq!(matches(&conn, "apples")?, 1);
+
+        assert!(upsert(&mut conn, "oranges")? > 1);
+        assert_eq!(matches(&conn, "apples")?, 0);
+        assert_eq!(matches(&conn, "oranges")?, 1);
         Ok(())
     }
 }

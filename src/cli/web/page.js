@@ -381,6 +381,7 @@ async function markRead(row, offset) {
     return;
   }
   row.hidden = true;
+  updateEmptyMessage();
 
   // Undoing puts the row back itself, whether or not this worked.
   if (!(await request) && row.swipeAnimations) {
@@ -397,6 +398,26 @@ function restoreRow(row) {
   row.swipeAnimations = null;
   row.hidden = false;
   row.classList.remove("swiping");
+  updateEmptyMessage();
+}
+
+// Once every entry on the page has been swiped away, say so, the way the
+// server does for a list that has no unread entries to begin with.
+function updateEmptyMessage() {
+  const list = document.querySelector("ol.entries");
+  if (!list) {
+    return;
+  }
+  const empty = [...list.children].every((li) => li.hidden);
+  let message = document.querySelector(".entries-empty");
+  if (empty && !message) {
+    message = document.createElement("p");
+    message.className = "entries-empty";
+    message.textContent = "No unread entries.";
+    list.after(message);
+  } else if (!empty) {
+    message?.remove();
+  }
 }
 
 // Add (`read`) or remove the entry's `system:read` tag; resolves to whether
@@ -462,6 +483,7 @@ function showUndo(row, request) {
     // cannot pass each other; if it never was, there is nothing to undo.
     if ((await request) && !(await setRead(row, false))) {
       row.hidden = true;
+      updateEmptyMessage();
       adjustUnreadCount(-1);
       showToast("Could not mark the entry as unread.");
     }

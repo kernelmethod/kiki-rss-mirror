@@ -15,13 +15,14 @@ use std::collections::HashMap;
 pub(crate) fn entry_columns() -> String {
     format!(
         "e.id, e.feed_id, e.source_id, e.syndication_format, e.guid, e.published_at, \
-         e.title, e.url, e.content, e.ingested_at, {}",
+         e.title, e.url, e.content, e.ingested_at, {}, \
+         (SELECT f.title FROM feeds f WHERE f.id = e.feed_id)",
         favicon_hash_sql("e.feed_id")
     )
 }
 
 /// The number of columns in [`entry_columns`].
-pub(crate) const ENTRY_COLUMN_COUNT: usize = 11;
+pub(crate) const ENTRY_COLUMN_COUNT: usize = 12;
 
 /// Format a Unix timestamp as RFC3339, as entries' times are reported.
 pub(crate) fn rfc3339(secs: i64) -> Option<String> {
@@ -46,6 +47,7 @@ pub(crate) fn entry_from_row(
         content: row.get(8)?,
         ingested_at: rfc3339(row.get(9)?),
         feed_favicon_url: read_asset_url_column(row, 10)?,
+        feed_title: row.get(11)?,
         tags: Vec::new(),
     })
 }
