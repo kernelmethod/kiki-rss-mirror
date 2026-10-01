@@ -182,7 +182,7 @@ CREATE TABLE feeds (
 );
 
 CREATE INDEX idx_feeds_next_fetch_at ON feeds(next_fetch_at);
--- No two feeds may share a URL; see migration 0008_unique_feed_urls.
+-- No two feeds may share a URL.
 CREATE UNIQUE INDEX idx_feeds_url_unique ON feeds(url);
 
 -- A list of the tags that are automatically assigned to entries from a given
