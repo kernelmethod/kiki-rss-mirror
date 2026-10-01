@@ -10,10 +10,10 @@
 //! no-ops, so call sites stay free of `cfg` attributes.
 
 #[cfg(feature = "metrics")]
-pub use imp::{handle_metrics, track_http, Metrics};
+pub use imp::{handle_metrics, track_http, DbStatementSeries, Metrics};
 
 #[cfg(not(feature = "metrics"))]
-pub use stub::Metrics;
+pub use stub::{DbStatementSeries, Metrics};
 
 use std::sync::Arc;
 
@@ -96,6 +96,23 @@ mod imp {
 
     static METADATA: Metadata<'static> =
         Metadata::new("kiki_rss::metrics", metrics::Level::INFO, None);
+
+    /// The series one kind of SQL statement is recorded into, from
+    /// [`Metrics::db_statement_series`]. Cheap to clone.
+    #[derive(Clone)]
+    pub struct DbStatementSeries {
+        fullscan_steps: metrics::Counter,
+        duration: metrics::Histogram,
+    }
+
+    impl DbStatementSeries {
+        /// Record one run of the statement: how long it took, and how many
+        /// rows it stepped through in full table scans.
+        pub fn record(&self, duration_seconds: f64, fullscan_steps: u64) {
+            self.fullscan_steps.increment(fullscan_steps);
+            self.duration.record(duration_seconds);
+        }
+    }
 
     /// Per-server Prometheus metrics recorder.
     ///
@@ -744,16 +761,23 @@ mod imp {
             duration_seconds: f64,
             fullscan_steps: u64,
         ) {
+            self.db_statement_series(op, table)
+                .record(duration_seconds, fullscan_steps);
+        }
+
+        /// The series that runs of SQL statements labeled `op` and `table`
+        /// are recorded into, looked up once so that they can be recorded
+        /// into many times; see [`DbStatementSeries::record`].
+        pub fn db_statement_series(&self, op: &'static str, table: &str) -> DbStatementSeries {
             let labels = vec![Label::new("op", op), Label::new("table", table.to_string())];
             let key = Key::from_parts("kiki_db_statement_fullscan_steps_total", labels.clone());
-            self.recorder
-                .register_counter(&key, &METADATA)
-                .increment(fullscan_steps);
-
+            let fullscan_steps = self.recorder.register_counter(&key, &METADATA);
             let key = Key::from_parts("kiki_db_statement_duration_seconds", labels);
-            self.recorder
-                .register_histogram(&key, &METADATA)
-                .record(duration_seconds);
+            let duration = self.recorder.register_histogram(&key, &METADATA);
+            DbStatementSeries {
+                fullscan_steps,
+                duration,
+            }
         }
 
         // ----- Processes -----
@@ -953,6 +977,15 @@ mod stub {
     /// feature is disabled. All methods compile to zero-overhead no-ops.
     pub struct Metrics;
 
+    /// Stand-in for the series a SQL statement is recorded into.
+    #[derive(Clone)]
+    pub struct DbStatementSeries;
+
+    impl DbStatementSeries {
+        #[inline]
+        pub fn record(&self, _duration_seconds: f64, _fullscan_steps: u64) {}
+    }
+
     impl Metrics {
         pub fn new() -> anyhow::Result<Self> {
             Ok(Self)
@@ -1028,6 +1061,10 @@ mod stub {
             _duration_seconds: f64,
             _fullscan_steps: u64,
         ) {
+        }
+        #[inline]
+        pub fn db_statement_series(&self, _op: &'static str, _table: &str) -> DbStatementSeries {
+            DbStatementSeries
         }
 
         // ----- Processes -----

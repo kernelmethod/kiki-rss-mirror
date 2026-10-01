@@ -16,7 +16,7 @@
 //! statements too, but only to the millisecond, which rounds most of Kiki's
 //! down to nothing.)
 
-use crate::metrics::Metrics;
+use crate::metrics::{DbStatementSeries, Metrics};
 use rusqlite::{ffi, Connection};
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -36,7 +36,24 @@ struct Context {
     /// A connection is only ever used by one thread at a time, so the lock
     /// is never contended; it is there because that thread can change.
     started: Mutex<HashMap<usize, Instant>>,
+    /// The label and series of each statement recorded so far, by its SQL,
+    /// so that a statement run again, as most are, is neither labeled nor
+    /// looked up in the metrics registry again: FTS5 alone runs one of its
+    /// own statements per matching entry when ranking search results.
+    series: Mutex<HashMap<Box<str>, Series>>,
 }
+
+/// What runs of one statement are recorded under.
+struct Series {
+    op: &'static str,
+    table: String,
+    series: DbStatementSeries,
+}
+
+/// The most statements whose series a connection remembers. Kiki's own
+/// statements are far fewer; past this, the connection starts over, so SQL
+/// that differs every time cannot grow the map without bound.
+const MAX_REMEMBERED_STATEMENTS: usize = 512;
 
 /// Start recording every statement `conn` runs into `metrics`.
 ///
@@ -51,6 +68,7 @@ pub fn install(conn: &Connection, metrics: Arc<Metrics>) -> rusqlite::Result<()>
     let ctx = Box::into_raw(Box::new(Context {
         metrics,
         started: Mutex::new(HashMap::new()),
+        series: Mutex::new(HashMap::new()),
     }));
     // SAFETY: `handle` is the live connection that `conn` owns, and
     // nothing else uses it during this call, since we hold a reference to
@@ -133,7 +151,7 @@ unsafe extern "C" fn on_event(
             // Unwinding out of an `extern "C"` function aborts the process;
             // a bug in recording a sample must not take the server down.
             let _ = catch_unwind(AssertUnwindSafe(|| {
-                record(&ctx.metrics, &sql, duration, fullscan_steps)
+                record(ctx, &sql, duration, fullscan_steps)
             }));
         }
         ffi::SQLITE_TRACE_CLOSE => {
@@ -154,13 +172,26 @@ unsafe extern "C" fn on_event(
     0
 }
 
-fn record(metrics: &Metrics, sql: &str, duration: Duration, fullscan_steps: u64) {
-    let (op, table) = statement_label(sql);
-    metrics.record_db_statement(op, &table, duration.as_secs_f64(), fullscan_steps);
+fn record(ctx: &Context, sql: &str, duration: Duration, fullscan_steps: u64) {
+    // A panic while the lock was held cannot have left the map half
+    // updated, so carry on with it rather than stop recording.
+    let mut remembered = ctx.series.lock().unwrap_or_else(|e| e.into_inner());
+    if !remembered.contains_key(sql) {
+        if remembered.len() >= MAX_REMEMBERED_STATEMENTS {
+            remembered.clear();
+        }
+        let (op, table) = statement_label(sql);
+        let series = ctx.metrics.db_statement_series(op, &table);
+        remembered.insert(sql.into(), Series { op, table, series });
+    }
+    let Some(Series { op, table, series }) = remembered.get(sql) else {
+        return;
+    };
+    series.record(duration.as_secs_f64(), fullscan_steps);
     if duration >= SLOW_STATEMENT {
         tracing::info!(
             target: "sqlite::slow",
-            op,
+            op = *op,
             table = %table,
             duration_ms = duration.as_millis() as u64,
             fullscan_steps,
@@ -547,5 +578,63 @@ mod tests {
         drop(conn);
         assert_eq!(Arc::strong_count(&metrics), 1);
         Ok(())
+    }
+
+    /// The value of the `kiki_db_statement_duration_seconds` count for
+    /// `labels` in `metrics`' scrape output.
+    #[cfg(feature = "metrics")]
+    fn statement_count(metrics: &Metrics, labels: &str) -> Option<u64> {
+        let prefix = format!("kiki_db_statement_duration_seconds_count{{{labels}}} ");
+        metrics
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix).map(|n| n.parse().unwrap()))
+    }
+
+    /// Every run of a statement is recorded under its label, the same
+    /// however many times it runs, alongside other statements'.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn repeated_statements_are_each_recorded() {
+        let metrics = Arc::new(Metrics::new().unwrap());
+        let conn = Connection::open_in_memory().unwrap();
+        install(&conn, metrics.clone()).unwrap();
+        conn.execute_batch("CREATE TABLE t (x); CREATE TABLE u (y);")
+            .unwrap();
+        for _ in 0..3 {
+            conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0))
+                .unwrap();
+        }
+        conn.execute("INSERT INTO u VALUES (1)", []).unwrap();
+        assert_eq!(
+            statement_count(&metrics, r#"op="select",table="t""#),
+            Some(3)
+        );
+        assert_eq!(
+            statement_count(&metrics, r#"op="insert",table="u""#),
+            Some(1)
+        );
+    }
+
+    /// A connection remembers at most [`MAX_REMEMBERED_STATEMENTS`]
+    /// statements, and still records every run once it has started over.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn remembered_statements_are_bounded() {
+        let metrics = Arc::new(Metrics::new().unwrap());
+        let ctx = Context {
+            metrics: metrics.clone(),
+            started: Mutex::new(HashMap::new()),
+            series: Mutex::new(HashMap::new()),
+        };
+        let runs = MAX_REMEMBERED_STATEMENTS + 10;
+        for i in 0..runs {
+            record(&ctx, &format!("SELECT {i} FROM t"), Duration::ZERO, 0);
+            assert!(ctx.series.lock().unwrap().len() <= MAX_REMEMBERED_STATEMENTS);
+        }
+        assert_eq!(
+            statement_count(&metrics, r#"op="select",table="t""#),
+            Some(runs as u64)
+        );
     }
 }
