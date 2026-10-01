@@ -588,4 +588,39 @@ mod tests {
         assert!((chrono::Utc::now().timestamp() - ingested_at).abs() < 60);
         Ok(())
     }
+
+    /// Storing an entry again unchanged, as every refresh of its feed does,
+    /// leaves the full-text index alone; a changed title is reindexed.
+    #[test]
+    fn upsert_entry_reindexes_only_changes() -> Result<()> {
+        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute(
+            "INSERT INTO feeds (id, title, url) VALUES (1, 'f', 'u')",
+            [],
+        )?;
+        let upsert = |conn: &mut Connection, title: &str| -> Result<u64> {
+            let before = conn.total_changes();
+            let tx = conn.transaction()?;
+            upsert_entry(&tx, 1, "rss", &feed_entry("a", title))?;
+            tx.commit()?;
+            Ok(conn.total_changes() - before)
+        };
+        let matches = |conn: &Connection, word: &str| -> Result<i64> {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM entries_fts WHERE entries_fts MATCH ?1",
+                [word],
+                |row| row.get(0),
+            )?)
+        };
+
+        upsert(&mut conn, "apples")?;
+        // Only the entry's own row changes: no trigger writes to the index.
+        assert_eq!(upsert(&mut conn, "apples")?, 1);
+        assert_eq!(matches(&conn, "apples")?, 1);
+
+        assert!(upsert(&mut conn, "oranges")? > 1);
+        assert_eq!(matches(&conn, "apples")?, 0);
+        assert_eq!(matches(&conn, "oranges")?, 1);
+        Ok(())
+    }
 }

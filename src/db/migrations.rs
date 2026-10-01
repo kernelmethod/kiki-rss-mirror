@@ -65,6 +65,10 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0011_unread_entries",
         sql: include_str!("include/migrations/0011_unread_entries.sql"),
     },
+    Migration {
+        name: "0012_fts_unchanged_entries",
+        sql: include_str!("include/migrations/0012_fts_unchanged_entries.sql"),
+    },
 ];
 
 /// The migration that drops the `scripts` table in favour of plugins.
@@ -620,6 +624,21 @@ mod tests {
             .query_map([], |row| row.get::<_, i64>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(flags, [0, 0, 1]);
+        Ok(())
+    }
+
+    /// `0012_fts_unchanged_entries` gives the full-text index's update
+    /// trigger the same shape as a freshly-initialized database's.
+    #[test]
+    fn test_fts_unchanged_entries_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        run_pending_migrations(&mut conn)?;
+        let fresh = ConnectionBuilder::default().in_memory().create().build()?;
+        assert_eq!(
+            schema_sql(&conn, "entries_fts_au")?,
+            schema_sql(&fresh, "entries_fts_au")?
+        );
         Ok(())
     }
 

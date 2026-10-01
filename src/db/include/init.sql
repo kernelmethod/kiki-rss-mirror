@@ -611,8 +611,14 @@ CREATE TRIGGER entries_fts_bd BEFORE DELETE ON entries BEGIN
 END;
 
 -- Only the indexed columns: marking entries dropped touches many rows at
--- once and should not reindex them.
-CREATE TRIGGER entries_fts_au AFTER UPDATE OF title, content, url ON entries BEGIN
+-- once and should not reindex them. And only when one of them has changed:
+-- each refresh of a feed rewrites the entries it still lists, mostly with
+-- the values they already had.
+CREATE TRIGGER entries_fts_au AFTER UPDATE OF title, content, url ON entries
+WHEN OLD.title IS NOT NEW.title
+  OR OLD.content IS NOT NEW.content
+  OR OLD.url IS NOT NEW.url
+BEGIN
     INSERT INTO entries_fts(entries_fts, rowid, title, content, url)
     VALUES ('delete', old.id, old.title, old.content, old.url);
     INSERT INTO entries_fts(rowid, title, content, url)
