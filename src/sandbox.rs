@@ -36,7 +36,8 @@
 //! the children, before they read their first byte of IPC; for the web
 //! UI, before it accepts its first connection. They are
 //! inherited by every thread and task spawned later, and by the feed
-//! fetcher's forked workers.
+//! fetcher's forked workers. The server installs them one at a time, with
+//! its children started in between; see [`restrict_filesystem`].
 //!
 //! On non-Linux platforms [`apply`] is a no-op that logs a warning.
 
@@ -52,6 +53,12 @@ pub enum SandboxProfile {
     /// cache, and the listening socket, and resolves hostnames for the
     /// feed fetcher. It makes no HTTP(S) requests of its own, and may
     /// create only Unix, IPv4 and IPv6 sockets.
+    ///
+    /// Its children are started under its filesystem rules (see
+    /// [`restrict_filesystem`]), so besides the paths below it is granted
+    /// what they need: to read and execute the kiki executable and the
+    /// libraries it loads, to open `/dev/null`, and to read the TLS trust
+    /// stores.
     Server {
         /// Directory containing the SQLite database, its WAL/SHM
         /// companions, and the cached assets tree. Granted read-write
@@ -183,7 +190,8 @@ mod linux;
 /// building a multi-threaded tokio runtime, for instance.
 ///
 /// Note that every profile denies `execve`, so a process must spawn any
-/// children it needs *before* calling this.
+/// children it needs *before* calling this — or call
+/// [`restrict_filesystem`], spawn them, then [`restrict_syscalls`].
 pub fn apply(config: &SandboxConfig) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -195,6 +203,53 @@ pub fn apply(config: &SandboxConfig) -> anyhow::Result<()> {
             profile = config.profile_name(),
             "sandbox: not supported on this platform, continuing unsandboxed"
         );
+        Ok(())
+    }
+}
+
+/// Install only the filesystem half of the configured sandbox: on Linux,
+/// the Landlock rules. [`restrict_syscalls`] installs the other half.
+///
+/// The server installs the two halves separately so that it can start its
+/// children in between. Landlock lets a process inspect — through
+/// `/proc/<pid>/smaps_rollup`, say — only processes in its own Landlock
+/// domain or one nested inside it, and a child's domain nests inside its
+/// parent's only if the parent's rules were in place when the child was
+/// started. Children started before the server restricted itself would end
+/// up in domains of their own, beyond its reach. So the server restricts
+/// its filesystem access first, which leaves `execve` allowed, starts its
+/// children, and only then installs the syscall filter that denies it. Its
+/// [`SandboxProfile::Server`] rules include what the children need to
+/// start up under them.
+///
+/// The same threading rule as for [`apply`] holds: call this while the
+/// process is still single-threaded.
+pub fn restrict_filesystem(config: &SandboxConfig) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::restrict_filesystem(config)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tracing::warn!(
+            profile = config.profile_name(),
+            "sandbox: not supported on this platform, continuing unsandboxed"
+        );
+        Ok(())
+    }
+}
+
+/// Install only the syscall half of the configured sandbox: on Linux, the
+/// seccomp-bpf filter, which applies to every thread of the process. See
+/// [`restrict_filesystem`].
+pub fn restrict_syscalls(config: &SandboxConfig) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::restrict_syscalls(config)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config;
         Ok(())
     }
 }
