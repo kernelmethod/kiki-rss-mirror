@@ -109,8 +109,9 @@ impl ServeArgs {
         // The sandbox goes up in two halves, with the children started in
         // between. Landlock first, so the children's Landlock domains nest
         // inside the server's: Landlock only lets the server read
-        // `/proc/<pid>/smaps_rollup`, for the memory metrics, of processes
-        // in a domain nested in its own. Then seccomp, once the children
+        // `/proc/<pid>/smaps_rollup`, for the memory metrics, and send
+        // signals, to stop them, to processes in a domain nested in its
+        // own. Then seccomp, once the children
         // are running, since it denies the `execve` that starts them.
         let sandbox_config = (!self.no_sandbox)
             .then(|| build_sandbox_config(&db_path, socket_dir, temp_dir.clone(), self));
