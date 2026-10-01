@@ -89,6 +89,41 @@ async fn get_asset_returns_bytes_and_etag() -> Result<()> {
 }
 
 #[tokio::test]
+async fn get_asset_updates_last_accessed_at() -> Result<()> {
+    let tc = TestBuilder::all().build()?;
+    let client = tc.client()?;
+    let hash = seed_asset(&tc, b"touch me", "http://src.example/t.png")?;
+    let conn = tc.database_conn()?;
+    conn.execute(
+        "UPDATE feed_assets SET last_accessed_at = 0 WHERE blake3 = ?1",
+        [&hash],
+    )?;
+
+    let resp = client
+        .get(format!("http://localhost/v1/assets/{}", hash))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The touch runs in the background, so give it a moment to land.
+    let mut last_accessed_at = 0;
+    for _ in 0..100 {
+        last_accessed_at = conn.query_row(
+            "SELECT last_accessed_at FROM feed_assets WHERE blake3 = ?1",
+            [&hash],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if last_accessed_at > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(last_accessed_at > 0, "last_accessed_at was not updated");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn get_asset_invalid_hash_is_400() -> Result<()> {
     let tc = TestBuilder::all().build()?;
     let client = tc.client()?;

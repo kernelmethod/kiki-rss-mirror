@@ -83,11 +83,7 @@ pub async fn get_asset(
     let hash_cloned = hash.clone();
     let row = db
         .read(move |conn| -> anyhow::Result<Option<db_assets::AssetRow>> {
-            let row = db_assets::lookup_by_hash(conn, &hash_cloned)?;
-            if row.is_some() {
-                let _ = db_assets::touch(conn, &hash_cloned);
-            }
-            Ok(row)
+            db_assets::lookup_by_hash(conn, &hash_cloned)
         })
         .await
         .map_err(|e| {
@@ -103,6 +99,21 @@ pub async fn get_asset(
         Some(r) => r,
         None => return Err((StatusCode::NOT_FOUND, "asset not found").into_response()),
     };
+
+    // Record the access for LRU eviction. Read connections are query-only, so
+    // this needs the writer; it's bookkeeping, so don't make the response wait
+    // on it.
+    let hash_cloned = hash.clone();
+    tokio::spawn(async move {
+        match db
+            .write(move |conn| db_assets::touch(conn, &hash_cloned))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => event!(Level::WARN, "unable to touch asset {}: {:?}", hash, e),
+            Err(e) => event!(Level::WARN, "task error touching asset {}: {:?}", hash, e),
+        }
+    });
 
     if if_none_match.as_deref() == Some(asset.blake3.as_str()) {
         return Ok(StatusCode::NOT_MODIFIED.into_response());
