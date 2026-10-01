@@ -32,6 +32,10 @@ pub struct GetEntryResponse {
     /// entry's feed belongs to, or `null` if it has not been cached.
     #[serde(default)]
     pub feed_favicon_url: Option<String>,
+    /// Title of the feed the entry came from, or `null` if the entry has
+    /// no feed.
+    #[serde(default)]
+    pub feed_title: Option<String>,
     /// Every tag applied to the entry, both user tags and system tags (such
     /// as `system:read` and `system:saved`).
     #[serde(default)]
@@ -108,6 +112,7 @@ pub async fn get_entry(
                         content: e.content,
                         ingested_at: e.ingested_at,
                         feed_favicon_url: e.feed_favicon_url,
+                        feed_title: e.feed_title,
                         tags: e.tags,
                         rss,
                         atom,

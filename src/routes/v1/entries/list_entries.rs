@@ -78,6 +78,10 @@ pub struct ListEntriesResponseEntry {
     /// entry's feed belongs to, or `null` if it has not been cached.
     #[serde(default)]
     pub feed_favicon_url: Option<String>,
+    /// Title of the feed the entry came from, or `null` if the entry has
+    /// no feed.
+    #[serde(default)]
+    pub feed_title: Option<String>,
     /// Every tag applied to the entry, both user tags and system tags (such
     /// as `system:read` and `system:saved`).
     #[serde(default)]

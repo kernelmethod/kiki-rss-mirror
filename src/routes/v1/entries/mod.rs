@@ -306,6 +306,7 @@ mod test {
 
         assert_eq!(response.id, 1);
         assert_eq!(response.feed_id, Some(1));
+        assert_eq!(response.feed_title.as_deref(), Some("Test Feed"));
         assert_eq!(response.syndication_format, "rss");
         assert_eq!(response.guid, "rss-guid-1");
         assert_eq!(response.title, "RSS Entry");
@@ -712,6 +713,10 @@ mod test {
         // Ordered by published_at DESC
         assert_eq!(body.entries[0].entry.title, "Sports Update");
         assert_eq!(body.entries[3].entry.title, "Breaking News Today");
+        assert!(body
+            .entries
+            .iter()
+            .all(|e| e.entry.feed_title.as_deref() == Some("Test Feed")));
 
         Ok(())
     }

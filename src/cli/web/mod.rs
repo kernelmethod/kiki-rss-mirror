@@ -5,7 +5,6 @@ use crate::cli::serve::ServeArgs;
 use crate::db::tags::{SystemTag, TagKind, SYSTEM_TAG_PREFIX};
 use crate::plugins::settings::{Setting, SettingType};
 use crate::routes::v1::entries::entry_assets::ListEntryAssetsResponse;
-use crate::routes::v1::entries::entry_tags::GetEntryTagsResponse;
 use crate::routes::v1::entries::get_entry::GetEntryResponse;
 use crate::routes::v1::entries::search_entries::SearchEntriesResponse;
 use crate::routes::v1::entries::ListEntriesResponseEntry;
@@ -37,7 +36,6 @@ use std::process::ExitStatus;
 use std::sync::LazyLock;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 /// The layout every page is rendered into; see [`render_page`].
@@ -598,17 +596,11 @@ async fn index(State(api): State<reqwest::Client>, Query(params): Query<PagePara
         ..params.listing()
     };
     match fetch_entries(&api, &listing, None).await {
-        Ok(entries) => {
-            let (feeds, tags) = tokio::join!(
-                fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)),
-                fetch_entry_tags(&api, entries.entries.iter().map(|e| e.id)),
-            );
-            render_page(
-                StatusCode::OK,
-                "Kiki",
-                &render_entries(entries.count, &entries.entries, &feeds, &tags, &listing),
-            )
-        }
+        Ok(entries) => render_page(
+            StatusCode::OK,
+            "Kiki",
+            &render_entries(entries.count, &entries.entries, true, &listing),
+        ),
         Err(e) => server_unavailable(&e),
     }
 }
@@ -638,25 +630,13 @@ async fn entry_page(
         Err(e) => return server_unavailable(&e),
     };
 
-    let feed_title = async {
-        match entry.feed_id {
-            Some(feed_id) => fetch_feed_titles(&api, [feed_id]).await.remove(&feed_id),
-            None => None,
-        }
-    };
-    let (feed_title, cached, mut tags) = tokio::join!(
-        feed_title,
-        fetch_cached_assets(&api, id),
-        fetch_entry_tags(&api, [id])
-    );
-    let tags = tags.remove(&id).unwrap_or_default();
+    let cached = fetch_cached_assets(&api, id).await;
     render_page(
         StatusCode::OK,
         &format!("{} - Kiki", display_title(&entry.title)),
         &render_entry_page(
             &entry,
-            feed_title.as_deref(),
-            &tags,
+            entry.feed_title.as_deref(),
             &cached,
             &params.listing(),
         ),
@@ -851,11 +831,10 @@ async fn feed_page(
         Err(e) => return server_unavailable(&e),
     };
 
-    let tags = fetch_entry_tags(&api, entries.entries.iter().map(|e| e.id)).await;
     render_page(
         StatusCode::OK,
         &format!("{} - Kiki", display_feed_title(&feed.title)),
-        &render_feed_page(&feed, &entries, &tags, &listing),
+        &render_feed_page(&feed, &entries, &listing),
     )
 }
 
@@ -902,14 +881,10 @@ async fn tag_page(
         Err(e) => return server_unavailable(&e),
     };
 
-    let (feeds, tags) = tokio::join!(
-        fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)),
-        fetch_entry_tags(&api, entries.entries.iter().map(|e| e.id)),
-    );
     render_page(
         StatusCode::OK,
         &format!("{} - Kiki", tag.name),
-        &render_tag_page(&tag, &entries, &feeds, &tags, &listing),
+        &render_tag_page(&tag, &entries, &listing),
     )
 }
 
@@ -938,10 +913,6 @@ async fn search_page(
         Err(e) => return server_unavailable(&e),
     };
 
-    let (feeds, tags) = tokio::join!(
-        fetch_feed_titles(&api, entries.entries.iter().filter_map(|e| e.feed_id)),
-        fetch_entry_tags(&api, entries.entries.iter().map(|e| e.id)),
-    );
     render_search_page(
         StatusCode::OK,
         &format!("{} - Search - Kiki", search.query),
@@ -949,7 +920,7 @@ async fn search_page(
         &format!(
             "<h2>Search results for &ldquo;{}&rdquo;</h2>\n{}{}",
             escape(&search.query),
-            render_entries(entries.count, &entries.entries, &feeds, &tags, &listing),
+            render_entries(entries.count, &entries.entries, true, &listing),
             render_search_help(),
         ),
     )
@@ -1603,100 +1574,15 @@ struct Feed {
     favicon_url: Option<String>,
 }
 
-/// Fetch the titles of the feeds in `feed_ids` from the Kiki API, keyed by
-/// feed ID.
-///
-/// Each feed is fetched once, however often it appears in `feed_ids`. A
-/// feed that cannot be fetched is logged and left out, so its entries are
-/// shown without a feed rather than not at all.
-async fn fetch_feed_titles(
-    api: &reqwest::Client,
-    feed_ids: impl IntoIterator<Item = i64>,
-) -> HashMap<i64, String> {
-    let mut tasks = JoinSet::new();
-    for id in feed_ids.into_iter().collect::<BTreeSet<_>>() {
-        let api = api.clone();
-        tasks.spawn(async move {
-            let feed: Result<Feed> = async {
-                Ok(api
-                    .get(format!("{API_BASE}/v1/feeds/id/{id}"))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?)
-            }
-            .await;
-            (id, feed)
-        });
-    }
-
-    let mut titles = HashMap::new();
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok((id, Ok(feed))) => {
-                titles.insert(id, feed.title);
-            }
-            Ok((id, Err(e))) => tracing::warn!(feed_id = id, "failed to fetch feed: {e:#}"),
-            Err(e) => tracing::warn!("feed fetch task failed: {e}"),
-        }
-    }
-    titles
-}
-
-/// Fetch the tags of the entries in `entry_ids` from the Kiki API, keyed by
-/// entry ID. Both user tags and system tags are included.
-///
-/// An entry whose tags cannot be fetched is logged and left out, so it is
-/// shown without tags rather than not at all.
-async fn fetch_entry_tags(
-    api: &reqwest::Client,
-    entry_ids: impl IntoIterator<Item = i64>,
-) -> HashMap<i64, Vec<TagResponse>> {
-    let mut tasks = JoinSet::new();
-    for id in entry_ids.into_iter().collect::<BTreeSet<_>>() {
-        let api = api.clone();
-        tasks.spawn(async move {
-            let tags: Result<GetEntryTagsResponse> = async {
-                Ok(api
-                    .get(format!("{API_BASE}/v1/entries/id/{id}/tags"))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?)
-            }
-            .await;
-            (id, tags)
-        });
-    }
-
-    let mut tags = HashMap::new();
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok((id, Ok(resp))) => {
-                tags.insert(id, resp.tags);
-            }
-            Ok((id, Err(e))) => tracing::warn!(entry_id = id, "failed to fetch entry tags: {e:#}"),
-            Err(e) => tracing::warn!("entry tags fetch task failed: {e}"),
-        }
-    }
-    tags
-}
-
 /// Render the entry count (`count`, of all the entries in the list), the
 /// "Mark all as read" button and the filter menu — or, for search results,
 /// the links that sort them — the entries on this page of `listing`, and the
-/// page links.
-/// `feeds` maps feed
-/// IDs to the titles of the feeds; entries from feeds not in it are shown
-/// without their feed. `tags` maps entry IDs to the entries' tags; entries
-/// not in it are shown without tags.
+/// page links. Each entry is shown with its own tags, and with the title of
+/// its feed if `show_feed`.
 fn render_entries(
     count: usize,
     entries: &[ListEntriesResponseEntry],
-    feeds: &HashMap<i64, String>,
-    tags: &HashMap<i64, Vec<TagResponse>>,
+    show_feed: bool,
     listing: &Listing,
 ) -> String {
     let searching = listing.search.is_some();
@@ -1736,8 +1622,8 @@ fn render_entries(
         let swipeable = !listing.show_read && !searching;
         html.push_str("<ol class=\"entries\">\n");
         for entry in entries {
-            let feed = entry.feed_id.and_then(|id| feeds.get(&id));
-            let tags = tags.get(&entry.id).map_or(&[][..], Vec::as_slice);
+            let feed = entry.feed_title.as_deref().filter(|_| show_feed);
+            let tags = entry.tags.as_slice();
             if swipeable && !has_system_tag(tags, SystemTag::Read) {
                 html.push_str(&format!(
                     "<li class=\"swipe-read\" data-entry=\"{}\">",
@@ -1746,12 +1632,7 @@ fn render_entries(
             } else {
                 html.push_str("<li>");
             }
-            html.push_str(&render_entry(
-                entry,
-                feed.map(String::as_str),
-                tags,
-                listing,
-            ));
+            html.push_str(&render_entry(entry, feed, tags, listing));
             html.push_str("</li>\n");
         }
         html.push_str("</ol>\n");
@@ -1925,7 +1806,6 @@ fn tag_attrs(tag: &TagResponse) -> String {
 fn render_entry_page(
     entry: &GetEntryResponse,
     feed: Option<&str>,
-    tags: &[TagResponse],
     cached: &HashMap<String, String>,
     listing: &Listing,
 ) -> String {
@@ -1948,7 +1828,7 @@ fn render_entry_page(
     let mut html = format!(
         "<article class=\"entry\">\n<div class=\"title-row\"><h2>{}</h2>{}</div>\n{}\n",
         escape(display_title(&entry.title)),
-        render_save_button(entry.id, tags),
+        render_save_button(entry.id, &entry.tags),
         render_meta(
             entry.published_at.as_deref(),
             feed,
@@ -1963,7 +1843,7 @@ fn render_entry_page(
             categories.join(", ")
         ));
     }
-    html.push_str(&render_tags(tags));
+    html.push_str(&render_tags(&entry.tags));
 
     // Links and images in the content are resolved against the entry's own
     // URL, where the content was written to appear.
@@ -2135,14 +2015,8 @@ fn render_tag_list(resp: &ListTagsResponse, page: u32) -> String {
 
 /// Render the page for `tag`: its name, a button that deletes it if it is a
 /// user tag, and the entries on this page of `listing`, each with the title
-/// of its feed from `feeds` and its tags from `tags`.
-fn render_tag_page(
-    tag: &TagResponse,
-    entries: &EntryPage,
-    feeds: &HashMap<i64, String>,
-    tags: &HashMap<i64, Vec<TagResponse>>,
-    listing: &Listing,
-) -> String {
+/// of its feed.
+fn render_tag_page(tag: &TagResponse, entries: &EntryPage, listing: &Listing) -> String {
     let mut html = format!(
         "<div class=\"title-row\">\n<h2>Entries tagged <span {}>{}</span></h2>\n{}</div>\n",
         tag_attrs(tag),
@@ -2152,8 +2026,7 @@ fn render_tag_page(
     html.push_str(&render_entries(
         entries.count,
         &entries.entries,
-        feeds,
-        tags,
+        true,
         listing,
     ));
     html.push_str("<p><a href=\"/tags\">&larr; Back to tags</a></p>\n");
@@ -2539,14 +2412,8 @@ fn to_json_pretty(value: &Value) -> String {
 }
 
 /// Render the page for `feed`: its title, URL, description and when it was
-/// last checked, then `entries`, the entries on this page of `listing`, with
-/// their tags from `tags`, keyed by entry ID.
-fn render_feed_page(
-    feed: &Feed,
-    entries: &EntryPage,
-    tags: &HashMap<i64, Vec<TagResponse>>,
-    listing: &Listing,
-) -> String {
+/// last checked, then `entries`, the entries on this page of `listing`.
+fn render_feed_page(feed: &Feed, entries: &EntryPage, listing: &Listing) -> String {
     let mut html = format!(
         "<header class=\"feed-header\">\n<h2>{}{}</h2>\n{}\n",
         render_favicon(feed.favicon_url.as_deref()),
@@ -2571,8 +2438,7 @@ fn render_feed_page(
     html.push_str(&render_entries(
         entries.count,
         &entries.entries,
-        &HashMap::new(),
-        tags,
+        false,
         listing,
     ));
     html.push_str("<p><a href=\"/feeds\">&larr; Back to feeds</a></p>\n");
