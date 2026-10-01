@@ -61,6 +61,10 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0010_entry_sync",
         sql: include_str!("include/migrations/0010_entry_sync.sql"),
     },
+    Migration {
+        name: "0011_unread_entries",
+        sql: include_str!("include/migrations/0011_unread_entries.sql"),
+    },
 ];
 
 /// The migration that drops the `scripts` table in favour of plugins.
@@ -212,6 +216,7 @@ mod tests {
         CREATE TABLE feed_tags (feed_id INTEGER NOT NULL, tag_id INTEGER NOT NULL);
         CREATE TABLE entries (
             id              INTEGER PRIMARY KEY,
+            feed_id         INTEGER,
             published_at    DATETIME NOT NULL
         );
         CREATE TABLE entry_tags (entry_id INTEGER NOT NULL, tag_id INTEGER NOT NULL);
@@ -513,6 +518,194 @@ mod tests {
         assert_eq!(high_water(&conn)?, 7);
         conn.execute("INSERT INTO entries (id, published_at) VALUES (9, 0)", [])?;
         assert_eq!(high_water(&conn)?, 9);
+        Ok(())
+    }
+
+    /// The `sql` of the schema object `name`.
+    fn schema_sql(conn: &Connection, name: &str) -> Result<String> {
+        Ok(conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// `0011_unread_entries` adds `entries.unread_visible`, backfilled from
+    /// the entries' read and hidden tags, with the same indexes and triggers
+    /// as a freshly-initialized database's, which then keep it in step.
+    #[test]
+    fn test_unread_entries_migration() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        conn.execute_batch(
+            "INSERT INTO entries (id, published_at) VALUES (1, 0), (2, 0), (3, 0), (4, 0);
+             INSERT INTO tags (id, name) VALUES (1, 'news');",
+        )?;
+        run_pending_migrations(&mut conn)?;
+
+        let fresh = ConnectionBuilder::default().in_memory().create().build()?;
+        for name in [
+            "idx_entry_unread_visible",
+            "idx_entry_feed_unread_visible",
+            "entry_tags_unread_visible_ai",
+            "entry_tags_unread_visible_ad",
+            "entry_tags_unread_visible_au",
+        ] {
+            assert_eq!(
+                schema_sql(&conn, name)?,
+                schema_sql(&fresh, name)?,
+                "{name}"
+            );
+        }
+
+        let tag = |name: &str| -> Result<i64> {
+            Ok(
+                conn.query_row("SELECT id FROM tags WHERE name = ?1", [name], |row| {
+                    row.get(0)
+                })?,
+            )
+        };
+        let (news, read, hidden, saved) = (
+            tag("news")?,
+            tag("system:read")?,
+            tag("system:hidden")?,
+            tag("system:saved")?,
+        );
+        let unread_visible = |conn: &Connection| -> Result<Vec<i64>> {
+            let mut stmt =
+                conn.prepare("SELECT id FROM entries WHERE unread_visible = 1 ORDER BY id")?;
+            let ids = stmt.query_map([], |row| row.get(0))?;
+            Ok(ids.collect::<Result<_, _>>()?)
+        };
+
+        // Nothing was tagged, so every entry is listed; the triggers then
+        // follow the tags added afterwards.
+        assert_eq!(unread_visible(&conn)?, [1, 2, 3, 4]);
+        conn.execute(
+            "INSERT INTO entry_tags VALUES (1, ?1), (2, ?2), (3, ?3), (4, ?4)",
+            [news, read, hidden, saved],
+        )?;
+        assert_eq!(unread_visible(&conn)?, [1, 4]);
+        Ok(())
+    }
+
+    /// `0011_unread_entries` backfills `unread_visible` from tags that were
+    /// already there.
+    #[test]
+    fn test_unread_entries_migration_backfill() -> Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        conn.execute_batch(
+            "INSERT INTO entries (id, published_at) VALUES (1, 0), (2, 0), (3, 0);",
+        )?;
+        // Apply the migrations up to 0011, tag the entries as a database of
+        // that version would have them, and then apply 0011 itself.
+        conn.execute_batch(CREATE_MIGRATIONS_TABLE)?;
+        for m in MIGRATIONS
+            .iter()
+            .take_while(|m| m.name != "0011_unread_entries")
+        {
+            conn.execute_batch(m.sql)?;
+            conn.execute("INSERT INTO migrations (name) VALUES (?1)", [m.name])?;
+        }
+        conn.execute_batch(
+            "INSERT INTO entry_tags (entry_id, tag_id)
+                 SELECT 1, id FROM tags WHERE name = 'system:read';
+             INSERT INTO entry_tags (entry_id, tag_id)
+                 SELECT 2, id FROM tags WHERE name = 'system:hidden';",
+        )?;
+        run_pending_migrations(&mut conn)?;
+        let flags = conn
+            .prepare("SELECT unread_visible FROM entries ORDER BY id")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(flags, [0, 0, 1]);
+        Ok(())
+    }
+
+    /// However entry_tags rows are added, removed or changed, an entry's
+    /// `unread_visible` says whether it has neither `system:read` nor
+    /// `system:hidden`.
+    #[test]
+    fn test_unread_visible_tracks_entry_tags() -> Result<()> {
+        let conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute_batch(
+            "INSERT INTO feeds (id, title, url) VALUES (1, 'f', 'http://f/');
+             INSERT INTO tags (name) VALUES ('news');",
+        )?;
+        for id in 1..=6 {
+            conn.execute(
+                "INSERT INTO entries (id, feed_id, syndication_format, guid, published_at, title, url)
+                 VALUES (?1, 1, 'rss', ?1, 0, 't', 'u')",
+                [id],
+            )?;
+        }
+        let tag_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM tags WHERE name IN ('news', 'system:read', 'system:saved', 'system:hidden')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(tag_ids.len(), 4);
+
+        let check = |step: usize| -> Result<()> {
+            let wrong: Vec<i64> = conn
+                .prepare(
+                    "SELECT e.id FROM entries e WHERE e.unread_visible IS NOT NOT EXISTS (
+                         SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+                         WHERE et.entry_id = e.id
+                           AND t.name IN ('system:read', 'system:hidden'))",
+                )?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            assert!(
+                wrong.is_empty(),
+                "step {step}: out of step for entries {wrong:?}"
+            );
+            Ok(())
+        };
+
+        // A fixed pseudo-random walk over adds, removes, retags and moves.
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        for step in 0..2000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let entry = (x % 6 + 1) as i64;
+            let other = ((x >> 8) % 6 + 1) as i64;
+            let pick = |bits: u64| -> Result<i64> {
+                tag_ids
+                    .get((bits % tag_ids.len() as u64) as usize)
+                    .copied()
+                    .context("a tag")
+            };
+            let tag = pick(x >> 16)?;
+            let other_tag = pick(x >> 24)?;
+            match (x >> 32) % 4 {
+                0 | 1 => {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+                        [entry, tag],
+                    )?;
+                }
+                2 => {
+                    conn.execute(
+                        "DELETE FROM entry_tags WHERE entry_id = ?1 AND tag_id = ?2",
+                        [entry, tag],
+                    )?;
+                }
+                _ => {
+                    conn.execute(
+                        "UPDATE OR IGNORE entry_tags SET entry_id = ?3, tag_id = ?4
+                         WHERE entry_id = ?1 AND tag_id = ?2",
+                        [entry, tag, other, other_tag],
+                    )?;
+                }
+            }
+            check(step)?;
+        }
+
+        // Deleting an entry takes its tags with it, leaving the rest alone.
+        conn.execute("DELETE FROM entries WHERE id = 1", [])?;
+        check(2000)?;
         Ok(())
     }
 }

@@ -1,3 +1,4 @@
+use crate::db::tags::SystemTag;
 use crate::routes::v1::entries::list_entries::{ListEntriesResponseEntry, DEFAULT_LIMIT};
 use crate::routes::v1::entries::rows::{
     entry_columns, entry_from_row, load_entry_tags, EntrySort, ENTRY_COLUMN_COUNT,
@@ -271,6 +272,23 @@ fn tag_names(filter: &TagFilter) -> Option<Vec<String>> {
     }
 }
 
+/// Whether `filter` matches exactly the entries with neither `system:read`
+/// nor `system:hidden`: `{"not": {"or": [...]}}` of those two tags, in
+/// either order, or of the two along with repeats of them.
+fn excludes_read_and_hidden(filter: &TagFilter) -> bool {
+    let TagFilter::Expr(TagExpr::Not(inner)) = filter else {
+        return false;
+    };
+    let Some(names) = tag_names(inner) else {
+        return false;
+    };
+    let read = SystemTag::Read.name();
+    let hidden = SystemTag::Hidden.name();
+    names.iter().all(|n| n == read || n == hidden)
+        && names.iter().any(|n| n == read)
+        && names.iter().any(|n| n == hidden)
+}
+
 /// Recursively collect leaf tag names from an OR expression.
 fn collect_or_leaves(
     filters: &[TagFilter],
@@ -478,11 +496,18 @@ impl CompiledSearch {
             push("e.url REGEXP ?#".into(), SqlParam::from_string(pat.clone()));
         }
 
-        // Tag filter, which numbers its own parameters
+        // Tag filter, which numbers its own parameters. Leaving out read and
+        // hidden entries, and nothing else, is what the web UI's lists do;
+        // `entries.unread_visible` records it, and partial indexes on it list
+        // and count those entries without looking at the others.
         if let Some(ref tag_filter) = payload.tags {
-            let (cond, new_idx) = build_tag_condition(tag_filter, &mut params, next_idx)?;
-            conditions.push(cond);
-            next_idx = new_idx;
+            if excludes_read_and_hidden(tag_filter) {
+                conditions.push("e.unread_visible = 1".into());
+            } else {
+                let (cond, new_idx) = build_tag_condition(tag_filter, &mut params, next_idx)?;
+                conditions.push(cond);
+                next_idx = new_idx;
+            }
         }
 
         let from_clause = if use_fts {
@@ -700,5 +725,40 @@ pub async fn search_entry_ids(
         Ok(Ok(response)) => Ok(Json(response).into_response()),
         Ok(Err(e)) => Err(error_response(e)),
         Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    fn filter(json: serde_json::Value) -> TagFilter {
+        serde_json::from_value(json).expect("a tag filter")
+    }
+
+    /// Only a filter that leaves out exactly the read and hidden entries
+    /// is answered from `entries.unread_visible`.
+    #[test]
+    fn test_excludes_read_and_hidden() {
+        for json in [
+            serde_json::json!({"not": {"or": ["system:read", "system:hidden"]}}),
+            serde_json::json!({"not": {"or": ["system:hidden", "system:read"]}}),
+            serde_json::json!({"not": {"or": ["system:hidden", {"or": ["system:read", "system:hidden"]}]}}),
+        ] {
+            assert!(excludes_read_and_hidden(&filter(json.clone())), "{json}");
+        }
+        for json in [
+            serde_json::json!("system:read"),
+            serde_json::json!({"not": "system:read"}),
+            serde_json::json!({"not": "system:hidden"}),
+            serde_json::json!({"not": {"or": ["system:read", "system:saved"]}}),
+            serde_json::json!({"not": {"or": ["system:read", "system:hidden", "news"]}}),
+            serde_json::json!({"not": {"and": ["system:read", "system:hidden"]}}),
+            serde_json::json!({"and": ["news", {"not": {"or": ["system:read", "system:hidden"]}}]}),
+        ] {
+            assert!(!excludes_read_and_hidden(&filter(json.clone())), "{json}");
+        }
     }
 }

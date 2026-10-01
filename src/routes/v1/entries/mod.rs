@@ -890,6 +890,103 @@ mod test {
         Ok(())
     }
 
+    /// Leaving out read and hidden entries, as the web UI's lists do, is
+    /// answered from `entries.unread_visible`; it lists and counts the same
+    /// entries as the equivalent filter that is answered from entry_tags,
+    /// alone or with a feed, and follows read state changed through the API.
+    #[tokio::test]
+    async fn test_search_unread_visible_matches_tags() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        populate_search_data(&tc)?;
+        {
+            let conn = tc.database_conn()?;
+            // Entry 1 read, entry 2 read and hidden, entry 3 hidden.
+            conn.execute_batch(
+                "INSERT INTO entry_tags (entry_id, tag_id)
+                     SELECT 1, id FROM tags WHERE name = 'system:read';
+                 INSERT INTO entry_tags (entry_id, tag_id)
+                     SELECT 2, id FROM tags WHERE name IN ('system:read', 'system:hidden');
+                 INSERT INTO entry_tags (entry_id, tag_id)
+                     SELECT 3, id FROM tags WHERE name = 'system:hidden';",
+            )?;
+        }
+
+        let search = |body: serde_json::Value| {
+            let client = client.clone();
+            async move {
+                let resp = client
+                    .post("http://localhost/v1/entries/search")
+                    .json(&body)
+                    .send()
+                    .await?;
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body = resp.json::<search_entries::SearchEntriesResponse>().await?;
+                let ids: Vec<i64> = body.entries.iter().map(|e| e.entry.id).collect();
+                anyhow::Ok((body.count, ids))
+            }
+        };
+        let fast = |extra: serde_json::Value, order: [&str; 2]| {
+            let mut body = serde_json::json!({ "tags": { "not": { "or": order } } });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body
+        };
+        let general = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "tags": { "and": [{ "not": "system:read" }, { "not": "system:hidden" }] }
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body
+        };
+
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({ "feed_id": 1 }),
+            serde_json::json!({ "limit": 1, "offset": 1 }),
+        ] {
+            let expected = search(general(extra.clone())).await?;
+            for order in [
+                ["system:hidden", "system:read"],
+                ["system:read", "system:hidden"],
+            ] {
+                assert_eq!(
+                    search(fast(extra.clone(), order)).await?,
+                    expected,
+                    "{extra}"
+                );
+            }
+        }
+        assert_eq!(
+            search(fast(
+                serde_json::json!({}),
+                ["system:hidden", "system:read"]
+            ))
+            .await?
+            .1,
+            [4]
+        );
+
+        // Unreading entry 1 through the API lists it again.
+        let resp = client
+            .delete("http://localhost/v1/entries/id/1/system-tags/read")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (count, ids) = search(fast(
+            serde_json::json!({}),
+            ["system:hidden", "system:read"],
+        ))
+        .await?;
+        assert_eq!(count, 2);
+        assert_eq!(ids, [4, 1]);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_search_tags_or_with_not() -> Result<()> {
         let tc = TestBuilder::all().build()?;

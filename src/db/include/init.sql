@@ -231,6 +231,13 @@ CREATE TABLE entries (
     -- the entry insert, since databases migrated from before this column
     -- existed have no default for it.
     ingested_at     INTEGER NOT NULL DEFAULT (unixepoch()),
+
+    -- 1 while the entry has neither `system:read` nor `system:hidden`, 0
+    -- otherwise: the entries the web UI lists by default. Kept in step with
+    -- entry_tags by the entry_tags_unread_visible_* triggers below, so that
+    -- the partial indexes on it can list and count those entries without
+    -- looking at the rest.
+    unread_visible  INTEGER NOT NULL DEFAULT 1,
     FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE SET NULL,
     FOREIGN KEY(source_id) REFERENCES entry_sources(id) ON DELETE SET NULL
 );
@@ -266,6 +273,47 @@ CREATE INDEX idx_entry_feed_published_at ON entries(feed_id, published_at);
 -- Also serves lookups by entry_id.
 CREATE UNIQUE INDEX idx_entry_tags_unique ON entry_tags(entry_id, tag_id);
 CREATE INDEX idx_entry_tags_tag_id ON entry_tags(tag_id);
+
+-- The unread entries that are not hidden, newest first, overall and by
+-- feed; see `entries.unread_visible`.
+CREATE INDEX idx_entry_unread_visible ON entries(published_at)
+    WHERE unread_visible = 1;
+CREATE INDEX idx_entry_feed_unread_visible ON entries(feed_id, published_at)
+    WHERE unread_visible = 1;
+
+-- Keep `entries.unread_visible` in step with the entry's system:read and
+-- system:hidden tags, however entry_tags rows are added, removed or changed.
+CREATE TRIGGER entry_tags_unread_visible_ai AFTER INSERT ON entry_tags
+WHEN NEW.tag_id IN (
+    SELECT id FROM tags WHERE name IN ('system:read', 'system:hidden')
+)
+BEGIN
+    UPDATE entries SET unread_visible = 0
+    WHERE id = NEW.entry_id AND unread_visible = 1;
+END;
+
+CREATE TRIGGER entry_tags_unread_visible_ad AFTER DELETE ON entry_tags
+WHEN OLD.tag_id IN (
+    SELECT id FROM tags WHERE name IN ('system:read', 'system:hidden')
+)
+BEGIN
+    UPDATE entries SET unread_visible = NOT EXISTS (
+        SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+        WHERE et.entry_id = OLD.entry_id
+          AND t.name IN ('system:read', 'system:hidden')
+    )
+    WHERE id = OLD.entry_id;
+END;
+
+CREATE TRIGGER entry_tags_unread_visible_au AFTER UPDATE ON entry_tags
+BEGIN
+    UPDATE entries SET unread_visible = NOT EXISTS (
+        SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+        WHERE et.entry_id = entries.id
+          AND t.name IN ('system:read', 'system:hidden')
+    )
+    WHERE id IN (OLD.entry_id, NEW.entry_id);
+END;
 
 ---------------------------------------------------------------------------------
 -- RSS-related data
