@@ -33,6 +33,47 @@ KIKI_BIN=../../target/profiling/kiki STRESS_OUT=/tmp/kiki-stress \
 The harness strips proxy variables from Kiki's environment so it can reach
 the local feed server.
 
+### Web UI mode
+
+With `MODE=web`, the harness runs `kiki web` instead of `kiki serve`, and its
+clients browse the web UI the way a person reading in a browser does:
+opening the index (mostly its first page), feed and tag pages, entries and
+search results; loading the images and favicons on each page, revalidating
+the ones it has seen with `If-None-Match`; swiping entries read, saving
+them, and now and then marking a feed read. Every listing page is one
+`/v1/entries/search` call that leaves out read and hidden entries, plus a
+count of them, so this is the mode to use for the server's work under
+normal use.
+
+Before starting Kiki it sets the `filter` and `auto-tag` plugins' rules, as
+a deployment of the web UI does, so that one entry in ten is hidden and the
+tag pages have entries: see `STRESS_FILTER` and `STRESS_AUTOTAG` in
+`src/main.rs`. `FILTER_TOML` and `AUTOTAG_TOML` add rules of your own, such
+as a deployment's real ones, ahead of those.
+
+```bash
+KIKI_BIN=../../target/profiling/kiki STRESS_OUT=/tmp/kiki-web \
+    MODE=web FEEDS=300 WORKERS=8 SECS=60 cargo run --release
+```
+
+The setup, sampling and canaries still use the API over the Unix socket.
+
+### Profiling
+
+`STRESS_OUT/pids.txt` names the processes started (`web=` and `serve=` in
+web mode), for attaching a profiler once the log says the warm-up is done.
+Most of the server's work happens on tokio's blocking threads, so sample
+the whole system with DWARF call graphs (Kiki is built without frame
+pointers):
+
+```bash
+perf record -e cpu-clock -F 99 -a --call-graph dwarf,8192 -o perf.data -- sleep 50
+perf report -i perf.data --no-children --no-inline -g none --pid <serve pid> --sort sym
+```
+
+`--no-inline` keeps `perf report` from spending minutes resolving inlined
+frames. `-e cpu-clock` works in VMs without hardware counters.
+
 | Variable      | Default | Meaning                                                  |
 |---------------|---------|----------------------------------------------------------|
 | `KIKI_BIN`    | `kiki`  | The `kiki` binary to run                                 |
@@ -45,6 +86,9 @@ the local feed server.
 | `STALL_MS`    | `5000`  | In-flight age that triggers a thread dump                |
 | `KIKI_ARGS`   | —       | Extra arguments for `kiki serve`                         |
 | `KIKI_LOG`    | `warn`  | `RUST_LOG` for the server                                |
+| `MODE`        | `api`   | `api` to drive the API, `web` to drive the web UI        |
+| `FILTER_TOML` | —       | In web mode, extra `filter` plugin rules                 |
+| `AUTOTAG_TOML`| —       | In web mode, extra `auto-tag` plugin rules               |
 
 ## Output
 
@@ -56,7 +100,10 @@ the local feed server.
 - `kiki.log`: the server's log;
 - `metrics.txt`: the server's `/metrics` after the load, including pool
   acquire times, task-queue depth, and per-statement timings;
-- `stack-N.txt`: `gdb` backtraces taken on stalls (at most four).
+- `stack-N.txt`: `gdb` backtraces taken on stalls (at most four), of
+  every process started;
+- `pids.txt`: the processes started;
+- in web mode, `filter.toml` and `auto-tag.toml`: the plugin rules set.
 
 Clients run a closed loop, so when every client is blocked on one kind of
 request, nothing else is sent. A gap in the timeline is a sign of that, not
