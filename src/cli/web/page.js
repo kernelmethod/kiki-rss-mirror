@@ -222,7 +222,7 @@ document.addEventListener("click", async (event) => {
 // uncovering a "Read" panel, and once dragged far enough it slides away,
 // collapses, and is tagged `system:read`. A popup at the bottom of the page
 // offers to undo it. Only touches swipe; a mouse drag does nothing.
-const SWIPE_START = 10; // px moved before deciding between swipe and scroll
+const SWIPE_START = 10; // px moved left before the row starts to follow
 const SWIPE_COMMIT = 0.35; // fraction of the row's width that marks it read
 const SWIPE_FLICK = 0.5; // px per ms: a flick this fast marks it read too
 const UNDO_TIMEOUT = 5000;
@@ -239,7 +239,7 @@ document.addEventListener("pointerdown", (event) => {
   if (!row || event.pointerType !== "touch" || !event.isPrimary || swipe || row.swipeAnimations) {
     return;
   }
-  swipe = { row, id: event.pointerId, x: event.clientX, y: event.clientY, dragging: false };
+  swipe = { row, id: event.pointerId, x: event.clientX, y: event.clientY, claimed: false, dragging: false };
 });
 
 document.addEventListener("pointermove", (event) => {
@@ -248,14 +248,24 @@ document.addEventListener("pointermove", (event) => {
   }
   const dx = event.clientX - swipe.x;
   const dy = event.clientY - swipe.y;
-  if (!swipe.dragging) {
-    if (Math.abs(dx) < SWIPE_START && Math.abs(dy) < SWIPE_START) {
+  if (!swipe.claimed) {
+    if (dx === 0 && dy === 0) {
       return;
     }
-    // A mostly vertical move is a scroll, and one to the right is not a
-    // swipe we act on; either way, leave it to the browser.
-    if (Math.abs(dy) >= Math.abs(dx) || dx > 0) {
+    // Decide between swipe and scroll on the very first move: browsers only
+    // let a page keep a touch from scrolling if it says so then (see the
+    // `touchmove` listener below). A move that is mostly vertical is a
+    // scroll, and one to the right is not a swipe we act on; either way,
+    // leave it to the browser.
+    if (dx >= 0 || Math.abs(dy) >= Math.abs(dx)) {
       swipe = null;
+      return;
+    }
+    swipe.claimed = true;
+  }
+  if (!swipe.dragging) {
+    // Until the finger has gone a little way, this may still be a tap.
+    if (-dx < SWIPE_START) {
       return;
     }
     swipe.dragging = true;
@@ -271,6 +281,22 @@ document.addEventListener("pointermove", (event) => {
   swipe.row.style.transform = `translateX(${offset}px)`;
 });
 
+// Keep the browser from scrolling during a swipe. `touch-action: pan-y`
+// alone is not enough: some browsers drop the declaration (WebKit does not
+// know `pinch-zoom`), and Firefox on Android starts scrolling anyway once the
+// finger drifts far enough up or down. Either way the swipe is cancelled and
+// the row snaps back. Touch events come after the pointer events for the
+// same move, so `claimed` is already set on the first move of a swipe.
+document.addEventListener(
+  "touchmove",
+  (event) => {
+    if (swipe?.claimed && event.cancelable) {
+      event.preventDefault();
+    }
+  },
+  { passive: false },
+);
+
 function endSwipe(event) {
   if (!swipe || event.pointerId !== swipe.id) {
     return;
@@ -281,9 +307,11 @@ function endSwipe(event) {
     return;
   }
   lastSwipeEnd = Date.now();
+  // A row dragged far enough is marked read even if the browser cancelled
+  // the gesture before the finger came up.
   const commit =
-    event.type === "pointerup" &&
-    (-offset > row.offsetWidth * SWIPE_COMMIT || (-speed > SWIPE_FLICK && -offset > SWIPE_START * 3));
+    -offset > row.offsetWidth * SWIPE_COMMIT ||
+    (event.type === "pointerup" && -speed > SWIPE_FLICK && -offset > SWIPE_START * 3);
   if (commit) {
     markRead(row, offset);
   } else {
