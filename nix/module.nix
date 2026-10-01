@@ -68,6 +68,11 @@ in
         ExecStart = "${cfg.package}/bin/kiki serve -u ${cfg.unixSocket}";
         Restart = "on-failure";
         RestartSec = 5;
+
+        # Kiki refuses writable and executable memory itself on Linux 6.3+;
+        # these also cover older kernels.
+        MemoryDenyWriteExecute = true;
+        LockPersonality = true;
       };
     };
   };

@@ -5,7 +5,7 @@
 //! enough for the union of everything Kiki does. A profile is chosen with
 //! [`SandboxProfile`] and applied by [`apply`].
 //!
-//! On Linux two layers are installed, per profile:
+//! On Linux three layers are installed, per profile:
 //!
 //! * **Landlock** restricts filesystem access to the paths the profile
 //!   actually needs — for the server that is the data directory holding
@@ -32,8 +32,13 @@
 //!   defence-in-depth layer that eliminates the most dangerous escape
 //!   primitives without risking that a benign syscall we forgot about
 //!   will kill the process.
+//! * **`PR_SET_MDWE`** (Linux 6.3+) makes the kernel refuse memory that is
+//!   writable and executable, and refuse making any mapping executable
+//!   that was not already, so injected code cannot be written and then
+//!   run. Every profile gets it; it is the in-process counterpart of
+//!   systemd's `MemoryDenyWriteExecute=`.
 //!
-//! Both restrictions are installed before the process touches untrusted
+//! All three are installed before the process touches untrusted
 //! input — for the server, before it opens its listening socket(s); for
 //! the children, before they read their first byte of IPC; for the web
 //! UI, before it accepts its first connection. They are
@@ -246,7 +251,8 @@ pub fn restrict_filesystem(config: &SandboxConfig) -> anyhow::Result<()> {
 }
 
 /// Install only the syscall half of the configured sandbox: on Linux, the
-/// seccomp-bpf filter, which applies to every thread of the process. See
+/// seccomp-bpf filter and the refusal of writable and executable memory,
+/// both of which apply to every thread of the process. See
 /// [`restrict_filesystem`].
 pub fn restrict_syscalls(config: &SandboxConfig) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
