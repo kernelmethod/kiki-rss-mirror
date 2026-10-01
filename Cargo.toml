@@ -1,6 +1,6 @@
 [package]
 name = "kiki-rss"
-version = "0.28.0"
+version = "0.29.0"
 edition = "2021"
 description = "An RSS feed aggregator"
 license = "MIT"
@@ -37,10 +37,6 @@ blake3 = "1"
 chrono = "0.4"
 dirs = "6"
 lol_html = "2"
-# The global allocator; see src/main.rs.
-mimalloc = { version = "0.1", features = ["secure"] }
-# For `mi_collect`; see src/memory.rs. Must match the version mimalloc uses.
-libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
 url = "2"
 clap = { version = "4.5", features = ["cargo", "derive"], optional = true }
 quick-xml = { version = "0.37", features = ["serialize", "escape-html"] }

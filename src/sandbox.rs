@@ -5,7 +5,7 @@
 //! enough for the union of everything Kiki does. A profile is chosen with
 //! [`SandboxProfile`] and applied by [`apply`].
 //!
-//! On Linux two layers are installed, per profile:
+//! On Linux three layers are installed, per profile:
 //!
 //! * **Landlock** restricts filesystem access to the paths the profile
 //!   actually needs — for the server that is the data directory holding
@@ -15,10 +15,12 @@
 //!   which makes all of Kiki's HTTP(S) requests, gets only the TLS trust
 //!   stores (it has the server resolve hostnames for it), and the script
 //!   host and the web UI get *nothing at all*. Where the kernel
-//!   supports it, the feed fetcher is also barred from binding TCP ports
-//!   and from reaching abstract Unix sockets or signalling processes
-//!   outside its own sandbox, and the web UI from binding or connecting
-//!   to TCP ports and from reaching abstract Unix sockets.
+//!   supports it (Linux 6.12+), every profile is also barred from
+//!   reaching abstract Unix sockets outside its own sandbox, and every
+//!   profile but the web UI from signalling processes outside it — its
+//!   own children, whose sandboxes nest inside its own, excepted. The
+//!   feed fetcher is barred from binding TCP ports, and the web UI from
+//!   binding or connecting to them.
 //! * **seccomp-bpf** blocks a denylist of syscalls the profile never uses
 //!   (`ptrace`, `mount`, `unshare`, `bpf`, `kexec_load`, module loading,
 //!   `io_uring`, `userfaultfd`, and friends; plus, for the server,
@@ -30,8 +32,13 @@
 //!   defence-in-depth layer that eliminates the most dangerous escape
 //!   primitives without risking that a benign syscall we forgot about
 //!   will kill the process.
+//! * **`PR_SET_MDWE`** (Linux 6.3+) makes the kernel refuse memory that is
+//!   writable and executable, and refuse making any mapping executable
+//!   that was not already, so injected code cannot be written and then
+//!   run. Every profile gets it; it is the in-process counterpart of
+//!   systemd's `MemoryDenyWriteExecute=`.
 //!
-//! Both restrictions are installed before the process touches untrusted
+//! All three are installed before the process touches untrusted
 //! input — for the server, before it opens its listening socket(s); for
 //! the children, before they read their first byte of IPC; for the web
 //! UI, before it accepts its first connection. They are
@@ -51,8 +58,9 @@ use std::path::PathBuf;
 pub enum SandboxProfile {
     /// The main `kiki serve` process: owns the SQLite database, the asset
     /// cache, and the listening socket, and resolves hostnames for the
-    /// feed fetcher. It makes no HTTP(S) requests of its own, and may
-    /// create only Unix, IPv4 and IPv6 sockets.
+    /// feed fetcher. It makes no HTTP(S) requests of its own, may create
+    /// only Unix, IPv4 and IPv6 sockets, and may signal no process but
+    /// itself and its children.
     ///
     /// Its children are started under its filesystem rules (see
     /// [`restrict_filesystem`]), so besides the paths below it is granted
@@ -79,8 +87,9 @@ pub enum SandboxProfile {
     /// The Lua script host: evaluates user-supplied scripts and talks to
     /// the server over an inherited socket pair, nothing else.
     ///
-    /// This profile grants **no filesystem access whatsoever** and denies
-    /// every syscall that could open a socket. The host's inherited IPC
+    /// This profile grants **no filesystem access whatsoever**, denies
+    /// every syscall that could open a socket, and may signal no process
+    /// but itself. The host's inherited IPC
     /// file descriptor already exists by the time the sandbox is applied,
     /// and is used through plain `read`/`write`.
     ScriptHost,
@@ -208,12 +217,14 @@ pub fn apply(config: &SandboxConfig) -> anyhow::Result<()> {
 }
 
 /// Install only the filesystem half of the configured sandbox: on Linux,
-/// the Landlock rules. [`restrict_syscalls`] installs the other half.
+/// the Landlock rules, which also scope signals and abstract Unix
+/// sockets. [`restrict_syscalls`] installs the other half.
 ///
 /// The server installs the two halves separately so that it can start its
 /// children in between. Landlock lets a process inspect — through
-/// `/proc/<pid>/smaps_rollup`, say — only processes in its own Landlock
-/// domain or one nested inside it, and a child's domain nests inside its
+/// `/proc/<pid>/smaps_rollup`, say — and, once scoped, signal only
+/// processes in its own Landlock domain or one nested inside it, and a
+/// child's domain nests inside its
 /// parent's only if the parent's rules were in place when the child was
 /// started. Children started before the server restricted itself would end
 /// up in domains of their own, beyond its reach. So the server restricts
@@ -240,7 +251,8 @@ pub fn restrict_filesystem(config: &SandboxConfig) -> anyhow::Result<()> {
 }
 
 /// Install only the syscall half of the configured sandbox: on Linux, the
-/// seccomp-bpf filter, which applies to every thread of the process. See
+/// seccomp-bpf filter and the refusal of writable and executable memory,
+/// both of which apply to every thread of the process. See
 /// [`restrict_filesystem`].
 pub fn restrict_syscalls(config: &SandboxConfig) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]

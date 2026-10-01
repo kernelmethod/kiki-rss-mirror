@@ -55,7 +55,13 @@ impl Kiki {
     /// As [`Self::spawn`], calling `setup` with the data directory once
     /// it has been initialized and before the server starts.
     fn spawn_with(extra_args: &[&str], setup: impl FnOnce(&Path)) -> Self {
-        Self::spawn_as(extra_args, setup, None)
+        Self::spawn_as(extra_args, setup, None, &[])
+    }
+
+    /// As [`Self::spawn`], with `envs` added to `kiki serve`'s
+    /// environment.
+    fn spawn_with_env(extra_args: &[&str], envs: &[(&str, &str)]) -> Self {
+        Self::spawn_as(extra_args, |_| {}, None, envs)
     }
 
     /// As [`Self::spawn`], but run kiki as an unprivileged user when the
@@ -64,12 +70,18 @@ impl Kiki {
     fn spawn_unprivileged(extra_args: &[&str]) -> Self {
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         let root = unsafe { libc::geteuid() } == 0;
-        Self::spawn_as(extra_args, |_| {}, root.then_some(NOBODY))
+        Self::spawn_as(extra_args, |_| {}, root.then_some(NOBODY), &[])
     }
 
     /// As [`Self::spawn_with`], running kiki as the user and group `id`
-    /// if one is given, with the data directory handed over to it.
-    fn spawn_as(extra_args: &[&str], setup: impl FnOnce(&Path), id: Option<u32>) -> Self {
+    /// if one is given, with the data directory handed over to it, and
+    /// with `envs` added to `kiki serve`'s environment.
+    fn spawn_as(
+        extra_args: &[&str],
+        setup: impl FnOnce(&Path),
+        id: Option<u32>,
+        envs: &[(&str, &str)],
+    ) -> Self {
         use std::os::unix::process::CommandExt;
 
         let dir = TempDir::with_prefix("kiki-sandbox-test").expect("create tempdir");
@@ -104,6 +116,7 @@ impl Kiki {
             .arg(&socket)
             .args(extra_args)
             .env("RUST_LOG", "warn")
+            .envs(envs.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
@@ -196,6 +209,21 @@ impl Drop for Kiki {
             let _ = child.wait();
         }
     }
+}
+
+/// The Landlock ABI version the kernel supports, or 0 without Landlock.
+fn landlock_abi() -> i64 {
+    // SAFETY: with a null attribute pointer and the VERSION flag,
+    // landlock_create_ruleset(2) only reports the ABI version.
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            1u32, // LANDLOCK_CREATE_RULESET_VERSION
+        )
+    };
+    abi.max(0)
 }
 
 /// Render an ExitStatus in a way that flags SIGSYS (the likely symptom
@@ -1448,21 +1476,6 @@ mod web_ui {
     /// Printed by the probe once every check has passed.
     const PROBE_PASSED: &str = "web UI sandbox probe passed";
 
-    /// The Landlock ABI version the kernel supports, or 0 without Landlock.
-    fn landlock_abi() -> i64 {
-        // SAFETY: with a null attribute pointer and the VERSION flag,
-        // landlock_create_ruleset(2) only reports the ABI version.
-        let abi = unsafe {
-            libc::syscall(
-                libc::SYS_landlock_create_ruleset,
-                std::ptr::null::<libc::c_void>(),
-                0usize,
-                1u32, // LANDLOCK_CREATE_RULESET_VERSION
-            )
-        };
-        abi.max(0)
-    }
-
     /// The other half of [`the_web_ui_sandbox_is_enforced`]: does nothing
     /// unless that test ran it, in which case it installs the web UI's
     /// sandbox on itself and checks what gets through.
@@ -1544,5 +1557,216 @@ mod web_ui {
             "kiki web: {}",
             describe_exit(status)
         );
+    }
+}
+
+// --------------------------------------------------------------------
+// Landlock scoping: signals and abstract Unix sockets
+// --------------------------------------------------------------------
+
+mod landlock_scoping {
+    use super::*;
+    use kiki_rss::sandbox::{self, SandboxConfig};
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr as UnixAddr, UnixDatagram, UnixListener};
+
+    /// Set by [`run_probe`] when it re-runs this test binary to probe a
+    /// profile's scoping; names the profile.
+    const PROBE_ENV: &str = "KIKI_SCOPE_PROBE";
+
+    /// The PID of a process outside the probe's sandbox: the test that
+    /// started it.
+    const PROBE_PID_ENV: &str = "KIKI_SCOPE_PROBE_PID";
+
+    /// The abstract name of a stream listener outside the probe's sandbox.
+    /// A datagram socket waits at the same name with [`DGRAM_SUFFIX`].
+    const PROBE_SOCKET_ENV: &str = "KIKI_SCOPE_PROBE_SOCKET";
+
+    const DGRAM_SUFFIX: &str = "-dgram";
+
+    /// What the probe sends over the datagram socket it connected before
+    /// its sandbox went up, as the server does with `$NOTIFY_SOCKET`.
+    const NOTIFY_MESSAGE: &[u8] = b"READY=1";
+
+    /// Printed by the probe once every check has passed.
+    const PROBE_PASSED: &str = "scope probe passed";
+
+    /// Printed instead when the kernel predates scoping (Linux 6.12).
+    const PROBE_SKIPPED: &str = "scope probe skipped";
+
+    fn abstract_addr(name: &str) -> UnixAddr {
+        UnixAddr::from_abstract_name(name.as_bytes()).expect("abstract address")
+    }
+
+    /// The other half of [`run_probe`]: does nothing unless that ran it,
+    /// in which case it installs the named profile's Landlock rules on
+    /// itself — the rules alone, since seccomp would refuse some of the
+    /// probe's sockets before Landlock had its say — and checks what they
+    /// let through.
+    #[test]
+    fn scope_probe() {
+        let Some(profile) = std::env::var(PROBE_ENV).ok() else {
+            return;
+        };
+        let outside: libc::pid_t = std::env::var(PROBE_PID_ENV)
+            .expect("probe PID")
+            .parse()
+            .expect("valid probe PID");
+        let name = std::env::var(PROBE_SOCKET_ENV).expect("probe socket name");
+
+        let notify = UnixDatagram::unbound().expect("datagram socket");
+        notify
+            .connect_addr(&abstract_addr(&format!("{name}{DGRAM_SUFFIX}")))
+            .expect("connect the datagram socket");
+
+        let dir = TempDir::with_prefix("kiki-scope-probe").expect("create tempdir");
+        let config = match profile.as_str() {
+            "server" => SandboxConfig::server(
+                dir.path().to_path_buf(),
+                dir.path().to_path_buf(),
+                dir.path().to_path_buf(),
+                false,
+            ),
+            "script-host" => SandboxConfig::script_host(false),
+            "feed-fetcher" => SandboxConfig::feed_fetcher(false),
+            "web-ui" => SandboxConfig::web_ui(false),
+            other => panic!("unknown profile {other}"),
+        };
+        sandbox::restrict_filesystem(&config).expect("install the Landlock rules");
+
+        if landlock_abi() < 6 {
+            println!("{PROBE_SKIPPED}");
+            return;
+        }
+
+        // Abstract sockets outside the sandbox are out of reach...
+        let err = UnixStream::connect_addr(&abstract_addr(&name))
+            .expect_err("connecting to an outside abstract socket was allowed");
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
+        // ...except for a datagram peer connected beforehand.
+        notify
+            .send(NOTIFY_MESSAGE)
+            .expect("sending on the pre-connected datagram socket");
+
+        // SAFETY: signal 0 only checks that the signal could be sent.
+        let outside_result = unsafe { libc::kill(outside, 0) };
+        if profile == "web-ui" {
+            assert_eq!(outside_result, 0, "the web UI could not signal outside");
+        } else {
+            assert_eq!(outside_result, -1, "signalling outside was allowed");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+
+        // SAFETY: as above, to the probe itself.
+        assert_eq!(
+            unsafe { libc::kill(libc::getpid(), 0) },
+            0,
+            "could not signal itself"
+        );
+
+        // A child started under the sandbox nests in it, so may still be
+        // stopped: what the server does to its children.
+        //
+        // SAFETY: the child calls only `pause` and `_exit`, both
+        // async-signal-safe, so forking a multithreaded process is sound.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: our own child, which we then reap.
+        unsafe {
+            assert_eq!(
+                libc::kill(child, libc::SIGKILL),
+                0,
+                "could not stop a child"
+            );
+            let mut status = 0;
+            assert_eq!(libc::waitpid(child, &mut status, 0), child);
+            assert!(libc::WIFSIGNALED(status));
+        }
+
+        println!("{PROBE_PASSED}");
+    }
+
+    /// Run [`scope_probe`] for `profile` in a fresh process, and check it
+    /// passed — and delivered its datagram — or skipped on an old kernel.
+    fn run_probe(profile: &str) {
+        let name = format!("kiki-scope-probe-{}-{profile}", std::process::id());
+        let _listener =
+            UnixListener::bind_addr(&abstract_addr(&name)).expect("bind the stream listener");
+        let dgram = UnixDatagram::bind_addr(&abstract_addr(&format!("{name}{DGRAM_SUFFIX}")))
+            .expect("bind the datagram socket");
+
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "landlock_scoping::scope_probe", "--nocapture"])
+            .env(PROBE_ENV, profile)
+            .env(PROBE_PID_ENV, std::process::id().to_string())
+            .env(PROBE_SOCKET_ENV, &name)
+            .output()
+            .expect("run the probe");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && (stdout.contains(PROBE_PASSED) || stdout.contains(PROBE_SKIPPED)),
+            "{profile} probe failed ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
+        if stdout.contains(PROBE_PASSED) {
+            dgram
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set a read timeout");
+            let mut buf = [0u8; 64];
+            let n = dgram.recv(&mut buf).expect("receive the probe's datagram");
+            assert_eq!(&buf[..n], NOTIFY_MESSAGE);
+        }
+    }
+
+    #[test]
+    fn the_server_is_scoped() {
+        run_probe("server");
+    }
+
+    #[test]
+    fn the_script_host_is_scoped() {
+        run_probe("script-host");
+    }
+
+    #[test]
+    fn the_feed_fetcher_is_scoped() {
+        run_probe("feed-fetcher");
+    }
+
+    #[test]
+    fn the_web_ui_is_scoped_for_abstract_sockets_only() {
+        run_probe("web-ui");
+    }
+
+    /// The real server still tells the service manager it is ready over
+    /// an abstract `$NOTIFY_SOCKET`, which it connects before its sandbox
+    /// scopes abstract sockets away.
+    #[test]
+    fn the_sandboxed_server_notifies_over_an_abstract_socket() {
+        let name = format!("kiki-notify-test-{}", std::process::id());
+        let dgram = UnixDatagram::bind_addr(&abstract_addr(&name)).expect("bind the notify socket");
+        dgram
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set a read timeout");
+
+        let mut kiki = Kiki::spawn_with_env(&[], &[("NOTIFY_SOCKET", &format!("@{name}"))]);
+        let mut buf = [0u8; 256];
+        let n = dgram.recv(&mut buf).expect("receive READY=1");
+        let msg = String::from_utf8_lossy(&buf[..n]);
+        assert!(msg.contains("READY=1"), "unexpected notification: {msg:?}");
+        kiki.assert_still_running();
+        kiki.shutdown();
     }
 }
