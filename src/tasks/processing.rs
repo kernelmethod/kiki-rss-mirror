@@ -36,6 +36,17 @@ impl StoredEntries {
     }
 }
 
+/// The most entries written in one transaction by a refresh. Between
+/// batches the writer is free for other work, such as marking an entry
+/// read, so a long feed cannot hold it for its whole refresh.
+const ENTRIES_PER_TRANSACTION: usize = 100;
+
+/// How long a refresh pauses between batches of entries, so that work
+/// already waiting for the writer gets it: the writer's pool does not queue
+/// its waiters, and would otherwise hand the writer straight back to the
+/// refresh.
+const WRITER_HANDOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// Store a parsed Atom feed: its feed-level data, then each entry after
 /// it has been through the script chain.
 ///
@@ -46,11 +57,8 @@ impl StoredEntries {
 /// syndication format are re-stamped from the caller's own values before
 /// scripts or the database see them.
 ///
-/// Scripts run first, outside any transaction; everything is then written
-/// in a single `BEGIN IMMEDIATE` transaction, so a refresh takes the write
-/// lock once rather than once per entry, and waits for it (up to the busy
-/// timeout) instead of failing with "database is locked" when it would
-/// have to upgrade a read.
+/// Scripts run first, outside any transaction; the entries are then written
+/// by [`store_entries`].
 pub(super) fn process_atom_feed(
     feed_id: i64,
     site_url: Option<&str>,
@@ -77,35 +85,18 @@ pub(super) fn process_atom_feed(
         )
         .collect();
 
-    // Only now, with the scripts run, is the writer taken.
-    let stored = db.write_blocking(|conn| -> Result<StoredEntries> {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "UPDATE feeds SET syndication_format = 'atom' WHERE id = ?1",
-            [feed_id],
-        )?;
-        crate::db::favicons::set_site_url(&tx, feed_id, site_url)?;
-        upsert_atom_feed_data(&tx, feed_id, &feed_data)?;
-
-        let mut stored = StoredEntries::with_capacity(entries.len());
-        let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
-        for (feed_entry, ingest) in entries {
-            let (entry_id, is_new) = upsert_entry(&tx, feed_id, "atom", &feed_entry)?;
-            insert_atom_entry_data(&tx, entry_id, &ingest)?;
-            if is_new && feed_entry.cache_assets {
-                crate::db::pending_assets::add(&tx, entry_id)?;
-            }
-            if !feed_entry.tags.is_empty() {
-                sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
-            }
-            stored.push(entry_id, &feed_entry);
-            seen_guids.push(feed_entry.guid);
-        }
-
-        mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
-        tx.commit()?;
-        Ok(stored)
-    })??;
+    let stored = store_entries(
+        db,
+        feed_id,
+        "atom",
+        parsed_count,
+        entries,
+        |tx| {
+            crate::db::favicons::set_site_url(tx, feed_id, site_url)?;
+            upsert_atom_feed_data(tx, feed_id, &feed_data)
+        },
+        |tx, entry_id, data, _| insert_atom_entry_data(tx, entry_id, data),
+    )?;
     for _ in &stored.ids {
         metrics.record_feed_entry_upserted("atom");
     }
@@ -117,8 +108,8 @@ pub(super) fn process_atom_feed(
 ///
 /// Returns the entries that were written. As with
 /// [`process_atom_feed`], `feed_id` and the syndication format are
-/// re-stamped on every entry rather than trusted, and everything is
-/// written in one immediate transaction once the scripts have run.
+/// re-stamped on every entry rather than trusted, and the entries are
+/// written by [`store_entries`] once the scripts have run.
 pub(super) fn process_rss_feed(
     feed_id: i64,
     site_url: Option<&str>,
@@ -144,36 +135,85 @@ pub(super) fn process_rss_feed(
         )
         .collect();
 
-    // Only now, with the scripts run, is the writer taken.
-    let stored = db.write_blocking(|conn| -> Result<StoredEntries> {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "UPDATE feeds SET syndication_format = 'rss' WHERE id = ?1",
-            [feed_id],
-        )?;
-        crate::db::favicons::set_site_url(&tx, feed_id, site_url)?;
-
-        let mut stored = StoredEntries::with_capacity(entries.len());
-        let mut seen_guids: Vec<String> = Vec::with_capacity(entries.len());
-        for (feed_entry, ingest) in entries {
-            let (entry_id, is_new) = upsert_entry(&tx, feed_id, "rss", &feed_entry)?;
-            insert_rss_entry_data(&tx, entry_id, &ingest, feed_entry.content.as_deref())?;
-            if is_new && feed_entry.cache_assets {
-                crate::db::pending_assets::add(&tx, entry_id)?;
-            }
-            if !feed_entry.tags.is_empty() {
-                sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
-            }
-            stored.push(entry_id, &feed_entry);
-            seen_guids.push(feed_entry.guid);
-        }
-
-        mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
-        tx.commit()?;
-        Ok(stored)
-    })??;
+    let stored = store_entries(
+        db,
+        feed_id,
+        "rss",
+        parsed_count,
+        entries,
+        |tx| crate::db::favicons::set_site_url(tx, feed_id, site_url),
+        |tx, entry_id, data, entry| {
+            insert_rss_entry_data(tx, entry_id, data, entry.content.as_deref())
+        },
+    )?;
     for _ in &stored.ids {
         metrics.record_feed_entry_upserted("rss");
+    }
+    Ok(stored)
+}
+
+/// Write a refreshed feed's `entries`, each with its format-specific data,
+/// and then mark the feed's stored entries that it no longer lists as
+/// dropped.
+///
+/// The entries are written in batches of [`ENTRIES_PER_TRANSACTION`], each
+/// in a `BEGIN IMMEDIATE` transaction of its own, which takes the write lock
+/// up front and waits for it (up to the busy timeout) instead of failing
+/// with "database is locked" when it would have to upgrade a read. The
+/// first batch also records the feed's syndication format and runs
+/// `feed_data` for the rest of its feed-level data; the last also marks
+/// dropped entries, once every entry the feed lists has been stored. A feed
+/// with no entries is one batch.
+///
+/// If a batch fails, the batches before it stay written: each entry is
+/// stored whole or not at all, and the next refresh stores the rest. No
+/// entries are marked dropped by a refresh that fails.
+fn store_entries<D>(
+    db: &Db,
+    feed_id: i64,
+    format: &'static str,
+    parsed_count: usize,
+    entries: Vec<(FeedEntry, D)>,
+    feed_data: impl FnOnce(&rusqlite::Transaction) -> Result<()>,
+    entry_data: impl Fn(&rusqlite::Transaction, i64, &D, &FeedEntry) -> Result<()>,
+) -> Result<StoredEntries> {
+    let seen_guids: Vec<String> = entries.iter().map(|(e, _)| e.guid.clone()).collect();
+    let batches = entries.len().div_ceil(ENTRIES_PER_TRANSACTION).max(1);
+    let mut stored = StoredEntries::with_capacity(entries.len());
+    let mut feed_data = Some(feed_data);
+    let mut entries = entries.into_iter();
+
+    for batch in 0..batches {
+        if batch > 0 {
+            std::thread::sleep(WRITER_HANDOFF);
+        }
+        let last = batch + 1 == batches;
+        db.write_blocking(|conn| -> Result<()> {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(feed_data) = feed_data.take() {
+                tx.execute(
+                    "UPDATE feeds SET syndication_format = ?2 WHERE id = ?1",
+                    rusqlite::params![feed_id, format],
+                )?;
+                feed_data(&tx)?;
+            }
+            for (feed_entry, data) in entries.by_ref().take(ENTRIES_PER_TRANSACTION) {
+                let (entry_id, is_new) = upsert_entry(&tx, feed_id, format, &feed_entry)?;
+                entry_data(&tx, entry_id, &data, &feed_entry)?;
+                if is_new && feed_entry.cache_assets {
+                    crate::db::pending_assets::add(&tx, entry_id)?;
+                }
+                if !feed_entry.tags.is_empty() {
+                    sync_entry_tags(&tx, entry_id, &feed_entry.tags, is_new)?;
+                }
+                stored.push(entry_id, &feed_entry);
+            }
+            if last {
+                mark_dropped_entries(&tx, feed_id, parsed_count, &seen_guids)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })??;
     }
     Ok(stored)
 }
