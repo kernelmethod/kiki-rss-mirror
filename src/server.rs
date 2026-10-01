@@ -287,6 +287,10 @@ impl Server {
         // in this server instance writes samples into the returned `Metrics`
         // value, which is rendered by the `/metrics` handler.
         let metrics = Arc::new(crate::metrics::Metrics::new()?);
+        tokio::spawn(crate::metrics::run_upkeep(
+            metrics.clone(),
+            self.cancel_token.clone(),
+        ));
 
         // One writer connection and a pool of readers, shared by all of the
         // threads that we spawn.
