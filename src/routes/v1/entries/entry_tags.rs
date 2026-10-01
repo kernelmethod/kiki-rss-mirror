@@ -166,10 +166,12 @@ pub async fn set_entry_tags(
                 }
             }
 
-            // Delete existing user tag associations
+            // Delete existing user tag associations. Each of the entry's tags
+            // is checked by primary key, rather than through a list of every
+            // user tag, which would mean scanning the whole tags table.
             tx.prepare(
                 "DELETE FROM entry_tags WHERE entry_id = ?1
-             AND tag_id IN (SELECT id FROM tags WHERE kind = 'user')",
+             AND EXISTS (SELECT 1 FROM tags t WHERE t.id = entry_tags.tag_id AND t.kind = 'user')",
             )
             .inspect_err(|e| {
                 event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);

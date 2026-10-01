@@ -6,7 +6,8 @@ use crate::scripting::{FeedEntry, ScriptRunner};
 use crate::tasks::command::TaskManagerCommand;
 use crate::tasks::parsing::{insert_atom_entry_data, insert_rss_entry_data, upsert_atom_feed_data};
 use anyhow::Result;
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use std::collections::BTreeSet;
 use std::time::Instant;
 use tracing::{debug, warn};
 
@@ -353,84 +354,75 @@ pub(super) fn enqueue_favicon_caching(
 ///
 /// If `tags` holds only system tags, the entry's user tags are left alone,
 /// so that a script that only hides entries does not also untag them.
-/// Otherwise, for each other (user) tag name in `tags`:
-/// - ensures the tag row exists in `tags` (`INSERT OR IGNORE`)
-/// - looks up its `id`
+/// Otherwise the entry's user tags are made to match the other (user) tag
+/// names in `tags`: user tags not among them are removed, and those missing
+/// are added, creating the tag first if it does not exist.
 ///
-/// Then removes any user-tag `entry_tags` rows for this entry whose `tag_id` is
-/// not in the script-provided set, and inserts new associations (`INSERT OR
-/// IGNORE`).
+/// This runs for every tagged entry in a feed on every refresh, and usually
+/// finds the tags already in place, so it reads the entry's current user
+/// tags first and writes only the difference. An entry whose tags are
+/// unchanged costs one indexed read and no writes.
 fn sync_entry_tags(conn: &Connection, entry_id: i64, tags: &[String], is_new: bool) -> Result<()> {
-    let has_user_tags = tags.iter().any(|name| !is_reserved_tag_name(name));
-
-    // Upsert each tag and collect its id.
-    let mut tag_ids: Vec<i64> = Vec::with_capacity(tags.len());
+    let mut wanted: BTreeSet<&str> = BTreeSet::new();
     for name in tags {
-        if is_reserved_tag_name(name) {
-            match SystemTag::ALL.into_iter().find(|tag| tag.name() == name) {
-                Some(tag) if is_new => {
-                    conn.execute(
-                        "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
-                        rusqlite::params![entry_id, tag.id(conn)?],
-                    )?;
-                }
-                Some(_) => {}
-                None => warn!(
-                    "ignoring tag {:?} set by a script on entry {}: it is not a system tag, and names starting with \"system:\" are reserved for system tags",
-                    name, entry_id
-                ),
-            }
+        if !is_reserved_tag_name(name) {
+            wanted.insert(name);
             continue;
         }
-        conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [name])?;
-        let id: i64 = conn.query_row(
-            "SELECT id FROM tags WHERE name = ?1",
-            [name.as_str()],
-            |row| row.get(0),
-        )?;
-        tag_ids.push(id);
+        match SystemTag::ALL.into_iter().find(|tag| tag.name() == name) {
+            Some(tag) if is_new => {
+                conn.prepare_cached(
+                    "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+                )?
+                .execute(rusqlite::params![entry_id, tag.id(conn)?])?;
+            }
+            Some(_) => {}
+            None => warn!(
+                "ignoring tag {:?} set by a script on entry {}: it is not a system tag, and names starting with \"system:\" are reserved for system tags",
+                name, entry_id
+            ),
+        }
     }
 
-    if !has_user_tags {
+    if wanted.is_empty() {
         return Ok(());
     }
 
-    // Remove stale user-tag entry_tags rows (those not in the script-provided
-    // set).
-    const USER_TAGS: &str = "tag_id IN (SELECT id FROM tags WHERE kind = 'user')";
-    if tag_ids.is_empty() {
-        conn.execute(
-            &format!("DELETE FROM entry_tags WHERE entry_id = ?1 AND {USER_TAGS}"),
-            [entry_id],
-        )?;
-    } else {
-        let placeholders = tag_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "DELETE FROM entry_tags WHERE entry_id = ?1 AND {USER_TAGS} \
-             AND tag_id NOT IN ({placeholders})"
-        );
-        let params: Vec<rusqlite::types::Value> =
-            std::iter::once(rusqlite::types::Value::Integer(entry_id))
-                .chain(
-                    tag_ids
-                        .iter()
-                        .map(|&id| rusqlite::types::Value::Integer(id)),
-                )
-                .collect();
-        conn.execute(&sql, rusqlite::params_from_iter(params))?;
+    // The entry's current user tags. Both tables are reached through an
+    // index, so this reads only the entry's own tags, however many tags
+    // there are in all.
+    let current = conn
+        .prepare_cached(
+            "SELECT t.id, t.name FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+             WHERE et.entry_id = ?1 AND t.kind = 'user'",
+        )?
+        .query_map([entry_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Remove the user tags the script no longer sets; whatever is left in
+    // `wanted` afterwards is missing from the entry.
+    for (tag_id, name) in current {
+        if !wanted.remove(name.as_str()) {
+            conn.prepare_cached("DELETE FROM entry_tags WHERE entry_id = ?1 AND tag_id = ?2")?
+                .execute([entry_id, tag_id])?;
+        }
     }
 
-    // Insert new tag associations.
-    for tag_id in tag_ids {
-        conn.execute(
-            "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
-            rusqlite::params![entry_id, tag_id],
-        )?;
+    for name in wanted {
+        let existing: Option<i64> = conn
+            .prepare_cached("SELECT id FROM tags WHERE name = ?1")?
+            .query_row([name], |row| row.get(0))
+            .optional()?;
+        let tag_id = match existing {
+            Some(id) => id,
+            None => conn
+                .prepare_cached("INSERT INTO tags (name) VALUES (?1) RETURNING id")?
+                .query_row([name], |row| row.get(0))?,
+        };
+        conn.prepare_cached("INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)")?
+            .execute([entry_id, tag_id])?;
     }
 
     Ok(())
@@ -528,6 +520,77 @@ mod tests {
 
         sync_entry_tags(&conn, entry_id, &["system:hidden".into()], true)?;
         assert_eq!(entry_tag_names(&conn, entry_id)?, ["a", "system:hidden"]);
+
+        Ok(())
+    }
+
+    /// A refresh that finds the entry's tags already in place writes
+    /// nothing; one that changes them writes only the difference, reusing
+    /// tags that already exist.
+    #[test]
+    fn sync_entry_tags_writes_only_changes() -> Result<()> {
+        let conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute(
+            "INSERT INTO entries (syndication_format, guid, published_at, title, url)
+             VALUES ('rss', 'g', 0, 't', 'u')",
+            [],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO tags (name) VALUES ('c')", [])?;
+        let c_id = conn.last_insert_rowid();
+
+        sync_entry_tags(&conn, entry_id, &["a".into(), "b".into(), "a".into()], true)?;
+        assert_eq!(entry_tag_names(&conn, entry_id)?, ["a", "b"]);
+
+        let before = conn.total_changes();
+        sync_entry_tags(&conn, entry_id, &["b".into(), "a".into()], false)?;
+        assert_eq!(conn.total_changes(), before);
+
+        // Drop `a`, keep `b`, add the existing tag `c`: one delete and one
+        // insert, and no new tag.
+        let before = conn.total_changes();
+        sync_entry_tags(&conn, entry_id, &["b".into(), "c".into()], false)?;
+        assert_eq!(conn.total_changes(), before + 2);
+        assert_eq!(entry_tag_names(&conn, entry_id)?, ["b", "c"]);
+        let c_ids: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tags WHERE name = 'c' AND id = ?1",
+            [c_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(c_ids, 1);
+
+        Ok(())
+    }
+
+    /// Syncing an entry's tags reads only that entry's tags, never the
+    /// whole tags table, however many tags there are.
+    #[test]
+    fn sync_entry_tags_does_not_scan_tags() -> Result<()> {
+        let conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute(
+            "INSERT INTO entries (syndication_format, guid, published_at, title, url)
+             VALUES ('rss', 'g', 0, 't', 'u')",
+            [],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+        for i in 0..100 {
+            conn.execute("INSERT INTO tags (name) VALUES (?1)", [format!("t{i}")])?;
+        }
+        let metrics = std::sync::Arc::new(crate::metrics::Metrics::new()?);
+        crate::db::profile::install(&conn, metrics.clone())?;
+
+        sync_entry_tags(&conn, entry_id, &["a".into(), "t1".into()], true)?;
+        sync_entry_tags(&conn, entry_id, &["a".into(), "t1".into()], false)?;
+        sync_entry_tags(&conn, entry_id, &["b".into()], false)?;
+        assert_eq!(entry_tag_names(&conn, entry_id)?, ["b"]);
+
+        let fullscan_steps: f64 = metrics
+            .render()
+            .lines()
+            .filter(|l| l.starts_with("kiki_db_statement_fullscan_steps_total{"))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum();
+        assert_eq!(fullscan_steps, 0.0);
 
         Ok(())
     }
