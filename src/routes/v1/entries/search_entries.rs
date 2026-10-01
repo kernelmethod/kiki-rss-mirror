@@ -228,11 +228,46 @@ fn tag_filter_to_sql(
                 Ok((sql, current_idx))
             }
             TagExpr::Not(inner) => {
+                // Leaving out the entries with any of a list of tags, as the
+                // web UI does with read and hidden entries on every page, is
+                // a correlated `NOT EXISTS`, one index lookup per entry
+                // looked at. `NOT (e.id IN (SELECT ...))` would collect the
+                // ID of every entry with the tags on each query first, which
+                // costs as much for a page of 25 entries as for a full count.
+                if let Some(names) = tag_names(inner) {
+                    let placeholders: Vec<String> = (idx..idx + names.len())
+                        .map(|i| format!("?{}", i))
+                        .collect();
+                    let sql = format!(
+                        "NOT EXISTS (SELECT 1 FROM entry_tags et \
+                         JOIN tags t ON et.tag_id = t.id \
+                         WHERE et.entry_id = e.id AND t.name IN ({}))",
+                        placeholders.join(", ")
+                    );
+                    let next_idx = idx + names.len();
+                    params.extend(names.into_iter().map(SqlParam::from_string));
+                    return Ok((sql, next_idx));
+                }
                 let (cond, next_idx) = build_tag_condition(inner, params, idx)?;
                 let sql = format!("NOT ({})", cond);
                 Ok((sql, next_idx))
             }
         },
+    }
+}
+
+/// The names in `filter` if it is a single tag or an OR of tags, which an
+/// entry matches by having any one of them; `None` for anything else,
+/// including an empty OR.
+fn tag_names(filter: &TagFilter) -> Option<Vec<String>> {
+    match filter {
+        TagFilter::Single(name) => Some(vec![name.clone()]),
+        TagFilter::Expr(TagExpr::Or(filters)) if !filters.is_empty() => {
+            let mut names = Vec::new();
+            collect_or_leaves(filters, &mut names).ok()?;
+            Some(names)
+        }
+        TagFilter::Expr(_) => None,
     }
 }
 
