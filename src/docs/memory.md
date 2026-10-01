@@ -13,8 +13,9 @@ processes while it fetched about 45 feeds for a single reader.
 * **The allocator decides most of the footprint.** mimalloc in secure mode,
   the allocator until now, kept about four times as much memory as musl's
   malloc across Kiki's processes, with no measurable difference in
-  throughput or latency. The static musl build now uses musl's malloc (see
-  `src/main.rs`).
+  throughput or latency. Kiki no longer uses mimalloc: the static musl
+  build uses musl's malloc, and glibc builds use glibc's with its arenas
+  capped at two (see `src/main.rs`).
 * **Histogram samples piled up between scrapes.** The Prometheus recorder
   is built with `build_recorder`, which starts no upkeep task, so every
   sample recorded between `/metrics` renders was kept: about 1.5 MiB/s
@@ -54,6 +55,9 @@ brought it back to about 70 MiB. With scrapes every 15 seconds it held at
 100–118 MiB under the same load.
 
 ## Allocator benchmarks
+
+The glibc numbers were taken with `MALLOC_ARENA_MAX` set in the
+environment, before `src/main.rs` set it itself; the two are equivalent.
 
 Each run started a fresh Kiki home with 50 feeds from `tools/stress` in web
 mode (`MODE=web`), scraped `/metrics` every 30 seconds as nixdev's
@@ -102,7 +106,8 @@ The tuned variants were:
 
 musl's malloc was chosen as the smallest and the simplest: it needs no
 dependency and no tuning, and returns freed memory to the OS as it goes,
-which also makes [`crate::memory`] unnecessary on musl. What it gives up is
+so Kiki's runtimes no longer need to hand memory back to mimalloc as their
+threads park, as they did before. What it gives up is
 mimalloc's secure mode (guard pages, encrypted free lists, randomized
 allocation); musl's malloc keeps its metadata out of band and checks it,
 which is some, but less, protection against heap corruption.
@@ -110,8 +115,8 @@ which is some, but less, protection against heap corruption.
 ### The glibc build
 
 The glibc builds (the default and `profiling` flake outputs, and the deb
-and rpm packages) still use mimalloc in secure mode. For reference, the same
-harness with one client, on glibc builds:
+and rpm packages) use glibc's malloc, with `M_ARENA_MAX` set to 2 at
+startup. The same harness with one client, on glibc builds:
 
 | Allocator | 1 client | req/s |
 |---|---|---|
@@ -124,7 +129,9 @@ harness with one client, on glibc builds:
 
 In the background runs, mimalloc's secure mode held 131 MiB and glibc's
 malloc with `MALLOC_ARENA_MAX=2` held 53 MiB. A zero purge delay for
-mimalloc cost a fifth of the throughput, so it was ruled out.
+mimalloc cost a fifth of the throughput, so it was ruled out. Two arenas
+rather than one keeps two threads from contending for one lock, for the
+few MiB the second costs.
 
 ## Other findings
 
@@ -169,10 +176,8 @@ Scrape `/metrics` during the run
 deployment's Prometheus would, or the histogram buffer will be part of what
 you measure. Unset `RUST_BACKTRACE`, for the reason above.
 
-For a heap profile, build with the system allocator (remove the
-`#[global_allocator]` in `src/main.rs`, or build for musl), start the
-server under `heaptrack`, and pass `--no-sandbox` so that heaptrack can
-write its output:
+For a heap profile of a glibc build, start the server under `heaptrack`,
+and pass `--no-sandbox` so that heaptrack can write its output:
 
 ```bash
 heaptrack -o /tmp/serve target/profiling/kiki serve --no-sandbox

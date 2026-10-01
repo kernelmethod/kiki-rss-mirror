@@ -2,23 +2,18 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use kiki_rss::cli;
 
-// On glibc, mimalloc: it returns freed memory to the OS, unlike glibc under
-// tokio's thread pool, whose per-thread arenas grow and rarely shrink —
-// though only when a thread calls into it again, which is why kiki's
-// runtimes collect as their threads park (see kiki_rss::memory). Its
-// secure mode (guard pages, encrypted free lists, randomized allocation)
-// hardens the heap against the untrusted feeds and plugins kiki parses and
-// runs.
-//
-// The static musl build keeps musl's own malloc. It holds a quarter of the
-// memory mimalloc does across Kiki's processes (about 30 MiB rather than
-// 120 MiB while fetching feeds in the background), since it hands freed
-// memory straight back to the OS, and under load from `tools/stress` its
-// global lock cost no measurable throughput or latency. It also keeps its
-// metadata out of band and checks it, short of mimalloc's secure mode.
-#[cfg(not(target_env = "musl"))]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+/// The most malloc arenas glibc may create.
+///
+/// Kiki uses the C library's malloc. musl's, in the static build, hands
+/// freed memory straight back to the OS. glibc's gives each thread that
+/// contends for the heap an arena of its own, up to eight per core, and
+/// rarely shrinks them; with tokio's blocking pool running every database
+/// call, the server collects dozens. Under load from `tools/stress`,
+/// capping them at two cut the memory across Kiki's processes by a third
+/// (from 133 to 86 MiB), and at one by little more, with no measurable
+/// cost in throughput. See `kiki_rss::docs::memory` for the measurements.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const MALLOC_ARENA_MAX: libc::c_int = 2;
 
 #[derive(Parser)]
 #[command(about, long_about = None)]
@@ -106,6 +101,14 @@ impl Commands {
 }
 
 pub fn main() -> Result<()> {
+    // Before any other thread starts, so that none gets an arena of its own.
+    // SAFETY: mallopt takes no pointers; it only changes glibc's malloc
+    // parameters, and no other thread is allocating yet.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, MALLOC_ARENA_MAX);
+    }
+
     // Ensure files created by kiki are not accessible to other users.
     // SAFETY: umask is always safe to call and has no failure modes.
     #[cfg(unix)]

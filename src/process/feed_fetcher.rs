@@ -1035,10 +1035,7 @@ fn worker_main(stream: UnixStream, supervisor_pid: u32) -> i32 {
         }
     }
 
-    // Each refresh sends the worker a burst of fetches whose bodies and
-    // parsed feeds are all freed once the replies are sent.
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    let runtime = match crate::memory::release_on_park(&mut builder)
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("fetcher-worker")
         .build()

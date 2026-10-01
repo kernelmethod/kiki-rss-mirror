@@ -169,8 +169,7 @@ impl WebArgs {
 
         self.apply_sandbox()?;
 
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        crate::memory::release_on_park(&mut builder)
+        tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
             .enable_all()
             .build()?

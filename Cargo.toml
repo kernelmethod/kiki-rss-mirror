@@ -74,12 +74,6 @@ base64 = "0.22"
 tar = { version = "0.4", default-features = false, optional = true }
 zstd = { version = "0.14", default-features = false, optional = true }
 
-# The global allocator, except on musl, which uses its own; see src/main.rs.
-[target.'cfg(not(target_env = "musl"))'.dependencies]
-mimalloc = { version = "0.1", features = ["secure"] }
-# For `mi_collect`; see src/memory.rs. Must match the version mimalloc uses.
-libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
-
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 seccompiler = "0.5"

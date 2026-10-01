@@ -262,14 +262,13 @@ impl Server {
     /// Run the server synchronously, creating a Tokio runtime and installing
     /// signal handlers. This is the entry point used by the CLI.
     pub fn run(self) -> Result<()> {
-        let mut builder = if self.single_threaded {
+        let rt = if self.single_threaded {
             tokio::runtime::Builder::new_current_thread()
         } else {
             tokio::runtime::Builder::new_multi_thread()
-        };
-        let rt = crate::memory::release_on_park(&mut builder)
-            .enable_all()
-            .build()?;
+        }
+        .enable_all()
+        .build()?;
         let cancel = self.cancel_token.clone();
         rt.block_on(async {
             tokio::spawn(shutdown_signal(cancel));
