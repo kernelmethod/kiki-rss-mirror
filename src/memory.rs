@@ -1,7 +1,9 @@
 //! Returning memory to the OS once threads go idle.
 //!
-//! Kiki's binary uses mimalloc as its global allocator (see `src/main.rs`).
-//! mimalloc gives every thread a heap of its own, and a page freed in it —
+//! Kiki's binary uses mimalloc as its global allocator (see `src/main.rs`),
+//! except in the static musl build, where musl's malloc returns freed
+//! memory to the OS by itself and everything here is a no-op. mimalloc
+//! gives every thread a heap of its own, and a page freed in it —
 //! including by *another* thread, as happens whenever a tokio task moves
 //! between workers — only leaves that heap when the owning thread next
 //! calls into the allocator. Even then, freed memory stays committed until
@@ -15,7 +17,9 @@
 //! empty pages back as it parks, and a background thread purges them — for
 //! the whole process — a few seconds later.
 
+#[cfg(not(target_env = "musl"))]
 use std::sync::Once;
+#[cfg(not(target_env = "musl"))]
 use std::time::Duration;
 
 /// How often the background thread purges freed memory.
@@ -23,6 +27,7 @@ use std::time::Duration;
 /// Well past mimalloc's purge delay, so memory freed in a burst is
 /// returned within this long of the process going idle, while waking an
 /// otherwise idle process only rarely.
+#[cfg(not(target_env = "musl"))]
 const PURGE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Hand the calling thread's empty pages back to mimalloc's shared arenas.
@@ -34,7 +39,8 @@ const PURGE_INTERVAL: Duration = Duration::from_secs(5);
 ///
 /// It is harmless when mimalloc is not the global allocator, as in the
 /// library's tests: mimalloc's heaps are then empty, and there is nothing
-/// to collect.
+/// to collect. On musl, where mimalloc is not linked at all, it does
+/// nothing.
 ///
 /// # Examples
 ///
@@ -43,10 +49,13 @@ const PURGE_INTERVAL: Duration = Duration::from_secs(5);
 /// kiki_rss::memory::release_thread_memory();
 /// ```
 pub fn release_thread_memory() {
+    #[cfg(not(target_env = "musl"))]
     // SAFETY: `mi_collect` takes no pointers and may be called from any
     // thread at any time; it only operates on the calling thread's heap
     // and mimalloc's own, internally synchronized, arenas.
-    unsafe { libmimalloc_sys::mi_collect(false) };
+    unsafe {
+        libmimalloc_sys::mi_collect(false)
+    };
 }
 
 /// Start, once per process, a thread that returns memory freed by any
@@ -58,6 +67,7 @@ pub fn release_thread_memory() {
 /// expensive forced collection (around 100µs, against a few for
 /// [`release_thread_memory`]) off the runtime's threads, and makes sure it
 /// happens even if nothing else in the process runs again.
+#[cfg(not(target_env = "musl"))]
 fn start_purger() {
     static PURGER: Once = Once::new();
     PURGER.call_once(|| {
@@ -79,7 +89,8 @@ fn start_purger() {
 /// Each of the runtime's worker threads calls [`release_thread_memory`] as
 /// it parks, and a background thread, started with the first runtime
 /// configured this way, purges what they released. Use this for any
-/// long-lived runtime whose workers allocate in bursts.
+/// long-lived runtime whose workers allocate in bursts. On musl it leaves
+/// the builder as it is.
 ///
 /// # Examples
 ///
@@ -92,6 +103,11 @@ fn start_purger() {
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub fn release_on_park(builder: &mut tokio::runtime::Builder) -> &mut tokio::runtime::Builder {
-    start_purger();
-    builder.on_thread_park(release_thread_memory)
+    #[cfg(not(target_env = "musl"))]
+    {
+        start_purger();
+        builder.on_thread_park(release_thread_memory)
+    }
+    #[cfg(target_env = "musl")]
+    builder
 }

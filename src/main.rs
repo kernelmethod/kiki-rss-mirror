@@ -2,13 +2,21 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use kiki_rss::cli;
 
-// mimalloc returns freed memory to the OS, unlike glibc under tokio's
-// thread pool, whose per-thread arenas grow and rarely shrink — though
-// only when a thread calls into it again, which is why kiki's runtimes
-// collect as their threads park (see kiki_rss::memory). It
-// also avoids musl's malloc, which is slow under contention. Its secure
-// mode (guard pages, encrypted free lists, randomized allocation) hardens
-// the heap against the untrusted feeds and plugins kiki parses and runs.
+// On glibc, mimalloc: it returns freed memory to the OS, unlike glibc under
+// tokio's thread pool, whose per-thread arenas grow and rarely shrink —
+// though only when a thread calls into it again, which is why kiki's
+// runtimes collect as their threads park (see kiki_rss::memory). Its
+// secure mode (guard pages, encrypted free lists, randomized allocation)
+// hardens the heap against the untrusted feeds and plugins kiki parses and
+// runs.
+//
+// The static musl build keeps musl's own malloc. It holds a quarter of the
+// memory mimalloc does across Kiki's processes (about 30 MiB rather than
+// 120 MiB while fetching feeds in the background), since it hands freed
+// memory straight back to the OS, and under load from `tools/stress` its
+// global lock cost no measurable throughput or latency. It also keeps its
+// metadata out of band and checks it, short of mimalloc's secure mode.
+#[cfg(not(target_env = "musl"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

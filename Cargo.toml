@@ -37,10 +37,6 @@ blake3 = "1"
 chrono = "0.4"
 dirs = "6"
 lol_html = "2"
-# The global allocator; see src/main.rs.
-mimalloc = { version = "0.1", features = ["secure"] }
-# For `mi_collect`; see src/memory.rs. Must match the version mimalloc uses.
-libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
 url = "2"
 clap = { version = "4.5", features = ["cargo", "derive"], optional = true }
 quick-xml = { version = "0.37", features = ["serialize", "escape-html"] }
@@ -77,6 +73,12 @@ base64 = "0.22"
 [build-dependencies]
 tar = { version = "0.4", default-features = false, optional = true }
 zstd = { version = "0.14", default-features = false, optional = true }
+
+# The global allocator, except on musl, which uses its own; see src/main.rs.
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+mimalloc = { version = "0.1", features = ["secure"] }
+# For `mi_collect`; see src/memory.rs. Must match the version mimalloc uses.
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
