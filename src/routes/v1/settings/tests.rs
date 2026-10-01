@@ -317,3 +317,46 @@ async fn lowering_max_backoff_brings_scheduled_fetches_forward() -> Result<()> {
 
     Ok(())
 }
+
+/// `adaptive_fetch` is on by default, and turning it off brings in the
+/// fetches it had put off for feeds without a setting of their own.
+#[tokio::test]
+async fn adaptive_fetch_setting_unwinds_feeds_that_follow_it() -> Result<()> {
+    let tc = TestBuilder::all().build()?;
+    let client = tc.client()?;
+
+    let resp = client
+        .get("http://localhost/v1/settings/feed-fetch")
+        .send()
+        .await?;
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["adaptive_fetch"], true);
+
+    // Both are due in the future, so the scheduler leaves them alone.
+    let last_checked = chrono::Utc::now().timestamp() - 10;
+    let next = last_checked + 3000;
+    let conn = tc.database_conn()?;
+    conn.execute(
+        "INSERT INTO feeds (id, title, url, adaptive_fetch, adaptive_fetch_level,
+                            last_checked, next_fetch_at)
+         VALUES (1, 'follows', 'http://a/', NULL, 5, ?1, ?2),
+                (2, 'own setting', 'http://b/', 1, 5, ?1, ?2)",
+        [last_checked, next],
+    )?;
+
+    let resp = client
+        .put("http://localhost/v1/settings/feed-fetch")
+        .json(&serde_json::json!({"adaptive_fetch": false}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await?;
+    assert_eq!(body["adaptive_fetch"], false);
+
+    let rows: Vec<(i64, i64, i64)> = conn
+        .prepare("SELECT id, adaptive_fetch_level, next_fetch_at FROM feeds ORDER BY id")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(rows, [(1, 0, last_checked + 60), (2, 5, next)]);
+    Ok(())
+}

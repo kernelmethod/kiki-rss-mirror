@@ -44,8 +44,10 @@ async fn setup(
     tc.init_feed_server_with_state(state.clone()).await?;
 
     let conn = tc.database_conn()?;
+    // Adaptive fetching would stretch hints after a 304; these tests are
+    // about the hints themselves (see adaptive_tests for the stretching).
     conn.execute(
-        "INSERT INTO feeds (title, url) VALUES ('feed hints test', ?1)",
+        "INSERT INTO feeds (title, url, adaptive_fetch) VALUES ('feed hints test', ?1, 0)",
         [tc.rss_feed_url()],
     )?;
     let feed_id = conn.last_insert_rowid();

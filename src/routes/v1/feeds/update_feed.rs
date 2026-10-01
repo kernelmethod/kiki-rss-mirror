@@ -10,6 +10,61 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{event, Level};
 
+/// Whether a feed is fetched adaptively: backed off from while a short
+/// freshness hint keeps turning out to be unchanged.
+///
+/// Stored in the `feeds.adaptive_fetch` column, where `NULL` is
+/// [`AdaptiveFetch::Default`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AdaptiveFetch {
+    /// Follow the server's `feed_fetch.adaptive_fetch` setting.
+    #[default]
+    Default,
+    /// Fetch this feed adaptively whatever the server setting.
+    Enabled,
+    /// Never fetch this feed adaptively.
+    Disabled,
+}
+
+impl AdaptiveFetch {
+    /// Decode the `feeds.adaptive_fetch` column.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::routes::v1::feeds::update_feed::AdaptiveFetch;
+    ///
+    /// assert_eq!(AdaptiveFetch::from_db(None), AdaptiveFetch::Default);
+    /// assert_eq!(AdaptiveFetch::from_db(Some(false)), AdaptiveFetch::Disabled);
+    /// ```
+    pub fn from_db(value: Option<bool>) -> Self {
+        match value {
+            None => AdaptiveFetch::Default,
+            Some(true) => AdaptiveFetch::Enabled,
+            Some(false) => AdaptiveFetch::Disabled,
+        }
+    }
+
+    /// Encode this value for the `feeds.adaptive_fetch` column.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::routes::v1::feeds::update_feed::AdaptiveFetch;
+    ///
+    /// assert_eq!(AdaptiveFetch::Enabled.as_db(), Some(true));
+    /// assert_eq!(AdaptiveFetch::Default.as_db(), None);
+    /// ```
+    pub fn as_db(self) -> Option<bool> {
+        match self {
+            AdaptiveFetch::Default => None,
+            AdaptiveFetch::Enabled => Some(true),
+            AdaptiveFetch::Disabled => Some(false),
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateFeedRequest {
     pub title: Option<String>,
@@ -29,6 +84,11 @@ pub struct UpdateFeedRequest {
     /// Token for HTTP Bearer auth. Omitted fields are left unchanged. When `auth_type`
     /// is omitted, this may only be set if the feed already uses `"bearer"`.
     pub auth_bearer_token: Option<String>,
+    /// Whether to back off from this feed while its short freshness hint
+    /// keeps turning out to be unchanged. `"default"` follows the server's
+    /// `feed_fetch.adaptive_fetch` setting.
+    #[serde(default)]
+    pub adaptive_fetch: Option<AdaptiveFetch>,
 }
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
@@ -40,6 +100,9 @@ pub struct UpdateFeedResponse {
     pub min_fetch_interval_seconds: i64,
     /// Current authentication scheme. Credentials are never returned.
     pub auth_type: FeedAuthType,
+    /// This feed's adaptive-fetch setting.
+    #[serde(default)]
+    pub adaptive_fetch: AdaptiveFetch,
 }
 
 #[derive(Error, Debug)]
@@ -84,12 +147,13 @@ struct FetchConfig {
         Option<String>,
     ),
     min_fetch_interval_seconds: i64,
+    adaptive_fetch: Option<bool>,
 }
 
 fn read_fetch_config(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<FetchConfig> {
     conn.query_row(
         "SELECT url, auth_type, auth_username, auth_password, auth_bearer_token,
-            min_fetch_interval_seconds
+            min_fetch_interval_seconds, adaptive_fetch
          FROM feeds WHERE id = ?1",
         [id],
         |row| {
@@ -97,6 +161,7 @@ fn read_fetch_config(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<F
                 url: row.get(0)?,
                 auth: (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
                 min_fetch_interval_seconds: row.get(5)?,
+                adaptive_fetch: row.get(6)?,
             })
         },
     )
@@ -106,25 +171,34 @@ fn read_fetch_config(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<F
 /// rather than after the fetch that was already scheduled.
 ///
 /// - A new URL or new credentials may well fix a feed that has been
-///   failing, so the feed is made due at once and its failure streak and
-///   `Retry-After` are forgotten.
+///   failing, so the feed is made due at once and its failure streak,
+///   `Retry-After` and adaptive-fetch level are forgotten.
 /// - A shorter interval pulls the next fetch in to one interval after the
 ///   last successful check. A feed backing off after errors keeps its
 ///   backoff, and a longer interval takes effect after the next fetch.
+/// - Turning adaptive fetching off forgets the feed's adaptive level and
+///   pulls a fetch it had put off in to `min_cadence` after the last
+///   successful check; the next fetch then schedules it as usual.
+///   `server_adaptive` is the server's `feed_fetch.adaptive_fetch`.
 fn reschedule_after_update(
     conn: &rusqlite::Connection,
     id: i64,
     before: &FetchConfig,
     after: &FetchConfig,
+    server_adaptive: bool,
+    min_cadence: i64,
 ) -> rusqlite::Result<()> {
     if before.url != after.url || before.auth != after.auth {
         conn.execute(
             "UPDATE feeds
-             SET next_fetch_at = NULL, consecutive_failures = 0, retry_after_at = NULL
+             SET next_fetch_at = NULL, consecutive_failures = 0, retry_after_at = NULL,
+                 adaptive_fetch_level = 0
              WHERE id = ?1",
             [id],
         )?;
-    } else if after.min_fetch_interval_seconds < before.min_fetch_interval_seconds {
+        return Ok(());
+    }
+    if after.min_fetch_interval_seconds < before.min_fetch_interval_seconds {
         // MIN() with a NULL `next_fetch_at` stays NULL, i.e. already due.
         conn.execute(
             "UPDATE feeds
@@ -133,7 +207,37 @@ fn reschedule_after_update(
             [id, after.min_fetch_interval_seconds],
         )?;
     }
+    let was_adaptive = before.adaptive_fetch.unwrap_or(server_adaptive);
+    let is_adaptive = after.adaptive_fetch.unwrap_or(server_adaptive);
+    if was_adaptive && !is_adaptive {
+        unwind_adaptive_fetch(conn, "id = ?2", [min_cadence, id])?;
+    }
     Ok(())
+}
+
+/// Undo adaptive fetching for the feeds matching `filter`, a SQL condition
+/// whose parameters follow `?1`, the minimum polling cadence: a fetch put
+/// off because of it is pulled in to `?1` seconds after the feed's last
+/// successful check, and its adaptive level is reset. A feed backing off
+/// after errors keeps its backoff.
+pub(crate) fn unwind_adaptive_fetch<P: rusqlite::Params>(
+    conn: &rusqlite::Connection,
+    filter: &str,
+    params: P,
+) -> rusqlite::Result<usize> {
+    // The level is only raised by successful fetches, so a feed with a
+    // failure streak was scheduled by its backoff, not by the level.
+    conn.execute(
+        &format!(
+            "UPDATE feeds
+             SET next_fetch_at = CASE WHEN consecutive_failures = 0
+                     THEN MIN(next_fetch_at, COALESCE(last_checked, 0) + ?1)
+                     ELSE next_fetch_at END,
+                 adaptive_fetch_level = 0
+             WHERE adaptive_fetch_level > 0 AND ({filter})"
+        ),
+        params,
+    )
 }
 
 /// Update a feed
@@ -161,6 +265,7 @@ pub async fn update_feed(
     Path(id): Path<i64>,
     Json(payload): Json<UpdateFeedRequest>,
 ) -> Result<Response, Response> {
+    let fetch_settings = state.config.current().feed_fetch.clone();
     let result = state
         .db
         .write(move |conn| {
@@ -201,6 +306,11 @@ pub async fn update_feed(
                 }
                 updates.push("min_fetch_interval_seconds = ?".to_string());
                 params.push(Box::new(min_fetch_interval_seconds));
+            }
+
+            if let Some(adaptive_fetch) = payload.adaptive_fetch {
+                updates.push("adaptive_fetch = ?".to_string());
+                params.push(Box::new(adaptive_fetch.as_db()));
             }
 
             // Authentication updates. When `auth_type` is provided we always
@@ -345,13 +455,21 @@ pub async fn update_feed(
                 }
             }
             let after = read_fetch_config(&tx, id)?;
-            reschedule_after_update(&tx, id, &before, &after)?;
+            reschedule_after_update(
+                &tx,
+                id,
+                &before,
+                &after,
+                fetch_settings.adaptive_fetch,
+                i64::try_from(fetch_settings.min_polling_cadence_seconds).unwrap_or(i64::MAX),
+            )?;
             tx.commit()?;
 
             // Retrieve the updated feed data
             let feed = conn
                 .prepare(
-                    "SELECT id, title, url, description, min_fetch_interval_seconds, auth_type
+                    "SELECT id, title, url, description, min_fetch_interval_seconds, auth_type,
+                    adaptive_fetch
                 FROM feeds WHERE id = ?1 LIMIT 1",
                 )
                 .inspect_err(|e| {
@@ -368,6 +486,7 @@ pub async fn update_feed(
                         description: row.get(3)?,
                         min_fetch_interval_seconds: row.get(4)?,
                         auth_type,
+                        adaptive_fetch: AdaptiveFetch::from_db(row.get(6)?),
                     })
                 })?;
 
@@ -1289,6 +1408,144 @@ mod test {
         assert_eq!(read_feed_row(&tc, id_a)?.title, "changed");
         assert_eq!(read_feed_row(&tc, id_b)?, before_b);
 
+        Ok(())
+    }
+
+    /// Reads a feed's adaptive-fetch columns and schedule.
+    fn read_adaptive(tc: &TestConfig, id: i64) -> Result<(Option<bool>, i64, Option<i64>)> {
+        Ok(tc.database_conn()?.query_row(
+            "SELECT adaptive_fetch, adaptive_fetch_level, next_fetch_at FROM feeds WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?)
+    }
+
+    /// Insert a feed last checked at `last_checked` and due at
+    /// `next_fetch_at`, at adaptive level 6, with `failures` failures in a
+    /// row. Inserted directly rather than through the API, which would
+    /// queue a refresh that could overwrite the schedule mid-test.
+    fn insert_backed_off_feed(
+        tc: &TestConfig,
+        last_checked: i64,
+        next_fetch_at: i64,
+        failures: i64,
+    ) -> Result<i64> {
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO feeds (title, url, last_checked, next_fetch_at,
+                adaptive_fetch_level, consecutive_failures)
+             VALUES ('feed', 'https://example.com/adaptive.xml', ?1, ?2, 6, ?3)",
+            [last_checked, next_fetch_at, failures],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// `adaptive_fetch` is set and reported per feed, and turning it off
+    /// pulls in a fetch it had put off and forgets the feed's level.
+    #[tokio::test]
+    async fn test_update_feed_adaptive_fetch() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        // Backed off to an hour after its last check, which is in the
+        // future, so the scheduler leaves it alone.
+        let now = chrono::Utc::now().timestamp();
+        let last_checked = now - 10;
+        let id = insert_backed_off_feed(&tc, last_checked, last_checked + 3600, 0)?;
+
+        let resp = client
+            .get(format!("http://localhost/v1/feeds/id/{id}"))
+            .send()
+            .await?;
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["adaptive_fetch"], "default");
+
+        // Turning it on for the feed changes nothing while the server has it on.
+        let resp = put_feed(
+            &client,
+            id,
+            &UpdateFeedRequest {
+                adaptive_fetch: Some(AdaptiveFetch::Enabled),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<UpdateFeedResponse>().await?;
+        assert_eq!(body.adaptive_fetch, AdaptiveFetch::Enabled);
+        assert_eq!(
+            read_adaptive(&tc, id)?,
+            (Some(true), 6, Some(last_checked + 3600))
+        );
+
+        // Turning it off brings the fetch in to the 60s polling floor.
+        let resp = put_feed(
+            &client,
+            id,
+            &UpdateFeedRequest {
+                adaptive_fetch: Some(AdaptiveFetch::Disabled),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.json::<UpdateFeedResponse>().await?;
+        assert_eq!(body.adaptive_fetch, AdaptiveFetch::Disabled);
+        assert_eq!(
+            read_adaptive(&tc, id)?,
+            (Some(false), 0, Some(last_checked + 60))
+        );
+
+        let resp = client
+            .get(format!("http://localhost/v1/feeds/id/{id}"))
+            .send()
+            .await?;
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["adaptive_fetch"], "disabled");
+
+        // Back to following the server.
+        let resp = put_feed(
+            &client,
+            id,
+            &UpdateFeedRequest {
+                adaptive_fetch: Some(AdaptiveFetch::Default),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let body = resp.json::<UpdateFeedResponse>().await?;
+        assert_eq!(body.adaptive_fetch, AdaptiveFetch::Default);
+        assert_eq!(read_adaptive(&tc, id)?, (None, 0, Some(last_checked + 60)));
+
+        // Unknown values are rejected.
+        let resp = client
+            .put(format!("http://localhost/v1/feeds/id/{id}"))
+            .json(&serde_json::json!({ "adaptive_fetch": "sometimes" }))
+            .send()
+            .await?;
+        assert!(resp.status().is_client_error());
+
+        Ok(())
+    }
+
+    /// A feed backing off after errors keeps its backoff when adaptive
+    /// fetching is turned off.
+    #[tokio::test]
+    async fn test_disabling_adaptive_fetch_keeps_error_backoff() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        let now = chrono::Utc::now().timestamp();
+        let id = insert_backed_off_feed(&tc, now - 10, now + 9000, 3)?;
+        let resp = put_feed(
+            &client,
+            id,
+            &UpdateFeedRequest {
+                adaptive_fetch: Some(AdaptiveFetch::Disabled),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(read_adaptive(&tc, id)?, (Some(false), 0, Some(now + 9000)));
         Ok(())
     }
 }
