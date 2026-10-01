@@ -37,6 +37,11 @@ struct Config {
     /// Extra arguments passed to `kiki serve`.
     extra_args: Vec<String>,
     stall_ms: u128,
+    /// Drive the web UI (`kiki web`) rather than the API (`kiki serve`).
+    web: bool,
+    /// Extra `filter` and `auto-tag` plugin rules (TOML) for web mode.
+    filter_toml: Option<PathBuf>,
+    autotag_toml: Option<PathBuf>,
 }
 
 impl Config {
@@ -55,6 +60,13 @@ impl Config {
                 .map(String::from)
                 .collect(),
             stall_ms: var("STALL_MS", "5000").parse()?,
+            web: match var("MODE", "api").as_str() {
+                "api" => false,
+                "web" => true,
+                m => bail!("MODE must be `api` or `web`, not {m:?}"),
+            },
+            filter_toml: std::env::var_os("FILTER_TOML").map(PathBuf::from),
+            autotag_toml: std::env::var_os("AUTOTAG_TOML").map(PathBuf::from),
         })
     }
 }
@@ -138,6 +150,7 @@ async fn start_feed_server(slow_every: u64) -> Result<String> {
     let app = Router::new()
         .route("/feed/{name}", get(feed))
         .route("/img/{name}", get(img))
+        .route("/favicon.ico", get(|| img(Path("favicon.png".into()))))
         .route("/post/{a}/{b}", get(|| async { "post" }))
         .with_state(FeedState {
             addr: addr.clone(),
@@ -181,7 +194,17 @@ struct Shared {
     tags: Mutex<Vec<(i64, String)>>,
     read_tag: AtomicU64,
     dumps: AtomicU64,
+    /// The process started: `kiki serve`, or `kiki web` in web mode.
     pid: u32,
+    /// In web mode, the `kiki serve` child of `kiki web`.
+    server_pid: Option<u32>,
+    /// In web mode, the web UI's base URL, e.g. `http://127.0.0.1:1234`.
+    web_base: String,
+    /// In web mode, the tags whose pages are browsed.
+    web_tags: Mutex<Vec<i64>>,
+    /// In web mode, the `ETag` of each asset fetched so far, as a browser
+    /// cache would keep it.
+    etags: Mutex<HashMap<String, String>>,
     out: PathBuf,
     feed_base: String,
     stall_ms: u128,
@@ -214,19 +237,22 @@ impl Shared {
             "STALL: {why}; dumping threads to {}",
             path.display()
         ));
-        let out = std::process::Command::new("gdb")
-            .args(["-p", &self.pid.to_string(), "-batch", "-nx"])
-            .args(["-ex", "set pagination off", "-ex", "thread apply all bt 40"])
-            .output();
-        match out {
-            Ok(o) => {
-                let mut text = format!("# {why}\n");
-                text.push_str(&String::from_utf8_lossy(&o.stdout));
-                text.push_str(&String::from_utf8_lossy(&o.stderr));
-                let _ = std::fs::write(&path, text);
+        let mut text = format!("# {why}\n");
+        for pid in std::iter::once(self.pid).chain(self.server_pid) {
+            let out = std::process::Command::new("gdb")
+                .args(["-p", &pid.to_string(), "-batch", "-nx"])
+                .args(["-ex", "set pagination off", "-ex", "thread apply all bt 40"])
+                .output();
+            match out {
+                Ok(o) => {
+                    let _ = writeln!(text, "## pid {pid}");
+                    text.push_str(&String::from_utf8_lossy(&o.stdout));
+                    text.push_str(&String::from_utf8_lossy(&o.stderr));
+                }
+                Err(e) => self.event(format!("gdb failed: {e}")),
             }
-            Err(e) => self.event(format!("gdb failed: {e}")),
         }
+        let _ = std::fs::write(&path, text);
     }
 
     fn pick<T: Clone>(v: &Mutex<Vec<T>>, r: u64) -> Option<T> {
@@ -239,7 +265,8 @@ impl Shared {
     }
 }
 
-/// Send one request, recording its latency and outcome under `op`.
+/// Send one request to the API, recording its latency and outcome under
+/// `op`, and return its JSON body if it succeeded.
 async fn call(
     sh: &Shared,
     client: &Client,
@@ -248,30 +275,42 @@ async fn call(
     path: &str,
     body: Option<Value>,
 ) -> Option<Value> {
-    let id = sh.next_id.fetch_add(1, Ordering::Relaxed);
-    let t = Instant::now();
-    sh.inflight.lock().unwrap().insert(id, (op, t));
     let mut rb = client.request(method, format!("{BASE}{path}"));
     if let Some(b) = body {
         rb = rb.json(&b);
     }
-    let (key, value) = match rb.send().await {
+    let (status, _, bytes) = send(sh, op, path, rb).await;
+    if status < 300 {
+        bytes.and_then(|b| serde_json::from_slice(&b).ok())
+    } else {
+        None
+    }
+}
+
+/// Send `rb`, recording its latency and outcome under `op`, and return
+/// its status (`0` if there was no response), headers and body.
+async fn send(
+    sh: &Shared,
+    op: &'static str,
+    path: &str,
+    rb: reqwest::RequestBuilder,
+) -> (u16, reqwest::header::HeaderMap, Option<Vec<u8>>) {
+    let id = sh.next_id.fetch_add(1, Ordering::Relaxed);
+    let t = Instant::now();
+    sh.inflight.lock().unwrap().insert(id, (op, t));
+    let (key, status, headers, bytes) = match rb.send().await {
         Ok(r) => {
             let s = r.status().as_u16();
-            let bytes = r.bytes().await.ok();
-            let v = if s < 300 {
-                bytes.and_then(|b| serde_json::from_slice(&b).ok())
-            } else {
-                None
-            };
-            (s.to_string(), v)
+            let headers = r.headers().clone();
+            let bytes = r.bytes().await.ok().map(|b| b.to_vec());
+            (s.to_string(), s, headers, bytes)
         }
-        Err(e) if e.is_timeout() => ("client-timeout".into(), None),
-        Err(_) => ("conn-err".into(), None),
+        Err(e) if e.is_timeout() => ("client-timeout".into(), 0, Default::default(), None),
+        Err(_) => ("conn-err".into(), 0, Default::default(), None),
     };
     let lat = t.elapsed();
     sh.inflight.lock().unwrap().remove(&id);
-    let is_err = !key.starts_with('2') && key != "404" && key != "409";
+    let is_err = !(key.starts_with('2') || key.starts_with('3')) && key != "404" && key != "409";
     let is_timeout = key == "408" || key == "client-timeout";
     {
         let mut st = sh.stats.lock().unwrap();
@@ -298,7 +337,7 @@ async fn call(
             sh.dump(&format!("{op} {path} -> {key}"));
         }
     }
-    value
+    (status, headers, bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -343,21 +382,8 @@ const MIX: &[(&str, u32)] = &[
 
 async fn worker(sh: Arc<Shared>, client: Client, seed: u64) {
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-    let total: u32 = MIX.iter().map(|(_, w)| w).sum();
     while !sh.stop.load(Ordering::Relaxed) {
-        let mut roll = (rng.next() % total as u64) as u32;
-        let op = MIX
-            .iter()
-            .find(|(_, w)| {
-                if roll < *w {
-                    true
-                } else {
-                    roll -= w;
-                    false
-                }
-            })
-            .map(|(o, _)| *o)
-            .unwrap_or("list_entries");
+        let op = pick_op(MIX, &mut rng);
         let r = rng.next();
         let f = Shared::pick(&sh.feeds, r).unwrap_or(1);
         let e = Shared::pick(&sh.entries, r >> 8).unwrap_or(1);
@@ -591,6 +617,188 @@ async fn worker(sh: Arc<Shared>, client: Client, seed: u64) {
     }
 }
 
+/// The web UI workload: what one person reading in a browser does, from
+/// most to least often. Listing pages and entry pages also load the
+/// images on them, as `web_asset`.
+const WEB_MIX: &[(&str, u32)] = &[
+    ("web_index", 30),
+    ("web_index_read", 3),
+    ("web_feed", 10),
+    ("web_tag", 6),
+    ("web_entry", 15),
+    ("web_swipe_read", 15),
+    ("web_swipe_undo", 2),
+    ("web_save", 4),
+    ("web_search", 5),
+    ("web_feeds", 3),
+    ("web_tags", 2),
+    ("web_mark_feed_read", 1),
+    ("web_plugins", 1),
+];
+
+fn pick_op(mix: &[(&'static str, u32)], rng: &mut Rng) -> &'static str {
+    let total: u32 = mix.iter().map(|(_, w)| w).sum();
+    let mut roll = (rng.next() % total as u64) as u32;
+    for (op, w) in mix {
+        if roll < *w {
+            return op;
+        }
+        roll -= w;
+    }
+    mix[0].0
+}
+
+/// A listing's first page is opened far more often than later ones.
+fn pick_page(r: u64) -> u64 {
+    match r % 10 {
+        0..=6 => 1,
+        7 | 8 => 2,
+        _ => 3 + r % 3,
+    }
+}
+
+/// The distinct `/assets/{hash}` URLs an HTML page links to.
+fn asset_links(html: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (i, _) in html.match_indices("/assets/") {
+        let hash: String = html[i + 8..]
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect();
+        if hash.len() == 64 {
+            let url = format!("/assets/{hash}");
+            if !out.contains(&url) {
+                out.push(url);
+            }
+        }
+    }
+    out
+}
+
+/// Request `path` from the web UI, recording it under `op`, and return the
+/// body if it succeeded. Changes carry `Sec-Fetch-Site: same-origin`, as
+/// the UI's own script's requests do.
+async fn web_call(
+    sh: &Shared,
+    client: &Client,
+    op: &'static str,
+    method: Method,
+    path: &str,
+) -> Option<String> {
+    let mut rb = client.request(method.clone(), format!("{}{path}", sh.web_base));
+    if method != Method::GET {
+        rb = rb.header("sec-fetch-site", "same-origin");
+    }
+    let (status, _, body) = send(sh, op, path, rb).await;
+    (status < 300).then(|| String::from_utf8_lossy(&body.unwrap_or_default()).into_owned())
+}
+
+/// Load the images on a page, as a browser with a warm cache does:
+/// revalidating the ones it has an `ETag` for.
+async fn web_assets(sh: &Shared, client: &Client, html: &str) {
+    for path in asset_links(html) {
+        let mut rb = client.get(format!("{}{path}", sh.web_base));
+        let known = sh.etags.lock().unwrap().get(&path).cloned();
+        if let Some(etag) = known {
+            rb = rb.header("if-none-match", etag);
+        }
+        let (status, headers, _) = send(sh, "web_asset", &path, rb).await;
+        if status == 200 {
+            if let Some(etag) = headers.get("etag").and_then(|v| v.to_str().ok()) {
+                sh.etags.lock().unwrap().insert(path, etag.to_owned());
+            }
+        }
+    }
+}
+
+async fn web_worker(sh: Arc<Shared>, client: Client, seed: u64) {
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    while !sh.stop.load(Ordering::Relaxed) {
+        let op = pick_op(WEB_MIX, &mut rng);
+        let r = rng.next();
+        let f = Shared::pick(&sh.feeds, r).unwrap_or(1);
+        let e = Shared::pick(&sh.entries, r >> 8).unwrap_or(1);
+        let t = Shared::pick(&sh.web_tags, r >> 16).unwrap_or(1);
+        let page = pick_page(r >> 24);
+        let c = &client;
+        use Method as M;
+        let html = match op {
+            "web_index" => web_call(&sh, c, op, M::GET, &format!("/?page={page}")).await,
+            "web_index_read" => {
+                web_call(&sh, c, op, M::GET, &format!("/?show_read=true&page={page}")).await
+            }
+            "web_feed" => web_call(&sh, c, op, M::GET, &format!("/feeds/{f}?page={page}")).await,
+            "web_tag" => web_call(&sh, c, op, M::GET, &format!("/tags/{t}?page={page}")).await,
+            "web_entry" => web_call(&sh, c, op, M::GET, &format!("/entries/{e}?page=1")).await,
+            "web_swipe_read" | "web_swipe_undo" => {
+                let m = if op == "web_swipe_read" {
+                    M::PUT
+                } else {
+                    M::DELETE
+                };
+                web_call(&sh, c, op, m, &format!("/entries/{e}/system-tags/read")).await;
+                None
+            }
+            "web_save" => {
+                let m = if r.is_multiple_of(2) {
+                    M::PUT
+                } else {
+                    M::DELETE
+                };
+                web_call(&sh, c, op, m, &format!("/entries/{e}/system-tags/saved")).await;
+                None
+            }
+            "web_search" => {
+                let q = ["lorem", "hello", "consectetur", "feed 7"][(r % 4) as usize];
+                let sort = if r.is_multiple_of(3) {
+                    "&sort=newest"
+                } else {
+                    ""
+                };
+                let path = format!("/search?q={}{sort}&page={page}", q.replace(' ', "+"));
+                web_call(&sh, c, op, M::GET, &path).await
+            }
+            "web_feeds" => web_call(&sh, c, op, M::GET, &format!("/feeds?page={page}")).await,
+            "web_tags" => web_call(&sh, c, op, M::GET, "/tags").await,
+            "web_mark_feed_read" => {
+                web_call(&sh, c, op, M::POST, &format!("/entries/read?feed={f}")).await;
+                None
+            }
+            "web_plugins" => web_call(&sh, c, op, M::GET, "/plugins").await,
+            _ => unreachable!(),
+        };
+        if let Some(html) = html {
+            web_assets(&sh, c, &html).await;
+        }
+    }
+}
+
+/// Keeps the IDs of the tags the web workers browse up to date, as the
+/// `auto-tag` plugin creates them.
+async fn tag_sampler(sh: Arc<Shared>, client: Client) {
+    while !sh.stop.load(Ordering::Relaxed) {
+        if let Some(v) = call(
+            &sh,
+            &client,
+            "sample_tags",
+            Method::GET,
+            "/v1/tags?limit=1000",
+            None,
+        )
+        .await
+        {
+            let ids: Vec<i64> = v["tags"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|t| t["id"].as_i64()).collect())
+                .unwrap_or_default();
+            if !ids.is_empty() {
+                *sh.web_tags.lock().unwrap() = ids;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
 /// Keeps a sample of live entry IDs for the workers to act on.
 async fn entry_sampler(sh: Arc<Shared>, client: Client) {
     while !sh.stop.load(Ordering::Relaxed) {
@@ -694,6 +902,63 @@ fn pct(sorted: &[u64], p: f64) -> f64 {
     sorted[i] as f64 / 1000.0
 }
 
+/// Rules for the `filter` plugin in web mode: hide one entry in ten, as
+/// a filter on real feeds does. Any rules in `FILTER_TOML` are added.
+const STRESS_FILTER: &str = r#"
+[[exclude]]
+fields = ["title"]
+pattern = '^Item \d*7 of'
+"#;
+
+/// Rules for the `auto-tag` plugin in web mode: a few topics, each on a
+/// share of the entries. Any rules in `AUTOTAG_TOML` are added.
+const STRESS_AUTOTAG: &str = r#"
+[[rules]]
+tag = "topic-a"
+fields = ["title"]
+pattern = '^Item \d*[0-2] of'
+
+[[rules]]
+tag = "topic-b"
+fields = ["title"]
+pattern = '^Item \d*[3-5] of'
+
+[[rules]]
+tag = "topic-c"
+fields = ["content"]
+pattern = 'Feed \d*[0-4] says'
+"#;
+
+/// Set the `filter` and `auto-tag` plugins' rules with `kiki plugin config
+/// set --replace`, the way a deployment of the web UI does before starting
+/// it, so that the web UI's lists leave out hidden entries and its tag
+/// pages have entries to show.
+fn configure_plugins(cfg: &Config) -> Result<()> {
+    for (plugin, rules, extra) in [
+        ("filter", STRESS_FILTER, &cfg.filter_toml),
+        ("auto-tag", STRESS_AUTOTAG, &cfg.autotag_toml),
+    ] {
+        let mut toml = String::new();
+        if let Some(path) = extra {
+            toml = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
+            toml.push('\n');
+        }
+        toml.push_str(rules);
+        let path = cfg.out.join(format!("{plugin}.toml"));
+        std::fs::write(&path, toml)?;
+        let status = std::process::Command::new(&cfg.kiki)
+            .args(["plugin", "config", "set", "--replace", plugin])
+            .arg(&path)
+            .env("KIKI_HOME", &cfg.home)
+            .status()
+            .with_context(|| format!("configuring the {plugin} plugin"))?;
+        if !status.success() {
+            bail!("`kiki plugin config set {plugin}` failed: {status}");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
@@ -702,12 +967,21 @@ async fn main() -> Result<()> {
     let sock = cfg.home.join("kiki.sock");
     let _ = std::fs::remove_file(&sock);
 
+    if cfg.web {
+        configure_plugins(&cfg)?;
+    }
+    // The web UI's port: free now, and very likely still free once
+    // `kiki web` binds it.
+    let web_addr = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+
     let log = std::fs::File::create(cfg.out.join("kiki.log"))?;
     let mut cmd = tokio::process::Command::new(&cfg.kiki);
-    cmd.arg("serve")
-        .arg("--uds")
-        .arg(&sock)
-        .args(&cfg.extra_args);
+    if cfg.web {
+        cmd.arg("web").arg("--listen").arg(web_addr.to_string());
+    } else {
+        cmd.arg("serve");
+    }
+    cmd.arg("--uds").arg(&sock).args(&cfg.extra_args);
     for k in [
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -744,6 +1018,37 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(60))
         .pool_max_idle_per_host(cfg.workers * 2)
         .build()?;
+    // ...and this one only to the web UI on localhost.
+    #[allow(clippy::disallowed_methods)]
+    let web_client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(cfg.workers * 2)
+        .build()?;
+
+    let server_pid = if cfg.web {
+        while std::net::TcpStream::connect(web_addr).is_err() {
+            if t0.elapsed() > Duration::from_secs(15) {
+                bail!("kiki web did not start listening; see kiki.log");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))?;
+        children
+            .split_whitespace()
+            .next()
+            .and_then(|p| p.parse().ok())
+    } else {
+        None
+    };
+    // For profilers attached from outside, e.g. `perf record -p`.
+    std::fs::write(
+        cfg.out.join("pids.txt"),
+        match server_pid {
+            Some(s) => format!("web={pid}\nserve={s}\n"),
+            None => format!("serve={pid}\n"),
+        },
+    )?;
 
     let sh = Arc::new(Shared {
         start: Instant::now(),
@@ -760,6 +1065,10 @@ async fn main() -> Result<()> {
         read_tag: AtomicU64::new(0),
         dumps: AtomicU64::new(0),
         pid,
+        server_pid,
+        web_base: format!("http://{web_addr}"),
+        web_tags: Default::default(),
+        etags: Default::default(),
         out: cfg.out.clone(),
         feed_base: feed_base.clone(),
         stall_ms: cfg.stall_ms,
@@ -906,11 +1215,15 @@ async fn main() -> Result<()> {
     // --- Load --------------------------------------------------------------
     let mut tasks = Vec::new();
     for w in 0..cfg.workers {
-        tasks.push(tokio::spawn(worker(
-            sh.clone(),
-            client.clone(),
-            w as u64 + 1,
-        )));
+        let seed = w as u64 + 1;
+        tasks.push(if cfg.web {
+            tokio::spawn(web_worker(sh.clone(), web_client.clone(), seed))
+        } else {
+            tokio::spawn(worker(sh.clone(), client.clone(), seed))
+        });
+    }
+    if cfg.web {
+        tasks.push(tokio::spawn(tag_sampler(sh.clone(), client.clone())));
     }
     tasks.push(tokio::spawn(entry_sampler(sh.clone(), client.clone())));
     tasks.push(tokio::spawn(canaries(sh.clone(), client.clone())));
