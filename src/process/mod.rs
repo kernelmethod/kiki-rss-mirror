@@ -15,20 +15,28 @@
 //!
 //! | Process | Started by | Filesystem | Network | Sandbox profile |
 //! |---|---|---|---|---|
-//! | server | `kiki serve` | data dir + socket dir + SQLite temp dir (rw), system paths (ro) | listening; DNS for the fetcher | [`SandboxProfile::Server`] |
-//! | feed fetcher | the server, at startup | TLS trust stores (ro) | outbound TCP only; DNS via the server | [`SandboxProfile::FeedFetcher`] |
+//! | server | `kiki serve` | data dir + socket dir + SQLite temp dir (rw), system paths (ro) | listening on Unix sockets only | [`SandboxProfile::Server`] |
+//! | feed fetcher's supervisor | the server, at startup | TLS trust stores, resolver configuration (ro) | none of its own | [`SandboxProfile::FeedFetcher`] |
+//! | ↳ worker | the supervisor | TLS trust stores (ro) | outbound TCP only; DNS via the resolver | [`SandboxProfile::FeedWorker`] |
+//! | ↳ parser | the supervisor | none | none | [`SandboxProfile::FeedParser`] |
+//! | ↳ resolver | the supervisor | resolver configuration (ro) | DNS: UDP, TCP to port 53 only | [`SandboxProfile::FeedResolver`] |
 //! | script host | the server, at startup | none | none | [`SandboxProfile::ScriptHost`] |
 //!
 //! [`SandboxProfile::Server`]: crate::sandbox::SandboxProfile::Server
 //! [`SandboxProfile::FeedFetcher`]: crate::sandbox::SandboxProfile::FeedFetcher
+//! [`SandboxProfile::FeedWorker`]: crate::sandbox::SandboxProfile::FeedWorker
+//! [`SandboxProfile::FeedParser`]: crate::sandbox::SandboxProfile::FeedParser
+//! [`SandboxProfile::FeedResolver`]: crate::sandbox::SandboxProfile::FeedResolver
 //! [`SandboxProfile::ScriptHost`]: crate::sandbox::SandboxProfile::ScriptHost
 //!
 //! The feed fetcher ([`feed_fetcher`]) does every step of a feed refresh
 //! that handles untrusted bytes — the HTTP exchange, TLS, decompression,
-//! and parsing — and hands the server back plain data. It downloads
-//! assets and favicons the same way, so the server makes no HTTP(S)
-//! requests at all. The server keeps the database, scheduling, and script
-//! dispatch. The script host ([`script_host`]) runs user-supplied Lua.
+//! parsing, and name resolution — and hands the server back plain data.
+//! It downloads assets and favicons the same way, so the server makes no
+//! network connections at all. Within it, the worker downloads, the parser
+//! parses, and the resolver looks hostnames up, each in a process of its
+//! own. The server keeps the database, scheduling, and script dispatch.
+//! The script host ([`script_host`]) runs user-supplied Lua.
 //!
 //! # Spawning order
 //!

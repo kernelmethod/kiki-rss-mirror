@@ -12,9 +12,9 @@
 //!   the SQLite DB and cached assets, the Unix socket's parent directory,
 //!   SQLite's temp directory (normally inside the data directory), and
 //!   time zone data. The feed fetcher, which makes all of Kiki's HTTP(S)
-//!   requests, gets only the TLS trust stores and the resolver's
-//!   configuration, its resolver only the latter, and the feed fetcher's
-//!   parser, the script host and the web UI get *nothing at all*. Where the kernel
+//!   requests, gets only the TLS trust stores, its resolver only the
+//!   resolver's configuration, and the feed fetcher's parser, the script
+//!   host and the web UI get *nothing at all*. Where the kernel
 //!   supports it (Linux 6.12+), every profile is also barred from
 //!   reaching abstract Unix sockets outside its own sandbox, and every
 //!   profile but the web UI from signalling processes outside it — its
@@ -28,8 +28,8 @@
 //!   creating any socket but a Unix one; for the script host and the
 //!   feed fetcher's parser, every socket call; for the feed fetcher,
 //!   binding, listening, accepting, and creating Unix sockets; for its
-//!   resolver, all that and creating any socket but an IPv4 or IPv6 one;
-//!   and for the web UI, binding,
+//!   resolver, listening, accepting, and creating any socket but an IPv4
+//!   or IPv6 one; and for the web UI, binding,
 //!   listening, and creating any socket but a Unix one).
 //!   The default action for unmatched syscalls is `Allow` — this is a
 //!   defence-in-depth layer that eliminates the most dangerous escape
@@ -46,8 +46,8 @@
 //! the children, before they read their first byte of IPC; for the web
 //! UI, before it accepts its first connection. They are
 //! inherited by every thread and task spawned later, and by the feed
-//! fetcher's forked worker, parser and resolver, the last two of which add
-//! a stricter set of their own on top. The server installs them one at a time, with
+//! fetcher's forked worker, parser and resolver, each of which adds a
+//! stricter set of its own on top. The server installs them one at a time, with
 //! its children started in between; see [`restrict_filesystem`].
 //!
 //! On non-Linux platforms [`apply`] is a no-op that logs a warning.
@@ -98,20 +98,32 @@ pub enum SandboxProfile {
     /// and is used through plain `read`/`write`.
     ScriptHost,
 
-    /// The feed fetcher's supervisor and worker: retrieves feeds over
-    /// HTTP(S), downloads their assets and favicons, and talks to the
-    /// server over an inherited socket pair. What they download is parsed
-    /// under [`Self::FeedParser`], which the supervisor's parser installs
-    /// on top of this profile.
+    /// The feed fetcher's supervisor: talks to the server over an
+    /// inherited socket pair, and forks the processes that do the
+    /// fetcher's work, each of which installs a profile of its own on top
+    /// of this one — [`Self::FeedWorker`], [`Self::FeedParser`] and
+    /// [`Self::FeedResolver`].
     ///
-    /// This profile grants read-only access to the TLS trust stores and
-    /// the resolver's configuration, which the supervisor holds for the
-    /// resolver it forks, and nothing else — no data directory, no
-    /// `/proc`. It may make outbound TCP connections, but may not bind,
-    /// listen for or accept them, or create a Unix socket: the last keeps
-    /// it away from the server's API socket, whose only access control is
-    /// reachability.
+    /// A process forked from it can have no more than it has, so this
+    /// profile holds what its children need between them, and no more:
+    /// read-only access to the TLS trust stores and the resolver's
+    /// configuration, and nothing else — no data directory, no `/proc`.
+    /// It may make outbound connections, and bind UDP sockets, which the
+    /// resolver needs, but may not bind TCP ports, listen for or accept
+    /// connections, or create a Unix socket: the last keeps the fetcher's
+    /// processes away from the server's API socket, whose only access
+    /// control is reachability.
     FeedFetcher,
+
+    /// The feed fetcher's worker: retrieves feeds over HTTP(S), downloads
+    /// their assets and favicons, and hands what it downloads to the
+    /// parser, all through the supervisor.
+    ///
+    /// Forked from the supervisor, it installs this profile on top of
+    /// [`Self::FeedFetcher`], which takes away what only the resolver
+    /// needs: it may read the TLS trust stores and nothing else, and may
+    /// not bind any socket.
+    FeedWorker,
 
     /// The feed fetcher's parser: parses what the fetcher downloads —
     /// feeds, web pages, SVG images, entries' HTML — and talks to the
@@ -198,6 +210,14 @@ impl SandboxConfig {
         }
     }
 
+    /// Configuration for the feed fetcher's worker process.
+    pub fn feed_worker(log_only: bool) -> Self {
+        SandboxConfig {
+            profile: SandboxProfile::FeedWorker,
+            log_only,
+        }
+    }
+
     /// Configuration for the feed fetcher's parser process.
     pub fn feed_parser(log_only: bool) -> Self {
         SandboxConfig {
@@ -228,6 +248,7 @@ impl SandboxConfig {
             SandboxProfile::Server { .. } => "server",
             SandboxProfile::ScriptHost => "script-host",
             SandboxProfile::FeedFetcher => "feed-fetcher",
+            SandboxProfile::FeedWorker => "feed-worker",
             SandboxProfile::FeedParser => "feed-parser",
             SandboxProfile::FeedResolver => "feed-resolver",
             SandboxProfile::WebUi => "web-ui",

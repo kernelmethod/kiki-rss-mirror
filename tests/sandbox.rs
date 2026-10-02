@@ -704,7 +704,85 @@ mod fetch_isolation {
                 "fetcher pid {pid} is not running under a seccomp filter"
             );
         }
+        assert_stricter_than_the_supervisor(&kiki, worker, "worker");
         kiki.shutdown();
+    }
+
+    /// Each of the supervisor's children installs a sandbox of its own on
+    /// top of the supervisor's, which shows as more seccomp filters, on
+    /// kernels that say how many (5.9+).
+    fn assert_stricter_than_the_supervisor(kiki: &Kiki, child: u32, what: &str) {
+        let supervisor = kiki.fetcher_supervisor_pids()[0];
+        if let (Some(s), Some(c)) = (seccomp_filters(supervisor), seccomp_filters(child)) {
+            assert!(
+                c > s,
+                "the {what} runs under {c} seccomp filters, no more than the supervisor's {s}"
+            );
+        }
+    }
+
+    /// Set to anything to make [`worker_sandbox_probe`] run.
+    const WORKER_PROBE_ENV: &str = "KIKI_WORKER_SANDBOX_PROBE";
+
+    /// Printed by the worker probe once it has made a UDP socket, just
+    /// before it tries to bind it.
+    const WORKER_PROBE_SOCKET_MADE: &str = "worker sandbox probe: socket made";
+
+    /// Not a test of its own: [`binding_kills_the_worker_but_not_the_supervisor`]
+    /// runs it in a process of its own. It installs the worker's sandbox
+    /// as the worker does, on top of the supervisor's, makes a UDP socket,
+    /// which the worker may, then binds it, which must kill it.
+    #[test]
+    fn worker_sandbox_probe() {
+        use kiki_rss::sandbox::{apply, SandboxConfig};
+        if std::env::var_os(WORKER_PROBE_ENV).is_none() {
+            return;
+        }
+        apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
+        // The supervisor may bind, for the resolver it forks.
+        std::net::UdpSocket::bind("127.0.0.1:0").expect("the supervisor may bind");
+        apply(&SandboxConfig::feed_worker(false)).expect("install the worker sandbox");
+
+        // SAFETY: a plain `socket` call; the descriptor is left open.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        assert!(fd >= 0, "a UDP socket was refused");
+        println!("{WORKER_PROBE_SOCKET_MADE}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        // Seccomp kills the process here.
+        let _ = std::net::UdpSocket::bind("127.0.0.1:0");
+        println!("worker sandbox probe: binding was allowed");
+    }
+
+    /// The supervisor may bind sockets, for the resolver it forks, but the
+    /// worker it also forks may not: run [`worker_sandbox_probe`] in a
+    /// fresh process and check that it was killed for binding.
+    #[test]
+    fn binding_kills_the_worker_but_not_the_supervisor() {
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "fetch_isolation::worker_sandbox_probe",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(WORKER_PROBE_ENV, "1")
+            .output()
+            .expect("run the probe");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains(WORKER_PROBE_SOCKET_MADE),
+            "probe failed before binding ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGSYS),
+            "probe was not killed for binding ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
     }
 
     /// A worker that dies is replaced inside the sandbox, and fetching
@@ -759,12 +837,7 @@ mod fetch_isolation {
         let resolver = kiki.wait_for_fetcher_resolver(None);
         assert_ne!(worker, resolver);
         assert_eq!(seccomp_mode(resolver), Some(2));
-        if let (Some(w), Some(r)) = (seccomp_filters(worker), seccomp_filters(resolver)) {
-            assert!(
-                r > w,
-                "the resolver runs under {r} seccomp filters, the worker {w}"
-            );
-        }
+        assert_stricter_than_the_supervisor(&kiki, resolver, "resolver");
         let environ = std::fs::read(format!("/proc/{resolver}/environ")).expect("read environ");
         let kept: Vec<String> = environ
             .split(|&b| b == 0)
@@ -815,6 +888,14 @@ mod fetch_isolation {
             .expect("resolve localhost")
             .collect();
         assert!(!addrs.is_empty());
+
+        // That includes what musl's resolver does to query a name server:
+        // bind a UDP socket to port 0, then send from it. A name that is in
+        // /etc/hosts never gets that far, so it is done by hand.
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket");
+        let to_itself = udp.local_addr().expect("local address");
+        udp.send_to(b"query", to_itself)
+            .expect("send from a bound UDP socket");
 
         // No Unix sockets, which would reach the server's API socket; no
         // netlink ones either.
@@ -894,12 +975,7 @@ mod fetch_isolation {
             "the parser kept its environment: {}",
             String::from_utf8_lossy(&environ)
         );
-        if let (Some(w), Some(p)) = (seccomp_filters(worker), seccomp_filters(parser)) {
-            assert!(
-                p > w,
-                "the parser runs under {p} seccomp filters, no more than the worker's {w}"
-            );
-        }
+        assert_stricter_than_the_supervisor(&kiki, parser, "parser");
         kiki.shutdown();
     }
 

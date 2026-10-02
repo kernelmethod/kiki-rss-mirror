@@ -60,9 +60,9 @@
 //! `kiki __feed-fetcher` is a small **supervisor**. It installs the
 //! sandbox, then `fork`s a **worker** that does the downloading and two
 //! **helpers**, the **parser** and the **resolver**. All three inherit the
-//! sandbox, and the helpers tighten it further (see
-//! [`SandboxProfile::FeedParser`]). None has a descriptor to the server or
-//! to the others, only a socket pair each to the supervisor, which relays
+//! sandbox, and each tightens it further to what its own job needs (see
+//! [`SandboxProfile::FeedParser`]). None has a descriptor to the server
+//! or to the others, only a socket pair each to the supervisor, which relays
 //! frames between them: requests and their answers between the server and
 //! the worker, and the worker's tasks and their answers between it and the
 //! helpers.
@@ -180,17 +180,32 @@ const ISOLATED_ATTEMPTS: usize = 3;
 /// does not fit is turned into an error by the worker rather than sent.
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 
-/// Extra time the server allows past the fetch's own timeouts before it
-/// stops waiting: time to parse, and to cross two process boundaries.
+/// Extra time the server allows past a job's own time limits before it
+/// stops waiting: time to cross the process boundaries between it and the
+/// worker, and the worker and the parser.
 const DEADLINE_SLACK: Duration = Duration::from_secs(30);
+
+/// The most time the worker may spend on one parse task: [`PARSE_WAIT`]
+/// for the first attempt, and as long again for each of the
+/// [`ISOLATED_ATTEMPTS`] it is retried alone if the parser dies with it.
+///
+/// A job that needs something parsed must be given this long on top of
+/// everything else it does, or the server would give up on it before the
+/// worker could say that its task killed the parser — taking a parser
+/// that hangs to be merely slow, and sending it the same task again.
+const PARSE_BUDGET: Duration = PARSE_WAIT.saturating_mul(ISOLATED_ATTEMPTS as u32 + 1);
 
 /// How long the server waits for a `file://` body to be parsed, or for an
 /// entry's images to be found.
-const PARSE_DEADLINE: Duration = Duration::from_secs(60);
+const PARSE_DEADLINE: Duration = PARSE_BUDGET.saturating_add(DEADLINE_SLACK);
 
 /// How long the server waits for an asset to be downloaded, or a page to
-/// be searched for icons: the requests' own overall limit, plus slack.
-const ASSET_DEADLINE: Duration = AssetTimeouts::DEFAULT.total.saturating_add(DEADLINE_SLACK);
+/// be searched for icons: the requests' own overall limit, then time to
+/// parse what they downloaded (an SVG image, a web page), plus slack.
+const ASSET_DEADLINE: Duration = AssetTimeouts::DEFAULT
+    .total
+    .saturating_add(PARSE_BUDGET)
+    .saturating_add(DEADLINE_SLACK);
 
 /// How long the supervisor waits for a worker to finish a frame it has
 /// started writing, or to accept one, before declaring it wedged.
@@ -604,6 +619,7 @@ impl FeedFetcherHost {
         let hops = u32::try_from(MAX_REDIRECTS + 1).unwrap_or(u32::MAX);
         let deadline = Duration::from_secs(spec.timeout_secs)
             .saturating_mul(hops)
+            .saturating_add(PARSE_BUDGET)
             .saturating_add(DEADLINE_SLACK);
         match self.request(Job::Fetch(spec), deadline).await? {
             JobResult::Fetched(reply) => Ok(reply),
@@ -882,7 +898,8 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
 
         // The worker must never be able to talk to the server, or to the
         // parser, directly: everything it says goes through the relay.
-        let pid = fork_child(theirs, worker_main).context("forking a fetcher worker")?;
+        let pid = fork_child(theirs, |stream| worker_main(stream, log_only, no_sandbox))
+            .context("forking a fetcher worker")?;
 
         info!(pid, "feed fetcher: worker started");
         let started = Instant::now();
@@ -1630,7 +1647,18 @@ fn answer(worker: &mut UnixStream, msg: &ToFetcher) -> Result<(), String> {
 // ------------------------------------------------------------------
 
 /// Entry point of a forked worker. Returns the process exit code.
-fn worker_main(stream: UnixStream) -> i32 {
+///
+/// Tightens the sandbox it inherited from the supervisor to the
+/// [`crate::sandbox::SandboxProfile::FeedWorker`] profile before it
+/// starts its runtime, unless the operator turned sandboxing off.
+fn worker_main(stream: UnixStream, log_only: bool, no_sandbox: bool) -> i32 {
+    if !no_sandbox {
+        let config = crate::sandbox::SandboxConfig::feed_worker(log_only);
+        if let Err(e) = crate::sandbox::apply(&config) {
+            warn!(error = %format!("{e:#}"), "feed fetcher: could not sandbox the worker");
+            return 1;
+        }
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("fetcher-worker")
@@ -2853,6 +2881,20 @@ mod tests {
             .fetch(spec(&format!("http://localhost:{port}/feed")))
             .await;
         assert!(matches!(reply, Ok(FetchReply::Body(_))), "got {reply:?}");
+    }
+
+    /// Blaming a task that hangs the parser takes a kill with it in hand,
+    /// then another once it has been retried alone, each after up to
+    /// [`PARSE_TIMEOUT`] and some queueing. The server must wait out every
+    /// attempt the worker may make, or it gives up first and takes the
+    /// task's feed to have had a passing failure, not to hang the parser.
+    #[test]
+    fn the_server_outwaits_the_hunt_for_a_task_that_kills_the_parser() {
+        let attempts = u32::try_from(ISOLATED_ATTEMPTS).unwrap() + 1;
+        let hunt = PARSE_WAIT * attempts;
+        assert!(PARSE_WAIT >= PARSE_QUEUE_LIMIT + PARSE_TIMEOUT);
+        assert!(PARSE_DEADLINE > hunt);
+        assert!(ASSET_DEADLINE > AssetTimeouts::DEFAULT.total + hunt);
     }
 
     #[test]

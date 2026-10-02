@@ -360,6 +360,7 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
         // The supervisor forks the resolver, whose domain nests inside its
         // own, so it holds the resolver's paths for it, and so does the
         // worker it forks: the configuration is readable by every user.
+        SandboxProfile::FeedWorker => (Vec::new(), tls_paths()),
         SandboxProfile::FeedFetcher => (
             Vec::new(),
             tls_paths().into_iter().chain(dns_paths()).collect(),
@@ -396,6 +397,7 @@ fn landlock_scopes(profile: &SandboxProfile) -> BitFlags<Scope> {
         SandboxProfile::Server { .. }
         | SandboxProfile::ScriptHost
         | SandboxProfile::FeedFetcher
+        | SandboxProfile::FeedWorker
         | SandboxProfile::FeedParser
         | SandboxProfile::FeedResolver => Scope::AbstractUnixSocket | Scope::Signal,
     }
@@ -413,11 +415,14 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
     };
 
     let mut ruleset = Ruleset::default().handle_access(all)?.scope(scopes)?;
-    if matches!(config.profile, SandboxProfile::FeedFetcher) {
+    if matches!(
+        config.profile,
+        SandboxProfile::FeedFetcher | SandboxProfile::FeedWorker
+    ) {
         // Handling `BindTcp` with no rule allowing any port denies TCP
-        // binds outright (Linux 6.7+, ABI v4) — redundant with seccomp's
-        // `bind` denial, but independent of it. It degrades silently on
-        // older kernels, as the filesystem rules do.
+        // binds outright (Linux 6.7+, ABI v4) — for the worker, redundant
+        // with seccomp's `bind` denial, but independent of it. It degrades
+        // silently on older kernels, as the filesystem rules do.
         ruleset = ruleset.handle_access(AccessNet::BindTcp)?;
     }
     if matches!(
@@ -610,12 +615,21 @@ const DENIED_SCRIPT_HOST: &[i64] = &[
     libc::SYS_accept4,
 ];
 
-/// Extra syscalls denied to the feed fetcher and its resolver: binding an
-/// address and accepting connections. They only ever connect out. The
-/// resolver's `getaddrinfo` would bind a netlink socket to learn which
-/// address families the host has, but it may not create one (see
-/// [`RESOLVER_SOCKET_FAMILIES`]), and carries on without.
-const DENIED_FEED_FETCHER: &[i64] = &[libc::SYS_bind, libc::SYS_listen, libc::SYS_accept4];
+/// Extra syscalls denied to the feed fetcher's supervisor and resolver:
+/// listening for and accepting connections. They only ever connect out.
+///
+/// Binding stays allowed, as musl's resolver binds every UDP socket it
+/// sends a query from (to port 0). Landlock denies them TCP binds where
+/// the kernel supports it (6.7+). glibc's `getaddrinfo` would bind a
+/// netlink socket too, to learn which address families the host has, but
+/// the resolver may not create one (see [`RESOLVER_SOCKET_FAMILIES`]), and
+/// it carries on without.
+const DENIED_FEED_FETCHER: &[i64] = &[libc::SYS_listen, libc::SYS_accept4];
+
+/// Extra syscalls denied to the feed fetcher's worker: binding an address
+/// as well as listening for and accepting connections. It only ever
+/// connects out, and leaves name resolution to the resolver.
+const DENIED_FEED_WORKER: &[i64] = &[libc::SYS_bind, libc::SYS_listen, libc::SYS_accept4];
 
 /// The only address family the server may create sockets in: Unix, for
 /// its API listener and the service manager's notification socket. It
@@ -691,6 +705,7 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
         SandboxProfile::FeedFetcher | SandboxProfile::FeedResolver => {
             &[DENIED_FEED_FETCHER, arch_specific_sockets]
         }
+        SandboxProfile::FeedWorker => &[DENIED_FEED_WORKER, arch_specific_sockets],
         SandboxProfile::WebUi => &[DENIED_WEB_UI],
     };
 
@@ -721,7 +736,9 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
         // Internet sockets only: no Unix or netlink ones.
         SandboxProfile::FeedResolver => Some(SocketDomains::AllowOnly(RESOLVER_SOCKET_FAMILIES)),
         // Internet sockets only: no Unix ones.
-        SandboxProfile::FeedFetcher => Some(SocketDomains::Deny(&[libc::AF_UNIX])),
+        SandboxProfile::FeedFetcher | SandboxProfile::FeedWorker => {
+            Some(SocketDomains::Deny(&[libc::AF_UNIX]))
+        }
         // Unix sockets only: no Internet (or netlink, or packet) ones.
         SandboxProfile::WebUi => Some(SocketDomains::AllowOnly(&[libc::AF_UNIX])),
         // Every socket call is already denied outright.
@@ -1094,11 +1111,22 @@ mod tests {
 
     #[test]
     fn the_feed_fetcher_may_connect_but_not_accept() {
-        assert!(DENIED_FEED_FETCHER.contains(&libc::SYS_bind));
+        assert!(DENIED_FEED_WORKER.contains(&libc::SYS_bind));
+        assert!(DENIED_FEED_WORKER.contains(&libc::SYS_listen));
+        assert!(DENIED_FEED_WORKER.contains(&libc::SYS_accept4));
+        assert!(!DENIED_FEED_WORKER.contains(&libc::SYS_socket));
+        assert!(!DENIED_FEED_WORKER.contains(&libc::SYS_connect));
+    }
+
+    /// musl's resolver binds each UDP socket it queries from, and a
+    /// process forked from the supervisor can do nothing the supervisor
+    /// may not, so neither the supervisor nor the resolver may be denied
+    /// `bind`; only the worker, which installs its own filter, is.
+    #[test]
+    fn the_supervisor_and_the_resolver_may_bind_for_musls_resolver() {
+        assert!(!DENIED_FEED_FETCHER.contains(&libc::SYS_bind));
         assert!(DENIED_FEED_FETCHER.contains(&libc::SYS_listen));
         assert!(DENIED_FEED_FETCHER.contains(&libc::SYS_accept4));
-        assert!(!DENIED_FEED_FETCHER.contains(&libc::SYS_socket));
-        assert!(!DENIED_FEED_FETCHER.contains(&libc::SYS_connect));
     }
 
     #[test]
@@ -1185,6 +1213,7 @@ mod tests {
             server,
             SandboxProfile::ScriptHost,
             SandboxProfile::FeedFetcher,
+            SandboxProfile::FeedWorker,
             SandboxProfile::FeedParser,
             SandboxProfile::FeedResolver,
             SandboxProfile::WebUi,
