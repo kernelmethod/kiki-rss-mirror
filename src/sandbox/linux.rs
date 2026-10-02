@@ -338,7 +338,9 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
                 .collect();
             (rw_paths, ro_paths)
         }
-        SandboxProfile::ScriptHost | SandboxProfile::WebUi => (Vec::new(), Vec::new()),
+        SandboxProfile::ScriptHost | SandboxProfile::FeedParser | SandboxProfile::WebUi => {
+            (Vec::new(), Vec::new())
+        }
         SandboxProfile::FeedFetcher => (Vec::new(), tls_paths()),
     }
 }
@@ -370,7 +372,8 @@ fn landlock_scopes(profile: &SandboxProfile) -> BitFlags<Scope> {
         SandboxProfile::WebUi => Scope::AbstractUnixSocket.into(),
         SandboxProfile::Server { .. }
         | SandboxProfile::ScriptHost
-        | SandboxProfile::FeedFetcher => Scope::AbstractUnixSocket | Scope::Signal,
+        | SandboxProfile::FeedFetcher
+        | SandboxProfile::FeedParser => Scope::AbstractUnixSocket | Scope::Signal,
     }
 }
 
@@ -393,11 +396,15 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
         // older kernels, as the filesystem rules do.
         ruleset = ruleset.handle_access(AccessNet::BindTcp)?;
     }
-    if matches!(config.profile, SandboxProfile::WebUi) {
+    if matches!(
+        config.profile,
+        SandboxProfile::WebUi | SandboxProfile::FeedParser
+    ) {
         // Handling both TCP rights with no rule allowing any port denies
-        // every TCP bind and connect (Linux 6.7+, ABI v4). The listener was
-        // bound before the sandbox went up, and the API is reached over a
-        // Unix socket, so the web UI needs neither.
+        // every TCP bind and connect (Linux 6.7+, ABI v4). The web UI's
+        // listener was bound before the sandbox went up, and the API is
+        // reached over a Unix socket, so it needs neither; the parser
+        // needs no network at all, and seccomp denies it sockets anyway.
         ruleset = ruleset.handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp)?;
     }
     let ruleset = ruleset
@@ -549,11 +556,12 @@ const DENIED_COMMON: &[i64] = &[
     libc::SYS_execveat,
 ];
 
-/// Extra syscalls denied to the script host: everything that creates a
-/// socket or attaches one to a peer.
+/// Extra syscalls denied to the script host, and to the feed fetcher's
+/// parser: everything that creates a socket or attaches one to a peer.
 ///
-/// The host does its IPC over a socket pair it inherited at exec time, so
-/// it needs no way to make a new one. `send`/`recv` on an already-open
+/// The host does its IPC over a socket pair it inherited at exec time (the
+/// parser, over one it inherited at fork time), so it needs no way to make
+/// a new one. `send`/`recv` on an already-open
 /// descriptor stay allowed — std reads a `UnixStream` with `recv(2)` —
 /// but with no way to obtain another descriptor, the only peer the host
 /// can ever reach is the server that spawned it.
@@ -632,7 +640,9 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
 
     let profile_denied: &[&[i64]] = match config.profile {
         SandboxProfile::Server { .. } => &[],
-        SandboxProfile::ScriptHost => &[DENIED_SCRIPT_HOST, arch_specific_sockets],
+        SandboxProfile::ScriptHost | SandboxProfile::FeedParser => {
+            &[DENIED_SCRIPT_HOST, arch_specific_sockets]
+        }
         SandboxProfile::FeedFetcher => &[DENIED_FEED_FETCHER, arch_specific_sockets],
         SandboxProfile::WebUi => &[DENIED_WEB_UI],
     };
@@ -666,7 +676,7 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
         // Unix sockets only: no Internet (or netlink, or packet) ones.
         SandboxProfile::WebUi => Some(SocketDomains::AllowOnly(&[libc::AF_UNIX])),
         // Every socket call is already denied outright.
-        SandboxProfile::ScriptHost => None,
+        SandboxProfile::ScriptHost | SandboxProfile::FeedParser => None,
     };
     if let Some(domains) = domains {
         apply_socket_domain_filter(arch, &domains, config.log_only)?;

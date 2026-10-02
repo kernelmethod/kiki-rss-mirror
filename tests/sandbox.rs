@@ -613,6 +613,21 @@ mod fetch_isolation {
 
         /// Wait for the supervisor's worker to exist and return its PID.
         fn wait_for_fetcher_worker(&mut self, not: Option<u32>) -> u32 {
+            self.wait_for_fetcher_child("worker", not, |pid| !is_parser(pid))
+        }
+
+        /// Wait for the supervisor's parser to exist and return its PID.
+        /// It is started when there is first something to parse.
+        fn wait_for_fetcher_parser(&mut self, not: Option<u32>) -> u32 {
+            self.wait_for_fetcher_child("parser", not, is_parser)
+        }
+
+        fn wait_for_fetcher_child(
+            &mut self,
+            what: &str,
+            not: Option<u32>,
+            wanted: impl Fn(u32) -> bool,
+        ) -> u32 {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 self.assert_still_running();
@@ -620,16 +635,32 @@ mod fetch_isolation {
                     .fetcher_supervisor_pids()
                     .first()
                     .expect("a feed fetcher supervisor");
-                let workers = child_pids_matching(supervisor, feed_fetcher::SUBCOMMAND);
-                if let Some(&w) = workers.iter().find(|&&w| Some(w) != not) {
-                    return w;
+                let children = child_pids_matching(supervisor, feed_fetcher::SUBCOMMAND);
+                if let Some(&c) = children.iter().find(|&&c| Some(c) != not && wanted(c)) {
+                    return c;
                 }
                 if Instant::now() >= deadline {
-                    panic!("no feed fetcher worker appeared (excluding {not:?})");
+                    panic!("no feed fetcher {what} appeared (excluding {not:?})");
                 }
                 thread::sleep(Duration::from_millis(50));
             }
         }
+    }
+
+    /// Whether `pid` is the feed fetcher's parser, which names itself.
+    fn is_parser(pid: u32) -> bool {
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        Some(comm.trim()) == feed_fetcher::PARSER_NAME.to_str().ok()
+    }
+
+    /// How many seccomp filters `pid` runs under, on kernels that say
+    /// (5.9+).
+    fn seccomp_filters(pid: u32) -> Option<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Seccomp_filters:"))
+            .and_then(|v| v.trim().parse().ok())
     }
 
     fn create_feed(kiki: &mut Kiki, addr: SocketAddr) -> i64 {
@@ -642,7 +673,7 @@ mod fetch_isolation {
         created.json()["id"].as_i64().expect("id")
     }
 
-    /// By default feeds are fetched by a sandboxed supervisor/worker pair,
+    /// By default feeds are fetched by a sandboxed supervisor and worker,
     /// not by the server.
     #[test]
     fn feeds_are_fetched_in_a_separate_sandboxed_process_by_default() {
@@ -714,15 +745,148 @@ mod fetch_isolation {
         kiki.shutdown();
     }
 
-    /// Neither fetcher process may outlive the server.
+    /// Feeds are parsed in a process of their own, which installs a
+    /// stricter sandbox on top of the one it inherits from the
+    /// supervisor.
+    #[test]
+    fn feeds_are_parsed_in_a_separate_process_with_a_stricter_sandbox() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&[]);
+        let feed_id = create_feed(&mut kiki, addr);
+        refresh_until_entries(&mut kiki, feed_id, 1);
+
+        let worker = kiki.wait_for_fetcher_worker(None);
+        let parser = kiki.wait_for_fetcher_parser(None);
+        assert_ne!(worker, parser);
+        assert_eq!(seccomp_mode(parser), Some(2));
+        // The server's environment, which may hold credentials, is wiped.
+        let environ = std::fs::read(format!("/proc/{parser}/environ")).expect("read environ");
+        assert!(
+            environ.iter().all(|&b| b == 0),
+            "the parser kept its environment: {}",
+            String::from_utf8_lossy(&environ)
+        );
+        if let (Some(w), Some(p)) = (seccomp_filters(worker), seccomp_filters(parser)) {
+            assert!(
+                p > w,
+                "the parser runs under {p} seccomp filters, no more than the worker's {w}"
+            );
+        }
+        kiki.shutdown();
+    }
+
+    /// A parser that dies is replaced, and parsing carries on.
+    #[test]
+    fn a_killed_parser_is_replaced_and_fetching_continues() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&[]);
+        let first_feed = create_feed(&mut kiki, addr);
+        refresh_until_entries(&mut kiki, first_feed, 1);
+        let worker = kiki.wait_for_fetcher_worker(None);
+        let first = kiki.wait_for_fetcher_parser(None);
+
+        // SAFETY: SIGKILL to a process of our own; at worst ESRCH.
+        unsafe {
+            libc::kill(first as libc::pid_t, libc::SIGKILL);
+        }
+        assert!(wait_for_exit(first, Duration::from_secs(5)));
+
+        let (other, _other_server) = spawn_local_rss_server();
+        let second_feed = create_feed(&mut kiki, other);
+        refresh_until_entries(&mut kiki, second_feed, 1);
+        let second = kiki.wait_for_fetcher_parser(Some(first));
+        assert_ne!(first, second);
+        assert_eq!(
+            kiki.wait_for_fetcher_worker(None),
+            worker,
+            "the worker must survive the parser"
+        );
+        kiki.shutdown();
+    }
+
+    /// Set to a directory to make [`parser_sandbox_probe`] run.
+    const PROBE_ENV: &str = "KIKI_PARSER_SANDBOX_PROBE";
+
+    /// Printed by the probe once the filesystem checks have passed, just
+    /// before it tries to make a socket.
+    const PROBE_FILES_DENIED: &str = "parser sandbox probe: files denied";
+
+    /// Not a test of its own: [`the_parser_sandbox_is_enforced`] runs it in
+    /// a process of its own. It installs the parser's sandbox as the
+    /// parser does, on top of the fetcher's, checks that no file can be
+    /// read, then tries to make a socket, which must kill it.
+    #[test]
+    fn parser_sandbox_probe() {
+        use kiki_rss::sandbox::{apply, SandboxConfig};
+        let Some(dir) = std::env::var_os(PROBE_ENV).map(PathBuf::from) else {
+            return;
+        };
+        apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
+        apply(&SandboxConfig::feed_parser(false)).expect("install the parser sandbox");
+
+        // The fetcher may read the TLS trust stores; the parser may not
+        // read anything, where the kernel has Landlock.
+        if landlock_abi() >= 1 {
+            std::fs::read(dir.join("secret")).expect_err("reading a file was allowed");
+            std::fs::read_dir("/etc/ssl").expect_err("listing the trust stores was allowed");
+        } else {
+            println!("Landlock unavailable; skipping the filesystem checks");
+        }
+        println!("{PROBE_FILES_DENIED}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        // Seccomp kills the process here.
+        let _ = std::net::UdpSocket::bind("127.0.0.1:0");
+        println!("parser sandbox probe: a socket was allowed");
+    }
+
+    /// The parser's sandbox really denies what it claims to: run
+    /// [`parser_sandbox_probe`] in a fresh process, and check that it got
+    /// past the filesystem checks and was then killed for making a socket.
+    #[test]
+    fn the_parser_sandbox_is_enforced() {
+        let dir = TempDir::with_prefix("kiki-parser-probe").expect("create tempdir");
+        std::fs::write(dir.path().join("secret"), "hidden").expect("write secret");
+
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "fetch_isolation::parser_sandbox_probe",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE_ENV, dir.path())
+            .output()
+            .expect("run the probe");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains(PROBE_FILES_DENIED),
+            "probe failed the filesystem checks ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGSYS),
+            "probe was not killed for making a socket ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
+    }
+
+    /// None of the fetcher's processes may outlive the server.
     #[test]
     fn the_fetcher_exits_with_the_server() {
+        let (addr, _server) = spawn_local_rss_server();
         let mut kiki = Kiki::spawn(&[]);
+        let feed_id = create_feed(&mut kiki, addr);
+        refresh_until_entries(&mut kiki, feed_id, 1);
         let supervisor = kiki.fetcher_supervisor_pids()[0];
         let worker = kiki.wait_for_fetcher_worker(None);
+        let parser = kiki.wait_for_fetcher_parser(None);
         kiki.shutdown();
 
-        for pid in [supervisor, worker] {
+        for pid in [supervisor, worker, parser] {
             assert!(
                 wait_for_exit(pid, Duration::from_secs(5)),
                 "fetcher pid {pid} outlived the server"

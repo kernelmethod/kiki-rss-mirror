@@ -13,19 +13,21 @@
 //!   SQLite's temp directory (normally inside the data directory), and a
 //!   small read-only set of system paths needed for DNS. The feed fetcher,
 //!   which makes all of Kiki's HTTP(S) requests, gets only the TLS trust
-//!   stores (it has the server resolve hostnames for it), and the script
-//!   host and the web UI get *nothing at all*. Where the kernel
+//!   stores (it has the server resolve hostnames for it), and the feed
+//!   fetcher's parser, the script host and the web UI get *nothing at
+//!   all*. Where the kernel
 //!   supports it (Linux 6.12+), every profile is also barred from
 //!   reaching abstract Unix sockets outside its own sandbox, and every
 //!   profile but the web UI from signalling processes outside it — its
 //!   own children, whose sandboxes nest inside its own, excepted. The
-//!   feed fetcher is barred from binding TCP ports, and the web UI from
-//!   binding or connecting to them.
+//!   feed fetcher is barred from binding TCP ports, and its parser and
+//!   the web UI from binding or connecting to them.
 //! * **seccomp-bpf** blocks a denylist of syscalls the profile never uses
 //!   (`ptrace`, `mount`, `unshare`, `bpf`, `kexec_load`, module loading,
 //!   `io_uring`, `userfaultfd`, and friends; plus, for the server,
 //!   creating any socket but a Unix, IPv4 or IPv6 one; for the script
-//!   host, every socket call; for the feed fetcher, binding, listening,
+//!   host and the feed fetcher's parser, every socket call; for the feed
+//!   fetcher, binding, listening,
 //!   accepting, and creating Unix sockets; and for the web UI, binding,
 //!   listening, and creating any socket but a Unix one).
 //!   The default action for unmatched syscalls is `Allow` — this is a
@@ -43,7 +45,8 @@
 //! the children, before they read their first byte of IPC; for the web
 //! UI, before it accepts its first connection. They are
 //! inherited by every thread and task spawned later, and by the feed
-//! fetcher's forked workers. The server installs them one at a time, with
+//! fetcher's forked worker and parser, the last of which adds a stricter
+//! set of its own on top. The server installs them one at a time, with
 //! its children started in between; see [`restrict_filesystem`].
 //!
 //! On non-Linux platforms [`apply`] is a no-op that logs a warning.
@@ -94,9 +97,11 @@ pub enum SandboxProfile {
     /// and is used through plain `read`/`write`.
     ScriptHost,
 
-    /// The feed fetcher: retrieves feeds over HTTP(S) and parses them,
-    /// downloads their assets and favicons, and talks to the server over an
-    /// inherited socket pair.
+    /// The feed fetcher's supervisor and worker: retrieves feeds over
+    /// HTTP(S), downloads their assets and favicons, and talks to the
+    /// server over an inherited socket pair. What they download is parsed
+    /// under [`Self::FeedParser`], which the supervisor's parser installs
+    /// on top of this profile.
     ///
     /// This profile grants read-only access to the TLS trust stores and
     /// nothing else — no data directory, no resolver configuration, no
@@ -105,6 +110,19 @@ pub enum SandboxProfile {
     /// them, or create a Unix socket: the last keeps it away from the
     /// server's API socket, whose only access control is reachability.
     FeedFetcher,
+
+    /// The feed fetcher's parser: parses what the fetcher downloads —
+    /// feeds, web pages, SVG images, entries' HTML — and talks to the
+    /// fetcher's supervisor over a socket pair it inherited, nothing else.
+    ///
+    /// Forked from the feed fetcher's supervisor, it starts out under the
+    /// [`Self::FeedFetcher`] profile and installs this one on top, which
+    /// takes away what parsing does not need: like the script host's, it
+    /// grants **no filesystem access whatsoever**, denies every syscall
+    /// that could open a socket, and bars TCP binds and connections — so
+    /// a parser compromised by a hostile feed can reach neither the
+    /// network nor any file.
+    FeedParser,
 
     /// The `kiki web` UI: accepts browser connections on a TCP listener it
     /// bound before the sandbox went up, and turns each request into calls
@@ -166,6 +184,14 @@ impl SandboxConfig {
         }
     }
 
+    /// Configuration for the feed fetcher's parser process.
+    pub fn feed_parser(log_only: bool) -> Self {
+        SandboxConfig {
+            profile: SandboxProfile::FeedParser,
+            log_only,
+        }
+    }
+
     /// Configuration for the `kiki web` UI process.
     pub fn web_ui(log_only: bool) -> Self {
         SandboxConfig {
@@ -180,6 +206,7 @@ impl SandboxConfig {
             SandboxProfile::Server { .. } => "server",
             SandboxProfile::ScriptHost => "script-host",
             SandboxProfile::FeedFetcher => "feed-fetcher",
+            SandboxProfile::FeedParser => "feed-parser",
             SandboxProfile::WebUi => "web-ui",
         }
     }

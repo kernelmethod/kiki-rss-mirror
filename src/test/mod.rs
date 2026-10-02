@@ -571,8 +571,9 @@ impl TestConfig {
         let path = url
             .strip_prefix("file://")
             .with_context(|| format!("not a file:// URL: {url}"))?;
-        let expected = crate::fetcher::parse_off_thread(0, std::fs::read(path)?)
-            .await
+        let expected = crate::fetcher::Parsers::InProcess
+            .feed(0, std::fs::read(path)?)
+            .await?
             .feed
             .with_context(|| format!("failed to parse test feed {path}"))?
             .entry_count();
