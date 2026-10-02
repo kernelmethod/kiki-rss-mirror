@@ -55,13 +55,19 @@ impl Kiki {
     /// As [`Self::spawn`], calling `setup` with the data directory once
     /// it has been initialized and before the server starts.
     fn spawn_with(extra_args: &[&str], setup: impl FnOnce(&Path)) -> Self {
-        Self::spawn_as(extra_args, setup, None, &[])
+        Self::spawn_as(extra_args, setup, None, &[], Stdio::null())
     }
 
     /// As [`Self::spawn`], with `envs` added to `kiki serve`'s
     /// environment.
     fn spawn_with_env(extra_args: &[&str], envs: &[(&str, &str)]) -> Self {
-        Self::spawn_as(extra_args, |_| {}, None, envs)
+        Self::spawn_as(extra_args, |_| {}, None, envs, Stdio::null())
+    }
+
+    /// As [`Self::spawn`], with `kiki serve`'s standard error, which its
+    /// children share, written to `log`.
+    fn spawn_logging_to(extra_args: &[&str], log: std::fs::File) -> Self {
+        Self::spawn_as(extra_args, |_| {}, None, &[], log.into())
     }
 
     /// As [`Self::spawn`], but run kiki as an unprivileged user when the
@@ -70,17 +76,28 @@ impl Kiki {
     fn spawn_unprivileged(extra_args: &[&str]) -> Self {
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         let root = unsafe { libc::geteuid() } == 0;
-        Self::spawn_as(extra_args, |_| {}, root.then_some(NOBODY), &[])
+        Self::spawn_as(
+            extra_args,
+            |_| {},
+            root.then_some(NOBODY),
+            &[],
+            Stdio::null(),
+        )
     }
 
     /// As [`Self::spawn_with`], running kiki as the user and group `id`
-    /// if one is given, with the data directory handed over to it, and
-    /// with `envs` added to `kiki serve`'s environment.
+    /// if one is given, with the data directory handed over to it, with
+    /// `envs` added to `kiki serve`'s environment, and its standard error
+    /// sent to `stderr`.
+    ///
+    /// `stderr` must not be a pipe nobody drains, which would stop the
+    /// server and its children once it filled.
     fn spawn_as(
         extra_args: &[&str],
         setup: impl FnOnce(&Path),
         id: Option<u32>,
         envs: &[(&str, &str)],
+        stderr: Stdio,
     ) -> Self {
         use std::os::unix::process::CommandExt;
 
@@ -118,7 +135,7 @@ impl Kiki {
             .env("RUST_LOG", "warn")
             .envs(envs.iter().copied())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stderr(stderr);
 
         let child = cmd.spawn().expect("spawn kiki serve");
 
@@ -153,6 +170,22 @@ impl Kiki {
             thread::sleep(Duration::from_millis(50));
         }
         panic!("kiki did not start listening within {timeout:?}");
+    }
+
+    /// Wait until the log at `path` has every one of `needles` in it.
+    fn wait_for_log(&mut self, path: &Path, needles: &[&str]) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.assert_still_running();
+            let log = std::fs::read_to_string(path).unwrap_or_default();
+            if needles.iter().all(|n| log.contains(n)) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("{needles:?} did not all appear in the log:\n{log}");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Panic if the child has exited. Called between requests to catch
@@ -454,6 +487,22 @@ fn seccomp_log_only_mode_still_runs() {
     let mut kiki = Kiki::spawn(&["--seccomp-log-only"]);
     kiki.get("/v1/feeds").assert_success();
     kiki.assert_still_running();
+    kiki.shutdown();
+}
+
+/// The server's children log to its standard error, as it is the one
+/// standard stream it leaves them: the feed fetcher's supervisor and the
+/// worker it starts, and the script host, each say that their sandbox is
+/// up.
+#[test]
+fn the_childrens_logs_reach_the_servers_stderr() {
+    let dir = TempDir::with_prefix("kiki-child-logs").expect("create tempdir");
+    let path = dir.path().join("stderr.log");
+    let log = std::fs::File::create(&path).expect("create the log file");
+    let mut kiki = Kiki::spawn_logging_to(&[], log);
+    kiki.wait_for_log(&path, &["\"feed-fetcher\"", "\"feed-worker\""]);
+    #[cfg(feature = "lua")]
+    kiki.wait_for_log(&path, &["\"script-host\""]);
     kiki.shutdown();
 }
 

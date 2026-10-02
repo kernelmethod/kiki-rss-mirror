@@ -37,7 +37,11 @@ impl ChildArgs {
         fd_env: &str,
         run_child: fn(bool, bool) -> Result<()>,
     ) -> Result<()> {
-        tracing_subscriber::fmt::init();
+        // To stderr, the one standard stream `kiki serve` leaves its
+        // children, so their logs land wherever its own do.
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .init();
 
         if std::env::var_os(fd_env).is_none() {
             bail!(
