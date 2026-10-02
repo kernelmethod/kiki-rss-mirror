@@ -4,8 +4,7 @@
 //! user-supplied scripts, and the [`FeedEntry`] and [`EventPayload`] types that cross the
 //! scripting boundary.
 //!
-//! The [`lua`] sub-module provides a concrete Lua-based implementation ([`lua::LuaScriptRunner`])
-//! when the `lua` feature is enabled.
+//! The [`lua`] sub-module provides a concrete Lua-based implementation ([`lua::LuaScriptRunner`]).
 //!
 //! # Events
 //!
@@ -76,7 +75,6 @@
 //! [`crate::process::script_host::SubprocessScriptRunner`] forwards to the child, and callers
 //! cannot tell the difference.
 
-#[cfg(feature = "lua")]
 pub mod lua;
 
 use serde::{Deserialize, Serialize};

@@ -113,7 +113,7 @@ impl PluginRuntime {
             script_runner.clone(),
             cancel,
         ));
-        #[cfg(all(unix, feature = "lua"))]
+        #[cfg(unix)]
         if let Some(host) = &script_host {
             host.set_services(services.clone());
         }
@@ -199,7 +199,6 @@ impl PluginRuntime {
         Ok(ReloadOutcome { loaded, changed })
     }
 
-    #[cfg(feature = "lua")]
     fn load(&self, discovery: &Discovery) -> Result<(), ReloadError> {
         crate::tasks::load_script_runner(
             discovery,
@@ -210,18 +209,6 @@ impl PluginRuntime {
         )
         .map(|_| ())
         .map_err(|e| ReloadError::Load(e.to_string()))
-    }
-
-    #[cfg(not(feature = "lua"))]
-    fn load(&self, _discovery: &Discovery) -> Result<(), ReloadError> {
-        // Without the `lua` feature there is nothing to load plugins into.
-        let _ = (
-            &self.metrics,
-            &self.script_runner,
-            &self.script_host,
-            &self.services,
-        );
-        Ok(())
     }
 
     /// [`Self::reload`] on the blocking thread pool, logging the outcome.

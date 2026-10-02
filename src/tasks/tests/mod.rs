@@ -1,4 +1,3 @@
-#[cfg(feature = "lua")]
 mod lua_script_tests;
 
 mod adaptive_tests;

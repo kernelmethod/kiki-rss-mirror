@@ -1,7 +1,7 @@
 use crate::cli::paths::{self, Env};
 use crate::sandbox::{self, SandboxConfig};
 use crate::server;
-#[cfg(all(unix, feature = "lua"))]
+#[cfg(unix)]
 use anyhow::anyhow;
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -45,7 +45,7 @@ pub struct ServeArgs {
     /// the isolated host holds no database handle, no filesystem access,
     /// and no sockets. Turning this on puts the Lua VM back in the same
     /// address space as the database.
-    #[cfg(all(unix, feature = "lua"))]
+    #[cfg(unix)]
     #[arg(long)]
     no_script_isolation: bool,
 }
@@ -119,7 +119,7 @@ impl ServeArgs {
         }
 
         let feed_fetcher = self.spawn_feed_fetcher()?;
-        #[cfg(all(unix, feature = "lua"))]
+        #[cfg(unix)]
         let script_host = self.spawn_script_host()?;
 
         // Bound before the syscall filter goes up, so that the filter need
@@ -143,7 +143,7 @@ impl ServeArgs {
             .notifier(notifier)
             .socket_path(&socket_path)
             .listener(listener);
-        #[cfg(all(unix, feature = "lua"))]
+        #[cfg(unix)]
         let builder = builder.script_host(script_host);
         let server = builder.build();
 
@@ -200,7 +200,7 @@ impl ServeArgs {
         if self.seccomp_log_only {
             argv.push("--seccomp-log-only".into());
         }
-        #[cfg(all(unix, feature = "lua"))]
+        #[cfg(unix)]
         if self.no_script_isolation {
             argv.push("--no-script-isolation".into());
         }
@@ -234,7 +234,7 @@ impl ServeArgs {
     /// in-process VM: quietly running user scripts next to the database
     /// because a `fork` failed would be a security downgrade nobody
     /// asked for. The error names the flag that makes it explicit.
-    #[cfg(all(unix, feature = "lua"))]
+    #[cfg(unix)]
     fn spawn_script_host(&self) -> Result<crate::process::ScriptHostHandle> {
         use crate::process::script_host::ScriptHost;
         use std::sync::Arc;
@@ -679,7 +679,7 @@ mod tests {
     #[test]
     fn to_argv_round_trips() {
         let mut argvs = vec![vec![], vec!["--no-sandbox", "--seccomp-log-only"]];
-        #[cfg(all(unix, feature = "lua"))]
+        #[cfg(unix)]
         argvs.push(vec!["--no-script-isolation"]);
 
         for argv in argvs {
@@ -691,7 +691,7 @@ mod tests {
     }
 
     /// Script isolation is the default; opting out has to be explicit.
-    #[cfg(all(unix, feature = "lua"))]
+    #[cfg(unix)]
     #[test]
     fn script_isolation_is_on_unless_opted_out() {
         assert!(!parse(&[]).no_script_isolation);
@@ -700,7 +700,7 @@ mod tests {
 
     /// `--no-script-isolation` returns no handle, so the server falls
     /// back to the in-process VM rather than half-wiring an absent child.
-    #[cfg(all(unix, feature = "lua"))]
+    #[cfg(unix)]
     #[test]
     fn opting_out_yields_no_script_host() {
         let handle = parse(&["--no-script-isolation"])
