@@ -865,7 +865,11 @@ pub enum ComponentState {
 /// it are still running, for the health check and the watchdog.
 #[derive(Clone)]
 pub struct Liveness {
+    // Without isolated children, the handles are always `None`, and the
+    // accessors below report `InProcess` without looking at them.
+    #[cfg_attr(not(unix), allow(dead_code))]
     feed_fetcher: crate::process::FeedFetcherHandle,
+    #[cfg_attr(not(all(unix, feature = "lua")), allow(dead_code))]
     script_host: crate::process::ScriptHostHandle,
     workers: tokio::sync::watch::Receiver<usize>,
 }
