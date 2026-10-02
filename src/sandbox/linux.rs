@@ -546,280 +546,152 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
         .unwrap_or_else(|_| a == b)
 }
 
-/// Syscalls every profile may make: what the standard library, the C
-/// library and the allocator need to run threads, manage memory, handle
-/// signals, tell the time, and use the descriptors the process already
-/// holds — among them the socket pair each child talks to its parent over.
-///
-/// Opening and inspecting files is here too. Landlock, not seccomp,
-/// decides which files a profile can reach, and for the profiles granted
-/// none an `open` fails with `EACCES` rather than killing the process.
-///
-/// Anything a profile's lists leave out kills the process, so these err
-/// towards what the C library *might* call — `ppoll` as well as `poll`,
-/// `prlimit64` behind `getrlimit`, the time syscalls behind the vDSO — over
-/// only what a trace of the test suite happened to see.
-const ALLOWED_COMMON: &[i64] = &[
-    // Memory.
-    libc::SYS_brk,
-    libc::SYS_mmap,
-    libc::SYS_munmap,
-    libc::SYS_mremap,
-    libc::SYS_mprotect,
-    libc::SYS_madvise,
-    // Threads. `clone` is allowed only without namespace flags, and
-    // `clone3` is refused with `ENOSYS` so that the C library falls back
-    // to `clone`: see [`apply_seccomp`].
-    libc::SYS_clone,
-    libc::SYS_clone3,
-    libc::SYS_futex,
-    libc::SYS_set_robust_list,
-    libc::SYS_set_tid_address,
-    libc::SYS_rseq,
-    libc::SYS_sched_yield,
-    libc::SYS_sched_getaffinity,
-    libc::SYS_exit,
-    libc::SYS_exit_group,
-    // Who the process is.
-    libc::SYS_getpid,
-    libc::SYS_getppid,
-    libc::SYS_gettid,
-    libc::SYS_getuid,
-    libc::SYS_geteuid,
-    libc::SYS_getgid,
-    libc::SYS_getegid,
-    libc::SYS_uname,
-    libc::SYS_prctl,
-    libc::SYS_prlimit64,
-    // Signals. `tgkill` is how `abort` raises `SIGABRT`, so a panic that
-    // aborts still reports as one.
-    libc::SYS_rt_sigaction,
-    libc::SYS_rt_sigprocmask,
-    libc::SYS_rt_sigreturn,
-    libc::SYS_sigaltstack,
-    libc::SYS_tgkill,
-    // How the kernel resumes a sleep or wait a signal interrupted — a
-    // `clock_nanosleep`, say — once the handler returns. Seccomp sees it
-    // like any other syscall.
-    libc::SYS_restart_syscall,
-    // Time.
-    libc::SYS_clock_gettime,
-    libc::SYS_clock_getres,
-    libc::SYS_gettimeofday,
-    libc::SYS_nanosleep,
-    libc::SYS_clock_nanosleep,
-    // Descriptors already open. `ioctl` is narrowed to a few requests:
-    // see [`ALLOWED_IOCTLS`].
-    libc::SYS_read,
-    libc::SYS_readv,
-    libc::SYS_write,
-    libc::SYS_writev,
-    libc::SYS_lseek,
-    libc::SYS_close,
-    libc::SYS_fcntl,
-    libc::SYS_ioctl,
-    libc::SYS_ppoll,
-    libc::SYS_recvfrom,
-    libc::SYS_recvmsg,
-    libc::SYS_sendto,
-    libc::SYS_sendmsg,
-    libc::SYS_shutdown,
-    // Files, as far as Landlock lets.
-    libc::SYS_openat,
-    libc::SYS_fstat,
-    libc::SYS_newfstatat,
-    libc::SYS_statx,
-    libc::SYS_readlinkat,
-    libc::SYS_faccessat,
-    libc::SYS_faccessat2,
-    libc::SYS_getdents64,
-    libc::SYS_getcwd,
-    libc::SYS_getrandom,
+/// A curated denylist of syscalls no Kiki process ever legitimately makes
+/// at runtime. Blocking them costs nothing and eliminates the most
+/// dangerous post-exploitation primitives (ptrace, module loading,
+/// namespace escape, kexec, etc.). Syscalls not on this list are allowed,
+/// so a future dependency adding a new benign syscall won't surprise us
+/// in production.
+const DENIED_COMMON: &[i64] = &[
+    libc::SYS_ptrace,
+    libc::SYS_process_vm_readv,
+    libc::SYS_process_vm_writev,
+    libc::SYS_mount,
+    libc::SYS_umount2,
+    libc::SYS_pivot_root,
+    libc::SYS_chroot,
+    libc::SYS_unshare,
+    libc::SYS_setns,
+    libc::SYS_init_module,
+    libc::SYS_finit_module,
+    libc::SYS_delete_module,
+    libc::SYS_kexec_load,
+    libc::SYS_kexec_file_load,
+    libc::SYS_bpf,
+    libc::SYS_perf_event_open,
+    libc::SYS_add_key,
+    libc::SYS_request_key,
+    libc::SYS_keyctl,
+    libc::SYS_reboot,
+    libc::SYS_swapon,
+    libc::SYS_swapoff,
+    libc::SYS_settimeofday,
+    libc::SYS_adjtimex,
+    libc::SYS_clock_settime,
+    libc::SYS_clock_adjtime,
+    libc::SYS_personality,
+    libc::SYS_acct,
+    libc::SYS_quotactl,
+    libc::SYS_mbind,
+    libc::SYS_migrate_pages,
+    libc::SYS_move_pages,
+    // io_uring performs I/O on the process's behalf without passing
+    // through seccomp at all, and has been a steady source of kernel
+    // exploits; userfaultfd is the classic primitive for widening kernel
+    // race windows. Tokio and SQLite use neither.
+    libc::SYS_io_uring_setup,
+    libc::SYS_io_uring_enter,
+    libc::SYS_io_uring_register,
+    libc::SYS_userfaultfd,
+    // Reaching into, or comparing, another process's resources:
+    // ptrace-adjacent, and never needed.
+    libc::SYS_pidfd_getfd,
+    libc::SYS_process_madvise,
+    libc::SYS_kcmp,
+    // Opening files by handle sidesteps path-based checks.
+    libc::SYS_name_to_handle_at,
+    libc::SYS_open_by_handle_at,
+    // Host administration.
+    libc::SYS_fanotify_init,
+    libc::SYS_syslog,
+    libc::SYS_vhangup,
+    libc::SYS_sethostname,
+    libc::SYS_setdomainname,
+    // Only the feed fetcher's supervisor may `execve` (see [`DENIED_EXEC`]),
+    // and nothing needs `execveat`.
+    libc::SYS_execveat,
 ];
 
-/// The legacy forms of [`ALLOWED_COMMON`]'s syscalls that x86_64 still
-/// has, and its C library still calls. Newer architectures have only the
-/// `*at` and `p*` forms.
+/// The legacy syscalls in [`DENIED_COMMON`]'s spirit that only x86_64
+/// has: libc exposes these constants only where they are real syscalls.
 #[cfg(target_arch = "x86_64")]
-const ALLOWED_COMMON_X86_64: &[i64] = &[
-    libc::SYS_open,
-    libc::SYS_stat,
-    libc::SYS_lstat,
-    libc::SYS_access,
-    libc::SYS_readlink,
-    libc::SYS_poll,
-    libc::SYS_time,
-    libc::SYS_getrlimit,
-];
+const DENIED_COMMON_X86_64: &[i64] = &[libc::SYS_ioperm, libc::SYS_iopl, libc::SYS_uselib];
 
-/// Syscalls for an event loop, which the profiles that run a tokio runtime
-/// need: the server, the feed fetcher's worker (and so its supervisor, which
-/// starts it), and the web UI.
-const ALLOWED_EVENT_LOOP: &[i64] = &[
-    libc::SYS_epoll_create1,
-    libc::SYS_epoll_ctl,
-    libc::SYS_epoll_pwait,
-    libc::SYS_epoll_pwait2,
-    libc::SYS_eventfd2,
-    libc::SYS_pipe2,
-    // tokio's signal handling wakes the runtime over a socket pair it
-    // makes when the runtime starts.
-    libc::SYS_socketpair,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_epoll_wait,
-];
-
-/// Syscalls for making sockets of the profile's own and connecting them.
-/// Which address families it may make them in is narrowed separately: see
-/// [`socket_domains`].
+/// Executing a program, denied to every profile but the feed fetcher's
+/// supervisor, which starts its worker, parser and resolver by running the
+/// kiki executable again — the one file Landlock lets it execute (see
+/// `self_exec_paths`). The processes it starts install filters of their
+/// own on top of its, which deny it.
 ///
-/// Not granted to the server, which binds its API socket before its filter
-/// goes up, and the service manager's notification socket is connected
-/// before that: from then on it only accepts connections.
-const ALLOWED_SOCKETS: &[i64] = &[
+/// No other Kiki process spawns children after its sandbox is installed
+/// — the server starts its children *before* its filter goes up. Blocking
+/// exec means an attacker who gains code execution still can't pivot to
+/// running arbitrary binaries.
+const DENIED_EXEC: &[i64] = &[libc::SYS_execve];
+
+/// Extra syscalls denied to the server: making a socket of its own, and
+/// attaching one to an address or a peer. It binds its API socket before
+/// its filter goes up, and connects the service manager's notification
+/// socket before that, so from then on it only accepts connections. It
+/// makes no network connections of its own — the feed fetcher downloads
+/// everything, and its resolver looks every hostname up.
+const DENIED_SERVER: &[i64] = &[
     libc::SYS_socket,
     libc::SYS_connect,
-    libc::SYS_getsockname,
-    libc::SYS_getpeername,
-    libc::SYS_getsockopt,
-    libc::SYS_setsockopt,
-    libc::SYS_sendmmsg,
-    libc::SYS_recvmmsg,
+    libc::SYS_bind,
+    libc::SYS_listen,
 ];
 
-/// Binding a socket to an address. musl's resolver binds every UDP socket
-/// it sends a query from (to port 0), so the feed fetcher's resolver may
-/// bind — and so may its supervisor, as a process it starts can do
-/// nothing the supervisor may not. Landlock denies the two of them TCP
-/// binds where the kernel supports it (6.7+).
+/// Extra syscalls denied to the script host, and to the feed fetcher's
+/// parser: everything that creates a socket or attaches one to a peer.
 ///
-/// No profile may `listen`: the server's API socket and the web UI's
-/// listener are both listening before their filters go up.
-const ALLOWED_BIND: &[i64] = &[libc::SYS_bind];
-
-/// Accepting connections on a listening socket, for the server's API
-/// socket and the web UI's listener, both bound and listening before the
-/// sandbox goes up. `accept` is a distinct syscall only on
-/// the architectures that predate `accept4`.
-const ALLOWED_ACCEPT: &[i64] = &[
+/// Each does its IPC over a socket pair it inherited when it was started,
+/// so it needs no way to make a new one. `send`/`recv` on an already-open
+/// descriptor stay allowed — std reads a `UnixStream` with `recv(2)` —
+/// but with no way to obtain another descriptor, the only peer it can
+/// ever reach is the process that started it.
+const DENIED_SCRIPT_HOST: &[i64] = &[
+    libc::SYS_socket,
+    libc::SYS_socketpair,
+    libc::SYS_connect,
+    libc::SYS_bind,
+    libc::SYS_listen,
     libc::SYS_accept4,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_accept,
 ];
 
-/// Changing the filesystem, which only the server does: SQLite's database,
-/// journals and temp files, the asset cache, the API socket's file, and
-/// watching the configuration for changes.
-const ALLOWED_FILE_WRITES: &[i64] = &[
-    libc::SYS_pread64,
-    libc::SYS_pwrite64,
-    libc::SYS_preadv,
-    libc::SYS_pwritev,
-    libc::SYS_ftruncate,
-    libc::SYS_fallocate,
-    libc::SYS_fsync,
-    libc::SYS_fdatasync,
-    libc::SYS_flock,
-    libc::SYS_mkdirat,
-    libc::SYS_unlinkat,
-    libc::SYS_renameat2,
-    libc::SYS_linkat,
-    libc::SYS_symlinkat,
-    libc::SYS_fchmod,
-    libc::SYS_fchmodat,
-    libc::SYS_fchown,
-    libc::SYS_fchownat,
-    libc::SYS_utimensat,
-    libc::SYS_copy_file_range,
-    libc::SYS_sendfile,
-    libc::SYS_inotify_init1,
-    libc::SYS_inotify_add_watch,
-    libc::SYS_inotify_rm_watch,
-    // riscv64 has only `renameat2`.
-    #[cfg(not(target_arch = "riscv64"))]
-    libc::SYS_renameat,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_mkdir,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_rmdir,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_unlink,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_rename,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_link,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_symlink,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_chmod,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_chown,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_inotify_init,
-];
-
-/// Waiting for and stopping child processes: the server's feed fetcher and
-/// script host, the feed fetcher's worker, parser and resolver, and the web
-/// UI's `kiki serve`. Landlock keeps every profile but the web UI from
-/// signalling outside its own sandbox, where the kernel supports it.
-const ALLOWED_CHILDREN: &[i64] = &[libc::SYS_wait4, libc::SYS_waitid, libc::SYS_kill];
-
-/// What the feed fetcher's supervisor needs to install its children's
-/// sandboxes, which they do under its filter, before their own goes up.
-const ALLOWED_SANDBOXING: &[i64] = &[
-    libc::SYS_seccomp,
-    libc::SYS_landlock_create_ruleset,
-    libc::SYS_landlock_add_rule,
-    libc::SYS_landlock_restrict_self,
-];
-
-/// What the feed fetcher's supervisor needs to start its children by
-/// running the kiki executable again: the `execve` itself, the `dup2` that
-/// puts a child's socket on [`crate::process::CHILD_FD`] before it, and
-/// what the new process calls, still under the supervisor's filter, from
-/// when the dynamic loader loads it to when it installs its own filter:
-/// `pread64` to read the libraries' headers, the thread pointer set up with
-/// `arch_prctl` on x86_64, and the `umask` that `main` sets.
+/// Extra syscalls denied to the feed fetcher's supervisor and resolver:
+/// listening for and accepting connections. They only ever connect out.
 ///
-/// Landlock limits what the supervisor can execute to the kiki executable
-/// and what it loads (see `self_exec_paths`), and every other profile's
-/// allowlist leaves `execve` out, so the processes the supervisor starts
-/// can execute nothing at all.
-const ALLOWED_EXEC: &[i64] = &[
-    libc::SYS_execve,
-    libc::SYS_dup3,
-    libc::SYS_pread64,
-    libc::SYS_umask,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_dup2,
-    #[cfg(target_arch = "x86_64")]
-    libc::SYS_arch_prctl,
-];
+/// Binding stays allowed, as musl's resolver binds every UDP socket it
+/// sends a query from (to port 0), and a process the supervisor starts
+/// can do nothing the supervisor may not. Landlock denies them TCP binds
+/// where the kernel supports it (6.7+).
+const DENIED_FEED_FETCHER: &[i64] = &[libc::SYS_listen, libc::SYS_accept4];
 
-/// The `ioctl` requests every profile may make: making a descriptor
-/// (non-)blocking or close-on-exec, asking how many bytes are waiting to be
-/// read (as glibc's resolver does), and asking whether a descriptor is a
-/// terminal, and how big (as logging does, to decide on colours; newer
-/// glibc asks with `TCGETS2`).
-///
-/// Every other request fails with `ENOTTY`, as it would on a descriptor
-/// that does not support it — among them `TIOCSTI`, which would let a
-/// compromised process type commands into a terminal it inherited.
-const ALLOWED_IOCTLS: &[libc::Ioctl] = &[
-    libc::FIONBIO,
-    libc::FIOCLEX,
-    libc::FIONCLEX,
-    libc::FIONREAD,
-    libc::TCGETS,
-    libc::TCGETS2,
-    libc::TIOCGWINSZ,
-];
+/// Extra syscalls denied to the feed fetcher's worker: binding an address
+/// as well as listening for and accepting connections. It only ever
+/// connects out, and leaves name resolution to the resolver.
+const DENIED_FEED_WORKER: &[i64] = &[libc::SYS_bind, libc::SYS_listen, libc::SYS_accept4];
 
-/// The `clone` flags that create namespaces. A process that could create
-/// a user namespace would gain capabilities inside it, opening up kernel
-/// code that unprivileged processes cannot otherwise reach, and no Kiki
-/// process creates any. `CLONE_NEWTIME` is left out: in `clone`, as
-/// opposed to `clone3`, its bit is part of the exit signal.
+/// Extra syscalls denied to the web UI: binding an address and listening.
+/// Its listener is bound and listening before the sandbox goes up, and it
+/// only ever accepts on that one, so `accept4` stays allowed.
+const DENIED_WEB_UI: &[i64] = &[libc::SYS_bind, libc::SYS_listen];
+
+/// The `ioctl` requests every profile is refused, with `ENOTTY`, as on a
+/// descriptor that does not support them: `TIOCSTI`, which would let a
+/// compromised process type commands into a terminal it inherited, and
+/// `TIOCLINUX`, whose console selection can do the same on a virtual
+/// console.
+const DENIED_IOCTLS: &[libc::Ioctl] = &[libc::TIOCSTI, libc::TIOCLINUX];
+
+/// The `clone` flags that create namespaces, which kill the process like
+/// the rest of the denylist: a process that could create a user namespace
+/// would gain capabilities inside it, opening up kernel code that
+/// unprivileged processes cannot otherwise reach, and denying `unshare`
+/// alone would leave `clone` as a way in. No Kiki process creates any.
+/// `CLONE_NEWTIME` is left out: in `clone`, as opposed to `clone3`, its
+/// bit is part of the exit signal.
 const CLONE_NAMESPACE_FLAGS: u64 = (libc::CLONE_NEWNS
     | libc::CLONE_NEWCGROUP
     | libc::CLONE_NEWUTS
@@ -828,52 +700,42 @@ const CLONE_NAMESPACE_FLAGS: u64 = (libc::CLONE_NEWNS
     | libc::CLONE_NEWPID
     | libc::CLONE_NEWNET) as u64;
 
-/// The syscall lists a profile's allowlist is made of: everything else
-/// kills the process.
-fn allowed_syscalls(profile: &SandboxProfile) -> Vec<i64> {
+/// The syscalls a profile's denylist kills the process for; everything
+/// else is allowed. `clone` with namespace flags is denied separately: see
+/// [`apply_seccomp`].
+fn denied_syscalls(profile: &SandboxProfile) -> Vec<i64> {
     #[cfg(target_arch = "x86_64")]
-    let common: &[&[i64]] = &[ALLOWED_COMMON, ALLOWED_COMMON_X86_64];
+    let common: &[&[i64]] = &[DENIED_COMMON, DENIED_COMMON_X86_64];
     #[cfg(not(target_arch = "x86_64"))]
-    let common: &[&[i64]] = &[ALLOWED_COMMON];
+    let common: &[&[i64]] = &[DENIED_COMMON];
+
+    // `accept` is a distinct syscall only on architectures that predate
+    // `accept4`; aarch64 and riscv64 expose `accept4` alone.
+    #[cfg(target_arch = "x86_64")]
+    let accept: &[i64] = &[libc::SYS_accept];
+    #[cfg(not(target_arch = "x86_64"))]
+    let accept: &[i64] = &[];
 
     let extra: &[&[i64]] = match profile {
-        SandboxProfile::Server { .. } => &[
-            ALLOWED_EVENT_LOOP,
-            ALLOWED_ACCEPT,
-            ALLOWED_FILE_WRITES,
-            ALLOWED_CHILDREN,
-        ],
-        // Nothing beyond the inherited socket pair.
-        SandboxProfile::ScriptHost | SandboxProfile::FeedParser => &[],
-        // What its worker, parser and resolver need between them, and
-        // what it needs to start and sandbox them.
-        SandboxProfile::FeedFetcher => &[
-            ALLOWED_EVENT_LOOP,
-            ALLOWED_SOCKETS,
-            ALLOWED_BIND,
-            ALLOWED_CHILDREN,
-            ALLOWED_SANDBOXING,
-            ALLOWED_EXEC,
-        ],
-        SandboxProfile::FeedWorker => &[ALLOWED_EVENT_LOOP, ALLOWED_SOCKETS],
-        SandboxProfile::FeedResolver => &[ALLOWED_SOCKETS, ALLOWED_BIND],
-        SandboxProfile::WebUi => &[
-            ALLOWED_EVENT_LOOP,
-            ALLOWED_SOCKETS,
-            ALLOWED_ACCEPT,
-            ALLOWED_CHILDREN,
-        ],
+        SandboxProfile::Server { .. } => &[DENIED_EXEC, DENIED_SERVER],
+        SandboxProfile::ScriptHost | SandboxProfile::FeedParser => {
+            &[DENIED_EXEC, DENIED_SCRIPT_HOST, accept]
+        }
+        SandboxProfile::FeedFetcher => &[DENIED_FEED_FETCHER, accept],
+        SandboxProfile::FeedResolver => &[DENIED_EXEC, DENIED_FEED_FETCHER, accept],
+        SandboxProfile::FeedWorker => &[DENIED_EXEC, DENIED_FEED_WORKER, accept],
+        SandboxProfile::WebUi => &[DENIED_EXEC, DENIED_WEB_UI],
     };
 
-    let mut allowed: Vec<i64> = common
+    let mut denied: Vec<i64> = common
         .iter()
         .chain(extra)
         .flat_map(|s| s.iter())
         .copied()
         .collect();
-    allowed.sort_unstable();
-    allowed.dedup();
-    allowed
+    denied.sort_unstable();
+    denied.dedup();
+    denied
 }
 
 /// The only address families the feed fetcher's processes may create
@@ -899,44 +761,44 @@ const FETCHER_SOCKET_FAMILIES: &[i32] = &[libc::AF_INET, libc::AF_INET6];
 const WEB_UI_SOCKET_FAMILIES: &[i32] = &[libc::AF_UNIX];
 
 /// Which `socket(2)` address families a profile may use, for the profiles
-/// [`ALLOWED_SOCKETS`] is granted to.
+/// whose denylist leaves `socket` out.
 fn socket_domains(profile: &SandboxProfile) -> Option<&'static [i32]> {
     match profile {
         SandboxProfile::FeedFetcher | SandboxProfile::FeedWorker | SandboxProfile::FeedResolver => {
             Some(FETCHER_SOCKET_FAMILIES)
         }
         SandboxProfile::WebUi => Some(WEB_UI_SOCKET_FAMILIES),
-        // `socket` is not on their allowlist at all.
+        // `socket` is on their denylist outright.
         SandboxProfile::Server { .. } | SandboxProfile::ScriptHost | SandboxProfile::FeedParser => {
             None
         }
     }
 }
 
-/// Install the profile's seccomp filters: an allowlist that kills the
-/// process on any syscall it leaves out, and, ahead of it, filters that
-/// refuse some of the calls it allows with an error, according to their
+/// Install the profile's seccomp filters: a denylist that kills the
+/// process on any syscall it names and allows every other, and, alongside
+/// it, filters that refuse some calls with an error, according to their
 /// arguments.
 ///
 /// The kernel runs every installed filter and takes the most severe
-/// verdict, so an error from one of the latter wins over the allowlist's
-/// `Allow`. They refuse with an error rather than killing because the
-/// call has a fallback, or because a library may reasonably probe for it:
+/// verdict. The latter refuse with an error rather than killing because
+/// the call has a fallback, or because a library may reasonably probe for
+/// it:
 ///
 /// * `clone3` fails with `ENOSYS`, as on a kernel that predates it, and
 ///   the C library falls back to `clone` — whose flags, unlike `clone3`'s,
-///   are not behind a pointer, so the allowlist can refuse the ones that
+///   are not behind a pointer, so the denylist can kill for the ones that
 ///   create namespaces;
-/// * `ioctl` fails with `ENOTTY` for any request not in
-///   [`ALLOWED_IOCTLS`];
+/// * `ioctl` fails with `ENOTTY` for the requests in [`DENIED_IOCTLS`];
 /// * `socket` fails with `EACCES` for any address family the profile may
 ///   not use (see [`socket_domains`]); a library that probes for a local
 ///   service, as glibc's resolver does for nscd, sees it as absent rather
 ///   than bringing the process down.
 ///
-/// The allowlist goes on last, so that it need not allow `seccomp` itself
-/// — except for the feed fetcher's supervisor, whose children install
-/// filters of their own.
+/// The default action for unmatched syscalls is `Allow` — this is a
+/// defence-in-depth layer that eliminates the most dangerous escape
+/// primitives without risking that a benign syscall we forgot about will
+/// kill the process.
 fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
     use seccompiler::{
         apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
@@ -966,10 +828,9 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
     let mut programs: Vec<(&str, BpfProgram)> = Vec::new();
     let mut compile = |name: &'static str,
                        rules: BTreeMap<i64, Vec<SeccompRule>>,
-                       match_action: SeccompAction,
-                       mismatch_action: SeccompAction|
+                       match_action: SeccompAction|
      -> Result<()> {
-        let filter = SeccompFilter::new(rules, mismatch_action, match_action, arch)
+        let filter = SeccompFilter::new(rules, SeccompAction::Allow, match_action, arch)
             .with_context(|| format!("constructing the {name} seccomp filter"))?;
         let program: BpfProgram = filter
             .try_into()
@@ -992,32 +853,29 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
         "clone3",
         [(libc::SYS_clone3, Vec::new())].into_iter().collect(),
         SeccompAction::Errno(libc::ENOSYS as u32),
-        SeccompAction::Allow,
     )?;
 
-    // `ioctl`, refused unless its request is one of the allowed ones: a
-    // rule matches when all of its conditions do.
-    let ioctl_conditions = ALLOWED_IOCTLS
+    // `ioctl`, refused for the denied requests: a syscall matches when any
+    // one of its rules does.
+    let ioctl_rules = DENIED_IOCTLS
         .iter()
         .map(|&request| {
-            condition(
+            rule(vec![condition(
                 1,
                 SeccompCmpArgLen::Dword,
-                SeccompCmpOp::Ne,
+                SeccompCmpOp::Eq,
                 request as u32 as u64,
-            )
+            )?])
         })
         .collect::<Result<_>>()?;
     compile(
         "ioctl",
-        [(libc::SYS_ioctl, vec![rule(ioctl_conditions)?])]
-            .into_iter()
-            .collect(),
+        [(libc::SYS_ioctl, ioctl_rules)].into_iter().collect(),
         refuse(libc::ENOTTY),
-        SeccompAction::Allow,
     )?;
 
-    // `socket`, refused unless its domain is one of the allowed ones.
+    // `socket`, refused unless its domain is one of the allowed ones: a
+    // rule matches when all of its conditions do.
     if let Some(families) = socket_domains(&config.profile) {
         let socket_conditions = families
             .iter()
@@ -1029,30 +887,33 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
                 .into_iter()
                 .collect(),
             refuse(libc::EACCES),
-            SeccompAction::Allow,
         )?;
     }
 
-    // The allowlist itself, with `clone` allowed only without namespace
-    // flags.
-    let allowed = allowed_syscalls(&config.profile);
+    // The denylist itself, with `clone` denied only with namespace flags:
+    // one rule per flag, so that any one of them matches.
+    let denied = denied_syscalls(&config.profile);
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
-        allowed.iter().map(|&nr| (nr, Vec::new())).collect();
-    rules.insert(
-        libc::SYS_clone,
-        vec![rule(vec![condition(
-            0,
-            SeccompCmpArgLen::Qword,
-            SeccompCmpOp::MaskedEq(CLONE_NAMESPACE_FLAGS),
-            0,
-        )?])?],
-    );
+        denied.iter().map(|&nr| (nr, Vec::new())).collect();
+    let clone_rules = (0..u64::BITS)
+        .map(|bit| 1u64 << bit)
+        .filter(|flag| CLONE_NAMESPACE_FLAGS & flag != 0)
+        .map(|flag| {
+            rule(vec![condition(
+                0,
+                SeccompCmpArgLen::Qword,
+                SeccompCmpOp::MaskedEq(flag),
+                flag,
+            )?])
+        })
+        .collect::<Result<_>>()?;
+    rules.insert(libc::SYS_clone, clone_rules);
     let violation = if config.log_only {
         SeccompAction::Log
     } else {
         SeccompAction::KillProcess
     };
-    compile("allowlist", rules, SeccompAction::Allow, violation)?;
+    compile("denylist", rules, violation)?;
 
     for (name, program) in &programs {
         apply_filter_all_threads(program)
@@ -1068,8 +929,8 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
     } else {
         tracing::info!(
             profile = config.profile_name(),
-            allowed_syscalls = allowed.len(),
-            "seccomp: syscall filter installed (allowlist, kill-on-violation)"
+            denied_syscalls = denied.len(),
+            "seccomp: syscall filter installed (denylist, kill-on-violation)"
         );
     }
     Ok(())
@@ -1282,7 +1143,7 @@ mod tests {
     #[test]
     fn the_script_host_and_the_parser_may_not_make_sockets() {
         for profile in every_profile() {
-            let allowed = allowed_syscalls(&profile);
+            let denied = denied_syscalls(&profile);
             if matches!(
                 profile,
                 SandboxProfile::ScriptHost | SandboxProfile::FeedParser
@@ -1295,11 +1156,11 @@ mod tests {
                     libc::SYS_listen,
                     libc::SYS_accept4,
                 ] {
-                    assert!(!allowed.contains(&nr), "{nr} allowed");
+                    assert!(denied.contains(&nr), "{nr} allowed");
                 }
             }
             assert_eq!(
-                allowed.contains(&libc::SYS_socket),
+                !denied.contains(&libc::SYS_socket),
                 socket_domains(&profile).is_some()
             );
         }
@@ -1388,12 +1249,12 @@ mod tests {
 
     #[test]
     fn the_feed_worker_may_connect_but_not_bind_or_accept() {
-        let allowed = allowed_syscalls(&SandboxProfile::FeedWorker);
-        assert!(!allowed.contains(&libc::SYS_bind));
-        assert!(!allowed.contains(&libc::SYS_listen));
-        assert!(!allowed.contains(&libc::SYS_accept4));
-        assert!(allowed.contains(&libc::SYS_socket));
-        assert!(allowed.contains(&libc::SYS_connect));
+        let denied = denied_syscalls(&SandboxProfile::FeedWorker);
+        assert!(denied.contains(&libc::SYS_bind));
+        assert!(denied.contains(&libc::SYS_listen));
+        assert!(denied.contains(&libc::SYS_accept4));
+        assert!(!denied.contains(&libc::SYS_socket));
+        assert!(!denied.contains(&libc::SYS_connect));
     }
 
     /// musl's resolver binds each UDP socket it queries from, and a
@@ -1403,44 +1264,31 @@ mod tests {
     #[test]
     fn the_supervisor_and_the_resolver_may_bind_for_musls_resolver() {
         for profile in [SandboxProfile::FeedFetcher, SandboxProfile::FeedResolver] {
-            let allowed = allowed_syscalls(&profile);
-            assert!(allowed.contains(&libc::SYS_bind));
-            assert!(!allowed.contains(&libc::SYS_listen));
-            assert!(!allowed.contains(&libc::SYS_accept4));
+            let denied = denied_syscalls(&profile);
+            assert!(!denied.contains(&libc::SYS_bind));
+            assert!(denied.contains(&libc::SYS_listen));
+            assert!(denied.contains(&libc::SYS_accept4));
         }
     }
 
     /// The supervisor's children run under its filter as well as their
-    /// own, so a syscall one of them needs that the supervisor's
-    /// allowlist leaves out would kill it. Each child's allowlist must
-    /// therefore lie within the supervisor's.
+    /// own, so a syscall one of them needs that the supervisor's denylist
+    /// names would kill it. Each child's denylist must therefore cover the
+    /// supervisor's, and its socket families lie within the supervisor's.
     #[test]
-    fn the_supervisor_allows_whatever_its_children_do() {
-        let supervisor = allowed_syscalls(&SandboxProfile::FeedFetcher);
+    fn the_supervisor_denies_nothing_its_children_need() {
+        let supervisor = denied_syscalls(&SandboxProfile::FeedFetcher);
         for child in [
             SandboxProfile::FeedWorker,
             SandboxProfile::FeedParser,
             SandboxProfile::FeedResolver,
         ] {
-            for nr in allowed_syscalls(&child) {
-                assert!(supervisor.contains(&nr), "syscall {nr} missing");
+            let denied = denied_syscalls(&child);
+            for nr in &supervisor {
+                assert!(denied.contains(nr), "syscall {nr} denied to the supervisor");
             }
             if let Some(families) = socket_domains(&child) {
                 assert!(families.iter().all(|f| FETCHER_SOCKET_FAMILIES.contains(f)));
-            }
-        }
-    }
-
-    /// Only the supervisor installs filters once its own is up — its
-    /// children's, started under it. Every other profile installs its
-    /// allowlist last, so it need not allow `seccomp` or Landlock.
-    #[test]
-    fn only_the_supervisor_may_install_sandboxes() {
-        for profile in every_profile() {
-            let allowed = allowed_syscalls(&profile);
-            let supervisor = matches!(profile, SandboxProfile::FeedFetcher);
-            for nr in ALLOWED_SANDBOXING {
-                assert_eq!(allowed.contains(nr), supervisor, "syscall {nr}");
             }
         }
     }
@@ -1456,12 +1304,12 @@ mod tests {
     /// connects to the API's Unix socket, but opens no new listener.
     #[test]
     fn the_web_ui_may_accept_and_connect_but_not_listen() {
-        let allowed = allowed_syscalls(&SandboxProfile::WebUi);
-        assert!(!allowed.contains(&libc::SYS_bind));
-        assert!(!allowed.contains(&libc::SYS_listen));
-        assert!(allowed.contains(&libc::SYS_accept4));
-        assert!(allowed.contains(&libc::SYS_socket));
-        assert!(allowed.contains(&libc::SYS_connect));
+        let denied = denied_syscalls(&SandboxProfile::WebUi);
+        assert!(denied.contains(&libc::SYS_bind));
+        assert!(denied.contains(&libc::SYS_listen));
+        assert!(!denied.contains(&libc::SYS_accept4));
+        assert!(!denied.contains(&libc::SYS_socket));
+        assert!(!denied.contains(&libc::SYS_connect));
         assert_eq!(WEB_UI_SOCKET_FAMILIES, [libc::AF_UNIX]);
     }
 
@@ -1469,19 +1317,19 @@ mod tests {
     /// goes up, so all it may do with sockets is accept connections.
     #[test]
     fn the_server_may_accept_but_not_make_sockets() {
-        let allowed = allowed_syscalls(&SandboxProfile::Server {
+        let denied = denied_syscalls(&SandboxProfile::Server {
             data_dir: PathBuf::from("/var/lib/kiki"),
             socket_dir: PathBuf::from("/var/lib/kiki"),
             temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
         });
-        assert!(allowed.contains(&libc::SYS_accept4));
+        assert!(!denied.contains(&libc::SYS_accept4));
         for nr in [
             libc::SYS_socket,
             libc::SYS_connect,
             libc::SYS_bind,
             libc::SYS_listen,
         ] {
-            assert!(!allowed.contains(&nr), "syscall {nr} allowed");
+            assert!(denied.contains(&nr), "syscall {nr} allowed");
         }
     }
 
@@ -1490,7 +1338,7 @@ mod tests {
     #[test]
     fn no_profile_may_listen() {
         for profile in every_profile() {
-            assert!(!allowed_syscalls(&profile).contains(&libc::SYS_listen));
+            assert!(denied_syscalls(&profile).contains(&libc::SYS_listen));
         }
     }
 
@@ -1527,90 +1375,34 @@ mod tests {
         }
     }
 
-    /// What the denylist this allowlist replaced used to deny: the most
-    /// dangerous post-exploitation primitives, which no profile may ever
-    /// be allowed, however its lists grow.
-    const NEVER_ALLOWED: &[i64] = &[
-        libc::SYS_execve,
-        libc::SYS_execveat,
-        libc::SYS_ptrace,
-        libc::SYS_process_vm_readv,
-        libc::SYS_process_vm_writev,
-        libc::SYS_mount,
-        libc::SYS_umount2,
-        libc::SYS_pivot_root,
-        libc::SYS_chroot,
-        libc::SYS_unshare,
-        libc::SYS_setns,
-        libc::SYS_init_module,
-        libc::SYS_finit_module,
-        libc::SYS_delete_module,
-        libc::SYS_kexec_load,
-        // Not in libc for every target.
-        #[cfg(target_arch = "x86_64")]
-        libc::SYS_kexec_file_load,
-        libc::SYS_bpf,
-        libc::SYS_perf_event_open,
-        libc::SYS_add_key,
-        libc::SYS_request_key,
-        libc::SYS_keyctl,
-        libc::SYS_reboot,
-        libc::SYS_swapon,
-        libc::SYS_swapoff,
-        libc::SYS_settimeofday,
-        libc::SYS_adjtimex,
-        libc::SYS_clock_settime,
-        libc::SYS_clock_adjtime,
-        libc::SYS_personality,
-        libc::SYS_acct,
-        libc::SYS_quotactl,
-        libc::SYS_mbind,
-        libc::SYS_migrate_pages,
-        libc::SYS_move_pages,
-        #[cfg(target_arch = "x86_64")]
-        libc::SYS_uselib,
-        libc::SYS_io_uring_setup,
-        libc::SYS_io_uring_enter,
-        libc::SYS_io_uring_register,
-        libc::SYS_userfaultfd,
-        libc::SYS_pidfd_getfd,
-        libc::SYS_process_madvise,
-        libc::SYS_kcmp,
-        libc::SYS_name_to_handle_at,
-        libc::SYS_open_by_handle_at,
-        libc::SYS_fanotify_init,
-        libc::SYS_syslog,
-        libc::SYS_vhangup,
-        libc::SYS_sethostname,
-        libc::SYS_setdomainname,
-    ];
-
-    /// The one exception is the feed fetcher's supervisor's `execve`,
-    /// which is how it starts its children, and which Landlock confines to
-    /// the kiki executable.
+    /// Every profile denies the most dangerous post-exploitation
+    /// primitives.
     #[test]
-    fn no_profile_allows_what_the_old_denylist_denied() {
+    fn every_profile_denies_the_common_list() {
         for profile in every_profile() {
-            let allowed = allowed_syscalls(&profile);
-            let supervisor = matches!(profile, SandboxProfile::FeedFetcher);
-            for nr in NEVER_ALLOWED {
-                if supervisor && *nr == libc::SYS_execve {
-                    continue;
-                }
-                assert!(!allowed.contains(nr), "syscall {nr} allowed");
+            let denied = denied_syscalls(&profile);
+            for nr in DENIED_COMMON {
+                assert!(denied.contains(nr), "syscall {nr} allowed");
             }
         }
+        assert!(DENIED_COMMON.contains(&libc::SYS_io_uring_setup));
+        assert!(DENIED_COMMON.contains(&libc::SYS_userfaultfd));
+        assert!(DENIED_COMMON.contains(&libc::SYS_ptrace));
+        assert!(DENIED_COMMON.contains(&libc::SYS_unshare));
     }
 
     /// Only the supervisor may execute anything, and the processes it
     /// starts, which install their own filters on top of its, may not.
+    /// Nothing may `execveat`.
     #[test]
     fn only_the_supervisor_may_execute() {
         for profile in every_profile() {
             let supervisor = matches!(profile, SandboxProfile::FeedFetcher);
+            let denied = denied_syscalls(&profile);
+            assert!(denied.contains(&libc::SYS_execveat));
             assert_eq!(
-                allowed_syscalls(&profile).contains(&libc::SYS_execve),
-                supervisor,
+                denied.contains(&libc::SYS_execve),
+                !supervisor,
                 "{}",
                 SandboxConfig {
                     profile,
@@ -1631,19 +1423,19 @@ mod tests {
         assert_eq!(executable.first(), Some(&exe));
     }
 
-    /// Every profile's filters compile, for this architecture.
+    /// Every profile's denylist compiles, for this architecture.
     #[test]
-    fn every_profiles_allowlist_compiles() {
+    fn every_profiles_denylist_compiles() {
         let arch = detect_arch().expect("a supported architecture");
         for profile in every_profile() {
-            let rules = allowed_syscalls(&profile)
+            let rules = denied_syscalls(&profile)
                 .into_iter()
                 .map(|nr| (nr, Vec::new()))
                 .collect();
             let filter = seccompiler::SeccompFilter::new(
                 rules,
-                seccompiler::SeccompAction::KillProcess,
                 seccompiler::SeccompAction::Allow,
+                seccompiler::SeccompAction::KillProcess,
                 arch,
             )
             .unwrap();
