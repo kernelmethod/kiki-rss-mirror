@@ -8,9 +8,9 @@
 //!
 //! Each test provisions its own temporary data directory, starts a
 //! kiki subprocess pointed at it, and tears the process down on drop.
-//! A regression that adds a newly-denied syscall to a hot code path
-//! (DB open, UDS bind, JSON parse, SQLite write, reqwest fetch) will
-//! show up as the subprocess dying with SIGSYS before a request can
+//! A regression that adds a syscall the allowlist leaves out to a hot
+//! code path (DB open, UDS bind, JSON parse, SQLite write, reqwest fetch)
+//! will show up as the subprocess dying with SIGSYS before a request can
 //! complete, surfaced via [`Kiki::assert_still_running`].
 
 #![cfg(all(target_os = "linux", feature = "cli"))]
@@ -465,6 +465,87 @@ fn no_sandbox_flag_still_runs() {
     kiki.shutdown();
 }
 
+/// Set to anything to make [`allowlist_probe`] run.
+const ALLOWLIST_PROBE_ENV: &str = "KIKI_ALLOWLIST_PROBE";
+
+/// Printed by [`allowlist_probe`] once every check that should pass has,
+/// just before it makes the call that must kill it.
+const ALLOWLIST_PROBE_PASSED: &str = "allowlist probe: allowed calls passed";
+
+/// Not a test of its own: [`the_syscall_allowlist_is_enforced`] runs it in
+/// a process of its own. It installs the script host's sandbox, the
+/// strictest there is, and checks what the allowlist's argument filters
+/// let through, then tries to create a user namespace, which must kill it.
+#[test]
+fn allowlist_probe() {
+    use kiki_rss::sandbox::{apply, SandboxConfig};
+    if std::env::var_os(ALLOWLIST_PROBE_ENV).is_none() {
+        return;
+    }
+    apply(&SandboxConfig::script_host(false)).expect("install the script host sandbox");
+
+    // `clone3` is refused, and the C library falls back to `clone`.
+    thread::spawn(|| 42)
+        .join()
+        .map(|n| assert_eq!(n, 42))
+        .expect("start a thread");
+
+    // An ioctl the allowlist leaves out fails, rather than killing.
+    let ch: libc::c_char = 0;
+    // SAFETY: `TIOCSTI` reads one byte from a valid pointer.
+    let rc = unsafe { libc::ioctl(0, libc::TIOCSTI, &ch) };
+    assert_eq!(rc, -1, "TIOCSTI was allowed");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENOTTY)
+    );
+    println!("{ALLOWLIST_PROBE_PASSED}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    // Seccomp kills the process here.
+    let flags = (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong;
+    // SAFETY: a `fork`-like `clone` with no stack, so the child, if one
+    // is created, runs on a copy of this stack and exits at once.
+    let pid = unsafe { libc::syscall(libc::SYS_clone, flags, 0usize, 0usize, 0usize, 0usize) };
+    if pid == 0 {
+        // SAFETY: `_exit` is async-signal-safe, and skips the parent's
+        // destructors.
+        unsafe { libc::_exit(0) };
+    }
+    println!("allowlist probe: a user namespace was created");
+}
+
+/// The allowlist refuses what it leaves out, kills for namespaces, and
+/// lets threads start: run [`allowlist_probe`] in a fresh process, and
+/// check that it got past the allowed calls and was then killed.
+#[test]
+fn the_syscall_allowlist_is_enforced() {
+    let output = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "allowlist_probe",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ALLOWLIST_PROBE_ENV, "1")
+        .output()
+        .expect("run the probe");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains(ALLOWLIST_PROBE_PASSED),
+        "probe failed the allowed calls ({}):\n{stdout}\n{stderr}",
+        describe_exit(output.status)
+    );
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGSYS),
+        "probe was not killed for creating a user namespace ({}):\n{stdout}\n{stderr}",
+        describe_exit(output.status)
+    );
+}
+
 // --------------------------------------------------------------------
 // Process-tree helpers
 // --------------------------------------------------------------------
@@ -879,6 +960,9 @@ mod fetch_isolation {
             .expect("probe TCP address")
             .parse()
             .expect("valid probe TCP address");
+        // Asked before the sandbox goes up, whose allowlist leaves out
+        // the query.
+        let abi = landlock_abi();
         apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
         apply(&SandboxConfig::feed_resolver(false)).expect("install the resolver sandbox");
 
@@ -905,11 +989,11 @@ mod fetch_isolation {
         let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, 0) };
         assert!(fd < 0, "a netlink socket was allowed");
 
-        if landlock_abi() >= 1 {
+        if abi >= 1 {
             std::fs::read(dir.join("secret")).expect_err("reading a file was allowed");
             std::fs::read_dir("/etc/ssl").expect_err("listing the trust stores was allowed");
         }
-        if landlock_abi() >= 4 {
+        if abi >= 4 {
             let err = std::net::TcpStream::connect(tcp).expect_err("TCP connect was allowed");
             assert_eq!(err.raw_os_error(), Some(libc::EACCES), "{err}");
         } else {
@@ -1025,12 +1109,15 @@ mod fetch_isolation {
         let Some(dir) = std::env::var_os(PROBE_ENV).map(PathBuf::from) else {
             return;
         };
+        // Asked before the sandbox goes up, whose allowlist leaves out
+        // the query.
+        let abi = landlock_abi();
         apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
         apply(&SandboxConfig::feed_parser(false)).expect("install the parser sandbox");
 
         // The fetcher may read the TLS trust stores; the parser may not
         // read anything, where the kernel has Landlock.
-        if landlock_abi() >= 1 {
+        if abi >= 1 {
             std::fs::read(dir.join("secret")).expect_err("reading a file was allowed");
             std::fs::read_dir("/etc/ssl").expect_err("listing the trust stores was allowed");
         } else {
@@ -1766,8 +1853,8 @@ mod web_ui {
         }
     }
 
-    /// Every page renders with the web UI sandboxed — a newly denied
-    /// syscall on a handler's path would kill it with SIGSYS — and the
+    /// Every page renders with the web UI sandboxed — a syscall the
+    /// allowlist leaves out on a handler's path would kill it with SIGSYS — and the
     /// sandbox is really installed.
     #[test]
     fn the_sandboxed_web_ui_serves_every_page() {
@@ -1868,6 +1955,9 @@ mod web_ui {
             .expect("valid probe TCP address");
         let secret = dir.join("secret");
 
+        // Asked before the sandbox goes up, whose allowlist leaves out
+        // the query.
+        let abi = landlock_abi();
         kiki_rss::sandbox::apply(&kiki_rss::sandbox::SandboxConfig::web_ui(false))
             .expect("install the web UI sandbox");
 
@@ -1881,7 +1971,7 @@ mod web_ui {
         std::net::UdpSocket::bind("127.0.0.1:0").expect_err("UDP socket was allowed");
 
         // Nor does the filesystem, where the kernel has Landlock.
-        if landlock_abi() >= 1 {
+        if abi >= 1 {
             std::fs::read(&secret).expect_err("reading a file was allowed");
             std::fs::read_dir("/").expect_err("listing / was allowed");
             std::fs::write(dir.join("new"), "x").expect_err("creating a file was allowed");
