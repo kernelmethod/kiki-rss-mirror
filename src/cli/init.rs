@@ -5,23 +5,6 @@ use clap::Args;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Set restrictive permissions on a path so that only the owner and group can
-/// access it. On non-Unix platforms this is a no-op.
-fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(mode);
-        fs::set_permissions(path, perms)
-            .with_context(|| format!("unable to set permissions on {path:?}"))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
-    Ok(())
-}
-
 /// Returns the directory Kiki treats as its home.
 ///
 /// `$KIKI_HOME` if set, otherwise the platform data directory:
@@ -142,14 +125,14 @@ impl InitArgs {
 
         fs::create_dir_all(directory)
             .with_context(|| format!("unable to create directory {directory:?}"))?;
-        restrict_permissions(directory, 0o750)?;
+        paths::restrict_permissions(directory, 0o750)?;
 
         ConnectionBuilder::default()
             .at_path(&db_path)
             .create()
             .build()
             .with_context(|| format!("failed to create database in {:?}", db_path))?;
-        restrict_permissions(&db_path, 0o660)?;
+        paths::restrict_permissions(&db_path, 0o660)?;
 
         let plugins_dir = crate::plugins::plugins_dir(directory);
         fs::create_dir_all(&plugins_dir)

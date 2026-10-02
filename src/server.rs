@@ -1062,6 +1062,28 @@ async fn check_feeds(
     Ok(())
 }
 
+/// Resolve when the process is asked to terminate: on `SIGTERM` on Unix,
+/// and on `CTRL_BREAK_EVENT` on Windows, which is how `kiki web` stops the
+/// server it started. Ctrl+C is left to [`signal::ctrl_c`].
+///
+/// Never resolves if the handler cannot be installed, which is logged.
+pub(crate) async fn terminate_signal() {
+    #[cfg(unix)]
+    let sig = signal::unix::signal(signal::unix::SignalKind::terminate());
+    #[cfg(windows)]
+    let sig = signal::windows::ctrl_break();
+
+    match sig {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(e) => {
+            tracing::error!("failed to install signal handler: {:?}", e);
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 async fn shutdown_signal(token: CancellationToken) {
     let handler = || {
         token.cancel();
@@ -1073,21 +1095,7 @@ async fn shutdown_signal(token: CancellationToken) {
         }
     };
 
-    #[cfg(unix)]
-    let terminate = async {
-        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
-            }
-            Err(e) => {
-                tracing::error!("failed to install signal handler: {:?}", e);
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let terminate = terminate_signal();
 
     tokio::select! {
         _ = ctrl_c => { handler(); }

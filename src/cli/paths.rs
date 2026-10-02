@@ -42,8 +42,6 @@
 //! [`kiki init`]: crate::cli::init
 
 use anyhow::{bail, Context, Result};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// Environment variable naming Kiki's home directory. When set, both the
@@ -167,7 +165,13 @@ fn non_empty_var(name: &str) -> Option<PathBuf> {
 /// owned by the user with an access mode of `0700`; anything else means some
 /// other user could reach — or have planted — the socket. A symlink is
 /// rejected outright rather than followed.
+///
+/// Outside Unix there is no runtime directory to vet, so this always
+/// returns `false` and the socket falls back to the data directory.
+#[cfg(unix)]
 pub fn runtime_dir_is_usable(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
     let Ok(metadata) = std::fs::symlink_metadata(dir) else {
         return false;
     };
@@ -176,6 +180,34 @@ pub fn runtime_dir_is_usable(dir: &Path) -> bool {
     let euid = unsafe { libc::geteuid() };
 
     metadata.is_dir() && metadata.uid() == euid && metadata.mode() & 0o777 == 0o700
+}
+
+/// See the `unix` variant.
+#[cfg(not(unix))]
+pub fn runtime_dir_is_usable(dir: &Path) -> bool {
+    let _ = dir;
+    false
+}
+
+/// Restrict `path` to `mode`, so that only its owner, and its group if
+/// `mode` says so, can access it. A no-op outside Unix, where files are
+/// governed by the ACLs they inherit from their directory instead.
+///
+/// # Errors
+///
+/// Returns an error if the permissions cannot be set.
+pub(crate) fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("unable to set permissions on {path:?}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
 }
 
 /// The directory Kiki treats as its home when nothing more specific says
@@ -445,7 +477,7 @@ pub fn resolve_socket_path(explicit: Option<&Path>, data_dir: &DataDir, env: &En
 /// or contains an interior NUL byte, either of which `bind(2)` would reject
 /// with an error that says nothing about the real cause.
 pub fn validate_socket_path(path: &Path) -> Result<()> {
-    let bytes = path.as_os_str().as_bytes();
+    let bytes = path.as_os_str().as_encoded_bytes();
 
     if bytes.contains(&0) {
         bail!("socket path {path:?} contains a NUL byte");
@@ -756,6 +788,7 @@ mod test {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn runtime_dir_must_be_private_to_this_user() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;

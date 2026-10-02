@@ -30,7 +30,6 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::LazyLock;
@@ -201,15 +200,24 @@ impl WebArgs {
     ///
     /// The child gets its own process group, so a Ctrl+C at the terminal
     /// reaches only this process, which then stops the server itself. That
-    /// keeps shutdown in one order no matter how it was asked for.
+    /// keeps shutdown in one order no matter how it was asked for. (On
+    /// Windows, a new process group also ignores Ctrl+C, but still hears the
+    /// Ctrl+Break [`stop_server`] sends it.)
     fn spawn_server(&self, socket_path: &Path) -> Result<ServerProcess> {
         let exe = std::env::current_exe().context("locating the kiki executable")?;
-        let child = std::process::Command::new(exe)
-            .arg("serve")
-            .args(self.serve.to_argv(socket_path))
-            .process_group(0)
-            .spawn()
-            .context("failed to start the Kiki server")?;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("serve").args(self.serve.to_argv(socket_path));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+        }
+        let child = cmd.spawn().context("failed to start the Kiki server")?;
         tracing::info!(pid = child.id(), "started Kiki server");
         Ok(ServerProcess(child))
     }
@@ -261,6 +269,7 @@ impl ServerProcess {
     ///
     /// Only this handle ever reaps the child, so until this returns its pid
     /// cannot be reused, and [`stop_server`] can safely signal it.
+    #[cfg(unix)]
     async fn wait(&mut self) -> Result<ExitStatus> {
         // Listen for SIGCHLD before checking, so an exit between the check
         // and the wait still wakes us.
@@ -271,6 +280,18 @@ impl ServerProcess {
             }
             if sigchld.recv().await.is_none() {
                 bail!("SIGCHLD stream closed while waiting on the Kiki server");
+            }
+        }
+    }
+
+    /// See the `unix` variant. Windows has no `SIGCHLD`, so this polls.
+    #[cfg(windows)]
+    async fn wait(&mut self) -> Result<ExitStatus> {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            tick.tick().await;
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
             }
         }
     }
@@ -2605,21 +2626,13 @@ fn render_pagination(
     )
 }
 
-/// Ask the Kiki server to shut down gracefully with `SIGTERM`, and wait
-/// for it to exit.
+/// Ask the Kiki server to shut down gracefully, and wait for it to exit.
+///
+/// The request is a `SIGTERM` on Unix and a Ctrl+Break on Windows; see
+/// [`crate::server::terminate_signal`].
 async fn stop_server(server: &mut ServerProcess) -> Result<ExitStatus> {
     if server.0.try_wait()?.is_none() {
-        let pid = libc::pid_t::try_from(server.0.id()).context("Kiki server pid out of range")?;
-        // SAFETY: kill(2) has no memory-safety preconditions. The child has
-        // not been reaped yet (`try_wait` returned `None`, and only
-        // `ServerProcess` reaps it), so the pid still names it and cannot
-        // have been reused.
-        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-            tracing::warn!(
-                error = %std::io::Error::last_os_error(),
-                "failed to signal the Kiki server"
-            );
-        }
+        request_termination(&mut server.0)?;
     }
     server
         .wait()
@@ -2627,7 +2640,46 @@ async fn stop_server(server: &mut ServerProcess) -> Result<ExitStatus> {
         .context("failed to wait on the Kiki server")
 }
 
-/// Resolve on Ctrl+C or `SIGTERM`.
+/// Send `child` a `SIGTERM`.
+#[cfg(unix)]
+fn request_termination(child: &mut std::process::Child) -> Result<()> {
+    let pid = libc::pid_t::try_from(child.id()).context("Kiki server pid out of range")?;
+    // SAFETY: kill(2) has no memory-safety preconditions. The child has
+    // not been reaped yet (the caller's `try_wait` returned `None`, and
+    // only `ServerProcess` reaps it), so the pid still names it and cannot
+    // have been reused.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "failed to signal the Kiki server"
+        );
+    }
+    Ok(())
+}
+
+/// Send Ctrl+Break to `child`'s process group, which [`spawn_server`]
+/// made it the leader of, so the group id is its pid. That only works
+/// while the two share a console; without one, kill it instead.
+///
+/// [`spawn_server`]: WebArgs::spawn_server
+#[cfg(windows)]
+fn request_termination(child: &mut std::process::Child) -> Result<()> {
+    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+
+    // SAFETY: GenerateConsoleCtrlEvent takes no pointers. The child has
+    // not been reaped, so its process group id cannot have been reused.
+    if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) } == 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "failed to send Ctrl+Break to the Kiki server; killing it instead"
+        );
+        child.kill().context("failed to kill the Kiki server")?;
+    }
+    Ok(())
+}
+
+/// Resolve on Ctrl+C, or on whatever [`crate::server::terminate_signal`]
+/// waits for.
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = signal::ctrl_c().await {
@@ -2636,21 +2688,9 @@ async fn shutdown_signal() {
         }
     };
 
-    let terminate = async {
-        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
-            }
-            Err(e) => {
-                tracing::error!("failed to install signal handler: {e:?}");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-
     tokio::select! {
         _ = ctrl_c => {}
-        _ = terminate => {}
+        _ = crate::server::terminate_signal() => {}
     }
 }
 
