@@ -22,27 +22,27 @@
 //!   feed fetcher is barred from binding TCP ports, its resolver from
 //!   binding them or connecting to any but DNS's, and its parser and the
 //!   web UI from binding or connecting to them.
-//! * **seccomp-bpf** allows only the syscalls the profile uses, and kills
-//!   the process on any other — so `ptrace`, `mount`, `unshare`, `bpf`,
-//!   module loading, `io_uring`, `userfaultfd` and the rest of the
-//!   kernel's surface are out of reach without being named, and so is
-//!   `execve` for every profile but the feed fetcher's supervisor.
-//!   Every profile gets what the runtime needs for memory, threads,
-//!   signals, time and the descriptors it holds; on top of that, the
-//!   server may change files and accept connections on its API socket,
-//!   which it binds before its filter goes up, but may make no socket of
-//!   its own; the feed fetcher's worker may make and connect IPv4
-//!   and IPv6 sockets, its resolver bind them too, and its supervisor
-//!   whatever the three of those may, and start and sandbox them — which
-//!   it does by executing the kiki executable again, the one file
-//!   Landlock lets it execute; the web
-//!   UI may accept on its listener and make and connect Unix sockets; and
-//!   the script host and the feed fetcher's parser may make no socket at
-//!   all. A few allowed calls are narrowed by their arguments: `clone`
-//!   may not create namespaces (`clone3`, whose flags seccomp cannot see,
-//!   fails with `ENOSYS`, and the C library falls back to `clone`),
-//!   `ioctl` is limited to a handful of harmless requests, and `socket`
-//!   to the address families above.
+//! * **seccomp-bpf** kills the process on a denylist of syscalls no
+//!   profile uses: `ptrace`, `mount`, `unshare`, `bpf`, `kexec_load`,
+//!   module loading, `io_uring`, `userfaultfd`, and friends, and `clone`
+//!   with any namespace flag (`clone3`, whose flags seccomp cannot see,
+//!   fails with `ENOSYS`, and the C library falls back to `clone`).
+//!   Every profile but the feed fetcher's supervisor is also denied
+//!   `execve`; the supervisor starts its worker, parser and resolver by
+//!   executing the kiki executable again, the one file Landlock lets it
+//!   execute. On top of that, the server is denied making, connecting,
+//!   binding and listening on sockets, as it binds its API socket before
+//!   its filter goes up; the script host and the feed fetcher's parser
+//!   every socket call; the feed fetcher's supervisor and resolver
+//!   listening and accepting, and its worker binding as well; and the web
+//!   UI binding and listening. `socket` is refused, with `EACCES`, for any
+//!   address family but IPv4 and IPv6 in the feed fetcher's processes and
+//!   any but Unix in the web UI, and `ioctl` for `TIOCSTI` and
+//!   `TIOCLINUX`, with `ENOTTY`, in every profile.
+//!   The default action for unmatched syscalls is `Allow` — this is a
+//!   defence-in-depth layer that eliminates the most dangerous escape
+//!   primitives without risking that a benign syscall we forgot about
+//!   will kill the process.
 //! * **`PR_SET_MDWE`** (Linux 6.3+) makes the kernel refuse memory that is
 //!   writable and executable, and refuse making any mapping executable
 //!   that was not already, so injected code cannot be written and then
@@ -119,7 +119,7 @@ pub enum SandboxProfile {
     /// and nothing else — no data directory, no `/proc` — but the kiki
     /// executable and the libraries it loads, which it may execute. It is
     /// the only profile that may `execve`, which is how it starts its
-    /// children; theirs leave it out.
+    /// children; theirs deny it.
     /// It may make outbound connections, and bind UDP sockets, which the
     /// resolver needs, but may not bind TCP ports, listen for or accept
     /// connections, or create a Unix socket: the last keeps the fetcher's
