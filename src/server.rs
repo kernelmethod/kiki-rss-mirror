@@ -623,15 +623,29 @@ async fn metrics_sampler_loop(
                         #[cfg(target_os = "linux")]
                         match crate::process::stats::sample() {
                             Ok(usage) => {
-                                for (role, u) in usage {
-                                    if u.proportional_bytes.is_none() {
+                                use crate::process::stats::Role;
+                                for role in Role::ALL {
+                                    let Some(u) = usage.get(&role) else {
+                                        metrics.set_process_usage(
+                                            role.as_str(),
+                                            crate::metrics::ProcessUsage::default(),
+                                        );
+                                        continue;
+                                    };
+                                    // The server cannot read its parent's PSS.
+                                    if u.proportional_bytes.is_none() && role != Role::Web {
                                         warn_pss_unreadable(role);
                                     }
                                     metrics.set_process_usage(
                                         role.as_str(),
-                                        u.cpu_seconds,
-                                        u.resident_bytes as f64,
-                                        u.proportional_bytes.map(|b| b as f64),
+                                        crate::metrics::ProcessUsage {
+                                            cpu_seconds: u.cpu_seconds,
+                                            resident_bytes: u.resident_bytes as f64,
+                                            proportional_bytes: u.proportional_bytes.map(|b| b as f64),
+                                            swap_bytes: u.swap_bytes.map(|b| b as f64),
+                                            peak_resident_bytes: u.peak_resident_bytes.map(|b| b as f64),
+                                            processes: u.processes as f64,
+                                        },
                                     );
                                 }
                             }
