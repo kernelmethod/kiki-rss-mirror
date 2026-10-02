@@ -65,9 +65,16 @@ impl Kiki {
     }
 
     /// As [`Self::spawn`], with `kiki serve`'s standard error, which its
-    /// children share, written to `log`.
-    fn spawn_logging_to(extra_args: &[&str], log: std::fs::File) -> Self {
-        Self::spawn_as(extra_args, |_| {}, None, &[], log.into())
+    /// children share, written to `log`, and `rust_log` deciding what is
+    /// logged.
+    fn spawn_logging_to(extra_args: &[&str], log: std::fs::File, rust_log: &str) -> Self {
+        Self::spawn_as(
+            extra_args,
+            |_| {},
+            None,
+            &[("RUST_LOG", rust_log)],
+            log.into(),
+        )
     }
 
     /// As [`Self::spawn`], but run kiki as an unprivileged user when the
@@ -499,10 +506,29 @@ fn the_childrens_logs_reach_the_servers_stderr() {
     let dir = TempDir::with_prefix("kiki-child-logs").expect("create tempdir");
     let path = dir.path().join("stderr.log");
     let log = std::fs::File::create(&path).expect("create the log file");
-    let mut kiki = Kiki::spawn_logging_to(&[], log);
+    let mut kiki = Kiki::spawn_logging_to(&[], log, "info");
     kiki.wait_for_log(&path, &["\"feed-fetcher\"", "\"feed-worker\""]);
     #[cfg(feature = "lua")]
     kiki.wait_for_log(&path, &["\"script-host\""]);
+    kiki.shutdown();
+}
+
+/// `RUST_LOG` decides what every process logs. The supervisor says it has
+/// started the worker before the worker installs its sandbox, so once the
+/// worker has said so, the supervisor's line would be there if `RUST_LOG`
+/// let it through.
+#[test]
+fn rust_log_decides_what_the_children_log() {
+    let dir = TempDir::with_prefix("kiki-child-logs").expect("create tempdir");
+    let path = dir.path().join("stderr.log");
+    let log = std::fs::File::create(&path).expect("create the log file");
+    let mut kiki = Kiki::spawn_logging_to(&[], log, "warn,kiki_rss::sandbox=info");
+    kiki.wait_for_log(&path, &["\"feed-worker\""]);
+    let logged = std::fs::read_to_string(&path).expect("read the log");
+    assert!(
+        !logged.contains("worker started"),
+        "the supervisor logged at INFO despite RUST_LOG:\n{logged}"
+    );
     kiki.shutdown();
 }
 
@@ -1031,6 +1057,7 @@ mod fetch_isolation {
                     "LOCALDOMAIN",
                     "RES_OPTIONS",
                     "HOSTALIASES",
+                    "RUST_LOG",
                     feed_fetcher::RESOLVER_FD_ENV,
                 ]
                 .contains(&name)
@@ -1174,6 +1201,7 @@ mod fetch_isolation {
         assert!(
             names.iter().all(|name| {
                 [
+                    "RUST_LOG",
                     feed_fetcher::PARSER_FD_ENV,
                     feed_fetcher::PARSER_THREADS_ENV,
                 ]

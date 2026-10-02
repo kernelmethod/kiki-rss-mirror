@@ -52,7 +52,7 @@ pub struct ServeArgs {
 
 impl ServeArgs {
     pub fn run(&self) -> Result<()> {
-        tracing_subscriber::fmt::init();
+        crate::cli::init_logging(std::io::stdout);
         // Before anything opens the database, so SQLite still accepts it.
         if let Err(e) = crate::db::log::install() {
             tracing::warn!("unable to forward SQLite's error log: {e}");

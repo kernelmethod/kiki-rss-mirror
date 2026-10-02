@@ -39,9 +39,7 @@ impl ChildArgs {
     ) -> Result<()> {
         // To stderr, the one standard stream `kiki serve` leaves its
         // children, so their logs land wherever its own do.
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .init();
+        crate::cli::init_logging(std::io::stderr);
 
         if std::env::var_os(fd_env).is_none() {
             bail!(

@@ -106,8 +106,8 @@
 //! A child started this way shares no memory with the supervisor, and
 //! inherits no descriptor but its socket pair and the standard streams.
 //! Only the worker is given the supervisor's environment, which may hold
-//! a proxy password; the parser gets none of it, and the resolver only
-//! the few variables the C library's resolver reads.
+//! a proxy password; the parser gets only `RUST_LOG` of it, and the
+//! resolver that and the few variables the C library's resolver reads.
 //!
 //! [`SandboxProfile::FeedFetcher`]: crate::sandbox::SandboxProfile::FeedFetcher
 //!
@@ -1021,12 +1021,13 @@ impl ChildKind {
 
     /// The supervisor's environment variables the child is given. Only
     /// the worker, which makes the requests, needs the proxy settings,
-    /// which may hold a password.
+    /// which may hold a password; the helpers get `RUST_LOG`, and what
+    /// the resolver needs.
     fn env(self) -> crate::process::ChildEnv<'static> {
         use crate::process::ChildEnv;
         match self {
             ChildKind::Worker => ChildEnv::Inherit,
-            ChildKind::Parser { .. } => ChildEnv::Only(&[]),
+            ChildKind::Parser { .. } => ChildEnv::Only(&[LOG_ENV]),
             ChildKind::Resolver => ChildEnv::Only(RESOLVER_ENV),
         }
     }
@@ -1959,9 +1960,14 @@ fn finish_parse(reply: ParseReply) -> Result<ParseOutput, ParseFailure> {
 // Child side: helpers
 // ------------------------------------------------------------------
 
-/// Environment variables the C library's resolver reads, which are all
-/// the resolver is given of the supervisor's environment.
-const RESOLVER_ENV: &[&str] = &["LOCALDOMAIN", "RES_OPTIONS", "HOSTALIASES"];
+/// The environment variable that sets what is logged, which every child
+/// is given so that all of Kiki's processes log alike.
+const LOG_ENV: &str = "RUST_LOG";
+
+/// Environment variables the C library's resolver reads, which, with
+/// [`LOG_ENV`], are all the resolver is given of the supervisor's
+/// environment.
+const RESOLVER_ENV: &[&str] = &["LOCALDOMAIN", "RES_OPTIONS", "HOSTALIASES", LOG_ENV];
 
 /// Run the feed fetcher's parser, `kiki __feed-parser`: tighten the
 /// sandbox it started under, the supervisor's, to the

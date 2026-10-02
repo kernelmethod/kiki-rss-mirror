@@ -142,7 +142,7 @@ impl WebArgs {
     /// unsuccessfully, if the web UI cannot bind to its address, or if its
     /// sandbox cannot be installed.
     pub fn run(&self) -> Result<()> {
-        tracing_subscriber::fmt::init();
+        crate::cli::init_logging(std::io::stdout);
 
         // Everything that needs the filesystem, a new listening socket, or
         // `execve` happens here, before the sandbox forbids it. That has to
