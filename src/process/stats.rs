@@ -9,7 +9,7 @@
 //! Memory is reported two ways. Resident memory (RSS) counts every page a
 //! process has mapped, including pages it shares with others — and Kiki's
 //! processes share a lot: each child is the same executable as the server,
-//! and the feed fetcher's worker and parser are forked from its
+//! and the feed fetcher's worker, parser and resolver are forked from its
 //! supervisor, so their copy-on-write pages are the supervisor's until
 //! one of them writes to them.
 //! Summing RSS across processes counts those pages once per process.
@@ -22,9 +22,9 @@
 //! Landlock that takes the target to be in the reader's Landlock domain or
 //! one nested inside it, which is why the server starts its children only
 //! after installing its own Landlock rules (see
-//! [`crate::sandbox::restrict_filesystem`]). The feed fetcher's worker and
-//! parser, forked from the supervisor, are in domains nested inside the
-//! supervisor's, and so inside the server's too.
+//! [`crate::sandbox::restrict_filesystem`]). The feed fetcher's worker,
+//! parser and resolver, forked from the supervisor, are in domains nested
+//! inside the supervisor's, and so inside the server's too.
 
 use std::collections::HashMap;
 use std::fs;
@@ -33,13 +33,13 @@ use std::io;
 /// Which of Kiki's processes a process belongs to.
 ///
 /// A process counts towards the role of the child of the server it
-/// descends from, so the feed fetcher's worker and parser count towards
-/// [`Role::FeedFetcher`] along with their supervisor.
+/// descends from, so the feed fetcher's worker, parser and resolver count
+/// towards [`Role::FeedFetcher`] along with their supervisor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
     /// The server itself.
     Server,
-    /// The feed fetcher's supervisor, worker and parser.
+    /// The feed fetcher's supervisor, worker, parser and resolver.
     FeedFetcher,
     /// The script host.
     ScriptHost,

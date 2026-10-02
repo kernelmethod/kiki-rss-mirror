@@ -613,13 +613,21 @@ mod fetch_isolation {
 
         /// Wait for the supervisor's worker to exist and return its PID.
         fn wait_for_fetcher_worker(&mut self, not: Option<u32>) -> u32 {
-            self.wait_for_fetcher_child("worker", not, |pid| !is_parser(pid))
+            self.wait_for_fetcher_child("worker", not, |pid| process_name(pid).is_none())
         }
 
         /// Wait for the supervisor's parser to exist and return its PID.
         /// It is started when there is first something to parse.
         fn wait_for_fetcher_parser(&mut self, not: Option<u32>) -> u32 {
-            self.wait_for_fetcher_child("parser", not, is_parser)
+            let name = feed_fetcher::PARSER_NAME;
+            self.wait_for_fetcher_child("parser", not, |pid| process_name(pid) == Some(name))
+        }
+
+        /// Wait for the supervisor's resolver to exist and return its PID.
+        /// It is started when there is first something to look up.
+        fn wait_for_fetcher_resolver(&mut self, not: Option<u32>) -> u32 {
+            let name = feed_fetcher::RESOLVER_NAME;
+            self.wait_for_fetcher_child("resolver", not, |pid| process_name(pid) == Some(name))
         }
 
         fn wait_for_fetcher_child(
@@ -647,10 +655,13 @@ mod fetch_isolation {
         }
     }
 
-    /// Whether `pid` is the feed fetcher's parser, which names itself.
-    fn is_parser(pid: u32) -> bool {
+    /// Which of the feed fetcher's helpers `pid` is, by the name it gives
+    /// itself, or `None` for the supervisor and the worker.
+    fn process_name(pid: u32) -> Option<&'static std::ffi::CStr> {
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
-        Some(comm.trim()) == feed_fetcher::PARSER_NAME.to_str().ok()
+        [feed_fetcher::PARSER_NAME, feed_fetcher::RESOLVER_NAME]
+            .into_iter()
+            .find(|name| name.to_str().ok() == Some(comm.trim()))
     }
 
     /// How many seccomp filters `pid` runs under, on kernels that say
@@ -724,11 +735,12 @@ mod fetch_isolation {
         kiki.shutdown();
     }
 
-    /// A feed named by hostname rather than IP is fetched even though the
-    /// fetcher cannot read /etc/hosts or any resolver configuration: the
-    /// lookup is done by the server, on the fetcher's behalf.
+    /// A feed named by hostname rather than IP is fetched, with the lookup
+    /// done by the fetcher's resolver: a process of its own, with a
+    /// stricter sandbox, and with the server's environment wiped but for
+    /// what the C library's resolver reads.
     #[test]
-    fn hostnames_are_resolved_by_the_server() {
+    fn hostnames_are_resolved_by_the_resolver() {
         let (addr, _server) = spawn_local_rss_server();
         let mut kiki = Kiki::spawn(&[]);
         let created = kiki
@@ -742,7 +754,123 @@ mod fetch_isolation {
             .assert_success();
         let feed_id = created.json()["id"].as_i64().expect("id");
         refresh_until_entries(&mut kiki, feed_id, 1);
+
+        let worker = kiki.wait_for_fetcher_worker(None);
+        let resolver = kiki.wait_for_fetcher_resolver(None);
+        assert_ne!(worker, resolver);
+        assert_eq!(seccomp_mode(resolver), Some(2));
+        if let (Some(w), Some(r)) = (seccomp_filters(worker), seccomp_filters(resolver)) {
+            assert!(
+                r > w,
+                "the resolver runs under {r} seccomp filters, the worker {w}"
+            );
+        }
+        let environ = std::fs::read(format!("/proc/{resolver}/environ")).expect("read environ");
+        let kept: Vec<String> = environ
+            .split(|&b| b == 0)
+            .filter(|v| !v.is_empty())
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .collect();
+        assert!(
+            kept.iter().all(|v| {
+                let name = v.split('=').next().unwrap_or_default();
+                ["LOCALDOMAIN", "RES_OPTIONS", "HOSTALIASES"].contains(&name)
+            }),
+            "the resolver kept more of its environment than it needs: {kept:?}"
+        );
         kiki.shutdown();
+    }
+
+    /// Set to a directory to make [`resolver_sandbox_probe`] run.
+    const RESOLVER_PROBE_ENV: &str = "KIKI_RESOLVER_SANDBOX_PROBE";
+
+    /// Set to the address of a TCP listener on a port other than DNS's,
+    /// for [`resolver_sandbox_probe`] to fail to connect to.
+    const RESOLVER_PROBE_TCP_ENV: &str = "KIKI_RESOLVER_SANDBOX_PROBE_TCP";
+
+    const RESOLVER_PROBE_PASSED: &str = "resolver sandbox probe passed";
+
+    /// Not a test of its own: [`the_resolver_sandbox_is_enforced`] runs it
+    /// in a process of its own. It installs the resolver's sandbox as the
+    /// resolver does, on top of the fetcher's, and checks that hostnames
+    /// still resolve, while files other than the resolver's configuration,
+    /// Unix sockets, and TCP ports other than DNS's are out of reach.
+    #[test]
+    fn resolver_sandbox_probe() {
+        use kiki_rss::sandbox::{apply, SandboxConfig};
+        use std::net::ToSocketAddrs;
+        let Some(dir) = std::env::var_os(RESOLVER_PROBE_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let tcp: SocketAddr = std::env::var(RESOLVER_PROBE_TCP_ENV)
+            .expect("probe TCP address")
+            .parse()
+            .expect("valid probe TCP address");
+        apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
+        apply(&SandboxConfig::feed_resolver(false)).expect("install the resolver sandbox");
+
+        // What the resolver is for still works.
+        let addrs: Vec<SocketAddr> = ("localhost", 0)
+            .to_socket_addrs()
+            .expect("resolve localhost")
+            .collect();
+        assert!(!addrs.is_empty());
+
+        // No Unix sockets, which would reach the server's API socket; no
+        // netlink ones either.
+        let err = UnixStream::connect(dir.join("api.sock")).expect_err("Unix socket allowed");
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES), "{err}");
+        // SAFETY: a plain `socket` call; the descriptor, if any, is closed.
+        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, 0) };
+        assert!(fd < 0, "a netlink socket was allowed");
+
+        if landlock_abi() >= 1 {
+            std::fs::read(dir.join("secret")).expect_err("reading a file was allowed");
+            std::fs::read_dir("/etc/ssl").expect_err("listing the trust stores was allowed");
+        }
+        if landlock_abi() >= 4 {
+            let err = std::net::TcpStream::connect(tcp).expect_err("TCP connect was allowed");
+            assert_eq!(err.raw_os_error(), Some(libc::EACCES), "{err}");
+        } else {
+            println!("Landlock ABI < 4; skipping the TCP port check");
+        }
+        println!("{RESOLVER_PROBE_PASSED}");
+    }
+
+    /// The resolver's sandbox really allows only what it claims to: run
+    /// [`resolver_sandbox_probe`] in a fresh process, and check it passed
+    /// rather than died.
+    #[test]
+    fn the_resolver_sandbox_is_enforced() {
+        let dir = TempDir::with_prefix("kiki-resolver-probe").expect("create tempdir");
+        std::fs::write(dir.path().join("secret"), "hidden").expect("write secret");
+        let api = std::os::unix::net::UnixListener::bind(dir.path().join("api.sock"))
+            .expect("bind the API socket");
+        let tcp = TcpListener::bind("127.0.0.1:0").expect("bind a TCP listener");
+
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "fetch_isolation::resolver_sandbox_probe",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(RESOLVER_PROBE_ENV, dir.path())
+            .env(
+                RESOLVER_PROBE_TCP_ENV,
+                tcp.local_addr().expect("addr").to_string(),
+            )
+            .output()
+            .expect("run the probe");
+        drop(api);
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains(RESOLVER_PROBE_PASSED),
+            "probe failed ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
     }
 
     /// Feeds are parsed in a process of their own, which installs a
@@ -879,14 +1007,24 @@ mod fetch_isolation {
     fn the_fetcher_exits_with_the_server() {
         let (addr, _server) = spawn_local_rss_server();
         let mut kiki = Kiki::spawn(&[]);
-        let feed_id = create_feed(&mut kiki, addr);
+        let created = kiki
+            .post_json(
+                "/v1/feeds/create",
+                &format!(
+                    r#"{{"title":"by name","url":"http://localhost:{}/feed.xml"}}"#,
+                    addr.port()
+                ),
+            )
+            .assert_success();
+        let feed_id = created.json()["id"].as_i64().expect("id");
         refresh_until_entries(&mut kiki, feed_id, 1);
         let supervisor = kiki.fetcher_supervisor_pids()[0];
         let worker = kiki.wait_for_fetcher_worker(None);
         let parser = kiki.wait_for_fetcher_parser(None);
+        let resolver = kiki.wait_for_fetcher_resolver(None);
         kiki.shutdown();
 
-        for pid in [supervisor, worker, parser] {
+        for pid in [supervisor, worker, parser, resolver] {
             assert!(
                 wait_for_exit(pid, Duration::from_secs(5)),
                 "fetcher pid {pid} outlived the server"

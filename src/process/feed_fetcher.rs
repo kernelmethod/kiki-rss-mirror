@@ -32,38 +32,49 @@
 //!
 //! # Name resolution
 //!
-//! The worker does no DNS of its own. Its HTTP client's resolver sends
-//! each hostname to the server ([`FromFetcher::Resolve`]), which looks it
-//! up with the system resolver and answers with addresses
-//! ([`ToFetcher::Resolved`]). Hostname lookup therefore behaves exactly as
-//! it does for every other program on the host — including setups that
-//! resolve through a local daemon over a Unix socket (nscd, sssd,
-//! systemd-resolved), which the fetcher's sandbox could not reach — and
-//! the fetcher needs neither the resolver's configuration files nor the
-//! syscalls `getaddrinfo` makes.
+//! The worker does no DNS of its own either. Its HTTP client's resolver
+//! sends each hostname ([`FromFetcher::Resolve`]) to a third process, the
+//! **resolver**, which looks it up with the C library's resolver and
+//! answers with addresses ([`ToFetcher::Resolved`]). `getaddrinfo` parses
+//! replies from whichever name server a feed's domain points at, and loads
+//! whatever the host's NSS configuration names, so it gets a process with
+//! nothing else in it: read access to the resolver's configuration files,
+//! Internet sockets, TCP connections only to port 53, and no feed bytes or
+//! credentials (see [`SandboxProfile::FeedResolver`]). The server, which
+//! used to do this, now makes no network connections at all.
 //!
-//! This is for compatibility and a smaller sandbox, not an access control:
-//! the worker can still connect to any address it is given, or that a feed
-//! names by IP.
+//! The resolver may not create Unix sockets, which keeps it, like the
+//! worker, away from the server's API socket. That means lookups cannot go
+//! through a local resolver daemon (nscd, sssd, systemd-resolved's NSS
+//! module); the C library falls back to `/etc/hosts` and the name servers
+//! in `resolv.conf`, systemd-resolved's stub among them if listed there.
+//!
+//! Resolving out of process is for a smaller sandbox, not an access
+//! control: the worker can still connect to any address it is given, or
+//! that a feed names by IP.
+//!
+//! [`SandboxProfile::FeedResolver`]: crate::sandbox::SandboxProfile::FeedResolver
 //!
 //! # Processes
 //!
 //! `kiki __feed-fetcher` is a small **supervisor**. It installs the
-//! sandbox, then `fork`s a **worker** that does the downloading and a
-//! **parser** that does the parsing. Both inherit the sandbox, and the
-//! parser tightens it further (see [`SandboxProfile::FeedParser`]). Neither
-//! has a descriptor to the server or to each other, only a socket pair
-//! each to the supervisor, which relays frames between the three: requests
-//! and their answers between the server and the worker, and parse tasks
-//! and their results between the worker and the parser.
+//! sandbox, then `fork`s a **worker** that does the downloading and two
+//! **helpers**, the **parser** and the **resolver**. All three inherit the
+//! sandbox, and the helpers tighten it further (see
+//! [`SandboxProfile::FeedParser`]). None has a descriptor to the server or
+//! to the others, only a socket pair each to the supervisor, which relays
+//! frames between them: requests and their answers between the server and
+//! the worker, and the worker's tasks and their answers between it and the
+//! helpers.
 //!
 //! [`SandboxProfile::FeedParser`]: crate::sandbox::SandboxProfile::FeedParser
 //!
-//! The parser carries out tasks on a pool of threads, and the supervisor
+//! Each helper carries out tasks on a pool of threads, and the supervisor
 //! never gives it more tasks at once than it has threads, holding the rest
 //! back in a queue, so that every task it has in hand is being worked on.
 //! That lets the supervisor put a time limit on each task: a parser that
-//! takes longer than [`PARSE_TIMEOUT`] over one is killed.
+//! takes longer than [`PARSE_TIMEOUT`] over one, or a resolver that takes
+//! longer than [`LOOKUP_TIMEOUT`], is killed.
 //!
 //! The split exists so the fetcher can be *replaced*. The server cannot
 //! spawn anything once its own sandbox is up (every profile denies
@@ -78,19 +89,23 @@
 //! crashing the fetcher, while the others are served as if nothing had
 //! happened.
 //!
-//! The parser is replaced the same way when it dies or is killed, and its
-//! tasks are found out the same way, by the worker this time: each task
-//! the parser had in hand is answered with [`ParseReply::Exited`], and the
-//! worker retries them one at a time. A task that kills the parser while
-//! it is alone fails its request with [`JobResult::Crashed`], which blames
-//! the feed just as a worker crash would. When the worker dies, the parser
-//! is replaced along with it, since everything it had in hand was the dead
-//! worker's.
+//! The helpers are replaced the same way when they die or are killed. A
+//! lookup the resolver had in hand simply fails, as a lookup can. The
+//! parser's tasks are found out the same way as the worker's, by the
+//! worker this time: each task the parser had in hand is answered with
+//! [`ParseReply::Exited`], and the worker retries them one at a time. A
+//! task that kills the parser while it is alone fails its request with
+//! [`JobResult::Crashed`], which blames the feed just as a worker crash
+//! would. When the worker dies, the helpers are replaced along with it,
+//! since everything they had in hand was the dead worker's.
 //!
-//! Both children are forked from the supervisor, and so start with a copy
-//! of its memory. The supervisor clears every request it relays from the
-//! server as soon as it has passed it on, so that a parser forked after it
-//! does not inherit the credentials in it.
+//! The helpers are forked from the supervisor, and so start with a copy of
+//! its memory. The supervisor clears every frame it relays as soon as it
+//! is done with it, so that a helper forked later does not inherit the
+//! credentials in the server's requests, nor what the feeds contain; and
+//! each helper wipes the environment it inherits, which may hold a proxy
+//! password, keeping only the few variables the C library's resolver
+//! reads in the resolver.
 //!
 //! # Protocol
 //!
@@ -103,12 +118,14 @@
 //! back, in any order. Frames use [`crate::process::ipc`]'s
 //! length-prefixed framing, capped at [`MAX_FRAME_BYTES`].
 //!
-//! The worker's parse tasks travel in the same two enums, which keeps the
-//! supervisor's routing to a glance at each frame's kind and id: the
-//! worker sends a [`FromFetcher::Parse`], which the supervisor passes to
-//! the parser rather than to the server, and the parser's
-//! [`ToFetcher::Parsed`] goes back to the worker. Neither ever reaches the
-//! server, and the supervisor drops a `Parsed` that comes from it.
+//! The worker's tasks for the helpers travel in the same two enums, which
+//! keeps the supervisor's routing to a glance at each frame's kind and id:
+//! the worker sends a [`FromFetcher::Parse`] or [`FromFetcher::Resolve`],
+//! which the supervisor passes to the parser or the resolver rather than
+//! to the server, and the helper's [`ToFetcher::Parsed`] or
+//! [`ToFetcher::Resolved`] goes back to the worker. None of them ever
+//! reaches the server, and the supervisor drops a `Parsed` or `Resolved`
+//! that comes from it.
 
 use crate::fetcher::assets::{
     asset_client_builder, fetch_asset, find_page_icons, AssetReply, AssetSpec, AssetTimeouts,
@@ -186,19 +203,19 @@ const HEALTHY_WORKER_LIFETIME: Duration = Duration::from_secs(60);
 /// Ceiling on the delay between respawns of a crash-looping worker.
 const MAX_RESPAWN_DELAY: Duration = Duration::from_secs(30);
 
-/// How long a worker waits for the server to answer a lookup.
+/// How long a worker waits for the resolver to answer a lookup.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Threads the server dedicates to answering the worker's lookups. Each
-/// lookup blocks in `getaddrinfo`, so this bounds how many run at once.
+/// Threads the resolver runs. Each lookup blocks in `getaddrinfo`, so this
+/// bounds how many run at once.
 const RESOLVER_THREADS: usize = 4;
 
-/// Lookups the server will queue behind [`RESOLVER_THREADS`] before it
-/// starts refusing them, so a misbehaving worker cannot make the server
-/// buffer without limit.
-const RESOLVER_QUEUE: usize = 256;
+/// Longest one lookup may take before the supervisor decides the resolver
+/// is stuck and kills it. The C library gives up on a name server long
+/// before this unless `resolv.conf` asks it to wait far longer than usual.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Longest hostname the server will look up (RFC 1035's limit on a full
+/// Longest hostname the resolver will look up (RFC 1035's limit on a full
 /// domain name, in its dotted text form).
 const MAX_HOSTNAME_LEN: usize = 253;
 
@@ -236,8 +253,9 @@ pub enum ToFetcher {
     /// Work for the fetcher.
     Request(Request),
 
-    /// The answer to a [`FromFetcher::Resolve`] with the same id: the
-    /// host's addresses (port 0), or why they could not be found.
+    /// The answer to a [`FromFetcher::Resolve`] with the same id, from the
+    /// resolver (or, if it died, the supervisor) to the worker: the host's
+    /// addresses (port 0), or why they could not be found.
     Resolved {
         id: u64,
         result: Result<Vec<SocketAddr>, String>,
@@ -254,7 +272,8 @@ pub enum FromFetcher {
     /// The answer to a [`Request`].
     Response(Response),
 
-    /// Ask the server to look up `host`. `id` is chosen by the worker.
+    /// A lookup of `host` for the resolver, from the worker. `id` is chosen
+    /// by the worker.
     Resolve { id: u64, host: String },
 
     /// A task for the parser, from the worker. `id` is chosen by the
@@ -522,7 +541,6 @@ impl FeedFetcherHost {
         let mut read_half = stream;
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let lookups = spawn_resolver_pool(tx.clone())?;
 
         let writer_pending = Arc::clone(&pending);
         std::thread::Builder::new()
@@ -550,12 +568,11 @@ impl FeedFetcherHost {
                 };
                 match decode(&frame) {
                     Ok(FromFetcher::Response(r)) => reader_pending.complete(r.id, r.result),
-                    Ok(FromFetcher::Resolve { id, host }) => lookups.submit(id, host),
-                    // The supervisor keeps these to itself.
-                    Ok(FromFetcher::Parse { .. }) => {
+                    // The supervisor hands these to its helpers.
+                    Ok(FromFetcher::Resolve { .. } | FromFetcher::Parse { .. }) => {
                         retire(
                             &reader_pending,
-                            "the fetcher sent a parse task to the server",
+                            "the fetcher sent the server a helper's task",
                         );
                         return;
                     }
@@ -799,69 +816,6 @@ fn unexpected(result: JobResult) -> FetcherError {
     FetcherError::Unavailable(format!("unexpected response from the fetcher: {result:?}"))
 }
 
-/// The server's side of name resolution: a small, fixed pool of threads
-/// that answer the worker's [`FromFetcher::Resolve`] frames.
-struct ResolverPool {
-    jobs: mpsc::SyncSender<(u64, String)>,
-    replies: mpsc::Sender<Vec<u8>>,
-}
-
-impl ResolverPool {
-    /// Queue a lookup, or refuse it at once if the queue is full.
-    fn submit(&self, id: u64, host: String) {
-        if let Err(mpsc::TrySendError::Full((id, _))) = self.jobs.try_send((id, host)) {
-            send_resolved(&self.replies, id, Err("too many lookups in flight".into()));
-        }
-    }
-}
-
-/// Start [`RESOLVER_THREADS`] threads that look hostnames up and write the
-/// answers through `replies`. They exit when the returned pool is dropped,
-/// which happens when the reader thread that owns it does.
-fn spawn_resolver_pool(replies: mpsc::Sender<Vec<u8>>) -> Result<ResolverPool> {
-    let (jobs, queue) = mpsc::sync_channel::<(u64, String)>(RESOLVER_QUEUE);
-    let queue = Arc::new(Mutex::new(queue));
-    for n in 0..RESOLVER_THREADS {
-        let queue = Arc::clone(&queue);
-        let replies = replies.clone();
-        std::thread::Builder::new()
-            .name(format!("fetcher-dns-{n}"))
-            .spawn(move || loop {
-                let next = queue.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                let Ok((id, host)) = next else { return };
-                send_resolved(&replies, id, lookup_host(&host));
-            })
-            .context("starting a fetcher resolver thread")?;
-    }
-    Ok(ResolverPool { jobs, replies })
-}
-
-/// Resolve `host` with the system resolver, as any other program on this
-/// host would.
-fn lookup_host(host: &str) -> Result<Vec<SocketAddr>, String> {
-    if host.is_empty() || host.len() > MAX_HOSTNAME_LEN || host.contains('\0') {
-        return Err("not a valid hostname".into());
-    }
-    let addrs: Vec<SocketAddr> = (host, 0)
-        .to_socket_addrs()
-        .map_err(|e| format!("{e}"))?
-        .collect();
-    if addrs.is_empty() {
-        return Err(format!("no addresses found for {host}"));
-    }
-    Ok(addrs)
-}
-
-fn send_resolved(
-    replies: &mpsc::Sender<Vec<u8>>,
-    id: u64,
-    result: Result<Vec<SocketAddr>, String>,
-) {
-    if let Ok(frame) = encode_to(&ToFetcher::Resolved { id, result }) {
-        let _ = replies.send(frame);
-    }
-}
-
 impl Drop for FeedFetcherHost {
     fn drop(&mut self) {
         // Stop the writer, then shut the socket down: the reader thread
@@ -881,7 +835,7 @@ impl Drop for FeedFetcherHost {
 // ------------------------------------------------------------------
 
 /// Run the feed fetcher: sandbox this process, then supervise a worker
-/// and a parser until the server closes the channel.
+/// and its helpers until the server closes the channel.
 ///
 /// This is the whole of the child's life. It never returns to any other
 /// code path.
@@ -905,10 +859,19 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
     let mut server = crate::process::take_parent_socket(SUBCOMMAND)?;
 
     let threads = parser_threads();
-    let mut parser = Parser::new(
+    let mut parser = Helper::parser(
         threads,
-        Box::new(move || spawn_parser_process(threads, log_only, no_sandbox)),
+        Box::new(move || {
+            spawn_helper_process(HelperKind::Parser, |stream| {
+                parser_main(stream, threads, log_only, no_sandbox)
+            })
+        }),
     );
+    let mut resolver = Helper::resolver(Box::new(move || {
+        spawn_helper_process(HelperKind::Resolver, |stream| {
+            resolver_main(stream, log_only, no_sandbox)
+        })
+    }));
 
     let mut quick_deaths: u32 = 0;
     loop {
@@ -923,12 +886,13 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
 
         info!(pid, "feed fetcher: worker started");
         let started = Instant::now();
-        let end = relay(&mut server, &mut ours, &mut parser);
+        let end = relay(&mut server, &mut ours, &mut parser, &mut resolver);
 
         // Whatever happened, this worker is finished; make sure of it.
         let status = kill_and_reap(pid);
-        // And so is everything the parser was doing for it.
+        // And so is everything its helpers were doing for it.
         parser.reset();
+        resolver.reset();
 
         let in_flight = match end {
             RelayEnd::ServerClosed => {
@@ -1119,10 +1083,13 @@ enum RelayEnd {
     },
 }
 
-/// A frame whose bytes are overwritten with zeroes when it is dropped, for
-/// the server's requests, which may carry a feed's credentials: the parser
-/// is forked from the supervisor, and must not find them in what it
-/// inherits.
+/// A frame whose bytes are overwritten with zeroes when it is dropped.
+///
+/// Every frame the supervisor relays is held in one, because the parser
+/// and the resolver are forked from the supervisor and inherit a copy of
+/// its memory: the server's requests carry feeds' credentials, and the
+/// worker's replies carry what those feeds contain, neither of which a
+/// child forked later may find lying about in what it inherits.
 struct Scrubbed<B: AsMut<[u8]>>(B);
 
 impl<B: AsMut<[u8]>> Drop for Scrubbed<B> {
@@ -1134,46 +1101,62 @@ impl<B: AsMut<[u8]>> Drop for Scrubbed<B> {
     }
 }
 
-/// Copy frames between the server, the current worker and the parser
+/// A frame as the supervisor holds it.
+type Frame = Scrubbed<Vec<u8>>;
+
+/// Read a frame for the supervisor to relay.
+fn read_frame(stream: &mut UnixStream) -> io::Result<Frame> {
+    read_frame_limited(stream, MAX_FRAME_BYTES).map(Scrubbed)
+}
+
+/// Copy frames between the server, the current worker and its helpers
 /// until the server or the worker goes away, keeping track of which
 /// requests are outstanding in each direction.
 ///
-/// Lookups are tracked so that an answer meant for a worker that has since
-/// died is dropped rather than delivered to its replacement, whose ids
-/// start again from the beginning.
-///
 /// Every peer reads and writes independently, so blocking on a write to
 /// one can never deadlock against a write of theirs.
-fn relay(server: &mut UnixStream, worker: &mut UnixStream, parser: &mut Parser) -> RelayEnd {
+fn relay(
+    server: &mut UnixStream,
+    worker: &mut UnixStream,
+    parser: &mut Helper,
+    resolver: &mut Helper,
+) -> RelayEnd {
     let mut in_flight: HashSet<u64> = HashSet::new();
-    let mut lookups: HashSet<u64> = HashSet::new();
     let gone = |in_flight: HashSet<u64>, why: String| RelayEnd::WorkerGone { in_flight, why };
 
     loop {
-        if let Err(why) = parser.tend(worker) {
-            return gone(in_flight, why);
+        for helper in [&mut *parser, &mut *resolver] {
+            if let Err(why) = helper.tend(worker) {
+                return gone(in_flight, why);
+            }
         }
 
-        let parser_fd = parser.fd();
-        let mut fds = [
-            server.as_raw_fd(),
-            worker.as_raw_fd(),
-            parser_fd.unwrap_or(-1),
-        ]
-        .map(|fd| libc::pollfd {
+        // The helpers are watched only while they are running.
+        let pollfd = |fd| libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
-        });
-        let watched = if parser_fd.is_some() { 3 } else { 2 };
-        let timeout = parser.next_wakeup().map_or(-1, |at| {
+        };
+        let mut fds = vec![pollfd(server.as_raw_fd()), pollfd(worker.as_raw_fd())];
+        let mut slots = [None, None];
+        for (slot, helper) in slots.iter_mut().zip([&*parser, &*resolver]) {
+            if let Some(fd) = helper.fd() {
+                *slot = Some(fds.len());
+                fds.push(pollfd(fd));
+            }
+        }
+        let wakeup = [parser.next_wakeup(), resolver.next_wakeup()]
+            .into_iter()
+            .flatten()
+            .min();
+        let timeout = wakeup.map_or(-1, |at| {
             let ms = at.saturating_duration_since(Instant::now()).as_millis();
             // Rounded up, so as not to wake just before the moment.
             libc::c_int::try_from(ms.saturating_add(1)).unwrap_or(libc::c_int::MAX)
         });
-        // SAFETY: `fds` is a valid array of initialised pollfds, at least
-        // `watched` long.
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), watched as libc::nfds_t, timeout) };
+        // SAFETY: `fds` is a valid array of initialised pollfds, and its
+        // length is passed alongside it.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if rc < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -1181,58 +1164,63 @@ fn relay(server: &mut UnixStream, worker: &mut UnixStream, parser: &mut Parser) 
             }
             return gone(in_flight, format!("poll failed: {err}"));
         }
-
-        let [server_fd, worker_fd, parser_fd] = fds;
+        let ready = |slot: Option<usize>| {
+            slot.and_then(|i| fds.get(i))
+                .is_some_and(|fd| fd.revents != 0)
+        };
+        let (server_ready, worker_ready) = (ready(Some(0)), ready(Some(1)));
+        let [parser_slot, resolver_slot] = slots;
+        let (parser_ready, resolver_ready) = (ready(parser_slot), ready(resolver_slot));
 
         // Drain responses first so a busy server cannot starve them.
-        if worker_fd.revents != 0 {
-            let frame = match read_frame_limited(worker, MAX_FRAME_BYTES) {
+        if worker_ready {
+            let frame = match read_frame(worker) {
                 Ok(f) => f,
                 Err(e) => return gone(in_flight, format!("read failed: {e}")),
             };
-            match peek_from(&frame) {
+            match peek_from(&frame.0) {
                 Some(PeekFrom::Response(IdOnly { id })) => {
                     in_flight.remove(&id);
+                    if write_frame_limited(server, &frame.0, MAX_FRAME_BYTES).is_err() {
+                        return RelayEnd::ServerClosed;
+                    }
                 }
                 Some(PeekFrom::Resolve(IdOnly { id })) => {
-                    lookups.insert(id);
+                    if let Err(why) = resolver.submit(id, frame, worker) {
+                        return gone(in_flight, why);
+                    }
                 }
                 Some(PeekFrom::Parse(IdOnly { id })) => {
                     if let Err(why) = parser.submit(id, frame, worker) {
                         return gone(in_flight, why);
                     }
-                    continue;
                 }
                 None => return gone(in_flight, "sent a malformed frame".into()),
             }
-            if write_frame_limited(server, &frame, MAX_FRAME_BYTES).is_err() {
-                return RelayEnd::ServerClosed;
+        }
+
+        for (ready, helper) in [
+            (parser_ready, &mut *parser),
+            (resolver_ready, &mut *resolver),
+        ] {
+            if ready {
+                if let Err(why) = helper.receive(worker) {
+                    return gone(in_flight, why);
+                }
             }
         }
 
-        if watched == 3 && parser_fd.revents != 0 {
-            if let Err(why) = parser.receive(worker) {
-                return gone(in_flight, why);
-            }
-        }
-
-        if server_fd.revents != 0 {
-            let frame = match read_frame_limited(server, MAX_FRAME_BYTES) {
-                Ok(f) => Scrubbed(f),
+        if server_ready {
+            let frame = match read_frame(server) {
+                Ok(f) => f,
                 Err(_) => return RelayEnd::ServerClosed,
             };
             match peek_to(&frame.0) {
                 Some(PeekTo::Request(IdOnly { id })) => {
                     in_flight.insert(id);
                 }
-                Some(PeekTo::Resolved(IdOnly { id })) => {
-                    if !lookups.remove(&id) {
-                        // For a previous worker, or never asked for.
-                        continue;
-                    }
-                }
-                // Only ever from the parser.
-                Some(PeekTo::Parsed(_)) | None => continue,
+                // Only ever from a helper.
+                Some(PeekTo::Resolved(_) | PeekTo::Parsed(_)) | None => continue,
             }
             if let Err(e) = write_frame_limited(worker, &frame.0, MAX_FRAME_BYTES) {
                 return gone(in_flight, format!("write failed: {e}"));
@@ -1242,31 +1230,31 @@ fn relay(server: &mut UnixStream, worker: &mut UnixStream, parser: &mut Parser) 
 }
 
 // ------------------------------------------------------------------
-// Supervisor: the parser
+// Supervisor: the parser and the resolver
 // ------------------------------------------------------------------
 
-/// A running parser, as the supervisor sees it.
-struct ParserProc {
-    /// The supervisor's end of the parser's socket pair, with
+/// A running helper, as the supervisor sees it.
+struct ChildProc {
+    /// The supervisor's end of the helper's socket pair, with
     /// [`WORKER_IO_TIMEOUT`] on reads and writes.
     stream: UnixStream,
-    /// `None` for a parser that is not a process of its own, in tests.
+    /// `None` for a helper that is not a process of its own, in tests.
     pid: Option<libc::pid_t>,
     started: Instant,
 }
 
-impl ParserProc {
-    /// Stop the parser, and say how it ended.
-    fn end(self) -> String {
-        match self.pid {
+impl ChildProc {
+    /// Stop the helper, and say how it ended.
+    fn end(mut self) -> String {
+        match self.pid.take() {
             Some(pid) => describe_wait_status(kill_and_reap(pid)),
-            // A parser on a thread stops when its socket closes.
+            // A helper on a thread stops when its socket closes.
             None => "stopped".into(),
         }
     }
 }
 
-impl Drop for ParserProc {
+impl Drop for ChildProc {
     fn drop(&mut self) {
         if let Some(pid) = self.pid.take() {
             kill_and_reap(pid);
@@ -1274,58 +1262,156 @@ impl Drop for ParserProc {
     }
 }
 
-/// Starts a parser.
-type SpawnParser = Box<dyn FnMut() -> io::Result<ParserProc>>;
+/// Starts a helper.
+type SpawnChild = Box<dyn FnMut() -> io::Result<ChildProc>>;
 
-/// Fork a parser process with `threads` threads.
-fn spawn_parser_process(
-    threads: usize,
-    log_only: bool,
-    no_sandbox: bool,
-) -> io::Result<ParserProc> {
+/// Fork a helper process that runs `main` on its end of a new socket pair.
+fn spawn_helper_process(
+    what: HelperKind,
+    main: impl FnOnce(UnixStream) -> i32,
+) -> io::Result<ChildProc> {
     let (ours, theirs) = UnixStream::pair()?;
     ours.set_read_timeout(Some(WORKER_IO_TIMEOUT))?;
     ours.set_write_timeout(Some(WORKER_IO_TIMEOUT))?;
-    let pid = fork_child(theirs, |stream| {
-        parser_main(stream, threads, log_only, no_sandbox)
-    })?;
-    info!(pid, threads, "feed fetcher: parser started");
-    Ok(ParserProc {
+    let pid = fork_child(theirs, main)?;
+    info!(pid, "feed fetcher: {} started", what.name());
+    Ok(ChildProc {
         stream: ours,
         pid: Some(pid),
         started: Instant::now(),
     })
 }
 
-/// The supervisor's view of the parser: the process itself, the tasks it
-/// has in hand, and those waiting for one of its threads.
-struct Parser {
-    proc: Option<ParserProc>,
-    spawn: SpawnParser,
-    /// How many tasks the parser may have in hand: its thread count.
+/// Which helper a [`Helper`] runs, which decides the frames it is given
+/// and answers with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HelperKind {
+    /// Given [`FromFetcher::Parse`], answers [`ToFetcher::Parsed`].
+    Parser,
+    /// Given [`FromFetcher::Resolve`], answers [`ToFetcher::Resolved`].
+    Resolver,
+}
+
+impl HelperKind {
+    fn name(self) -> &'static str {
+        match self {
+            HelperKind::Parser => "parser",
+            HelperKind::Resolver => "resolver",
+        }
+    }
+
+    /// The id of `frame`, if it is an answer of this helper's kind.
+    fn answer_id(self, frame: &[u8]) -> Option<u64> {
+        match (self, peek_to(frame)?) {
+            (HelperKind::Parser, PeekTo::Parsed(IdOnly { id }))
+            | (HelperKind::Resolver, PeekTo::Resolved(IdOnly { id })) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// The answer to the task `id` when it could not be done, for a
+    /// reason that says nothing about it.
+    fn failed(self, id: u64, message: String) -> ToFetcher {
+        match self {
+            HelperKind::Parser => ToFetcher::Parsed {
+                id,
+                reply: ParseReply::Failed { message },
+            },
+            HelperKind::Resolver => ToFetcher::Resolved {
+                id,
+                result: Err(message),
+            },
+        }
+    }
+
+    /// The answer to the task `id` when the helper stopped while it had
+    /// it and `in_flight - 1` others in hand; `why` says how. A parse task
+    /// is retried, to find out whether it is to blame; a lookup just fails.
+    fn exited(self, id: u64, in_flight: u32, why: String) -> ToFetcher {
+        match self {
+            HelperKind::Parser => ToFetcher::Parsed {
+                id,
+                reply: ParseReply::Exited { in_flight, why },
+            },
+            HelperKind::Resolver => ToFetcher::Resolved {
+                id,
+                result: Err(why),
+            },
+        }
+    }
+}
+
+/// The supervisor's view of a helper — the parser or the resolver: the
+/// process itself, the tasks it has in hand, and those waiting for one of
+/// its threads.
+///
+/// A helper is given no more tasks at once than it has threads, so every
+/// task it has in hand is being worked on, and one that takes longer than
+/// `task_timeout` means the helper is stuck: it is killed, and every task
+/// it had is answered for it. It is started when it is first needed, and
+/// started again whenever it is needed after dying, after a delay if it
+/// keeps dying young.
+struct Helper {
+    kind: HelperKind,
+    proc: Option<ChildProc>,
+    spawn: SpawnChild,
+    /// How many tasks the helper may have in hand: its thread count.
     capacity: usize,
-    /// How long the parser may spend on one task: [`PARSE_TIMEOUT`],
-    /// except in tests.
+    /// How long the helper may spend on one task.
     task_timeout: Duration,
-    /// Tasks the parser has in hand, by id, with when each was handed
+    /// How long a task may wait for a thread before it is refused.
+    queue_limit: Duration,
+    /// Tasks the helper has in hand, by id, with when each was handed
     /// over.
     in_hand: HashMap<u64, Instant>,
     /// Tasks waiting for a thread, as the worker's frames, with when each
     /// arrived.
-    queue: VecDeque<(u64, Vec<u8>, Instant)>,
-    /// How many parsers in a row have died young.
+    queue: VecDeque<(u64, Frame, Instant)>,
+    /// How many helpers in a row have died young.
     quick_deaths: u32,
-    /// When the next parser may be started, after one died young.
+    /// When the next helper may be started, after one died young.
     down_until: Option<Instant>,
 }
 
-impl Parser {
-    fn new(capacity: usize, spawn: SpawnParser) -> Self {
-        Parser {
+impl Helper {
+    /// The parser, with `threads` threads.
+    fn parser(threads: usize, spawn: SpawnChild) -> Self {
+        Self::new(
+            HelperKind::Parser,
+            threads,
+            PARSE_TIMEOUT,
+            PARSE_QUEUE_LIMIT,
+            spawn,
+        )
+    }
+
+    /// The resolver, with [`RESOLVER_THREADS`] threads.
+    fn resolver(spawn: SpawnChild) -> Self {
+        // A lookup still queued once the worker has given up on it is not
+        // worth making.
+        Self::new(
+            HelperKind::Resolver,
+            RESOLVER_THREADS,
+            LOOKUP_TIMEOUT,
+            RESOLVE_TIMEOUT,
+            spawn,
+        )
+    }
+
+    fn new(
+        kind: HelperKind,
+        capacity: usize,
+        task_timeout: Duration,
+        queue_limit: Duration,
+        spawn: SpawnChild,
+    ) -> Self {
+        Helper {
+            kind,
             proc: None,
             spawn,
             capacity: capacity.max(1),
-            task_timeout: PARSE_TIMEOUT,
+            task_timeout,
+            queue_limit,
             in_hand: HashMap::new(),
             queue: VecDeque::new(),
             quick_deaths: 0,
@@ -1333,7 +1419,7 @@ impl Parser {
         }
     }
 
-    /// The parser's socket, if it is running.
+    /// The helper's socket, if it is running.
     fn fd(&self) -> Option<RawFd> {
         self.proc.as_ref().map(|p| p.stream.as_raw_fd())
     }
@@ -1341,18 +1427,18 @@ impl Parser {
     /// Accept the worker's task `id`, carried by `frame`.
     ///
     /// `Err` means the worker could not be written to; it carries why.
-    fn submit(&mut self, id: u64, frame: Vec<u8>, worker: &mut UnixStream) -> Result<(), String> {
+    fn submit(&mut self, id: u64, frame: Frame, worker: &mut UnixStream) -> Result<(), String> {
         let known = self.in_hand.contains_key(&id) || self.queue.iter().any(|(q, ..)| *q == id);
         if known {
-            let message = format!("parse task {id} is already in hand");
-            return answer(worker, id, ParseReply::Failed { message });
+            let message = format!("{} task {id} is already in hand", self.kind.name());
+            return answer(worker, &self.kind.failed(id, message));
         }
         self.queue.push_back((id, frame, Instant::now()));
         self.tend(worker)
     }
 
-    /// Do what is due: kill a parser that has spent too long over a task,
-    /// refuse tasks that have waited too long, start a parser if one is
+    /// Do what is due: kill a helper that has spent too long over a task,
+    /// refuse tasks that have waited too long, start a helper if one is
     /// needed and may be started, and hand it tasks while it has threads
     /// free.
     ///
@@ -1365,20 +1451,25 @@ impl Parser {
             .any(|&since| now.duration_since(since) >= self.task_timeout)
         {
             let why = format!(
-                "the parser was killed after a task ran for over {:?}",
+                "the {} was killed after a task ran for over {:?}",
+                self.kind.name(),
                 self.task_timeout
             );
             self.died(&why, worker)?;
         }
 
         while let Some((id, _, since)) = self.queue.front() {
-            if now.duration_since(*since) < PARSE_QUEUE_LIMIT {
+            if now.duration_since(*since) < self.queue_limit {
                 break;
             }
             let id = *id;
             self.queue.pop_front();
-            let message = format!("the parser was not available within {PARSE_QUEUE_LIMIT:?}");
-            answer(worker, id, ParseReply::Failed { message })?;
+            let message = format!(
+                "the {} was not available within {:?}",
+                self.kind.name(),
+                self.queue_limit
+            );
+            answer(worker, &self.kind.failed(id, message))?;
         }
 
         if self.queue.is_empty() {
@@ -1394,7 +1485,7 @@ impl Parser {
                     self.down_until = None;
                 }
                 Err(e) => {
-                    warn!(error = %e, "feed fetcher: could not start the parser");
+                    warn!(error = %e, "feed fetcher: could not start the {}", self.kind.name());
                     self.died_young();
                     return Ok(());
                 }
@@ -1408,46 +1499,50 @@ impl Parser {
             let Some(proc) = self.proc.as_mut() else {
                 break;
             };
-            // In hand from here on, so that a parser that dies taking it
+            // In hand from here on, so that a helper that dies taking it
             // answers for it.
             self.in_hand.insert(id, Instant::now());
-            if let Err(e) = write_frame_limited(&mut proc.stream, &frame, MAX_FRAME_BYTES) {
-                self.died(&format!("the parser could not be written to: {e}"), worker)?;
+            if let Err(e) = write_frame_limited(&mut proc.stream, &frame.0, MAX_FRAME_BYTES) {
+                let why = format!("the {} could not be written to: {e}", self.kind.name());
+                self.died(&why, worker)?;
                 break;
             }
         }
         Ok(())
     }
 
-    /// Read a result from the parser, which has one ready (or has gone
+    /// Read an answer from the helper, which has one ready (or has gone
     /// away), and pass it on to the worker.
     ///
     /// `Err` means the worker could not be written to; it carries why.
     fn receive(&mut self, worker: &mut UnixStream) -> Result<(), String> {
+        let name = self.kind.name();
         let Some(proc) = self.proc.as_mut() else {
             return Ok(());
         };
-        let frame = match read_frame_limited(&mut proc.stream, MAX_FRAME_BYTES) {
+        let frame = match read_frame(&mut proc.stream) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                return self.died("the parser died", worker);
+                return self.died(&format!("the {name} died"), worker);
             }
-            Err(e) => return self.died(&format!("the parser could not be read: {e}"), worker),
+            Err(e) => return self.died(&format!("the {name} could not be read: {e}"), worker),
         };
-        match peek_to(&frame) {
-            Some(PeekTo::Parsed(IdOnly { id })) if self.in_hand.remove(&id).is_some() => {
-                write_frame_limited(worker, &frame, MAX_FRAME_BYTES)
+        match self.kind.answer_id(&frame.0) {
+            Some(id) if self.in_hand.remove(&id).is_some() => {
+                write_frame_limited(worker, &frame.0, MAX_FRAME_BYTES)
                     .map_err(|e| format!("write failed: {e}"))?;
                 self.tend(worker)
             }
-            _ => self.died("the parser answered a task it did not have", worker),
+            _ => self.died(
+                &format!("the {name} answered a task it did not have"),
+                worker,
+            ),
         }
     }
 
-    /// Stop the parser, which has died or must, and answer every task it
-    /// had in hand with [`ParseReply::Exited`], so that the worker retries
-    /// them; `what` says what happened. Tasks still queued wait for the
-    /// next parser.
+    /// Stop the helper, which has died or must, and answer every task it
+    /// had in hand (see [`HelperKind::exited`]); `what` says what
+    /// happened. Tasks still queued wait for the next helper.
     ///
     /// `Err` means the worker could not be written to; it carries why.
     fn died(&mut self, what: &str, worker: &mut UnixStream) -> Result<(), String> {
@@ -1463,7 +1558,8 @@ impl Parser {
             reason = what,
             status = %status,
             in_hand = in_hand.len(),
-            "feed fetcher: parser stopped; starting a new one"
+            "feed fetcher: {} stopped; starting a new one",
+            self.kind.name()
         );
         if lived >= HEALTHY_WORKER_LIFETIME {
             self.quick_deaths = 0;
@@ -1474,19 +1570,12 @@ impl Parser {
         let count = u32::try_from(in_hand.len()).unwrap_or(u32::MAX);
         let why = format!("{what} ({status})");
         for id in in_hand {
-            answer(
-                worker,
-                id,
-                ParseReply::Exited {
-                    in_flight: count,
-                    why: why.clone(),
-                },
-            )?;
+            answer(worker, &self.kind.exited(id, count, why.clone()))?;
         }
         Ok(())
     }
 
-    /// Note that a parser died young, or could not be started, and put off
+    /// Note that a helper died young, or could not be started, and put off
     /// starting the next one if that keeps happening.
     fn died_young(&mut self) {
         self.quick_deaths = self.quick_deaths.saturating_add(1);
@@ -1494,7 +1583,8 @@ impl Parser {
         if !delay.is_zero() {
             warn!(
                 ?delay,
-                "feed fetcher: parser is crash-looping; delaying restart"
+                "feed fetcher: {} is crash-looping; delaying restart",
+                self.kind.name()
             );
             self.down_until = Some(Instant::now() + delay);
         }
@@ -1509,13 +1599,15 @@ impl Parser {
         let expiries = self
             .queue
             .front()
-            .map(|(_, _, since)| *since + PARSE_QUEUE_LIMIT);
+            .map(|(_, _, since)| *since + self.queue_limit);
         let restart = self.down_until.filter(|_| !self.queue.is_empty());
         timeouts.chain(expiries).chain(restart).min()
     }
 
-    /// Forget everything, and stop the parser: the worker it was working
-    /// for has gone. The next task starts a new one.
+    /// Forget everything, and stop the helper: the worker it was working
+    /// for has gone, and the next worker's ids start again from the
+    /// beginning, so nothing the old one asked for may be answered. The
+    /// next task starts a new helper.
     fn reset(&mut self) {
         if let Some(proc) = self.proc.take() {
             proc.end();
@@ -1525,12 +1617,11 @@ impl Parser {
     }
 }
 
-/// Send the worker `reply` to its parse task `id`.
+/// Send the worker `msg`, a helper's answer.
 ///
 /// `Err` means the worker could not be written to; it carries why.
-fn answer(worker: &mut UnixStream, id: u64, reply: ParseReply) -> Result<(), String> {
-    let frame = encode(&ToFetcher::Parsed { id, reply })
-        .map_err(|e| format!("could not encode a parse reply: {e}"))?;
+fn answer(worker: &mut UnixStream, msg: &ToFetcher) -> Result<(), String> {
+    let frame = encode(msg).map_err(|e| format!("could not encode an answer: {e}"))?;
     write_frame_limited(worker, &frame, MAX_FRAME_BYTES).map_err(|e| format!("write failed: {e}"))
 }
 
@@ -1578,7 +1669,7 @@ async fn serve(stream: UnixStream) -> Result<()> {
         }
     });
 
-    let resolver = ServerResolver {
+    let resolver = ResolverClient {
         frames: tx.clone(),
         pending: Arc::new(Pending::new()),
     };
@@ -1647,15 +1738,15 @@ async fn serve(stream: UnixStream) -> Result<()> {
 /// A host's addresses, or why they could not be found.
 type LookupResult = Result<Vec<SocketAddr>, String>;
 
-/// The worker's DNS resolver: asks the server, over the same channel as
-/// everything else, instead of resolving anything itself.
+/// The worker's DNS resolver: asks the supervisor's resolver, over the same
+/// channel as everything else, instead of resolving anything itself.
 #[derive(Clone)]
-struct ServerResolver {
+struct ResolverClient {
     frames: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     pending: Arc<Pending<LookupResult>>,
 }
 
-impl reqwest::dns::Resolve for ServerResolver {
+impl reqwest::dns::Resolve for ResolverClient {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let this = self.clone();
         let host = name.as_str().to_string();
@@ -1670,22 +1761,22 @@ impl reqwest::dns::Resolve for ServerResolver {
             })?;
             if this.frames.send(frame).is_err() {
                 this.pending.forget(id);
-                return Err("the channel to the server is closed".into());
+                return Err("the channel to the supervisor is closed".into());
             }
             let answer = tokio::time::timeout(RESOLVE_TIMEOUT, rx).await;
             this.pending.forget(id);
             match answer {
                 Ok(Ok(Ok(addrs))) => Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs),
                 Ok(Ok(Err(message))) => Err(format!("resolving {host}: {message}").into()),
-                Ok(Err(_)) => Err("the channel to the server is closed".into()),
-                Err(_) => Err(format!("resolving {host}: no answer from the server").into()),
+                Ok(Err(_)) => Err("the channel to the supervisor is closed".into()),
+                Err(_) => Err(format!("resolving {host}: no answer from the resolver").into()),
             }
         })
     }
 }
 
-/// The worker's HTTP clients, which resolve hostnames through the server,
-/// and its way to the parser.
+/// The worker's HTTP clients, which resolve hostnames through the
+/// resolver, and its way to the parser.
 #[derive(Clone)]
 struct Clients {
     feeds: ProxiedClient,
@@ -1827,11 +1918,18 @@ fn finish_parse(reply: ParseReply) -> Result<ParseOutput, ParseFailure> {
 }
 
 // ------------------------------------------------------------------
-// Child side: parser
+// Child side: helpers
 // ------------------------------------------------------------------
 
 /// The parser's process name, as `/proc/<pid>/comm` shows it.
 pub const PARSER_NAME: &std::ffi::CStr = c"kiki-parser";
+
+/// The resolver's process name, as `/proc/<pid>/comm` shows it.
+pub const RESOLVER_NAME: &std::ffi::CStr = c"kiki-resolver";
+
+/// Environment variables the C library's resolver reads, which the
+/// resolver keeps when it wipes the rest; see [`scrub_environment`].
+const RESOLVER_ENV: &[&str] = &["LOCALDOMAIN", "RES_OPTIONS", "HOSTALIASES"];
 
 /// Entry point of a forked parser. Returns the process exit code.
 ///
@@ -1839,41 +1937,75 @@ pub const PARSER_NAME: &std::ffi::CStr = c"kiki-parser";
 /// [`crate::sandbox::SandboxProfile::FeedParser`] profile before it reads
 /// a single task, unless the operator turned sandboxing off.
 fn parser_main(stream: UnixStream, threads: usize, log_only: bool, no_sandbox: bool) -> i32 {
-    // Named, so that it can be told apart from the worker, which shares
-    // its command line; its threads inherit the name until they are
-    // given their own.
-    // SAFETY: `PARSER_NAME` is NUL-terminated and outlives the call.
-    unsafe {
-        libc::prctl(libc::PR_SET_NAME, PARSER_NAME.as_ptr());
-    }
-    scrub_environment();
-    if !no_sandbox {
-        let config = crate::sandbox::SandboxConfig::feed_parser(log_only);
-        if let Err(e) = crate::sandbox::apply(&config) {
+    let config = crate::sandbox::SandboxConfig::feed_parser(log_only);
+    match prepare_helper(PARSER_NAME, &[], (!no_sandbox).then_some(config)) {
+        Ok(()) => exit_code("parser", serve_parses(stream, threads)),
+        Err(e) => {
             warn!(error = %format!("{e:#}"), "feed fetcher: could not sandbox the parser");
-            return 1;
+            1
         }
     }
-    match serve_parses(stream, threads) {
+}
+
+/// Entry point of a forked resolver. Returns the process exit code.
+///
+/// Tightens the sandbox it inherited from the supervisor to the
+/// [`crate::sandbox::SandboxProfile::FeedResolver`] profile before it
+/// reads a single lookup, unless the operator turned sandboxing off.
+fn resolver_main(stream: UnixStream, log_only: bool, no_sandbox: bool) -> i32 {
+    let config = crate::sandbox::SandboxConfig::feed_resolver(log_only);
+    match prepare_helper(RESOLVER_NAME, RESOLVER_ENV, (!no_sandbox).then_some(config)) {
+        Ok(()) => exit_code("resolver", serve_lookups(stream, RESOLVER_THREADS)),
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "feed fetcher: could not sandbox the resolver");
+            1
+        }
+    }
+}
+
+/// Set a freshly forked helper up: name it, so that it can be told apart
+/// from the worker, which shares its command line (its threads inherit
+/// the name until they are given their own); wipe the environment but for
+/// `keep_env`; and install `sandbox`, if any.
+///
+/// Must be called while the helper is still single-threaded.
+fn prepare_helper(
+    name: &std::ffi::CStr,
+    keep_env: &[&str],
+    sandbox: Option<crate::sandbox::SandboxConfig>,
+) -> Result<()> {
+    // SAFETY: `name` is NUL-terminated and outlives the call.
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, name.as_ptr());
+    }
+    scrub_environment(keep_env);
+    if let Some(config) = sandbox {
+        crate::sandbox::apply(&config)?;
+    }
+    Ok(())
+}
+
+fn exit_code(what: &str, served: io::Result<()>) -> i32 {
+    match served {
         Ok(()) => 0,
         Err(e) => {
-            warn!(error = %e, "feed fetcher: parser failed");
+            warn!(error = %e, "feed fetcher: {what} failed");
             1
         }
     }
 }
 
 /// Overwrite every environment variable the process inherited with
-/// zeroes, in place.
+/// zeroes, in place, but for those named in `keep`.
 ///
 /// The environment is the server's, and may hold credentials — a proxy
 /// URL with a password in `HTTPS_PROXY`, say — that the worker needs and
-/// the parser must not have. Unsetting the variables would leave their
-/// text where it was; this wipes it. Nothing in the parser reads the
-/// environment, which reads as empty afterwards.
+/// the helpers must not have. Unsetting the variables would leave their
+/// text where it was; this wipes it. The variables wiped read as absent
+/// afterwards.
 ///
 /// Must be called while the process is single-threaded.
-fn scrub_environment() {
+fn scrub_environment(keep: &[&str]) {
     extern "C" {
         static mut environ: *mut *mut libc::c_char;
     }
@@ -1885,36 +2017,43 @@ fn scrub_environment() {
         let mut var = environ;
         while !var.is_null() && !(*var).is_null() {
             let text = *var;
-            std::ptr::write_bytes(text, 0, libc::strlen(text));
+            let len = libc::strlen(text);
+            let bytes = std::slice::from_raw_parts(text.cast::<u8>(), len);
+            let name = bytes.split(|&b| b == b'=').next().unwrap_or_default();
+            if !keep.iter().any(|k| k.as_bytes() == name) {
+                std::ptr::write_bytes(text, 0, len);
+            }
             var = var.add(1);
         }
     }
 }
 
 /// Carry out the tasks that arrive on `stream` on `threads` threads,
-/// writing each result back as it is ready, until the supervisor closes
+/// writing each answer back as it is ready, until the supervisor closes
 /// the channel.
-fn serve_parses(stream: UnixStream, threads: usize) -> io::Result<()> {
+///
+/// `accept` picks the task out of a frame, refusing any other kind of
+/// frame, and `work` carries one out and encodes the frame that answers
+/// it.
+fn serve_helper<T: Send + 'static>(
+    stream: UnixStream,
+    threads: usize,
+    name: &str,
+    accept: fn(FromFetcher) -> Option<(u64, T)>,
+    work: fn(u64, T) -> Vec<u8>,
+) -> io::Result<()> {
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
-    let (tx, rx) = mpsc::channel::<(u64, ParseTask)>();
+    let (tx, rx) = mpsc::channel::<(u64, T)>();
     let rx = Arc::new(Mutex::new(rx));
     for n in 0..threads.max(1) {
         let rx = Arc::clone(&rx);
         let writer = Arc::clone(&writer);
         std::thread::Builder::new()
-            .name(format!("parser-{n}"))
+            .name(format!("{name}-{n}"))
             .spawn(move || loop {
                 let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                 let Ok((id, task)) = next else { return };
-                let reply = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::fetcher::parsing::run(task)
-                })) {
-                    Ok(output) => ParseReply::Done(output),
-                    Err(_) => ParseReply::Failed {
-                        message: "the parser panicked".into(),
-                    },
-                };
-                let frame = encode_parsed(id, reply);
+                let frame = work(id, task);
                 let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
                 if write_frame_limited(&mut *writer, &frame, MAX_FRAME_BYTES).is_err() {
                     // The supervisor is gone; the reader will see it too.
@@ -1930,21 +2069,74 @@ fn serve_parses(stream: UnixStream, threads: usize) -> io::Result<()> {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        match decode(&frame) {
-            Ok(FromFetcher::Parse { id, task }) => {
-                if tx.send((id, task)).is_err() {
-                    return Err(io::Error::other("every parser thread has exited"));
-                }
-            }
-            // Both ends are the same binary, so this is corruption.
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "malformed parse task",
-                ))
-            }
+        // Both ends are the same binary, so anything else is corruption.
+        let Some(task) = decode(&frame).ok().and_then(accept) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed {name} task"),
+            ));
+        };
+        if tx.send(task).is_err() {
+            return Err(io::Error::other(format!("every {name} thread has exited")));
         }
     }
+}
+
+/// The parser's loop: see [`serve_helper`].
+fn serve_parses(stream: UnixStream, threads: usize) -> io::Result<()> {
+    serve_helper(
+        stream,
+        threads,
+        "parser",
+        |msg| match msg {
+            FromFetcher::Parse { id, task } => Some((id, task)),
+            _ => None,
+        },
+        |id, task| {
+            let run = std::panic::AssertUnwindSafe(|| crate::fetcher::parsing::run(task));
+            let reply = match std::panic::catch_unwind(run) {
+                Ok(output) => ParseReply::Done(output),
+                Err(_) => ParseReply::Failed {
+                    message: "the parser panicked".into(),
+                },
+            };
+            encode_parsed(id, reply)
+        },
+    )
+}
+
+/// The resolver's loop: see [`serve_helper`].
+fn serve_lookups(stream: UnixStream, threads: usize) -> io::Result<()> {
+    serve_helper(
+        stream,
+        threads,
+        "resolver",
+        |msg| match msg {
+            FromFetcher::Resolve { id, host } => Some((id, host)),
+            _ => None,
+        },
+        |id, host| {
+            let result = lookup_host(&host);
+            // A short host name and a few addresses always encode.
+            encode(&ToFetcher::Resolved { id, result }).unwrap_or_default()
+        },
+    )
+}
+
+/// Resolve `host` with the system resolver, as any other program on this
+/// host would.
+fn lookup_host(host: &str) -> Result<Vec<SocketAddr>, String> {
+    if host.is_empty() || host.len() > MAX_HOSTNAME_LEN || host.contains('\0') {
+        return Err("not a valid hostname".into());
+    }
+    let addrs: Vec<SocketAddr> = (host, 0)
+        .to_socket_addrs()
+        .map_err(|e| format!("{e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("no addresses found for {host}"));
+    }
+    Ok(addrs)
 }
 
 /// Encode a parse result, replacing it with a failure if it cannot be
@@ -2028,7 +2220,7 @@ mod tests {
         <description>d</description><item><title>hi</title><guid>g1</guid></item>
         </channel></rss>"#;
 
-    /// A host wired to the supervisor's relay, over a worker and parsers
+    /// A host wired to the supervisor's relay, over a worker and helpers
     /// that run on threads rather than in processes of their own, but are
     /// otherwise the real thing.
     fn host_with_in_thread_worker() -> FeedFetcherHost {
@@ -2044,6 +2236,18 @@ mod tests {
         parser: impl Fn(UnixStream) + Send + Clone + 'static,
         task_timeout: Duration,
     ) -> FeedFetcherHost {
+        host_with_helpers(parser, task_timeout, |stream| {
+            let _ = serve_lookups(stream, 2);
+        })
+    }
+
+    /// As [`host_with_parser`], with `resolver` run on a thread of its own
+    /// each time the relay starts a resolver.
+    fn host_with_helpers(
+        parser: impl Fn(UnixStream) + Send + Clone + 'static,
+        task_timeout: Duration,
+        resolver: impl Fn(UnixStream) + Send + Clone + 'static,
+    ) -> FeedFetcherHost {
         let (host_end, mut server) = UnixStream::pair().unwrap();
         let (mut worker, worker_end) = UnixStream::pair().unwrap();
         worker.set_read_timeout(Some(WORKER_IO_TIMEOUT)).unwrap();
@@ -2056,23 +2260,28 @@ mod tests {
             let _ = rt.block_on(serve(worker_end));
         });
         std::thread::spawn(move || {
-            let spawn = move || {
-                let (ours, theirs) = UnixStream::pair()?;
-                ours.set_read_timeout(Some(WORKER_IO_TIMEOUT))?;
-                ours.set_write_timeout(Some(WORKER_IO_TIMEOUT))?;
-                let parser = parser.clone();
-                std::thread::spawn(move || parser(theirs));
-                Ok(ParserProc {
-                    stream: ours,
-                    pid: None,
-                    started: Instant::now(),
-                })
-            };
-            let mut parser = Parser::new(2, Box::new(spawn));
+            let mut parser = Helper::parser(2, in_thread(parser));
             parser.task_timeout = task_timeout;
-            relay(&mut server, &mut worker, &mut parser);
+            let mut resolver = Helper::resolver(in_thread(resolver));
+            relay(&mut server, &mut worker, &mut parser, &mut resolver);
         });
         FeedFetcherHost::from_stream(host_end, None).unwrap()
+    }
+
+    /// Starts a helper that runs `main` on a thread of its own.
+    fn in_thread(main: impl Fn(UnixStream) + Send + Clone + 'static) -> SpawnChild {
+        Box::new(move || {
+            let (ours, theirs) = UnixStream::pair()?;
+            ours.set_read_timeout(Some(WORKER_IO_TIMEOUT))?;
+            ours.set_write_timeout(Some(WORKER_IO_TIMEOUT))?;
+            let main = main.clone();
+            std::thread::spawn(move || main(theirs));
+            Ok(ChildProc {
+                stream: ours,
+                pid: None,
+                started: Instant::now(),
+            })
+        })
     }
 
     fn host_with_in_thread_children(
@@ -2317,7 +2526,7 @@ mod tests {
     }
 
     /// The worker fetches through the proxy in the spec, with the proxy's
-    /// own hostname resolved by the server like any other.
+    /// own hostname resolved by the resolver like any other.
     #[tokio::test]
     async fn fetches_go_through_the_proxy_in_the_spec() {
         use crate::config::ProxySettings;
@@ -2334,7 +2543,7 @@ mod tests {
     }
 
     /// A SOCKS5 proxy works from the worker too, with the proxy's own
-    /// hostname resolved by the server and the feed's by the proxy.
+    /// hostname resolved by the resolver and the feed's by the proxy.
     #[tokio::test]
     async fn fetches_go_through_a_socks5_proxy_in_the_spec() {
         use crate::config::ProxySettings;
@@ -2482,7 +2691,7 @@ mod tests {
     }
 
     /// Asset downloads, icon searches and image extraction all run in the
-    /// worker, with hostnames resolved by the server as for feeds.
+    /// worker, with hostnames resolved by the resolver as for feeds.
     #[tokio::test]
     async fn asset_jobs_round_trip_through_a_worker() {
         use crate::fetcher::assets::{AssetKind, AssetReply, AssetSpec, PageSpec};
@@ -2595,6 +2804,57 @@ mod tests {
         assert!(host.is_alive());
     }
 
+    /// A resolver that dies fails the lookup it had, which surfaces as a
+    /// network failure of that one fetch, and is replaced for the next.
+    #[tokio::test]
+    async fn a_resolver_that_dies_is_replaced() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new().route("/feed", get(|| async { RSS }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+        // Dies when asked for `die.invalid`, and resolves anything else.
+        let resolver = |mut stream: UnixStream| loop {
+            let Ok(frame) = read_frame_limited(&mut stream, MAX_FRAME_BYTES) else {
+                return;
+            };
+            let Ok(FromFetcher::Resolve { id, host }) = decode(&frame) else {
+                return;
+            };
+            if host == "die.invalid" {
+                return;
+            }
+            let answer = encode(&ToFetcher::Resolved {
+                id,
+                result: lookup_host(&host),
+            })
+            .unwrap();
+            if write_frame_limited(&mut stream, &answer, MAX_FRAME_BYTES).is_err() {
+                return;
+            }
+        };
+        let host = host_with_helpers(
+            |stream| {
+                let _ = serve_parses(stream, 2);
+            },
+            PARSE_TIMEOUT,
+            resolver,
+        );
+
+        let reply = host.fetch(spec("http://die.invalid/feed")).await.unwrap();
+        match reply {
+            // reqwest's message does not carry the resolver's.
+            FetchReply::Network { .. } => {}
+            other => panic!("expected a network failure, got {other:?}"),
+        }
+        let reply = host
+            .fetch(spec(&format!("http://localhost:{port}/feed")))
+            .await;
+        assert!(matches!(reply, Ok(FetchReply::Body(_))), "got {reply:?}");
+    }
+
     #[test]
     fn respawns_back_off_only_when_crash_looping() {
         assert_eq!(respawn_delay(0), Duration::ZERO);
@@ -2703,18 +2963,18 @@ mod tests {
     }
 
     #[test]
-    fn the_server_refuses_to_look_up_nonsense() {
+    fn the_resolver_refuses_to_look_up_nonsense() {
         assert!(lookup_host("").is_err());
         assert!(lookup_host(&"a".repeat(MAX_HOSTNAME_LEN + 1)).is_err());
         assert!(lookup_host("bad\0host").is_err());
         assert!(lookup_host("localhost").is_ok());
     }
 
-    /// A feed named by hostname is resolved by the server side of the
+    /// A feed named by hostname is resolved by the resolver, through the
     /// channel, and a name that does not resolve surfaces as an ordinary
     /// network failure of that one fetch.
     #[tokio::test]
-    async fn hostnames_are_resolved_through_the_server() {
+    async fn hostnames_are_resolved_through_the_resolver() {
         use axum::{routing::get, Router};
 
         let app = Router::new().route("/feed", get(|| async { RSS }));

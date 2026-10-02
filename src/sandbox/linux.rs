@@ -4,19 +4,20 @@
 use super::{SandboxConfig, SandboxProfile};
 use anyhow::{Context, Result};
 use landlock::{
-    path_beneath_rules, Access, AccessFs, AccessNet, BitFlags, LandlockStatus, Ruleset,
+    path_beneath_rules, Access, AccessFs, AccessNet, BitFlags, LandlockStatus, NetPort, Ruleset,
     RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
 use std::path::{Path, PathBuf};
 
-/// Read-only paths needed to resolve hostnames and handle local time: the
-/// resolver's configuration files and time zone data.
+/// Read-only paths needed to resolve hostnames: the C library resolver's
+/// configuration files.
 ///
-/// Granted to the server only. The feed fetcher asks the server to
-/// resolve names for it (see [`crate::process::feed_fetcher`]) and keeps
-/// time in UTC.
-const RO_RESOLVER_PATHS: &[&str] = &[
-    // DNS + name resolution
+/// Granted to the feed fetcher's resolver, which resolves every hostname
+/// Kiki looks up (see [`crate::process::feed_fetcher`]). The fetcher's
+/// supervisor, which forks the resolver under its own Landlock domain, is
+/// granted them too, and so is the server, which starts the fetcher under
+/// its: see [`server_child_paths`].
+const RO_DNS_PATHS: &[&str] = &[
     "/etc/resolv.conf",
     "/etc/nsswitch.conf",
     "/etc/hosts",
@@ -24,7 +25,12 @@ const RO_RESOLVER_PATHS: &[&str] = &[
     "/etc/gai.conf",
     "/etc/services",
     "/etc/protocols",
-    // Time zone data (chrono reads /etc/localtime, some crates read zoneinfo)
+];
+
+/// Read-only paths needed to handle local time. Granted to the server
+/// only; the feed fetcher keeps time in UTC.
+const RO_TIME_ZONE_PATHS: &[&str] = &[
+    // chrono reads /etc/localtime, some crates read zoneinfo
     "/etc/localtime",
     "/usr/share/zoneinfo",
 ];
@@ -155,8 +161,14 @@ fn tls_paths() -> Vec<PathBuf> {
 
 /// Read-only paths for name resolution and time zones, including wherever
 /// their symlinks lead.
-fn resolver_paths() -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = existing(RO_RESOLVER_PATHS).collect();
+fn dns_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = existing(RO_DNS_PATHS).collect();
+    paths.extend(symlink_targets(&paths));
+    paths
+}
+
+fn time_zone_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = existing(RO_TIME_ZONE_PATHS).collect();
     paths.extend(symlink_targets(&paths));
     paths
 }
@@ -263,11 +275,13 @@ fn refuse_write_exec() -> std::io::Result<Mdwe> {
 ///   child, being the same executable, loads again — plus the loader's
 ///   cache and preload list;
 /// * have their standard streams pointed at `/dev/null`;
-/// * verify TLS certificates, in the feed fetcher's case.
+/// * verify TLS certificates and resolve hostnames, in the feed fetcher's
+///   case.
 ///
 /// The server cannot execute anything itself once its seccomp filter is
 /// up, and gains no secrets from the rest: the executable and libraries
-/// are already mapped into it, and trust stores hold public certificates.
+/// are already mapped into it, trust stores hold public certificates, and
+/// the resolver's configuration is readable by every user.
 fn server_child_paths() -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     let mut executable: Vec<PathBuf> = std::env::current_exe().into_iter().collect();
     if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
@@ -279,6 +293,7 @@ fn server_child_paths() -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     }
     let read_only = tls_paths()
         .into_iter()
+        .chain(dns_paths())
         .chain(existing(RO_LOADER_PATHS))
         .collect();
     (executable, read_only, vec![PathBuf::from(NULL_DEVICE)])
@@ -329,9 +344,10 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
             if !rw_paths.iter().any(|p| path_within(temp_dir, p)) {
                 rw_paths.push(temp_dir.clone());
             }
-            // No TLS trust stores: the server makes no HTTP(S) requests
-            // of its own, as the feed fetcher downloads assets too.
-            let ro_paths: Vec<PathBuf> = resolver_paths()
+            // No TLS trust stores or resolver configuration: the server
+            // makes no HTTP(S) requests and resolves no hostnames of its
+            // own, as the feed fetcher does both.
+            let ro_paths: Vec<PathBuf> = time_zone_paths()
                 .into_iter()
                 .chain(existing(RO_ENTROPY_PATHS))
                 .chain(existing(RO_INTROSPECTION_PATHS))
@@ -341,7 +357,14 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
         SandboxProfile::ScriptHost | SandboxProfile::FeedParser | SandboxProfile::WebUi => {
             (Vec::new(), Vec::new())
         }
-        SandboxProfile::FeedFetcher => (Vec::new(), tls_paths()),
+        // The supervisor forks the resolver, whose domain nests inside its
+        // own, so it holds the resolver's paths for it, and so does the
+        // worker it forks: the configuration is readable by every user.
+        SandboxProfile::FeedFetcher => (
+            Vec::new(),
+            tls_paths().into_iter().chain(dns_paths()).collect(),
+        ),
+        SandboxProfile::FeedResolver => (Vec::new(), dns_paths()),
     }
 }
 
@@ -373,7 +396,8 @@ fn landlock_scopes(profile: &SandboxProfile) -> BitFlags<Scope> {
         SandboxProfile::Server { .. }
         | SandboxProfile::ScriptHost
         | SandboxProfile::FeedFetcher
-        | SandboxProfile::FeedParser => Scope::AbstractUnixSocket | Scope::Signal,
+        | SandboxProfile::FeedParser
+        | SandboxProfile::FeedResolver => Scope::AbstractUnixSocket | Scope::Signal,
     }
 }
 
@@ -407,8 +431,17 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
         // needs no network at all, and seccomp denies it sockets anyway.
         ruleset = ruleset.handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp)?;
     }
+    if matches!(config.profile, SandboxProfile::FeedResolver) {
+        // TCP connections only to port 53, for DNS replies too large for
+        // UDP, and no binds (Linux 6.7+, ABI v4). Landlock has no say over
+        // UDP, which ordinary queries use.
+        ruleset = ruleset.handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp)?;
+    }
+    let mut ruleset = ruleset.create()?;
+    if matches!(config.profile, SandboxProfile::FeedResolver) {
+        ruleset = ruleset.add_rule(NetPort::new(DNS_PORT, AccessNet::ConnectTcp))?;
+    }
     let ruleset = ruleset
-        .create()?
         .add_rules(path_beneath_rules(&rw_paths, all))?
         .add_rules(path_beneath_rules(&ro_paths, read_only))?
         .add_rules(path_beneath_rules(
@@ -470,6 +503,9 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
     }
     Ok(())
 }
+
+/// The port DNS is served on, over UDP and TCP alike.
+const DNS_PORT: u16 = 53;
 
 /// Whether `path` is `dir` or lies below it, comparing canonical paths
 /// where both exist.
@@ -574,24 +610,33 @@ const DENIED_SCRIPT_HOST: &[i64] = &[
     libc::SYS_accept4,
 ];
 
-/// Extra syscalls denied to the feed fetcher: binding an address and
-/// accepting connections. It only ever connects out, and since the server
-/// resolves hostnames for it, it never calls `getaddrinfo` — which would
-/// otherwise need to bind a netlink socket.
+/// Extra syscalls denied to the feed fetcher and its resolver: binding an
+/// address and accepting connections. They only ever connect out. The
+/// resolver's `getaddrinfo` would bind a netlink socket to learn which
+/// address families the host has, but it may not create one (see
+/// [`RESOLVER_SOCKET_FAMILIES`]), and carries on without.
 const DENIED_FEED_FETCHER: &[i64] = &[libc::SYS_bind, libc::SYS_listen, libc::SYS_accept4];
 
-/// The only address families the server may create sockets in: Unix, for
-/// its API listener and for resolvers that answer over a local socket
-/// (nscd, sssd, systemd-resolved), and IPv4/IPv6, for DNS queries sent
-/// straight to a name server. Everything else — netlink, packet, `AF_ALG`,
-/// Bluetooth, and the rest of the long tail of rarely-exercised kernel
-/// protocol code — is refused.
+/// The only address family the server may create sockets in: Unix, for
+/// its API listener and the service manager's notification socket. It
+/// makes no network connections of its own — the feed fetcher downloads
+/// everything, and its resolver looks every hostname up — so everything
+/// else, IPv4 and IPv6 included, is refused.
+const SERVER_SOCKET_FAMILIES: &[i32] = &[libc::AF_UNIX];
+
+/// The only address families the feed fetcher's resolver may create
+/// sockets in: IPv4 and IPv6, for DNS queries sent straight to a name
+/// server.
 ///
-/// glibc's `getaddrinfo` also opens a netlink socket to learn which
-/// address families the host has configured; when that fails it assumes
-/// both, and resolution carries on. The systemd unit's
-/// `RestrictAddressFamilies=` makes the same choice.
-const SERVER_SOCKET_FAMILIES: &[i32] = &[libc::AF_UNIX, libc::AF_INET, libc::AF_INET6];
+/// Not Unix: a resolver that could create one could reach the server's API
+/// socket, whose only access control is reachability. So lookups that go
+/// through a local daemon — nscd, sssd, or systemd-resolved's NSS module —
+/// fail, and the C library falls back to the name servers in
+/// `resolv.conf` (systemd-resolved's stub among them, if listed there)
+/// and to `/etc/hosts`. Nor netlink: glibc's `getaddrinfo` opens one to
+/// learn which address families the host has configured, and when that
+/// fails it assumes both, and resolution carries on.
+const RESOLVER_SOCKET_FAMILIES: &[i32] = &[libc::AF_INET, libc::AF_INET6];
 
 /// Which `socket(2)` address families a profile may use.
 enum SocketDomains {
@@ -643,7 +688,9 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
         SandboxProfile::ScriptHost | SandboxProfile::FeedParser => {
             &[DENIED_SCRIPT_HOST, arch_specific_sockets]
         }
-        SandboxProfile::FeedFetcher => &[DENIED_FEED_FETCHER, arch_specific_sockets],
+        SandboxProfile::FeedFetcher | SandboxProfile::FeedResolver => {
+            &[DENIED_FEED_FETCHER, arch_specific_sockets]
+        }
         SandboxProfile::WebUi => &[DENIED_WEB_UI],
     };
 
@@ -669,8 +716,10 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
     apply_filter_all_threads(&program).context("installing seccomp BPF program")?;
 
     let domains = match config.profile {
-        // Unix, IPv4 and IPv6 sockets only.
+        // Unix sockets only.
         SandboxProfile::Server { .. } => Some(SocketDomains::AllowOnly(SERVER_SOCKET_FAMILIES)),
+        // Internet sockets only: no Unix or netlink ones.
+        SandboxProfile::FeedResolver => Some(SocketDomains::AllowOnly(RESOLVER_SOCKET_FAMILIES)),
         // Internet sockets only: no Unix ones.
         SandboxProfile::FeedFetcher => Some(SocketDomains::Deny(&[libc::AF_UNIX])),
         // Unix sockets only: no Internet (or netlink, or packet) ones.
@@ -972,13 +1021,15 @@ mod tests {
             "the feed fetcher must not be able to read /proc or /sys: {ro:?}"
         );
         let env_paths = tls_env_paths();
+        let dns = dns_paths();
         for p in &ro {
             assert!(
                 RO_TLS_PATHS
                     .iter()
                     .chain(RO_ENTROPY_PATHS)
                     .any(|allowed| Path::new(allowed) == p)
-                    || env_paths.contains(p),
+                    || env_paths.contains(p)
+                    || dns.contains(p),
                 "unexpected read-only path for the feed fetcher: {p:?}"
             );
         }
@@ -1071,12 +1122,40 @@ mod tests {
     /// The server keeps the families its API listener and the system
     /// resolver need, and nothing else.
     #[test]
-    fn the_server_may_only_create_unix_and_internet_sockets() {
-        for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
-            assert!(SERVER_SOCKET_FAMILIES.contains(&family));
+    fn the_server_may_only_create_unix_sockets() {
+        assert_eq!(SERVER_SOCKET_FAMILIES, [libc::AF_UNIX]);
+    }
+
+    #[test]
+    fn the_resolver_may_only_create_internet_sockets() {
+        assert_eq!(RESOLVER_SOCKET_FAMILIES, [libc::AF_INET, libc::AF_INET6]);
+    }
+
+    #[test]
+    fn the_resolver_gets_only_read_only_dns_paths() {
+        let (rw, ro) = landlock_paths(&SandboxProfile::FeedResolver);
+        assert!(rw.is_empty());
+        for p in &ro {
+            assert!(
+                RO_DNS_PATHS.iter().any(|d| p.starts_with(d))
+                    || symlink_targets(&dns_paths()).contains(p),
+                "unexpected read-only path for the resolver: {p:?}"
+            );
         }
-        for family in [libc::AF_NETLINK, libc::AF_PACKET, libc::AF_ALG] {
-            assert!(!SERVER_SOCKET_FAMILIES.contains(&family));
+    }
+
+    #[test]
+    fn the_server_gets_no_resolver_configuration_of_its_own() {
+        let (_, ro) = landlock_paths(&SandboxProfile::Server {
+            data_dir: PathBuf::from("/var/lib/kiki"),
+            socket_dir: PathBuf::from("/var/lib/kiki"),
+            temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
+        });
+        for dns in RO_DNS_PATHS {
+            assert!(
+                !ro.contains(&PathBuf::from(dns)),
+                "{dns} granted to the server"
+            );
         }
     }
 
@@ -1106,6 +1185,8 @@ mod tests {
             server,
             SandboxProfile::ScriptHost,
             SandboxProfile::FeedFetcher,
+            SandboxProfile::FeedParser,
+            SandboxProfile::FeedResolver,
             SandboxProfile::WebUi,
         ] {
             let scopes = landlock_scopes(&profile);
