@@ -40,8 +40,8 @@
 //!
 //! # Spawning order
 //!
-//! Every sandbox profile denies `execve`, so a process cannot spawn
-//! children once its own sandbox is installed. The server therefore
+//! The server's sandbox profile denies `execve`, so it cannot spawn
+//! children once its sandbox is installed. It therefore
 //! installs its sandbox in two halves, in [`crate::cli::serve`]: its
 //! Landlock rules, then both children, then — once it has bound its API
 //! socket, which the filter leaves it no way to do — its seccomp filter.
@@ -58,19 +58,25 @@
 //!   timeouts — inside the child, the ways it can actually die are an OOM
 //!   kill, a panic, or a seccomp violation, and refusing to hand a fresh
 //!   VM to whatever caused the last one to die is the safer default.
-//! * The **feed fetcher** is a supervisor that `fork`s (allowed, unlike
-//!   `exec`) a replacement worker whenever the last one dies, because
-//!   fetching is Kiki's core job; see [`feed_fetcher`]. Should the
+//! * The **feed fetcher** is a supervisor that starts a replacement worker
+//!   whenever the last one dies, because fetching is Kiki's core job: its
+//!   profile is the one that may `execve`, and then only the kiki
+//!   executable; see [`feed_fetcher`]. Should the
 //!   supervisor itself go, the server stops with an error, so that
 //!   whatever supervises it (systemd, say) can start both afresh.
 //!
 //! # Transport
 //!
 //! Parent and child talk over an anonymous `SOCK_STREAM` socket pair
-//! created before the fork, which the child inherits on [`CHILD_FD`].
+//! created before the child is started, which it inherits on
+//! [`CHILD_FD`]. Every child is the kiki executable run again with a hidden
+//! subcommand, and inherits no other descriptor but the standard streams.
 //! Messages are length-prefixed postcard frames (see [`ipc`]). Neither child
 //! can open a Unix socket to connect elsewhere, so its parent is the only
 //! local process it can ever talk to.
+
+#[cfg(unix)]
+use anyhow::Context;
 
 pub mod ipc;
 
@@ -137,6 +143,9 @@ pub(crate) fn reap(mut child: std::process::Child) {
 /// In a child started by [`spawn_child`], take ownership of the socket to
 /// the parent on [`CHILD_FD`].
 ///
+/// The descriptor is marked close-on-exec, so that a child this process
+/// starts in turn does not inherit it.
+///
 /// # Errors
 ///
 /// Fails if nothing is open on [`CHILD_FD`] — the subcommand was run by
@@ -152,10 +161,16 @@ pub(crate) fn take_parent_socket(
     // than returning an error. Check first so a bad invocation exits with
     // a diagnostic instead.
     // SAFETY: `fcntl(F_GETFD)` only inspects the descriptor table entry.
-    if unsafe { libc::fcntl(CHILD_FD, libc::F_GETFD) } < 0 {
+    let flags = unsafe { libc::fcntl(CHILD_FD, libc::F_GETFD) };
+    if flags < 0 {
         anyhow::bail!(
             "no socket on fd {CHILD_FD}: {subcommand} is spawned by `kiki serve`, not run directly"
         );
+    }
+    // SAFETY: as above; setting a descriptor flag touches no memory.
+    if unsafe { libc::fcntl(CHILD_FD, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("marking the parent socket close-on-exec");
     }
     // SAFETY: the parent dup2'd its end of the socket pair onto CHILD_FD
     // before exec, the check above confirms it is open, and nothing else
@@ -163,60 +178,91 @@ pub(crate) fn take_parent_socket(
     Ok(unsafe { std::os::unix::net::UnixStream::from_raw_fd(CHILD_FD) })
 }
 
-/// Re-exec the current binary as `kiki <subcommand>`, with one end of a
-/// fresh socket pair on [`CHILD_FD`], and return the other end.
-///
-/// `fd_env` is set on the child to name the descriptor, and `log_only`
-/// and `no_sandbox` are forwarded as `--seccomp-log-only` and
-/// `--no-sandbox` so the child's sandbox matches the server's. The child's
-/// stdin and stdout are closed; stderr is inherited so its logs land
-/// wherever the server's do.
-///
-/// **Must be called before the caller installs its seccomp filter**,
-/// which denies `execve`. Calling it after the caller's Landlock rules
-/// are in place nests the child's Landlock domain inside the caller's;
-/// see [`crate::sandbox::restrict_filesystem`].
-///
-/// # Errors
-///
-/// Fails if the current executable cannot be located, the socket pair
-/// cannot be created, or the child cannot be spawned.
+/// Which of its parent's environment variables a child gets.
 #[cfg(unix)]
-pub(crate) fn spawn_child(
+pub(crate) enum ChildEnv<'a> {
+    /// All of them.
+    Inherit,
+    /// Only those named, if set: the rest may hold secrets, a proxy
+    /// password among them, that the child has no use for.
+    Only(&'a [&'a str]),
+}
+
+/// A command that runs `exe` as `kiki <subcommand>`, with `fd_env` set to
+/// name [`CHILD_FD`], and `log_only` and `no_sandbox` forwarded as
+/// `--seccomp-log-only` and `--no-sandbox` so the child's sandbox matches
+/// its parent's. Start it with [`spawn_with_socket`].
+#[cfg(unix)]
+pub(crate) fn child_command(
+    exe: &std::path::Path,
     subcommand: &str,
     fd_env: &str,
+    env: ChildEnv<'_>,
     log_only: bool,
     no_sandbox: bool,
-) -> anyhow::Result<(std::os::unix::net::UnixStream, std::process::Child)> {
-    use anyhow::Context;
-    use std::io;
-    use std::os::unix::io::AsRawFd;
-    use std::os::unix::net::UnixStream;
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    let exe = std::env::current_exe().context("locating the kiki executable")?;
-    let (ours, theirs) = UnixStream::pair().context("creating the socket pair")?;
-
-    let mut cmd = Command::new(&exe);
-    cmd.arg(subcommand)
-        .env(fd_env, CHILD_FD.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    if let ChildEnv::Only(keep) = env {
+        cmd.env_clear();
+        for name in keep {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
+        }
+    }
+    cmd.arg(subcommand).env(fd_env, CHILD_FD.to_string());
     if log_only {
         cmd.arg("--seccomp-log-only");
     }
     if no_sandbox {
         cmd.arg("--no-sandbox");
     }
+    cmd
+}
 
+/// Start `cmd` with one end of a fresh socket pair on [`CHILD_FD`], and
+/// return the other end.
+///
+/// With `die_with_parent`, the child is killed (on Linux) when the
+/// thread that started it exits, and does not start at all if that has
+/// already happened by the time it would.
+///
+/// # Errors
+///
+/// Fails if the socket pair cannot be created or the child cannot be
+/// started.
+#[cfg(unix)]
+pub(crate) fn spawn_with_socket(
+    cmd: &mut std::process::Command,
+    die_with_parent: bool,
+) -> std::io::Result<(std::os::unix::net::UnixStream, std::process::Child)> {
+    use std::io;
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+
+    let (ours, theirs) = UnixStream::pair()?;
     let their_fd = theirs.as_raw_fd();
+    let parent = std::process::id();
     // SAFETY: the closure runs between fork and exec, where only
-    // async-signal-safe calls are permitted. `dup2` and `fcntl` are both
-    // on that list, and neither allocates nor takes a lock.
+    // async-signal-safe calls are permitted. `dup2`, `fcntl`, `prctl` and
+    // `getppid` are plain syscalls, and none of them allocates or takes a
+    // lock.
     unsafe {
         cmd.pre_exec(move || {
+            #[cfg(target_os = "linux")]
+            if die_with_parent {
+                // Checked after the `prctl`, in case the parent exited
+                // before it took effect.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() as u32 != parent {
+                    return Err(io::Error::other("the parent has exited"));
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = (die_with_parent, parent);
             if their_fd == CHILD_FD {
                 // Already in the right slot; just clear CLOEXEC so it
                 // survives the exec.
@@ -235,11 +281,50 @@ pub(crate) fn spawn_child(
         });
     }
 
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("spawning `{} {}`", exe.display(), subcommand))?;
+    let child = cmd.spawn()?;
     // The child has its own copy now; holding ours open would keep the
     // socket from ever reporting EOF.
     drop(theirs);
     Ok((ours, child))
+}
+
+/// Re-exec the current binary as `kiki <subcommand>`, with one end of a
+/// fresh socket pair on [`CHILD_FD`], and return the other end.
+///
+/// See [`child_command`] for `fd_env`, `log_only` and `no_sandbox`. The
+/// child's stdin and stdout are closed; stderr is inherited so its logs
+/// land wherever the server's do.
+///
+/// **Must be called before the caller installs its seccomp filter**,
+/// which denies `execve`. Calling it after the caller's Landlock rules
+/// are in place nests the child's Landlock domain inside the caller's;
+/// see [`crate::sandbox::restrict_filesystem`].
+///
+/// # Errors
+///
+/// Fails if the current executable cannot be located, the socket pair
+/// cannot be created, or the child cannot be spawned.
+#[cfg(unix)]
+pub(crate) fn spawn_child(
+    subcommand: &str,
+    fd_env: &str,
+    log_only: bool,
+    no_sandbox: bool,
+) -> anyhow::Result<(std::os::unix::net::UnixStream, std::process::Child)> {
+    use std::process::Stdio;
+
+    let exe = std::env::current_exe().context("locating the kiki executable")?;
+    let mut cmd = child_command(
+        &exe,
+        subcommand,
+        fd_env,
+        ChildEnv::Inherit,
+        log_only,
+        no_sandbox,
+    );
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    spawn_with_socket(&mut cmd, false)
+        .with_context(|| format!("spawning `{} {}`", exe.display(), subcommand))
 }

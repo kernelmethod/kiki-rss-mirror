@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Granted to the feed fetcher's resolver, which resolves every hostname
 /// Kiki looks up (see [`crate::process::feed_fetcher`]). The fetcher's
-/// supervisor, which forks the resolver under its own Landlock domain, is
+/// supervisor, which starts the resolver under its own Landlock domain, is
 /// granted them too, and so is the server, which starts the fetcher under
 /// its: see [`server_child_paths`].
 const RO_DNS_PATHS: &[&str] = &[
@@ -198,8 +198,9 @@ pub fn restrict_syscalls(config: &SandboxConfig) -> Result<()> {
 /// `MemoryDenyWriteExecute=` installs where the kernel has it, here
 /// applied however Kiki is started.
 ///
-/// The setting cannot be undone, and is inherited by forked children (the
-/// feed fetcher's workers) and kept across `execve`. Like Landlock, it has
+/// The setting cannot be undone, and is inherited by forked children and
+/// kept across `execve` (so the feed fetcher's worker, parser and resolver
+/// start out with it). Like Landlock, it has
 /// no log-only mode, so `log_only` does not affect it.
 ///
 /// An older kernel that lacks it is logged and otherwise ignored.
@@ -283,6 +284,21 @@ fn refuse_write_exec() -> std::io::Result<Mdwe> {
 /// are already mapped into it, trust stores hold public certificates, and
 /// the resolver's configuration is readable by every user.
 fn server_child_paths() -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let (executable, loader) = self_exec_paths();
+    let read_only = tls_paths()
+        .into_iter()
+        .chain(dns_paths())
+        .chain(loader)
+        .collect();
+    (executable, read_only, vec![PathBuf::from(NULL_DEVICE)])
+}
+
+/// What a process needs to run the kiki executable again, as
+/// `(executable, read_only)`: the executable itself and every file this
+/// process has mapped — the dynamic loader and the shared libraries,
+/// which the new process loads again — to execute and read, and the
+/// loader's cache and preload list to read.
+fn self_exec_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut executable: Vec<PathBuf> = std::env::current_exe().into_iter().collect();
     if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
         for path in mapped_files(&maps) {
@@ -291,12 +307,7 @@ fn server_child_paths() -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
             }
         }
     }
-    let read_only = tls_paths()
-        .into_iter()
-        .chain(dns_paths())
-        .chain(existing(RO_LOADER_PATHS))
-        .collect();
-    (executable, read_only, vec![PathBuf::from(NULL_DEVICE)])
+    (executable, existing(RO_LOADER_PATHS).collect())
 }
 
 /// The files mapped into a process, from the contents of its
@@ -357,9 +368,10 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
         SandboxProfile::ScriptHost | SandboxProfile::FeedParser | SandboxProfile::WebUi => {
             (Vec::new(), Vec::new())
         }
-        // The supervisor forks the resolver, whose domain nests inside its
-        // own, so it holds the resolver's paths for it, and so does the
-        // worker it forks: the configuration is readable by every user.
+        // The supervisor starts the resolver, whose domain nests inside its
+        // own, so it holds the resolver's paths for it, and the worker's
+        // too: the configuration is readable by every user. What it needs
+        // to start them is added in `apply_landlock`.
         SandboxProfile::FeedWorker => (Vec::new(), tls_paths()),
         SandboxProfile::FeedFetcher => (
             Vec::new(),
@@ -384,7 +396,7 @@ const LANDLOCK_ABI: ABI = ABI::V6;
 ///   the feed fetcher and the script host, which it starts after its
 ///   Landlock rules are in place (see
 ///   [`crate::sandbox::restrict_filesystem`]), and the fetcher kills its
-///   own forked workers. The web UI stops its `kiki serve` child with
+///   own workers. The web UI stops its `kiki serve` child with
 ///   `SIGTERM`, and that child was started outside the web UI's sandbox.
 /// * Every profile is scoped for abstract Unix sockets, which no Kiki
 ///   process connects to once its sandbox is up. The server's one
@@ -411,6 +423,13 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
     let (rw_paths, ro_paths) = landlock_paths(&config.profile);
     let (exec_paths, child_ro_paths, child_rw_paths) = match config.profile {
         SandboxProfile::Server { .. } => server_child_paths(),
+        // The supervisor starts its worker, parser and resolver by running
+        // the kiki executable again. They inherit its standard streams, so
+        // need no `/dev/null`.
+        SandboxProfile::FeedFetcher => {
+            let (executable, loader) = self_exec_paths();
+            (executable, loader, Vec::new())
+        }
         _ => Default::default(),
     };
 
@@ -635,7 +654,7 @@ const ALLOWED_COMMON_X86_64: &[i64] = &[
 
 /// Syscalls for an event loop, which the profiles that run a tokio runtime
 /// need: the server, the feed fetcher's worker (and so its supervisor, which
-/// forks it), and the web UI.
+/// starts it), and the web UI.
 const ALLOWED_EVENT_LOOP: &[i64] = &[
     libc::SYS_epoll_create1,
     libc::SYS_epoll_ctl,
@@ -670,7 +689,7 @@ const ALLOWED_SOCKETS: &[i64] = &[
 
 /// Binding a socket to an address. musl's resolver binds every UDP socket
 /// it sends a query from (to port 0), so the feed fetcher's resolver may
-/// bind — and so may its supervisor, as a process forked from it can do
+/// bind — and so may its supervisor, as a process it starts can do
 /// nothing the supervisor may not. Landlock denies the two of them TCP
 /// binds where the kernel supports it (6.7+).
 ///
@@ -745,16 +764,36 @@ const ALLOWED_FILE_WRITES: &[i64] = &[
 /// signalling outside its own sandbox, where the kernel supports it.
 const ALLOWED_CHILDREN: &[i64] = &[libc::SYS_wait4, libc::SYS_waitid, libc::SYS_kill];
 
-/// What the feed fetcher's supervisor needs to set up the children it
-/// forks — which call these under its filter, before their own goes up —
-/// beyond what [`ALLOWED_CHILDREN`] already has: closing the descriptors a
-/// child inherited, and installing the child's sandbox.
+/// What the feed fetcher's supervisor needs to install its children's
+/// sandboxes, which they do under its filter, before their own goes up.
 const ALLOWED_SANDBOXING: &[i64] = &[
-    libc::SYS_close_range,
     libc::SYS_seccomp,
     libc::SYS_landlock_create_ruleset,
     libc::SYS_landlock_add_rule,
     libc::SYS_landlock_restrict_self,
+];
+
+/// What the feed fetcher's supervisor needs to start its children by
+/// running the kiki executable again: the `execve` itself, the `dup2` that
+/// puts a child's socket on [`crate::process::CHILD_FD`] before it, and
+/// what the new process calls, still under the supervisor's filter, from
+/// when the dynamic loader loads it to when it installs its own filter:
+/// `pread64` to read the libraries' headers, the thread pointer set up with
+/// `arch_prctl` on x86_64, and the `umask` that `main` sets.
+///
+/// Landlock limits what the supervisor can execute to the kiki executable
+/// and what it loads (see `self_exec_paths`), and every other profile's
+/// allowlist leaves `execve` out, so the processes the supervisor starts
+/// can execute nothing at all.
+const ALLOWED_EXEC: &[i64] = &[
+    libc::SYS_execve,
+    libc::SYS_dup3,
+    libc::SYS_pread64,
+    libc::SYS_umask,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_dup2,
+    #[cfg(target_arch = "x86_64")]
+    libc::SYS_arch_prctl,
 ];
 
 /// The `ioctl` requests every profile may make: making a descriptor
@@ -807,13 +846,14 @@ fn allowed_syscalls(profile: &SandboxProfile) -> Vec<i64> {
         // Nothing beyond the inherited socket pair.
         SandboxProfile::ScriptHost | SandboxProfile::FeedParser => &[],
         // What its worker, parser and resolver need between them, and
-        // what it needs to fork and sandbox them.
+        // what it needs to start and sandbox them.
         SandboxProfile::FeedFetcher => &[
             ALLOWED_EVENT_LOOP,
             ALLOWED_SOCKETS,
             ALLOWED_BIND,
             ALLOWED_CHILDREN,
             ALLOWED_SANDBOXING,
+            ALLOWED_EXEC,
         ],
         SandboxProfile::FeedWorker => &[ALLOWED_EVENT_LOOP, ALLOWED_SOCKETS],
         SandboxProfile::FeedResolver => &[ALLOWED_SOCKETS, ALLOWED_BIND],
@@ -1357,7 +1397,7 @@ mod tests {
     }
 
     /// musl's resolver binds each UDP socket it queries from, and a
-    /// process forked from the supervisor can do nothing the supervisor
+    /// process the supervisor starts can do nothing the supervisor
     /// may not, so neither the supervisor nor the resolver may be denied
     /// `bind`; only the worker, which installs its own filter, is.
     #[test]
@@ -1392,7 +1432,7 @@ mod tests {
     }
 
     /// Only the supervisor installs filters once its own is up — its
-    /// children's, forked under it. Every other profile installs its
+    /// children's, started under it. Every other profile installs its
     /// allowlist last, so it need not allow `seccomp` or Landlock.
     #[test]
     fn only_the_supervisor_may_install_sandboxes() {
@@ -1545,14 +1585,50 @@ mod tests {
         libc::SYS_setdomainname,
     ];
 
+    /// The one exception is the feed fetcher's supervisor's `execve`,
+    /// which is how it starts its children, and which Landlock confines to
+    /// the kiki executable.
     #[test]
     fn no_profile_allows_what_the_old_denylist_denied() {
         for profile in every_profile() {
             let allowed = allowed_syscalls(&profile);
+            let supervisor = matches!(profile, SandboxProfile::FeedFetcher);
             for nr in NEVER_ALLOWED {
+                if supervisor && *nr == libc::SYS_execve {
+                    continue;
+                }
                 assert!(!allowed.contains(nr), "syscall {nr} allowed");
             }
         }
+    }
+
+    /// Only the supervisor may execute anything, and the processes it
+    /// starts, which install their own filters on top of its, may not.
+    #[test]
+    fn only_the_supervisor_may_execute() {
+        for profile in every_profile() {
+            let supervisor = matches!(profile, SandboxProfile::FeedFetcher);
+            assert_eq!(
+                allowed_syscalls(&profile).contains(&libc::SYS_execve),
+                supervisor,
+                "{}",
+                SandboxConfig {
+                    profile,
+                    log_only: false
+                }
+                .profile_name()
+            );
+        }
+    }
+
+    /// The supervisor may execute the kiki executable, and whatever it
+    /// has mapped: the loader and libraries, for a dynamically linked
+    /// build.
+    #[test]
+    fn the_supervisor_may_run_this_executable_again() {
+        let exe = std::env::current_exe().unwrap();
+        let (executable, _) = self_exec_paths();
+        assert_eq!(executable.first(), Some(&exe));
     }
 
     /// Every profile's filters compile, for this architecture.

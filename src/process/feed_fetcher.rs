@@ -58,10 +58,12 @@
 //! # Processes
 //!
 //! `kiki __feed-fetcher` is a small **supervisor**. It installs the
-//! sandbox, then `fork`s a **worker** that does the downloading and two
-//! **helpers**, the **parser** and the **resolver**. All three inherit the
-//! sandbox, and each tightens it further to what its own job needs (see
-//! [`SandboxProfile::FeedParser`]). None has a descriptor to the server
+//! sandbox, then starts a **worker** that does the downloading and two
+//! **helpers**, the **parser** and the **resolver**, each by running the
+//! kiki executable again with a hidden subcommand of its own
+//! ([`WORKER_SUBCOMMAND`], [`PARSER_SUBCOMMAND`], [`RESOLVER_SUBCOMMAND`]).
+//! All three start under the supervisor's sandbox, and each tightens it
+//! further to what its own job needs (see [`SandboxProfile::FeedParser`]). None has a descriptor to the server
 //! or to the others, only a socket pair each to the supervisor, which relays
 //! frames between them: requests and their answers between the server and
 //! the worker, and the worker's tasks and their answers between it and the
@@ -77,11 +79,13 @@
 //! longer than [`LOOKUP_TIMEOUT`], is killed.
 //!
 //! The split exists so the fetcher can be *replaced*. The server cannot
-//! spawn anything once its own sandbox is up (every profile denies
+//! spawn anything once its own sandbox is up (its profile denies
 //! `execve`), which is acceptable for the optional script host but not
-//! for fetching, which is Kiki's core job. `fork` is not denied, so the
-//! supervisor — single-threaded, and never touching untrusted input —
-//! forks a fresh worker whenever the last one dies. The supervisor tracks
+//! for fetching, which is Kiki's core job. The supervisor — single-threaded,
+//! and never touching untrusted input — is the one profile that may
+//! `execve`, and then only the kiki executable (see
+//! [`SandboxProfile::FeedFetcher`]), so it starts a fresh worker whenever
+//! the last one dies. The supervisor tracks
 //! which requests were in flight and answers each of them with
 //! [`JobResult::WorkerExited`]. Any of them may be what killed the worker,
 //! so the server retries them one at a time: a request that kills the
@@ -99,13 +103,13 @@
 //! would. When the worker dies, the helpers are replaced along with it,
 //! since everything they had in hand was the dead worker's.
 //!
-//! The helpers are forked from the supervisor, and so start with a copy of
-//! its memory. The supervisor clears every frame it relays as soon as it
-//! is done with it, so that a helper forked later does not inherit the
-//! credentials in the server's requests, nor what the feeds contain; and
-//! each helper wipes the environment it inherits, which may hold a proxy
-//! password, keeping only the few variables the C library's resolver
-//! reads in the resolver.
+//! A child started this way shares no memory with the supervisor, and
+//! inherits no descriptor but its socket pair and the standard streams.
+//! Only the worker is given the supervisor's environment, which may hold
+//! a proxy password; the parser gets none of it, and the resolver only
+//! the few variables the C library's resolver reads.
+//!
+//! [`SandboxProfile::FeedFetcher`]: crate::sandbox::SandboxProfile::FeedFetcher
 //!
 //! # Protocol
 //!
@@ -147,7 +151,8 @@ use std::io;
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::process::Child;
+use std::path::PathBuf;
+use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -160,8 +165,32 @@ pub const SUBCOMMAND: &str = "__feed-fetcher";
 /// Environment variable set on the child, naming [`CHILD_FD`](crate::process::CHILD_FD).
 ///
 /// As for the script host, purely informational: it lets a hand-run
-/// `kiki __feed-fetcher` refuse with a clear message.
+/// `kiki __feed-fetcher` refuse with a clear message. The supervisor's own
+/// children have one each in the same vein: [`WORKER_FD_ENV`],
+/// [`PARSER_FD_ENV`] and [`RESOLVER_FD_ENV`].
 pub const HOST_FD_ENV: &str = "KIKI_FEED_FETCHER_FD";
+
+/// The hidden subcommand the supervisor starts its worker with.
+pub const WORKER_SUBCOMMAND: &str = "__feed-worker";
+
+/// The hidden subcommand the supervisor starts its parser with.
+pub const PARSER_SUBCOMMAND: &str = "__feed-parser";
+
+/// The hidden subcommand the supervisor starts its resolver with.
+pub const RESOLVER_SUBCOMMAND: &str = "__feed-resolver";
+
+/// See [`HOST_FD_ENV`].
+pub const WORKER_FD_ENV: &str = "KIKI_FEED_WORKER_FD";
+
+/// See [`HOST_FD_ENV`].
+pub const PARSER_FD_ENV: &str = "KIKI_FEED_PARSER_FD";
+
+/// See [`HOST_FD_ENV`].
+pub const RESOLVER_FD_ENV: &str = "KIKI_FEED_RESOLVER_FD";
+
+/// Environment variable telling the parser how many threads to run: as
+/// many as the supervisor will give it tasks at once.
+pub const PARSER_THREADS_ENV: &str = "KIKI_FEED_PARSER_THREADS";
 
 /// How many times the server sends a job that was in hand when a worker
 /// died, one suspect at a time, before giving up on it.
@@ -859,9 +888,10 @@ impl Drop for FeedFetcherHost {
 /// # Errors
 ///
 /// Fails if the sandbox cannot be installed, or if a worker cannot be
-/// forked at all. Once running, the server closing the channel is a
+/// started at all. Once running, the server closing the channel is a
 /// normal shutdown, not an error.
 pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
+    let spawner = Spawner::new(log_only, no_sandbox)?;
     if no_sandbox {
         warn!(
             "feed fetcher: sandbox disabled via --no-sandbox; feeds are fetched and parsed \
@@ -875,38 +905,28 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
     let mut server = crate::process::take_parent_socket(SUBCOMMAND)?;
 
     let threads = parser_threads();
-    let mut parser = Helper::parser(
-        threads,
-        Box::new(move || {
-            spawn_helper_process(HelperKind::Parser, |stream| {
-                parser_main(stream, threads, log_only, no_sandbox)
-            })
-        }),
-    );
-    let mut resolver = Helper::resolver(Box::new(move || {
-        spawn_helper_process(HelperKind::Resolver, |stream| {
-            resolver_main(stream, log_only, no_sandbox)
-        })
-    }));
+    let mut parser = Helper::parser(threads, {
+        let spawner = spawner.clone();
+        Box::new(move || spawner.spawn_helper(ChildKind::Parser { threads }))
+    });
+    let mut resolver = Helper::resolver({
+        let spawner = spawner.clone();
+        Box::new(move || spawner.spawn_helper(ChildKind::Resolver))
+    });
 
     let mut quick_deaths: u32 = 0;
     loop {
-        let (mut ours, theirs) =
-            UnixStream::pair().context("creating the fetcher worker socket pair")?;
-        ours.set_read_timeout(Some(WORKER_IO_TIMEOUT))?;
-        ours.set_write_timeout(Some(WORKER_IO_TIMEOUT))?;
-
         // The worker must never be able to talk to the server, or to the
         // parser, directly: everything it says goes through the relay.
-        let pid = fork_child(theirs, |stream| worker_main(stream, log_only, no_sandbox))
-            .context("forking a fetcher worker")?;
-
-        info!(pid, "feed fetcher: worker started");
+        let (mut ours, worker) = spawner
+            .spawn(ChildKind::Worker)
+            .context("starting a fetcher worker")?;
+        let pid = worker.id();
         let started = Instant::now();
         let end = relay(&mut server, &mut ours, &mut parser, &mut resolver);
 
         // Whatever happened, this worker is finished; make sure of it.
-        let status = kill_and_reap(pid);
+        let status = stop(worker);
         // And so is everything its helpers were doing for it.
         parser.reset();
         resolver.reset();
@@ -920,7 +940,7 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
                 warn!(
                     pid,
                     reason = %why,
-                    status = %describe_wait_status(status),
+                    %status,
                     in_flight = in_flight.len(),
                     "feed fetcher: worker exited; starting a new one"
                 );
@@ -932,7 +952,7 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
         // can retry each of them now, and find which one killed it,
         // instead of waiting out their deadlines.
         let count = u32::try_from(in_flight.len()).unwrap_or(u32::MAX);
-        let why = format!("the fetcher worker died ({})", describe_wait_status(status));
+        let why = format!("the fetcher worker died ({status})");
         for id in in_flight {
             let response = FromFetcher::Response(Response {
                 id,
@@ -963,101 +983,151 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
     }
 }
 
-/// Fork a child of the supervisor that runs `body` on `stream`, its end
-/// of a socket pair, and exits with what `body` returns. Returns the
-/// child's pid.
-///
-/// The child closes every descriptor it inherited but `stream` and the
-/// standard ones before `body` runs — the supervisor's channel to the
-/// server, and to its other children, among them — and dies with the
-/// supervisor.
-///
-/// Must only be called while the supervisor is single-threaded, which it
-/// always is: it never starts a thread or a runtime.
-fn fork_child(stream: UnixStream, body: impl FnOnce(UnixStream) -> i32) -> io::Result<libc::pid_t> {
-    let supervisor_pid = std::process::id();
-    // SAFETY: this process is single-threaded — the supervisor never
-    // starts a thread or a runtime — so the child is a complete copy and
-    // may run arbitrary code, not just async-signal-safe calls.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if pid == 0 {
-        let code = (|| {
-            // Die with the supervisor. Checked again after the `prctl` in
-            // case the supervisor exited before it took effect.
-            // SAFETY: plain `prctl`/`getppid` calls with no pointer
-            // arguments.
-            unsafe {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                if libc::getppid() as u32 != supervisor_pid {
-                    return 0;
-                }
-            }
-            if let Err(e) = close_fds_except(stream.as_raw_fd()) {
-                warn!(error = %e, "feed fetcher: could not close inherited descriptors");
-                return 1;
-            }
-            // Nothing the supervisor owns may be dropped here — dropping a
-            // `ParserProc` would kill the parser — so a panic must not
-            // unwind past this point.
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(stream))).unwrap_or(101)
-        })();
-        std::process::exit(code);
-    }
-    Ok(pid)
+/// Which of the supervisor's children to start.
+#[derive(Clone, Copy, Debug)]
+enum ChildKind {
+    Worker,
+    /// The parser, to run `threads` threads.
+    Parser {
+        threads: usize,
+    },
+    Resolver,
 }
 
-/// Close every descriptor from 3 up but `keep`.
-fn close_fds_except(keep: RawFd) -> io::Result<()> {
-    let keep = libc::c_uint::try_from(keep)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative descriptor"))?;
-    if keep > 3 {
-        close_range(3, keep - 1)?;
+impl ChildKind {
+    fn name(self) -> &'static str {
+        match self {
+            ChildKind::Worker => "worker",
+            ChildKind::Parser { .. } => "parser",
+            ChildKind::Resolver => "resolver",
+        }
     }
-    close_range(keep.max(2) + 1, libc::c_uint::MAX)
+
+    fn subcommand(self) -> &'static str {
+        match self {
+            ChildKind::Worker => WORKER_SUBCOMMAND,
+            ChildKind::Parser { .. } => PARSER_SUBCOMMAND,
+            ChildKind::Resolver => RESOLVER_SUBCOMMAND,
+        }
+    }
+
+    fn fd_env(self) -> &'static str {
+        match self {
+            ChildKind::Worker => WORKER_FD_ENV,
+            ChildKind::Parser { .. } => PARSER_FD_ENV,
+            ChildKind::Resolver => RESOLVER_FD_ENV,
+        }
+    }
+
+    /// The supervisor's environment variables the child is given. Only
+    /// the worker, which makes the requests, needs the proxy settings,
+    /// which may hold a password.
+    fn env(self) -> crate::process::ChildEnv<'static> {
+        use crate::process::ChildEnv;
+        match self {
+            ChildKind::Worker => ChildEnv::Inherit,
+            ChildKind::Parser { .. } => ChildEnv::Only(&[]),
+            ChildKind::Resolver => ChildEnv::Only(RESOLVER_ENV),
+        }
+    }
 }
 
-/// Close the descriptors `first..=last` with `close_range(2)`, or one by
-/// one, up to the descriptor limit, on kernels that predate it (5.9).
-fn close_range(first: libc::c_uint, last: libc::c_uint) -> io::Result<()> {
-    // SAFETY: `close_range` takes no pointers; closing descriptors this
-    // process owns is always memory-safe.
-    let rc = unsafe { libc::syscall(libc::SYS_close_range, first, last, 0) };
-    if rc == 0 {
-        return Ok(());
-    }
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() != Some(libc::ENOSYS) {
-        return Err(err);
-    }
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is a valid, writable `rlimit`.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let end = libc::c_uint::try_from(limit.rlim_cur).unwrap_or(libc::c_uint::MAX);
-    for fd in first..end.min(last.saturating_add(1)) {
-        // SAFETY: as above; descriptors that are not open fail harmlessly.
-        unsafe { libc::close(fd as libc::c_int) };
-    }
-    Ok(())
+/// Starts the supervisor's children, as the same executable as itself.
+#[derive(Clone)]
+struct Spawner {
+    /// The kiki executable, as it was when the supervisor started.
+    exe: PathBuf,
+    log_only: bool,
+    no_sandbox: bool,
 }
 
-/// SIGKILL the child `pid`, if it is still running, and reap it. Returns
-/// its wait status.
-fn kill_and_reap(pid: libc::pid_t) -> libc::c_int {
-    // SAFETY: `pid` is our own child, which has not been reaped yet, and
-    // `status` is a valid pointer for the call.
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-        let mut status: libc::c_int = 0;
-        libc::waitpid(pid, &mut status, 0);
-        status
+impl Spawner {
+    /// A spawner for this executable, whose children install a sandbox
+    /// like this process's.
+    ///
+    /// Must be called before the sandbox is installed, while the path to
+    /// the executable can still be looked up.
+    fn new(log_only: bool, no_sandbox: bool) -> Result<Self> {
+        let exe = std::env::current_exe().context("locating the kiki executable")?;
+        Ok(Spawner {
+            exe,
+            log_only,
+            no_sandbox,
+        })
+    }
+
+    /// Start a child of `kind`, and return the supervisor's end of its
+    /// socket pair, with [`WORKER_IO_TIMEOUT`] on reads and writes.
+    ///
+    /// The child inherits no descriptor but that socket and the standard
+    /// streams, and dies with the supervisor.
+    fn spawn(&self, kind: ChildKind) -> io::Result<(UnixStream, Child)> {
+        let mut cmd = crate::process::child_command(
+            &self.program(),
+            kind.subcommand(),
+            kind.fd_env(),
+            kind.env(),
+            self.log_only,
+            self.no_sandbox,
+        );
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.arg0(&self.exe);
+        }
+        if let ChildKind::Parser { threads } = kind {
+            cmd.env(PARSER_THREADS_ENV, threads.to_string());
+        }
+        let (ours, child) = crate::process::spawn_with_socket(&mut cmd, true)?;
+        ours.set_read_timeout(Some(WORKER_IO_TIMEOUT))?;
+        ours.set_write_timeout(Some(WORKER_IO_TIMEOUT))?;
+        info!(pid = child.id(), "feed fetcher: {} started", kind.name());
+        Ok((ours, child))
+    }
+
+    /// Start a helper of `kind`.
+    fn spawn_helper(&self, kind: ChildKind) -> io::Result<ChildProc> {
+        let (stream, child) = self.spawn(kind)?;
+        Ok(ChildProc {
+            stream,
+            child: Some(child),
+            started: Instant::now(),
+        })
+    }
+
+    /// What to execute. On Linux that is `/proc/self/exe`, which names the
+    /// file the supervisor itself was started from even if it has since
+    /// been replaced — an upgrade, say — since the channels' messages are
+    /// only understood by the same build at both ends. (The supervisor's
+    /// Landlock rules allow executing that file, and no other.)
+    fn program(&self) -> PathBuf {
+        if cfg!(target_os = "linux") {
+            PathBuf::from("/proc/self/exe")
+        } else {
+            self.exe.clone()
+        }
+    }
+}
+
+/// Kill `child`, if it is still running, reap it, and say how it ended.
+fn stop(mut child: Child) -> String {
+    let _ = child.kill();
+    match child.wait() {
+        Ok(status) => describe_exit(status),
+        Err(e) => format!("could not be waited for: {e}"),
+    }
+}
+
+/// How a child that ended with `status` ended.
+fn describe_exit(status: ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (_, Some(sig)) if sig == libc::SIGSYS => {
+            "killed by SIGSYS (a syscall denied by the seccomp filter)".into()
+        }
+        (_, Some(sig)) => format!("killed by signal {sig}"),
+        (Some(code), _) => format!("exited with status {code}"),
+        (None, None) => format!("{status}"),
     }
 }
 
@@ -1070,21 +1140,6 @@ fn respawn_delay(quick_deaths: u32) -> Duration {
     }
     let exp = quick_deaths.saturating_sub(2).min(16);
     Duration::from_secs(1u64 << exp).min(MAX_RESPAWN_DELAY)
-}
-
-fn describe_wait_status(status: libc::c_int) -> String {
-    if libc::WIFSIGNALED(status) {
-        let sig = libc::WTERMSIG(status);
-        if sig == libc::SIGSYS {
-            "killed by SIGSYS (a syscall denied by the seccomp filter)".into()
-        } else {
-            format!("killed by signal {sig}")
-        }
-    } else if libc::WIFEXITED(status) {
-        format!("exited with status {}", libc::WEXITSTATUS(status))
-    } else {
-        format!("wait status {status}")
-    }
 }
 
 /// Why [`relay`] stopped.
@@ -1100,30 +1155,12 @@ enum RelayEnd {
     },
 }
 
-/// A frame whose bytes are overwritten with zeroes when it is dropped.
-///
-/// Every frame the supervisor relays is held in one, because the parser
-/// and the resolver are forked from the supervisor and inherit a copy of
-/// its memory: the server's requests carry feeds' credentials, and the
-/// worker's replies carry what those feeds contain, neither of which a
-/// child forked later may find lying about in what it inherits.
-struct Scrubbed<B: AsMut<[u8]>>(B);
-
-impl<B: AsMut<[u8]>> Drop for Scrubbed<B> {
-    fn drop(&mut self) {
-        let bytes = self.0.as_mut();
-        bytes.fill(0);
-        // Keep the writes from being optimised away as dead stores.
-        std::hint::black_box(bytes);
-    }
-}
-
 /// A frame as the supervisor holds it.
-type Frame = Scrubbed<Vec<u8>>;
+type Frame = Vec<u8>;
 
 /// Read a frame for the supervisor to relay.
 fn read_frame(stream: &mut UnixStream) -> io::Result<Frame> {
-    read_frame_limited(stream, MAX_FRAME_BYTES).map(Scrubbed)
+    read_frame_limited(stream, MAX_FRAME_BYTES)
 }
 
 /// Copy frames between the server, the current worker and its helpers
@@ -1195,10 +1232,10 @@ fn relay(
                 Ok(f) => f,
                 Err(e) => return gone(in_flight, format!("read failed: {e}")),
             };
-            match peek_from(&frame.0) {
+            match peek_from(&frame) {
                 Some(PeekFrom::Response(IdOnly { id })) => {
                     in_flight.remove(&id);
-                    if write_frame_limited(server, &frame.0, MAX_FRAME_BYTES).is_err() {
+                    if write_frame_limited(server, &frame, MAX_FRAME_BYTES).is_err() {
                         return RelayEnd::ServerClosed;
                     }
                 }
@@ -1232,14 +1269,14 @@ fn relay(
                 Ok(f) => f,
                 Err(_) => return RelayEnd::ServerClosed,
             };
-            match peek_to(&frame.0) {
+            match peek_to(&frame) {
                 Some(PeekTo::Request(IdOnly { id })) => {
                     in_flight.insert(id);
                 }
                 // Only ever from a helper.
                 Some(PeekTo::Resolved(_) | PeekTo::Parsed(_)) | None => continue,
             }
-            if let Err(e) = write_frame_limited(worker, &frame.0, MAX_FRAME_BYTES) {
+            if let Err(e) = write_frame_limited(worker, &frame, MAX_FRAME_BYTES) {
                 return gone(in_flight, format!("write failed: {e}"));
             }
         }
@@ -1256,15 +1293,15 @@ struct ChildProc {
     /// [`WORKER_IO_TIMEOUT`] on reads and writes.
     stream: UnixStream,
     /// `None` for a helper that is not a process of its own, in tests.
-    pid: Option<libc::pid_t>,
+    child: Option<Child>,
     started: Instant,
 }
 
 impl ChildProc {
     /// Stop the helper, and say how it ended.
     fn end(mut self) -> String {
-        match self.pid.take() {
-            Some(pid) => describe_wait_status(kill_and_reap(pid)),
+        match self.child.take() {
+            Some(child) => stop(child),
             // A helper on a thread stops when its socket closes.
             None => "stopped".into(),
         }
@@ -1273,31 +1310,14 @@ impl ChildProc {
 
 impl Drop for ChildProc {
     fn drop(&mut self) {
-        if let Some(pid) = self.pid.take() {
-            kill_and_reap(pid);
+        if let Some(child) = self.child.take() {
+            stop(child);
         }
     }
 }
 
 /// Starts a helper.
 type SpawnChild = Box<dyn FnMut() -> io::Result<ChildProc>>;
-
-/// Fork a helper process that runs `main` on its end of a new socket pair.
-fn spawn_helper_process(
-    what: HelperKind,
-    main: impl FnOnce(UnixStream) -> i32,
-) -> io::Result<ChildProc> {
-    let (ours, theirs) = UnixStream::pair()?;
-    ours.set_read_timeout(Some(WORKER_IO_TIMEOUT))?;
-    ours.set_write_timeout(Some(WORKER_IO_TIMEOUT))?;
-    let pid = fork_child(theirs, main)?;
-    info!(pid, "feed fetcher: {} started", what.name());
-    Ok(ChildProc {
-        stream: ours,
-        pid: Some(pid),
-        started: Instant::now(),
-    })
-}
 
 /// Which helper a [`Helper`] runs, which decides the frames it is given
 /// and answers with.
@@ -1519,7 +1539,7 @@ impl Helper {
             // In hand from here on, so that a helper that dies taking it
             // answers for it.
             self.in_hand.insert(id, Instant::now());
-            if let Err(e) = write_frame_limited(&mut proc.stream, &frame.0, MAX_FRAME_BYTES) {
+            if let Err(e) = write_frame_limited(&mut proc.stream, &frame, MAX_FRAME_BYTES) {
                 let why = format!("the {} could not be written to: {e}", self.kind.name());
                 self.died(&why, worker)?;
                 break;
@@ -1544,9 +1564,9 @@ impl Helper {
             }
             Err(e) => return self.died(&format!("the {name} could not be read: {e}"), worker),
         };
-        match self.kind.answer_id(&frame.0) {
+        match self.kind.answer_id(&frame) {
             Some(id) if self.in_hand.remove(&id).is_some() => {
-                write_frame_limited(worker, &frame.0, MAX_FRAME_BYTES)
+                write_frame_limited(worker, &frame, MAX_FRAME_BYTES)
                     .map_err(|e| format!("write failed: {e}"))?;
                 self.tend(worker)
             }
@@ -1646,38 +1666,28 @@ fn answer(worker: &mut UnixStream, msg: &ToFetcher) -> Result<(), String> {
 // Child side: worker
 // ------------------------------------------------------------------
 
-/// Entry point of a forked worker. Returns the process exit code.
+/// Run the feed fetcher's worker, `kiki __feed-worker`: tighten the
+/// sandbox it started under, the supervisor's, to the
+/// [`crate::sandbox::SandboxProfile::FeedWorker`] profile, unless the
+/// operator turned sandboxing off, then serve the supervisor until it
+/// closes the channel.
 ///
-/// Tightens the sandbox it inherited from the supervisor to the
-/// [`crate::sandbox::SandboxProfile::FeedWorker`] profile before it
-/// starts its runtime, unless the operator turned sandboxing off.
-fn worker_main(stream: UnixStream, log_only: bool, no_sandbox: bool) -> i32 {
+/// # Errors
+///
+/// Fails if the sandbox cannot be installed, the runtime cannot be
+/// started, or the channel to the supervisor breaks.
+pub fn run_worker(log_only: bool, no_sandbox: bool) -> Result<()> {
     if !no_sandbox {
-        let config = crate::sandbox::SandboxConfig::feed_worker(log_only);
-        if let Err(e) = crate::sandbox::apply(&config) {
-            warn!(error = %format!("{e:#}"), "feed fetcher: could not sandbox the worker");
-            return 1;
-        }
+        crate::sandbox::apply(&crate::sandbox::SandboxConfig::feed_worker(log_only))
+            .context("failed to install the feed worker sandbox")?;
     }
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
+    let stream = crate::process::take_parent_socket(WORKER_SUBCOMMAND)?;
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("fetcher-worker")
         .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            warn!(error = %e, "feed fetcher: could not start the worker runtime");
-            return 1;
-        }
-    };
-
-    match runtime.block_on(serve(stream)) {
-        Ok(()) => 0,
-        Err(e) => {
-            warn!(error = %format!("{e:#}"), "feed fetcher: worker failed");
-            1
-        }
-    }
+        .context("starting the worker runtime")?
+        .block_on(serve(stream))
 }
 
 /// Serve requests from the supervisor, each on its own task, until the
@@ -1949,111 +1959,50 @@ fn finish_parse(reply: ParseReply) -> Result<ParseOutput, ParseFailure> {
 // Child side: helpers
 // ------------------------------------------------------------------
 
-/// The parser's process name, as `/proc/<pid>/comm` shows it.
-pub const PARSER_NAME: &std::ffi::CStr = c"kiki-parser";
-
-/// The resolver's process name, as `/proc/<pid>/comm` shows it.
-pub const RESOLVER_NAME: &std::ffi::CStr = c"kiki-resolver";
-
-/// Environment variables the C library's resolver reads, which the
-/// resolver keeps when it wipes the rest; see [`scrub_environment`].
+/// Environment variables the C library's resolver reads, which are all
+/// the resolver is given of the supervisor's environment.
 const RESOLVER_ENV: &[&str] = &["LOCALDOMAIN", "RES_OPTIONS", "HOSTALIASES"];
 
-/// Entry point of a forked parser. Returns the process exit code.
+/// Run the feed fetcher's parser, `kiki __feed-parser`: tighten the
+/// sandbox it started under, the supervisor's, to the
+/// [`crate::sandbox::SandboxProfile::FeedParser`] profile, unless the
+/// operator turned sandboxing off, then carry out parse tasks until the
+/// supervisor closes the channel.
 ///
-/// Tightens the sandbox it inherited from the supervisor to the
-/// [`crate::sandbox::SandboxProfile::FeedParser`] profile before it reads
-/// a single task, unless the operator turned sandboxing off.
-fn parser_main(stream: UnixStream, threads: usize, log_only: bool, no_sandbox: bool) -> i32 {
-    let config = crate::sandbox::SandboxConfig::feed_parser(log_only);
-    match prepare_helper(PARSER_NAME, &[], (!no_sandbox).then_some(config)) {
-        Ok(()) => exit_code("parser", serve_parses(stream, threads)),
-        Err(e) => {
-            warn!(error = %format!("{e:#}"), "feed fetcher: could not sandbox the parser");
-            1
-        }
+/// # Errors
+///
+/// Fails if the sandbox cannot be installed or the channel to the
+/// supervisor breaks.
+pub fn run_parser(log_only: bool, no_sandbox: bool) -> Result<()> {
+    if !no_sandbox {
+        crate::sandbox::apply(&crate::sandbox::SandboxConfig::feed_parser(log_only))
+            .context("failed to install the feed parser sandbox")?;
     }
+    let stream = crate::process::take_parent_socket(PARSER_SUBCOMMAND)?;
+    let threads = std::env::var(PARSER_THREADS_ENV)
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(parser_threads);
+    serve_parses(stream, threads).context("parser failed")
 }
 
-/// Entry point of a forked resolver. Returns the process exit code.
+/// Run the feed fetcher's resolver, `kiki __feed-resolver`: tighten the
+/// sandbox it started under, the supervisor's, to the
+/// [`crate::sandbox::SandboxProfile::FeedResolver`] profile, unless the
+/// operator turned sandboxing off, then look hostnames up until the
+/// supervisor closes the channel.
 ///
-/// Tightens the sandbox it inherited from the supervisor to the
-/// [`crate::sandbox::SandboxProfile::FeedResolver`] profile before it
-/// reads a single lookup, unless the operator turned sandboxing off.
-fn resolver_main(stream: UnixStream, log_only: bool, no_sandbox: bool) -> i32 {
-    let config = crate::sandbox::SandboxConfig::feed_resolver(log_only);
-    match prepare_helper(RESOLVER_NAME, RESOLVER_ENV, (!no_sandbox).then_some(config)) {
-        Ok(()) => exit_code("resolver", serve_lookups(stream, RESOLVER_THREADS)),
-        Err(e) => {
-            warn!(error = %format!("{e:#}"), "feed fetcher: could not sandbox the resolver");
-            1
-        }
-    }
-}
-
-/// Set a freshly forked helper up: name it, so that it can be told apart
-/// from the worker, which shares its command line (its threads inherit
-/// the name until they are given their own); wipe the environment but for
-/// `keep_env`; and install `sandbox`, if any.
+/// # Errors
 ///
-/// Must be called while the helper is still single-threaded.
-fn prepare_helper(
-    name: &std::ffi::CStr,
-    keep_env: &[&str],
-    sandbox: Option<crate::sandbox::SandboxConfig>,
-) -> Result<()> {
-    // SAFETY: `name` is NUL-terminated and outlives the call.
-    unsafe {
-        libc::prctl(libc::PR_SET_NAME, name.as_ptr());
+/// Fails if the sandbox cannot be installed or the channel to the
+/// supervisor breaks.
+pub fn run_resolver(log_only: bool, no_sandbox: bool) -> Result<()> {
+    if !no_sandbox {
+        crate::sandbox::apply(&crate::sandbox::SandboxConfig::feed_resolver(log_only))
+            .context("failed to install the feed resolver sandbox")?;
     }
-    scrub_environment(keep_env);
-    if let Some(config) = sandbox {
-        crate::sandbox::apply(&config)?;
-    }
-    Ok(())
-}
-
-fn exit_code(what: &str, served: io::Result<()>) -> i32 {
-    match served {
-        Ok(()) => 0,
-        Err(e) => {
-            warn!(error = %e, "feed fetcher: {what} failed");
-            1
-        }
-    }
-}
-
-/// Overwrite every environment variable the process inherited with
-/// zeroes, in place, but for those named in `keep`.
-///
-/// The environment is the server's, and may hold credentials — a proxy
-/// URL with a password in `HTTPS_PROXY`, say — that the worker needs and
-/// the helpers must not have. Unsetting the variables would leave their
-/// text where it was; this wipes it. The variables wiped read as absent
-/// afterwards.
-///
-/// Must be called while the process is single-threaded.
-fn scrub_environment(keep: &[&str]) {
-    extern "C" {
-        static mut environ: *mut *mut libc::c_char;
-    }
-    // SAFETY: the process is single-threaded, so nothing reads or changes
-    // the environment meanwhile; `environ` is the C library's
-    // NULL-terminated array of NUL-terminated strings, each of which is
-    // overwritten only up to, and not including, its NUL.
-    unsafe {
-        let mut var = environ;
-        while !var.is_null() && !(*var).is_null() {
-            let text = *var;
-            let len = libc::strlen(text);
-            let bytes = std::slice::from_raw_parts(text.cast::<u8>(), len);
-            let name = bytes.split(|&b| b == b'=').next().unwrap_or_default();
-            if !keep.iter().any(|k| k.as_bytes() == name) {
-                std::ptr::write_bytes(text, 0, len);
-            }
-            var = var.add(1);
-        }
-    }
+    let stream = crate::process::take_parent_socket(RESOLVER_SUBCOMMAND)?;
+    serve_lookups(stream, RESOLVER_THREADS).context("resolver failed")
 }
 
 /// Carry out the tasks that arrive on `stream` on `threads` threads,
@@ -2306,7 +2255,7 @@ mod tests {
             std::thread::spawn(move || main(theirs));
             Ok(ChildProc {
                 stream: ours,
-                pid: None,
+                child: None,
                 started: Instant::now(),
             })
         })
@@ -2457,13 +2406,6 @@ mod tests {
         });
         let outcome = host.parse(1, RSS.to_vec()).await.unwrap();
         assert_eq!(outcome.feed.unwrap().entry_count(), 1);
-    }
-
-    #[test]
-    fn requests_from_the_server_are_scrubbed_once_relayed() {
-        let mut buf = *b"password";
-        drop(Scrubbed(&mut buf[..]));
-        assert_eq!(buf, [0; 8]);
     }
 
     #[tokio::test]

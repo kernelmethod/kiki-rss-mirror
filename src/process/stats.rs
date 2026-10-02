@@ -9,9 +9,8 @@
 //! Memory is reported two ways. Resident memory (RSS) counts every page a
 //! process has mapped, including pages it shares with others — and Kiki's
 //! processes share a lot: each child is the same executable as the server,
-//! and the feed fetcher's worker, parser and resolver are forked from its
-//! supervisor, so their copy-on-write pages are the supervisor's until
-//! one of them writes to them.
+//! so they all map the same pages of its code and of the libraries it
+//! loads.
 //! Summing RSS across processes counts those pages once per process.
 //! Proportional memory (PSS) instead splits each shared page evenly among
 //! the processes that map it, so it adds up across processes to the memory
@@ -23,7 +22,7 @@
 //! one nested inside it, which is why the server starts its children only
 //! after installing its own Landlock rules (see
 //! [`crate::sandbox::restrict_filesystem`]). The feed fetcher's worker,
-//! parser and resolver, forked from the supervisor, are in domains nested
+//! parser and resolver, started by the supervisor, are in domains nested
 //! inside the supervisor's, and so inside the server's too.
 
 use std::collections::HashMap;

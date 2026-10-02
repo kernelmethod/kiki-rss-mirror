@@ -694,29 +694,24 @@ mod fetch_isolation {
 
         /// Wait for the supervisor's worker to exist and return its PID.
         fn wait_for_fetcher_worker(&mut self, not: Option<u32>) -> u32 {
-            self.wait_for_fetcher_child("worker", not, |pid| process_name(pid).is_none())
+            self.wait_for_fetcher_child(feed_fetcher::WORKER_SUBCOMMAND, not)
         }
 
         /// Wait for the supervisor's parser to exist and return its PID.
         /// It is started when there is first something to parse.
         fn wait_for_fetcher_parser(&mut self, not: Option<u32>) -> u32 {
-            let name = feed_fetcher::PARSER_NAME;
-            self.wait_for_fetcher_child("parser", not, |pid| process_name(pid) == Some(name))
+            self.wait_for_fetcher_child(feed_fetcher::PARSER_SUBCOMMAND, not)
         }
 
         /// Wait for the supervisor's resolver to exist and return its PID.
         /// It is started when there is first something to look up.
         fn wait_for_fetcher_resolver(&mut self, not: Option<u32>) -> u32 {
-            let name = feed_fetcher::RESOLVER_NAME;
-            self.wait_for_fetcher_child("resolver", not, |pid| process_name(pid) == Some(name))
+            self.wait_for_fetcher_child(feed_fetcher::RESOLVER_SUBCOMMAND, not)
         }
 
-        fn wait_for_fetcher_child(
-            &mut self,
-            what: &str,
-            not: Option<u32>,
-            wanted: impl Fn(u32) -> bool,
-        ) -> u32 {
+        /// Wait for a child of the supervisor started with `subcommand`,
+        /// other than `not`, and return its PID.
+        fn wait_for_fetcher_child(&mut self, subcommand: &str, not: Option<u32>) -> u32 {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 self.assert_still_running();
@@ -724,25 +719,18 @@ mod fetch_isolation {
                     .fetcher_supervisor_pids()
                     .first()
                     .expect("a feed fetcher supervisor");
-                let children = child_pids_matching(supervisor, feed_fetcher::SUBCOMMAND);
-                if let Some(&c) = children.iter().find(|&&c| Some(c) != not && wanted(c)) {
+                let children = child_pids_matching(supervisor, subcommand);
+                if let Some(&c) = children.iter().find(|&&c| Some(c) != not) {
                     return c;
                 }
                 if Instant::now() >= deadline {
-                    panic!("no feed fetcher {what} appeared (excluding {not:?})");
+                    panic!(
+                        "no `{subcommand}` child of the feed fetcher appeared (excluding {not:?})"
+                    );
                 }
                 thread::sleep(Duration::from_millis(50));
             }
         }
-    }
-
-    /// Which of the feed fetcher's helpers `pid` is, by the name it gives
-    /// itself, or `None` for the supervisor and the worker.
-    fn process_name(pid: u32) -> Option<&'static std::ffi::CStr> {
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
-        [feed_fetcher::PARSER_NAME, feed_fetcher::RESOLVER_NAME]
-            .into_iter()
-            .find(|name| name.to_str().ok() == Some(comm.trim()))
     }
 
     /// How many seccomp filters `pid` runs under, on kernels that say
@@ -820,7 +808,7 @@ mod fetch_isolation {
             return;
         }
         apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
-        // The supervisor may bind, for the resolver it forks.
+        // The supervisor may bind, for the resolver it starts.
         std::net::UdpSocket::bind("127.0.0.1:0").expect("the supervisor may bind");
         apply(&SandboxConfig::feed_worker(false)).expect("install the worker sandbox");
 
@@ -835,8 +823,8 @@ mod fetch_isolation {
         println!("worker sandbox probe: binding was allowed");
     }
 
-    /// The supervisor may bind sockets, for the resolver it forks, but the
-    /// worker it also forks may not: run [`worker_sandbox_probe`] in a
+    /// The supervisor may bind sockets, for the resolver it starts, but the
+    /// worker it also starts may not: run [`worker_sandbox_probe`] in a
     /// fresh process and check that it was killed for binding.
     #[test]
     fn binding_kills_the_worker_but_not_the_supervisor() {
@@ -862,6 +850,68 @@ mod fetch_isolation {
             output.status.signal(),
             Some(libc::SIGSYS),
             "probe was not killed for binding ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
+    }
+
+    /// Set to anything to make [`supervisor_exec_probe`] run.
+    const EXEC_PROBE_ENV: &str = "KIKI_SUPERVISOR_EXEC_PROBE";
+
+    /// Printed by the exec probe once it has run this executable again
+    /// under the supervisor's sandbox, and been refused another.
+    const EXEC_PROBE_PASSED: &str = "supervisor exec probe: passed";
+
+    /// Not a test of its own: [`the_supervisor_may_execute_only_kiki`]
+    /// runs it in a process of its own. It installs the supervisor's
+    /// sandbox, then runs this executable again, as the supervisor runs
+    /// kiki to start its children, and tries to run another.
+    #[test]
+    fn supervisor_exec_probe() {
+        use kiki_rss::sandbox::{apply, SandboxConfig};
+        if std::env::var_os(EXEC_PROBE_ENV).is_none() {
+            return;
+        }
+        apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
+
+        // With the standard streams inherited, as the supervisor's children
+        // have them: the sandbox grants no `/dev/null`.
+        let listed = Command::new(std::env::current_exe().expect("test binary"))
+            .arg("--list")
+            .status()
+            .expect("run this executable again");
+        assert!(
+            listed.success(),
+            "running this executable again failed: {listed}"
+        );
+
+        let err = Command::new("/bin/true")
+            .status()
+            .expect_err("another executable was run");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        println!("{EXEC_PROBE_PASSED}");
+    }
+
+    /// The supervisor starts its children by running the kiki executable
+    /// again, and Landlock lets it execute nothing else: run
+    /// [`supervisor_exec_probe`] in a fresh process.
+    #[test]
+    fn the_supervisor_may_execute_only_kiki() {
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "fetch_isolation::supervisor_exec_probe",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(EXEC_PROBE_ENV, "1")
+            .output()
+            .expect("run the probe");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains(EXEC_PROBE_PASSED),
+            "probe failed ({}):\n{stdout}\n{stderr}",
             describe_exit(output.status)
         );
     }
@@ -896,7 +946,7 @@ mod fetch_isolation {
 
     /// A feed named by hostname rather than IP is fetched, with the lookup
     /// done by the fetcher's resolver: a process of its own, with a
-    /// stricter sandbox, and with the server's environment wiped but for
+    /// stricter sandbox, and with none of the server's environment but
     /// what the C library's resolver reads.
     #[test]
     fn hostnames_are_resolved_by_the_resolver() {
@@ -928,9 +978,15 @@ mod fetch_isolation {
         assert!(
             kept.iter().all(|v| {
                 let name = v.split('=').next().unwrap_or_default();
-                ["LOCALDOMAIN", "RES_OPTIONS", "HOSTALIASES"].contains(&name)
+                [
+                    "LOCALDOMAIN",
+                    "RES_OPTIONS",
+                    "HOSTALIASES",
+                    feed_fetcher::RESOLVER_FD_ENV,
+                ]
+                .contains(&name)
             }),
-            "the resolver kept more of its environment than it needs: {kept:?}"
+            "the resolver got more of the environment than it needs: {kept:?}"
         );
         kiki.shutdown();
     }
@@ -1052,12 +1108,29 @@ mod fetch_isolation {
         let parser = kiki.wait_for_fetcher_parser(None);
         assert_ne!(worker, parser);
         assert_eq!(seccomp_mode(parser), Some(2));
-        // The server's environment, which may hold credentials, is wiped.
+        // The server's environment, which may hold credentials, is not
+        // passed on: the parser gets only what the supervisor tells it.
         let environ = std::fs::read(format!("/proc/{parser}/environ")).expect("read environ");
+        let names: Vec<String> = environ
+            .split(|&b| b == 0)
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                String::from_utf8_lossy(v)
+                    .split('=')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
         assert!(
-            environ.iter().all(|&b| b == 0),
-            "the parser kept its environment: {}",
-            String::from_utf8_lossy(&environ)
+            names.iter().all(|name| {
+                [
+                    feed_fetcher::PARSER_FD_ENV,
+                    feed_fetcher::PARSER_THREADS_ENV,
+                ]
+                .contains(&name.as_str())
+            }),
+            "the parser got more of the environment than it needs: {names:?}"
         );
         assert_stricter_than_the_supervisor(&kiki, parser, "parser");
         kiki.shutdown();
