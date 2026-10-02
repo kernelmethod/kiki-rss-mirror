@@ -23,16 +23,19 @@
 //!   binding them or connecting to any but DNS's, and its parser and the
 //!   web UI from binding or connecting to them.
 //! * **seccomp-bpf** allows only the syscalls the profile uses, and kills
-//!   the process on any other — so `execve`, `ptrace`, `mount`,
-//!   `unshare`, `bpf`, module loading, `io_uring`, `userfaultfd` and the
-//!   rest of the kernel's surface are out of reach without being named.
+//!   the process on any other — so `ptrace`, `mount`, `unshare`, `bpf`,
+//!   module loading, `io_uring`, `userfaultfd` and the rest of the
+//!   kernel's surface are out of reach without being named, and so is
+//!   `execve` for every profile but the feed fetcher's supervisor.
 //!   Every profile gets what the runtime needs for memory, threads,
 //!   signals, time and the descriptors it holds; on top of that, the
 //!   server may change files and accept connections on its API socket,
 //!   which it binds before its filter goes up, but may make no socket of
 //!   its own; the feed fetcher's worker may make and connect IPv4
 //!   and IPv6 sockets, its resolver bind them too, and its supervisor
-//!   whatever the three of those may, and fork and sandbox them; the web
+//!   whatever the three of those may, and start and sandbox them — which
+//!   it does by executing the kiki executable again, the one file
+//!   Landlock lets it execute; the web
 //!   UI may accept on its listener and make and connect Unix sockets; and
 //!   the script host and the feed fetcher's parser may make no socket at
 //!   all. A few allowed calls are narrowed by their arguments: `clone`
@@ -51,8 +54,8 @@
 //! the children, before they read their first byte of IPC; for the web
 //! UI, before it accepts its first connection. They are
 //! inherited by every thread and task spawned later, and by the feed
-//! fetcher's forked worker, parser and resolver, each of which adds a
-//! stricter set of its own on top. The server installs them one at a time, with
+//! fetcher's worker, parser and resolver across the `execve` that starts
+//! them, each of which adds a stricter set of its own on top. The server installs them one at a time, with
 //! its children started in between; see [`restrict_filesystem`].
 //!
 //! On non-Linux platforms [`apply`] is a no-op that logs a warning.
@@ -105,15 +108,18 @@ pub enum SandboxProfile {
     ScriptHost,
 
     /// The feed fetcher's supervisor: talks to the server over an
-    /// inherited socket pair, and forks the processes that do the
+    /// inherited socket pair, and starts the processes that do the
     /// fetcher's work, each of which installs a profile of its own on top
     /// of this one — [`Self::FeedWorker`], [`Self::FeedParser`] and
     /// [`Self::FeedResolver`].
     ///
-    /// A process forked from it can have no more than it has, so this
-    /// profile holds what its children need between them, and no more:
-    /// read-only access to the TLS trust stores and the resolver's
-    /// configuration, and nothing else — no data directory, no `/proc`.
+    /// A process it starts can have no more than it has, so this profile
+    /// holds what its children need between them, and no more: read-only
+    /// access to the TLS trust stores and the resolver's configuration,
+    /// and nothing else — no data directory, no `/proc` — but the kiki
+    /// executable and the libraries it loads, which it may execute. It is
+    /// the only profile that may `execve`, which is how it starts its
+    /// children; theirs leave it out.
     /// It may make outbound connections, and bind UDP sockets, which the
     /// resolver needs, but may not bind TCP ports, listen for or accept
     /// connections, or create a Unix socket: the last keeps the fetcher's
@@ -275,8 +281,9 @@ mod linux;
 /// so call this while the process is still single-threaded — before
 /// building a multi-threaded tokio runtime, for instance.
 ///
-/// Note that every profile denies `execve`, so a process must spawn any
-/// children it needs *before* calling this — or call
+/// Note that every profile but the feed fetcher's supervisor denies
+/// `execve`, so a process must spawn any children it needs *before*
+/// calling this — or call
 /// [`restrict_filesystem`], spawn them, then [`restrict_syscalls`].
 pub fn apply(config: &SandboxConfig) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
