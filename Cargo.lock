@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "kiki-rss"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1523,6 +1523,7 @@ dependencies = [
  "url",
  "utoipa",
  "utoipa-scalar",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -1658,6 +1659,15 @@ checksum = "b3a8e7962a5368d5f264d045a5a255e90f9aa3fc1941ae15a8d2940d42cac671"
 dependencies = [
  "cc",
  "which",
+]
+
+[[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
 ]
 
 [[package]]
@@ -3113,10 +3123,14 @@ version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
+ "matchers",
  "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "tracing",
  "tracing-core",
  "tracing-log",
 ]

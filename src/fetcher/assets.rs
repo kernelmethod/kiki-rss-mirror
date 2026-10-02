@@ -10,8 +10,8 @@
 //! return is plain data: the server hashes, stores and indexes it
 //! ([`crate::tasks::assets`]), after checking it again.
 
-use super::svg::{sanitize_svg, SVG_CONTENT_TYPE};
-use super::ProxiedClient;
+use super::svg::SVG_CONTENT_TYPE;
+use super::{ParseFailure, Parsers, ProxiedClient};
 use crate::config::ProxySettings;
 use crate::http::{read_body_capped, CappedBody};
 use lol_html::html_content::Element;
@@ -103,7 +103,8 @@ impl AssetKind {
 /// Deliberately excludes `image/svg+xml`: SVG is XML and can embed
 /// executable script, which would run when a browser navigates directly to
 /// the asset URL. SVG images are cached too, but only after
-/// [`sanitize_svg`] has rebuilt them (see [`is_allowed_content_type`]).
+/// [`super::svg::sanitize_svg`] has rebuilt them (see
+/// [`is_allowed_content_type`]).
 const SAFE_IMAGE_TYPES: &[&str] = &[
     "image/png",
     "image/jpeg",
@@ -146,7 +147,7 @@ pub fn normalize_content_type(raw: &str) -> Option<String> {
 ///
 /// Inline images and favicons must match one of the safe raster image
 /// types, or be SVG, which is accepted only because [`fetch_asset`]
-/// sanitizes it. Enclosures additionally accept audio and video types plus a
+/// sanitizes it ([`super::svg::sanitize_svg`]). Enclosures additionally accept audio and video types plus a
 /// handful of common podcast-adjacent `application/*` types, but not SVG.
 pub fn is_allowed_content_type(normalized: &str, kind: AssetKind) -> bool {
     if SAFE_IMAGE_TYPES.contains(&normalized) {
@@ -277,37 +278,46 @@ pub struct FetchedAsset {
 }
 
 /// Download the asset described by `spec`, with the client for its proxy
-/// settings.
-pub async fn fetch_asset(clients: &ProxiedClient, spec: &AssetSpec) -> AssetReply {
+/// settings, having `parsers` sanitize it if it is an SVG image.
+///
+/// # Errors
+///
+/// Fails only if an SVG image could not be sanitized at all; see
+/// [`Parsers::run`].
+pub async fn fetch_asset(
+    clients: &ProxiedClient,
+    parsers: &Parsers,
+    spec: &AssetSpec,
+) -> Result<AssetReply, ParseFailure> {
     let Some(url) = Url::parse(&spec.url)
         .ok()
         .filter(|u| matches!(u.scheme(), "http" | "https"))
     else {
-        return AssetReply::Failed {
+        return Ok(AssetReply::Failed {
             message: "not an http(s) URL".to_string(),
-        };
+        });
     };
     let client = match clients.get(&spec.proxy) {
         Ok(c) => c,
         Err(_) => {
-            return AssetReply::Network {
+            return Ok(AssetReply::Network {
                 message: "could not configure the HTTP client for the proxy".to_string(),
-            }
+            })
         }
     };
 
     let resp = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) => {
-            return AssetReply::Network {
+            return Ok(AssetReply::Network {
                 message: e.to_string(),
-            }
+            })
         }
     };
     if !resp.status().is_success() {
-        return AssetReply::HttpStatus {
+        return Ok(AssetReply::HttpStatus {
             status: resp.status().as_u16(),
-        };
+        });
     }
 
     let raw_content_type = resp
@@ -317,9 +327,9 @@ pub async fn fetch_asset(clients: &ProxiedClient, spec: &AssetSpec) -> AssetRepl
     let content_type = match raw_content_type.and_then(normalize_content_type) {
         Some(ct) if is_allowed_content_type(&ct, spec.kind) => ct,
         _ => {
-            return AssetReply::DisallowedType {
+            return Ok(AssetReply::DisallowedType {
                 content_type: raw_content_type.map(str::to_string),
-            }
+            })
         }
     };
     let header = |name| {
@@ -334,29 +344,30 @@ pub async fn fetch_asset(clients: &ProxiedClient, spec: &AssetSpec) -> AssetRepl
     // Streamed under the cap: checking `Content-Length` up front and then
     // calling `bytes()` would still buffer the whole body for a server
     // that lies about (or omits) the header.
-    match read_body_capped(resp, MAX_ASSET_BYTES).await {
-        Ok(CappedBody::Complete(bytes)) => {
-            // What is served is the rebuilt SVG, never the original.
-            let bytes = if content_type == SVG_CONTENT_TYPE {
-                match sanitize_svg(&bytes) {
-                    Some(clean) => clean,
-                    None => return AssetReply::UnsafeSvg,
-                }
-            } else {
-                bytes
-            };
-            AssetReply::Fetched(Box::new(FetchedAsset {
-                content_type,
-                etag,
-                last_modified,
-                bytes,
-            }))
+    let bytes = match read_body_capped(resp, MAX_ASSET_BYTES).await {
+        Ok(CappedBody::Complete(bytes)) => bytes,
+        Ok(CappedBody::TooLarge { seen }) => return Ok(AssetReply::TooLarge { seen }),
+        Err(e) => {
+            return Ok(AssetReply::Failed {
+                message: e.to_string(),
+            })
         }
-        Ok(CappedBody::TooLarge { seen }) => AssetReply::TooLarge { seen },
-        Err(e) => AssetReply::Failed {
-            message: e.to_string(),
-        },
-    }
+    };
+    // What is served is the rebuilt SVG, never the original.
+    let bytes = if content_type == SVG_CONTENT_TYPE {
+        match parsers.svg(bytes).await? {
+            Some(clean) => clean,
+            None => return Ok(AssetReply::UnsafeSvg),
+        }
+    } else {
+        bytes
+    };
+    Ok(AssetReply::Fetched(Box::new(FetchedAsset {
+        content_type,
+        etag,
+        last_modified,
+        bytes,
+    })))
 }
 
 /// Everything needed to look for the icons a web page links to.
@@ -399,8 +410,18 @@ pub enum PageProblem {
 }
 
 /// Fetch the web page in `spec` and return the icons it links to, best
-/// first. Any failure yields no icons.
-pub async fn find_page_icons(clients: &ProxiedClient, spec: &PageSpec) -> PageIcons {
+/// first, having `parsers` read the page. Any failure to fetch the page
+/// yields no icons.
+///
+/// # Errors
+///
+/// Fails only if the page could not be parsed at all; see
+/// [`Parsers::run`].
+pub async fn find_page_icons(
+    clients: &ProxiedClient,
+    parsers: &Parsers,
+    spec: &PageSpec,
+) -> Result<PageIcons, ParseFailure> {
     let failed = |error: String| PageIcons {
         problem: Some(PageProblem::Unreachable(error)),
         ..PageIcons::default()
@@ -409,11 +430,15 @@ pub async fn find_page_icons(clients: &ProxiedClient, spec: &PageSpec) -> PageIc
         .ok()
         .filter(|u| matches!(u.scheme(), "http" | "https"))
     else {
-        return failed("not an http(s) URL".to_string());
+        return Ok(failed("not an http(s) URL".to_string()));
     };
     let client = match clients.get(&spec.proxy) {
         Ok(c) => c,
-        Err(_) => return failed("could not configure the HTTP client for the proxy".into()),
+        Err(_) => {
+            return Ok(failed(
+                "could not configure the HTTP client for the proxy".into(),
+            ))
+        }
     };
 
     let mut resp = match client
@@ -426,17 +451,17 @@ pub async fn find_page_icons(clients: &ProxiedClient, spec: &PageSpec) -> PageIc
         .await
     {
         Ok(r) => r,
-        Err(e) => return failed(e.to_string()),
+        Err(e) => return Ok(failed(e.to_string())),
     };
     let final_url = resp.url().clone();
     let landed_on = (final_url.origin() != page.origin()).then(|| final_url.to_string());
 
     if !resp.status().is_success() {
-        return PageIcons {
+        return Ok(PageIcons {
             landed_on,
             problem: Some(PageProblem::Status(resp.status().as_u16())),
             ..PageIcons::default()
-        };
+        });
     }
     let is_html = resp
         .headers()
@@ -445,10 +470,10 @@ pub async fn find_page_icons(clients: &ProxiedClient, spec: &PageSpec) -> PageIc
         .and_then(normalize_content_type)
         .is_some_and(|t| t == "text/html" || t == "application/xhtml+xml");
     if !is_html {
-        return PageIcons {
+        return Ok(PageIcons {
             landed_on,
             ..PageIcons::default()
-        };
+        });
     }
 
     // Only the start of the page is needed; stop reading once there is
@@ -467,14 +492,11 @@ pub async fn find_page_icons(clients: &ProxiedClient, spec: &PageSpec) -> PageIc
     }
     body.truncate(MAX_PAGE_BYTES);
 
-    PageIcons {
-        icons: extract_icon_links(&body, &final_url)
-            .into_iter()
-            .map(String::from)
-            .collect(),
+    Ok(PageIcons {
+        icons: parsers.page_icons(body, final_url.to_string()).await?,
         landed_on,
         problem,
-    }
+    })
 }
 
 /// An icon linked from a page, with what is needed to rank it.

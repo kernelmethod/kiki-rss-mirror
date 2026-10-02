@@ -58,6 +58,22 @@ pub enum Commands {
     #[command(name = kiki_rss::process::feed_fetcher::SUBCOMMAND, hide = true)]
     FeedFetcher(cli::child::ChildArgs),
 
+    /// Internal: run the feed fetcher's worker. Spawned by the feed fetcher.
+    #[cfg(unix)]
+    #[command(name = kiki_rss::process::feed_fetcher::WORKER_SUBCOMMAND, hide = true)]
+    FeedWorker(cli::child::ChildArgs),
+
+    /// Internal: run the feed fetcher's parser. Spawned by the feed fetcher.
+    #[cfg(unix)]
+    #[command(name = kiki_rss::process::feed_fetcher::PARSER_SUBCOMMAND, hide = true)]
+    FeedParser(cli::child::ChildArgs),
+
+    /// Internal: run the feed fetcher's resolver. Spawned by the feed
+    /// fetcher.
+    #[cfg(unix)]
+    #[command(name = kiki_rss::process::feed_fetcher::RESOLVER_SUBCOMMAND, hide = true)]
+    FeedResolver(cli::child::ChildArgs),
+
     /// Internal: run the sandboxed Lua script host. Spawned by `serve`.
     #[cfg(all(unix, feature = "lua"))]
     #[command(name = kiki_rss::process::script_host::SUBCOMMAND, hide = true)]
@@ -86,6 +102,21 @@ impl Commands {
             Commands::FeedFetcher(args) => {
                 use kiki_rss::process::feed_fetcher as f;
                 args.run(f::SUBCOMMAND, f::HOST_FD_ENV, f::run_child)
+            }
+            #[cfg(unix)]
+            Commands::FeedWorker(args) => {
+                use kiki_rss::process::feed_fetcher as f;
+                args.run(f::WORKER_SUBCOMMAND, f::WORKER_FD_ENV, f::run_worker)
+            }
+            #[cfg(unix)]
+            Commands::FeedParser(args) => {
+                use kiki_rss::process::feed_fetcher as f;
+                args.run(f::PARSER_SUBCOMMAND, f::PARSER_FD_ENV, f::run_parser)
+            }
+            #[cfg(unix)]
+            Commands::FeedResolver(args) => {
+                use kiki_rss::process::feed_fetcher as f;
+                args.run(f::RESOLVER_SUBCOMMAND, f::RESOLVER_FD_ENV, f::run_resolver)
             }
             #[cfg(all(unix, feature = "lua"))]
             Commands::ScriptHost(args) => {

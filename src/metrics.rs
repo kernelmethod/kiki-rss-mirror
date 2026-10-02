@@ -67,6 +67,19 @@ pub async fn run_upkeep(metrics: Arc<Metrics>, cancel: CancellationToken) {
 /// counts as an acquisition error, without instrumenting each call site.
 pub struct PoolMetrics(pub Arc<Metrics>);
 
+/// CPU and memory used by one of kiki's processes (or role), as reported to
+/// [`Metrics::set_process_usage`]. Memory figures are `None` when they could
+/// not be read, which the exported series show as `NaN`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessUsage {
+    pub cpu_seconds: f64,
+    pub resident_bytes: f64,
+    pub proportional_bytes: Option<f64>,
+    pub swap_bytes: Option<f64>,
+    pub peak_resident_bytes: Option<f64>,
+    pub processes: f64,
+}
+
 impl std::fmt::Debug for PoolMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PoolMetrics").finish_non_exhaustive()
@@ -545,21 +558,42 @@ mod imp {
                 KeyName::from_const_str("kiki_process_cpu_seconds_total"),
                 None,
                 SharedString::const_str(
-                    "CPU time used by kiki's processes, in seconds, labeled by process: the server, the feed fetcher, or the script host. Includes each process's children; resets when a process is replaced.",
+                    "CPU time used by kiki's processes, in seconds, labeled by process: the server, the feed fetcher, the script host, or `kiki web`. Includes each process's children; resets when a process is replaced.",
                 ),
             );
             r.describe_gauge(
                 KeyName::from_const_str("kiki_process_resident_memory_bytes"),
                 None,
                 SharedString::const_str(
-                    "Resident memory of kiki's processes, labeled by process: the server, the feed fetcher, or the script host. Includes each process's children. Pages shared between processes are counted once per process, so this overstates kiki's total; see kiki_process_proportional_memory_bytes.",
+                    "Resident memory of kiki's processes, labeled by process: the server, the feed fetcher, the script host, or `kiki web`. Includes each process's children. Pages shared between processes are counted once per process, so this overstates kiki's total; see kiki_process_proportional_memory_bytes.",
                 ),
             );
             r.describe_gauge(
                 KeyName::from_const_str("kiki_process_proportional_memory_bytes"),
                 None,
                 SharedString::const_str(
-                    "Proportional set size (PSS) of kiki's processes, labeled by process: the server, the feed fetcher, or the script host. Includes each process's children. Each page shared between processes is divided among them, so the values sum to the memory kiki occupies.",
+                    "Proportional set size (PSS) of kiki's processes, labeled by process: the server, the feed fetcher, the script host, or `kiki web`. Includes each process's children. Each page shared between processes is divided among them, so the values sum to the memory kiki occupies. NaN when it cannot be read; always so for `web`, whose memory the server may not inspect.",
+                ),
+            );
+            r.describe_gauge(
+                KeyName::from_const_str("kiki_process_swap_bytes"),
+                None,
+                SharedString::const_str(
+                    "Memory of kiki's processes that is swapped out, in bytes, labeled by process. Not included in the resident or proportional figures. NaN when it cannot be read.",
+                ),
+            );
+            r.describe_gauge(
+                KeyName::from_const_str("kiki_process_peak_resident_memory_bytes"),
+                None,
+                SharedString::const_str(
+                    "Sum of the peak resident memory each running process of the role has reached. Catches bursts between samples; restarts when a process is replaced.",
+                ),
+            );
+            r.describe_gauge(
+                KeyName::from_const_str("kiki_process_count"),
+                None,
+                SharedString::const_str(
+                    "Number of running processes of each role; 0 when the role has none.",
                 ),
             );
 
@@ -836,40 +870,35 @@ mod imp {
 
         // ----- Processes -----
 
-        /// Set the CPU time and memory used so far by one of kiki's
-        /// processes, together with its children. `proportional_bytes` is
-        /// left as it was when `None`.
-        pub fn set_process_usage(
-            &self,
-            process: &'static str,
-            cpu_seconds: f64,
-            resident_bytes: f64,
-            proportional_bytes: Option<f64>,
-        ) {
-            let key = Key::from_parts(
-                "kiki_process_cpu_seconds_total",
-                vec![Label::new("process", process)],
-            );
-            self.recorder
-                .register_gauge(&key, &METADATA)
-                .set(cpu_seconds);
-
-            let key = Key::from_parts(
-                "kiki_process_resident_memory_bytes",
-                vec![Label::new("process", process)],
-            );
-            self.recorder
-                .register_gauge(&key, &METADATA)
-                .set(resident_bytes);
-
-            if let Some(proportional_bytes) = proportional_bytes {
-                let key = Key::from_parts(
+        /// Set the CPU time and memory used by one of kiki's processes,
+        /// together with its children.
+        ///
+        /// Call it for every process on each sample, with
+        /// `ProcessUsage::default()` for one that is gone, so that the last
+        /// figures of a process that has died are not left behind. Memory
+        /// that could not be read is exported as `NaN` rather than left
+        /// at its previous value.
+        pub fn set_process_usage(&self, process: &'static str, usage: super::ProcessUsage) {
+            let gauges = [
+                ("kiki_process_cpu_seconds_total", usage.cpu_seconds),
+                ("kiki_process_resident_memory_bytes", usage.resident_bytes),
+                (
                     "kiki_process_proportional_memory_bytes",
-                    vec![Label::new("process", process)],
-                );
-                self.recorder
-                    .register_gauge(&key, &METADATA)
-                    .set(proportional_bytes);
+                    usage.proportional_bytes.unwrap_or(f64::NAN),
+                ),
+                (
+                    "kiki_process_swap_bytes",
+                    usage.swap_bytes.unwrap_or(f64::NAN),
+                ),
+                (
+                    "kiki_process_peak_resident_memory_bytes",
+                    usage.peak_resident_bytes.unwrap_or(f64::NAN),
+                ),
+                ("kiki_process_count", usage.processes),
+            ];
+            for (name, value) in gauges {
+                let key = Key::from_parts(name, vec![Label::new("process", process)]);
+                self.recorder.register_gauge(&key, &METADATA).set(value);
             }
         }
 
@@ -1127,14 +1156,7 @@ mod stub {
         // ----- Processes -----
 
         #[inline]
-        pub fn set_process_usage(
-            &self,
-            _process: &'static str,
-            _cpu_seconds: f64,
-            _resident_bytes: f64,
-            _proportional_bytes: Option<f64>,
-        ) {
-        }
+        pub fn set_process_usage(&self, _process: &'static str, _usage: super::ProcessUsage) {}
 
         #[inline]
         pub fn record_db_io(

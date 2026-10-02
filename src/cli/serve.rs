@@ -6,7 +6,6 @@ use anyhow::anyhow;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Arguments for the `kiki serve` subcommand.
@@ -34,7 +33,7 @@ pub struct ServeArgs {
     no_sandbox: bool,
 
     /// Run the seccomp filter in log-only mode instead of killing on
-    /// violation. Useful when tightening the denylist or diagnosing an
+    /// violation. Useful when tightening the allowlist or diagnosing an
     /// unexpected SIGSYS in production. Landlock is unaffected.
     #[arg(long)]
     seccomp_log_only: bool,
@@ -53,7 +52,7 @@ pub struct ServeArgs {
 
 impl ServeArgs {
     pub fn run(&self) -> Result<()> {
-        tracing_subscriber::fmt::init();
+        crate::cli::init_logging(std::io::stdout);
         // Before anything opens the database, so SQLite still accepts it.
         if let Err(e) = crate::db::log::install() {
             tracing::warn!("unable to forward SQLite's error log: {e}");
@@ -123,6 +122,11 @@ impl ServeArgs {
         #[cfg(all(unix, feature = "lua"))]
         let script_host = self.spawn_script_host()?;
 
+        // Bound before the syscall filter goes up, so that the filter need
+        // not let the server create, bind or listen on a socket at all.
+        // Landlock is already up, and grants the socket's directory.
+        let listener = server::bind_socket(&socket_path)?;
+
         if let Some(config) = &sandbox_config {
             sandbox::restrict_syscalls(config).context("failed to install sandbox")?;
             check_temp_dir_is_writable(&temp_dir)?;
@@ -137,14 +141,23 @@ impl ServeArgs {
             .autofetch()
             .feed_fetcher(feed_fetcher)
             .notifier(notifier)
-            .socket_path(&socket_path);
+            .socket_path(&socket_path)
+            .listener(listener);
         #[cfg(all(unix, feature = "lua"))]
         let builder = builder.script_host(script_host);
         let server = builder.build();
 
-        std::thread::spawn(|| server.run())
+        let result = std::thread::spawn(|| server.run())
             .join()
-            .map_err(|_| anyhow::anyhow!("panic in server thread"))?
+            .map_err(|_| anyhow::anyhow!("panic in server thread"))
+            .and_then(|r| r);
+        // A server that stops cleanly removes its socket file itself; one
+        // that failed — on a pending migration, say — may not have got far
+        // enough to, and the file is ours, as `bind_socket` succeeded.
+        if result.is_err() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+        result
     }
 
     /// Resolve the socket the server will listen on, from the flags and
@@ -276,8 +289,7 @@ fn ensure_socket_dir(socket_path: &Path) -> Result<PathBuf> {
     if !dir.exists() {
         fs::create_dir_all(&dir)
             .with_context(|| format!("unable to create socket directory {dir:?}"))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("unable to set permissions on socket directory {dir:?}"))?;
+        paths::restrict_permissions(&dir, 0o700)?;
     }
 
     Ok(dir)
@@ -313,9 +325,7 @@ fn ensure_temp_dir(dir: &Path) -> Result<PathBuf> {
     if !dir.exists() {
         fs::create_dir_all(dir)
             .with_context(|| format!("unable to create SQLite temp directory {dir:?}"))?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| {
-            format!("unable to set permissions on SQLite temp directory {dir:?}")
-        })?;
+        paths::restrict_permissions(dir, 0o700)?;
     }
     Ok(dir.to_path_buf())
 }
@@ -390,6 +400,8 @@ mod tests {
     use super::*;
     use crate::sandbox::SandboxProfile;
     use clap::Parser;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     /// Wrapper so the `Args`-derived [`ServeArgs`] can be exercised
@@ -623,6 +635,7 @@ mod tests {
             .is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_dir_is_created_owner_only() -> Result<()> {
         let td = TempDir::with_prefix("kiki_")?;
@@ -640,6 +653,7 @@ mod tests {
 
     /// An existing directory keeps whatever mode its owner gave it — under
     /// systemd that is `RuntimeDirectory=`/`RuntimeDirectoryMode=`.
+    #[cfg(unix)]
     #[test]
     fn socket_dir_that_already_exists_is_left_alone() -> Result<()> {
         let td = TempDir::with_prefix("kiki_")?;

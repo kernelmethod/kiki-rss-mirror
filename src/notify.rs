@@ -8,10 +8,24 @@
 //! could no longer reach it. Under a unit with `WatchdogSec=`, systemd also
 //! sets `$WATCHDOG_USEC`, and restarts the service if it goes that long
 //! without a `WATCHDOG=1`.
+//!
+//! There is no `sd_notify` outside Unix: there a `$NOTIFY_SOCKET` cannot
+//! be connected to, and the server carries on without a notifier.
 
 use std::io;
+#[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 use std::time::Duration;
+
+/// The socket notifications are sent over.
+#[cfg(unix)]
+type Socket = UnixDatagram;
+
+/// See the `unix` variant. Uninhabited, since no [`Notifier`] can be made
+/// here.
+#[cfg(not(unix))]
+#[derive(Debug)]
+enum Socket {}
 
 /// Names the socket to notify.
 const NOTIFY_SOCKET: &str = "NOTIFY_SOCKET";
@@ -26,7 +40,7 @@ const WATCHDOG_PID: &str = "WATCHDOG_PID";
 /// A connection to the service manager.
 #[derive(Debug)]
 pub struct Notifier {
-    socket: UnixDatagram,
+    socket: Socket,
     /// How often to ping the watchdog, if the service manager wants it.
     watchdog: Option<Duration>,
 }
@@ -59,8 +73,7 @@ impl Notifier {
             std::env::remove_var(var);
         }
 
-        let socket = UnixDatagram::unbound()?;
-        connect(&socket, std::path::Path::new(&path))?;
+        let socket = connect(std::path::Path::new(&path))?;
         Ok(Some(Notifier { socket, watchdog }))
     }
 
@@ -71,8 +84,7 @@ impl Notifier {
         path: &std::path::Path,
         watchdog: Option<Duration>,
     ) -> io::Result<Notifier> {
-        let socket = UnixDatagram::unbound()?;
-        connect(&socket, path)?;
+        let socket = connect(path)?;
         Ok(Notifier { socket, watchdog })
     }
 
@@ -97,31 +109,52 @@ impl Notifier {
         self.send("STOPPING=1");
     }
 
+    #[cfg(unix)]
     fn send(&self, msg: &str) {
         if let Err(e) = self.socket.send(msg.as_bytes()) {
             tracing::warn!("could not notify the service manager ({msg:?}): {e}");
         }
     }
+
+    #[cfg(not(unix))]
+    fn send(&self, _msg: &str) {
+        match self.socket {}
+    }
 }
 
-/// Connect `socket` to `path`, which names an abstract socket when it
+/// A socket connected to `path`, which names an abstract socket when it
 /// starts with `@`.
-fn connect(socket: &UnixDatagram, path: &std::path::Path) -> io::Result<()> {
+#[cfg(unix)]
+fn connect(path: &std::path::Path) -> io::Result<Socket> {
     use std::os::unix::ffi::OsStrExt;
+    let socket = UnixDatagram::unbound()?;
     match path.as_os_str().as_bytes().strip_prefix(b"@") {
         #[cfg(target_os = "linux")]
         Some(name) => {
             use std::os::linux::net::SocketAddrExt;
             let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
-            socket.connect_addr(&addr)
+            socket.connect_addr(&addr)?;
         }
         #[cfg(not(target_os = "linux"))]
-        Some(_) => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "abstract sockets are only supported on Linux",
-        )),
-        None => socket.connect(path),
+        Some(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "abstract sockets are only supported on Linux",
+            ))
+        }
+        None => socket.connect(path)?,
     }
+    Ok(socket)
+}
+
+/// See the `unix` variant.
+#[cfg(not(unix))]
+fn connect(path: &std::path::Path) -> io::Result<Socket> {
+    let _ = path;
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "sd_notify is only supported on Unix",
+    ))
 }
 
 /// How often to ping a watchdog that times out after `usec` microseconds:
@@ -162,17 +195,13 @@ mod tests {
         assert_eq!(watchdog_interval(Some("60000000"), Some("8"), 7), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn messages_reach_the_socket() {
         let dir = tempfile::TempDir::with_prefix("kiki_").unwrap();
         let path = dir.path().join("notify");
         let listener = UnixDatagram::bind(&path).unwrap();
-        let socket = UnixDatagram::unbound().unwrap();
-        connect(&socket, &path).unwrap();
-        let notifier = Notifier {
-            socket,
-            watchdog: None,
-        };
+        let notifier = Notifier::for_socket(&path, None).unwrap();
 
         let mut buf = [0u8; 64];
         for (send, expected) in [
@@ -196,8 +225,7 @@ mod tests {
         let name = format!("kiki-notify-test-{}", std::process::id());
         let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
         let listener = UnixDatagram::bind_addr(&addr).unwrap();
-        let socket = UnixDatagram::unbound().unwrap();
-        connect(&socket, std::path::Path::new(&format!("@{name}"))).unwrap();
+        let socket = connect(std::path::Path::new(&format!("@{name}"))).unwrap();
         socket.send(b"READY=1").unwrap();
         let mut buf = [0u8; 16];
         let n = listener.recv(&mut buf).unwrap();

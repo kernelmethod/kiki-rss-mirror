@@ -8,9 +8,9 @@
 //!
 //! Each test provisions its own temporary data directory, starts a
 //! kiki subprocess pointed at it, and tears the process down on drop.
-//! A regression that adds a newly-denied syscall to a hot code path
-//! (DB open, UDS bind, JSON parse, SQLite write, reqwest fetch) will
-//! show up as the subprocess dying with SIGSYS before a request can
+//! A regression that adds a syscall the allowlist leaves out to a hot
+//! code path (DB open, UDS bind, JSON parse, SQLite write, reqwest fetch)
+//! will show up as the subprocess dying with SIGSYS before a request can
 //! complete, surfaced via [`Kiki::assert_still_running`].
 
 #![cfg(all(target_os = "linux", feature = "cli"))]
@@ -55,13 +55,26 @@ impl Kiki {
     /// As [`Self::spawn`], calling `setup` with the data directory once
     /// it has been initialized and before the server starts.
     fn spawn_with(extra_args: &[&str], setup: impl FnOnce(&Path)) -> Self {
-        Self::spawn_as(extra_args, setup, None, &[])
+        Self::spawn_as(extra_args, setup, None, &[], Stdio::null())
     }
 
     /// As [`Self::spawn`], with `envs` added to `kiki serve`'s
     /// environment.
     fn spawn_with_env(extra_args: &[&str], envs: &[(&str, &str)]) -> Self {
-        Self::spawn_as(extra_args, |_| {}, None, envs)
+        Self::spawn_as(extra_args, |_| {}, None, envs, Stdio::null())
+    }
+
+    /// As [`Self::spawn`], with `kiki serve`'s standard error, which its
+    /// children share, written to `log`, and `rust_log` deciding what is
+    /// logged.
+    fn spawn_logging_to(extra_args: &[&str], log: std::fs::File, rust_log: &str) -> Self {
+        Self::spawn_as(
+            extra_args,
+            |_| {},
+            None,
+            &[("RUST_LOG", rust_log)],
+            log.into(),
+        )
     }
 
     /// As [`Self::spawn`], but run kiki as an unprivileged user when the
@@ -70,17 +83,28 @@ impl Kiki {
     fn spawn_unprivileged(extra_args: &[&str]) -> Self {
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         let root = unsafe { libc::geteuid() } == 0;
-        Self::spawn_as(extra_args, |_| {}, root.then_some(NOBODY), &[])
+        Self::spawn_as(
+            extra_args,
+            |_| {},
+            root.then_some(NOBODY),
+            &[],
+            Stdio::null(),
+        )
     }
 
     /// As [`Self::spawn_with`], running kiki as the user and group `id`
-    /// if one is given, with the data directory handed over to it, and
-    /// with `envs` added to `kiki serve`'s environment.
+    /// if one is given, with the data directory handed over to it, with
+    /// `envs` added to `kiki serve`'s environment, and its standard error
+    /// sent to `stderr`.
+    ///
+    /// `stderr` must not be a pipe nobody drains, which would stop the
+    /// server and its children once it filled.
     fn spawn_as(
         extra_args: &[&str],
         setup: impl FnOnce(&Path),
         id: Option<u32>,
         envs: &[(&str, &str)],
+        stderr: Stdio,
     ) -> Self {
         use std::os::unix::process::CommandExt;
 
@@ -118,7 +142,7 @@ impl Kiki {
             .env("RUST_LOG", "warn")
             .envs(envs.iter().copied())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stderr(stderr);
 
         let child = cmd.spawn().expect("spawn kiki serve");
 
@@ -153,6 +177,22 @@ impl Kiki {
             thread::sleep(Duration::from_millis(50));
         }
         panic!("kiki did not start listening within {timeout:?}");
+    }
+
+    /// Wait until the log at `path` has every one of `needles` in it.
+    fn wait_for_log(&mut self, path: &Path, needles: &[&str]) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.assert_still_running();
+            let log = std::fs::read_to_string(path).unwrap_or_default();
+            if needles.iter().all(|n| log.contains(n)) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("{needles:?} did not all appear in the log:\n{log}");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Panic if the child has exited. Called between requests to catch
@@ -457,12 +497,128 @@ fn seccomp_log_only_mode_still_runs() {
     kiki.shutdown();
 }
 
+/// The server's children log to its standard error, as it is the one
+/// standard stream it leaves them: the feed fetcher's supervisor and the
+/// worker it starts, and the script host, each say that their sandbox is
+/// up.
+#[test]
+fn the_childrens_logs_reach_the_servers_stderr() {
+    let dir = TempDir::with_prefix("kiki-child-logs").expect("create tempdir");
+    let path = dir.path().join("stderr.log");
+    let log = std::fs::File::create(&path).expect("create the log file");
+    let mut kiki = Kiki::spawn_logging_to(&[], log, "info");
+    kiki.wait_for_log(&path, &["\"feed-fetcher\"", "\"feed-worker\""]);
+    #[cfg(feature = "lua")]
+    kiki.wait_for_log(&path, &["\"script-host\""]);
+    kiki.shutdown();
+}
+
+/// `RUST_LOG` decides what every process logs. The supervisor says it has
+/// started the worker before the worker installs its sandbox, so once the
+/// worker has said so, the supervisor's line would be there if `RUST_LOG`
+/// let it through.
+#[test]
+fn rust_log_decides_what_the_children_log() {
+    let dir = TempDir::with_prefix("kiki-child-logs").expect("create tempdir");
+    let path = dir.path().join("stderr.log");
+    let log = std::fs::File::create(&path).expect("create the log file");
+    let mut kiki = Kiki::spawn_logging_to(&[], log, "warn,kiki_rss::sandbox=info");
+    kiki.wait_for_log(&path, &["\"feed-worker\""]);
+    let logged = std::fs::read_to_string(&path).expect("read the log");
+    assert!(
+        !logged.contains("worker started"),
+        "the supervisor logged at INFO despite RUST_LOG:\n{logged}"
+    );
+    kiki.shutdown();
+}
+
 #[test]
 fn no_sandbox_flag_still_runs() {
     let mut kiki = Kiki::spawn(&["--no-sandbox"]);
     kiki.get("/v1/feeds").assert_success();
     kiki.assert_still_running();
     kiki.shutdown();
+}
+
+/// Set to anything to make [`allowlist_probe`] run.
+const ALLOWLIST_PROBE_ENV: &str = "KIKI_ALLOWLIST_PROBE";
+
+/// Printed by [`allowlist_probe`] once every check that should pass has,
+/// just before it makes the call that must kill it.
+const ALLOWLIST_PROBE_PASSED: &str = "allowlist probe: allowed calls passed";
+
+/// Not a test of its own: [`the_syscall_allowlist_is_enforced`] runs it in
+/// a process of its own. It installs the script host's sandbox, the
+/// strictest there is, and checks what the allowlist's argument filters
+/// let through, then tries to create a user namespace, which must kill it.
+#[test]
+fn allowlist_probe() {
+    use kiki_rss::sandbox::{apply, SandboxConfig};
+    if std::env::var_os(ALLOWLIST_PROBE_ENV).is_none() {
+        return;
+    }
+    apply(&SandboxConfig::script_host(false)).expect("install the script host sandbox");
+
+    // `clone3` is refused, and the C library falls back to `clone`.
+    thread::spawn(|| 42)
+        .join()
+        .map(|n| assert_eq!(n, 42))
+        .expect("start a thread");
+
+    // An ioctl the allowlist leaves out fails, rather than killing.
+    let ch: libc::c_char = 0;
+    // SAFETY: `TIOCSTI` reads one byte from a valid pointer.
+    let rc = unsafe { libc::ioctl(0, libc::TIOCSTI, &ch) };
+    assert_eq!(rc, -1, "TIOCSTI was allowed");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENOTTY)
+    );
+    println!("{ALLOWLIST_PROBE_PASSED}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    // Seccomp kills the process here.
+    let flags = (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong;
+    // SAFETY: a `fork`-like `clone` with no stack, so the child, if one
+    // is created, runs on a copy of this stack and exits at once.
+    let pid = unsafe { libc::syscall(libc::SYS_clone, flags, 0usize, 0usize, 0usize, 0usize) };
+    if pid == 0 {
+        // SAFETY: `_exit` is async-signal-safe, and skips the parent's
+        // destructors.
+        unsafe { libc::_exit(0) };
+    }
+    println!("allowlist probe: a user namespace was created");
+}
+
+/// The allowlist refuses what it leaves out, kills for namespaces, and
+/// lets threads start: run [`allowlist_probe`] in a fresh process, and
+/// check that it got past the allowed calls and was then killed.
+#[test]
+fn the_syscall_allowlist_is_enforced() {
+    let output = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "allowlist_probe",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ALLOWLIST_PROBE_ENV, "1")
+        .output()
+        .expect("run the probe");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains(ALLOWLIST_PROBE_PASSED),
+        "probe failed the allowed calls ({}):\n{stdout}\n{stderr}",
+        describe_exit(output.status)
+    );
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGSYS),
+        "probe was not killed for creating a user namespace ({}):\n{stdout}\n{stderr}",
+        describe_exit(output.status)
+    );
 }
 
 // --------------------------------------------------------------------
@@ -613,6 +769,24 @@ mod fetch_isolation {
 
         /// Wait for the supervisor's worker to exist and return its PID.
         fn wait_for_fetcher_worker(&mut self, not: Option<u32>) -> u32 {
+            self.wait_for_fetcher_child(feed_fetcher::WORKER_SUBCOMMAND, not)
+        }
+
+        /// Wait for the supervisor's parser to exist and return its PID.
+        /// It is started when there is first something to parse.
+        fn wait_for_fetcher_parser(&mut self, not: Option<u32>) -> u32 {
+            self.wait_for_fetcher_child(feed_fetcher::PARSER_SUBCOMMAND, not)
+        }
+
+        /// Wait for the supervisor's resolver to exist and return its PID.
+        /// It is started when there is first something to look up.
+        fn wait_for_fetcher_resolver(&mut self, not: Option<u32>) -> u32 {
+            self.wait_for_fetcher_child(feed_fetcher::RESOLVER_SUBCOMMAND, not)
+        }
+
+        /// Wait for a child of the supervisor started with `subcommand`,
+        /// other than `not`, and return its PID.
+        fn wait_for_fetcher_child(&mut self, subcommand: &str, not: Option<u32>) -> u32 {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 self.assert_still_running();
@@ -620,16 +794,28 @@ mod fetch_isolation {
                     .fetcher_supervisor_pids()
                     .first()
                     .expect("a feed fetcher supervisor");
-                let workers = child_pids_matching(supervisor, feed_fetcher::SUBCOMMAND);
-                if let Some(&w) = workers.iter().find(|&&w| Some(w) != not) {
-                    return w;
+                let children = child_pids_matching(supervisor, subcommand);
+                if let Some(&c) = children.iter().find(|&&c| Some(c) != not) {
+                    return c;
                 }
                 if Instant::now() >= deadline {
-                    panic!("no feed fetcher worker appeared (excluding {not:?})");
+                    panic!(
+                        "no `{subcommand}` child of the feed fetcher appeared (excluding {not:?})"
+                    );
                 }
                 thread::sleep(Duration::from_millis(50));
             }
         }
+    }
+
+    /// How many seccomp filters `pid` runs under, on kernels that say
+    /// (5.9+).
+    fn seccomp_filters(pid: u32) -> Option<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Seccomp_filters:"))
+            .and_then(|v| v.trim().parse().ok())
     }
 
     fn create_feed(kiki: &mut Kiki, addr: SocketAddr) -> i64 {
@@ -642,7 +828,7 @@ mod fetch_isolation {
         created.json()["id"].as_i64().expect("id")
     }
 
-    /// By default feeds are fetched by a sandboxed supervisor/worker pair,
+    /// By default feeds are fetched by a sandboxed supervisor and worker,
     /// not by the server.
     #[test]
     fn feeds_are_fetched_in_a_separate_sandboxed_process_by_default() {
@@ -662,7 +848,155 @@ mod fetch_isolation {
                 "fetcher pid {pid} is not running under a seccomp filter"
             );
         }
+        assert_stricter_than_the_supervisor(&kiki, worker, "worker");
         kiki.shutdown();
+    }
+
+    /// Each of the supervisor's children installs a sandbox of its own on
+    /// top of the supervisor's, which shows as more seccomp filters, on
+    /// kernels that say how many (5.9+).
+    fn assert_stricter_than_the_supervisor(kiki: &Kiki, child: u32, what: &str) {
+        let supervisor = kiki.fetcher_supervisor_pids()[0];
+        if let (Some(s), Some(c)) = (seccomp_filters(supervisor), seccomp_filters(child)) {
+            assert!(
+                c > s,
+                "the {what} runs under {c} seccomp filters, no more than the supervisor's {s}"
+            );
+        }
+    }
+
+    /// Set to anything to make [`worker_sandbox_probe`] run.
+    const WORKER_PROBE_ENV: &str = "KIKI_WORKER_SANDBOX_PROBE";
+
+    /// Printed by the worker probe once it has made a UDP socket, just
+    /// before it tries to bind it.
+    const WORKER_PROBE_SOCKET_MADE: &str = "worker sandbox probe: socket made";
+
+    /// Not a test of its own: [`binding_kills_the_worker_but_not_the_supervisor`]
+    /// runs it in a process of its own. It installs the worker's sandbox
+    /// as the worker does, on top of the supervisor's, makes a UDP socket,
+    /// which the worker may, then binds it, which must kill it.
+    #[test]
+    fn worker_sandbox_probe() {
+        use kiki_rss::sandbox::{apply, SandboxConfig};
+        if std::env::var_os(WORKER_PROBE_ENV).is_none() {
+            return;
+        }
+        apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
+        // The supervisor may bind, for the resolver it starts.
+        std::net::UdpSocket::bind("127.0.0.1:0").expect("the supervisor may bind");
+        apply(&SandboxConfig::feed_worker(false)).expect("install the worker sandbox");
+
+        // SAFETY: a plain `socket` call; the descriptor is left open.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        assert!(fd >= 0, "a UDP socket was refused");
+        println!("{WORKER_PROBE_SOCKET_MADE}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        // Seccomp kills the process here.
+        let _ = std::net::UdpSocket::bind("127.0.0.1:0");
+        println!("worker sandbox probe: binding was allowed");
+    }
+
+    /// The supervisor may bind sockets, for the resolver it starts, but the
+    /// worker it also starts may not: run [`worker_sandbox_probe`] in a
+    /// fresh process and check that it was killed for binding.
+    #[test]
+    fn binding_kills_the_worker_but_not_the_supervisor() {
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "fetch_isolation::worker_sandbox_probe",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(WORKER_PROBE_ENV, "1")
+            .output()
+            .expect("run the probe");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains(WORKER_PROBE_SOCKET_MADE),
+            "probe failed before binding ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGSYS),
+            "probe was not killed for binding ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
+    }
+
+    /// Set to anything to make [`supervisor_exec_probe`] run.
+    const EXEC_PROBE_ENV: &str = "KIKI_SUPERVISOR_EXEC_PROBE";
+
+    /// Printed by the exec probe once it has run this executable again
+    /// under the supervisor's sandbox, and been refused another.
+    const EXEC_PROBE_PASSED: &str = "supervisor exec probe: passed";
+
+    /// Not a test of its own: [`the_supervisor_may_execute_only_kiki`]
+    /// runs it in a process of its own. It installs the supervisor's
+    /// sandbox, then runs this executable again, as the supervisor runs
+    /// kiki to start its children, and tries to run a copy of it: one
+    /// that certainly exists and could run, but is not the file the
+    /// sandbox lets the supervisor execute.
+    #[test]
+    fn supervisor_exec_probe() {
+        use kiki_rss::sandbox::{apply, SandboxConfig};
+        if std::env::var_os(EXEC_PROBE_ENV).is_none() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary");
+        let dir = TempDir::with_prefix("kiki-exec-probe").expect("create tempdir");
+        let copy = dir.path().join("copy");
+        std::fs::copy(&exe, &copy).expect("copy this executable");
+
+        apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
+
+        // With the standard streams inherited, as the supervisor's children
+        // have them: the sandbox grants no `/dev/null`.
+        let listed = Command::new(&exe)
+            .arg("--list")
+            .status()
+            .expect("run this executable again");
+        assert!(
+            listed.success(),
+            "running this executable again failed: {listed}"
+        );
+
+        let err = Command::new(&copy)
+            .arg("--list")
+            .status()
+            .expect_err("a copy of this executable was run");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        println!("{EXEC_PROBE_PASSED}");
+    }
+
+    /// The supervisor starts its children by running the kiki executable
+    /// again, and Landlock lets it execute nothing else: run
+    /// [`supervisor_exec_probe`] in a fresh process.
+    #[test]
+    fn the_supervisor_may_execute_only_kiki() {
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "fetch_isolation::supervisor_exec_probe",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(EXEC_PROBE_ENV, "1")
+            .output()
+            .expect("run the probe");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains(EXEC_PROBE_PASSED),
+            "probe failed ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
     }
 
     /// A worker that dies is replaced inside the sandbox, and fetching
@@ -693,11 +1027,12 @@ mod fetch_isolation {
         kiki.shutdown();
     }
 
-    /// A feed named by hostname rather than IP is fetched even though the
-    /// fetcher cannot read /etc/hosts or any resolver configuration: the
-    /// lookup is done by the server, on the fetcher's behalf.
+    /// A feed named by hostname rather than IP is fetched, with the lookup
+    /// done by the fetcher's resolver: a process of its own, with a
+    /// stricter sandbox, and with none of the server's environment but
+    /// what the C library's resolver reads.
     #[test]
-    fn hostnames_are_resolved_by_the_server() {
+    fn hostnames_are_resolved_by_the_resolver() {
         let (addr, _server) = spawn_local_rss_server();
         let mut kiki = Kiki::spawn(&[]);
         let created = kiki
@@ -711,18 +1046,306 @@ mod fetch_isolation {
             .assert_success();
         let feed_id = created.json()["id"].as_i64().expect("id");
         refresh_until_entries(&mut kiki, feed_id, 1);
+
+        let worker = kiki.wait_for_fetcher_worker(None);
+        let resolver = kiki.wait_for_fetcher_resolver(None);
+        assert_ne!(worker, resolver);
+        assert_eq!(seccomp_mode(resolver), Some(2));
+        assert_stricter_than_the_supervisor(&kiki, resolver, "resolver");
+        let environ = std::fs::read(format!("/proc/{resolver}/environ")).expect("read environ");
+        let kept: Vec<String> = environ
+            .split(|&b| b == 0)
+            .filter(|v| !v.is_empty())
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .collect();
+        assert!(
+            kept.iter().all(|v| {
+                let name = v.split('=').next().unwrap_or_default();
+                [
+                    "LOCALDOMAIN",
+                    "RES_OPTIONS",
+                    "HOSTALIASES",
+                    "RUST_LOG",
+                    feed_fetcher::RESOLVER_FD_ENV,
+                ]
+                .contains(&name)
+            }),
+            "the resolver got more of the environment than it needs: {kept:?}"
+        );
         kiki.shutdown();
     }
 
-    /// Neither fetcher process may outlive the server.
+    /// Set to a directory to make [`resolver_sandbox_probe`] run.
+    const RESOLVER_PROBE_ENV: &str = "KIKI_RESOLVER_SANDBOX_PROBE";
+
+    /// Set to the address of a TCP listener on a port other than DNS's,
+    /// for [`resolver_sandbox_probe`] to fail to connect to.
+    const RESOLVER_PROBE_TCP_ENV: &str = "KIKI_RESOLVER_SANDBOX_PROBE_TCP";
+
+    const RESOLVER_PROBE_PASSED: &str = "resolver sandbox probe passed";
+
+    /// Not a test of its own: [`the_resolver_sandbox_is_enforced`] runs it
+    /// in a process of its own. It installs the resolver's sandbox as the
+    /// resolver does, on top of the fetcher's, and checks that hostnames
+    /// still resolve, while files other than the resolver's configuration,
+    /// Unix sockets, and TCP ports other than DNS's are out of reach.
+    #[test]
+    fn resolver_sandbox_probe() {
+        use kiki_rss::sandbox::{apply, SandboxConfig};
+        use std::net::ToSocketAddrs;
+        let Some(dir) = std::env::var_os(RESOLVER_PROBE_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let tcp: SocketAddr = std::env::var(RESOLVER_PROBE_TCP_ENV)
+            .expect("probe TCP address")
+            .parse()
+            .expect("valid probe TCP address");
+        // Asked before the sandbox goes up, whose allowlist leaves out
+        // the query.
+        let abi = landlock_abi();
+        apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
+        apply(&SandboxConfig::feed_resolver(false)).expect("install the resolver sandbox");
+
+        // What the resolver is for still works.
+        let addrs: Vec<SocketAddr> = ("localhost", 0)
+            .to_socket_addrs()
+            .expect("resolve localhost")
+            .collect();
+        assert!(!addrs.is_empty());
+
+        // That includes what musl's resolver does to query a name server:
+        // bind a UDP socket to port 0, then send from it. A name that is in
+        // /etc/hosts never gets that far, so it is done by hand.
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket");
+        let to_itself = udp.local_addr().expect("local address");
+        udp.send_to(b"query", to_itself)
+            .expect("send from a bound UDP socket");
+
+        // No Unix sockets, which would reach the server's API socket; no
+        // netlink ones either.
+        let err = UnixStream::connect(dir.join("api.sock")).expect_err("Unix socket allowed");
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES), "{err}");
+        // SAFETY: a plain `socket` call; the descriptor, if any, is closed.
+        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, 0) };
+        assert!(fd < 0, "a netlink socket was allowed");
+
+        if abi >= 1 {
+            std::fs::read(dir.join("secret")).expect_err("reading a file was allowed");
+            std::fs::read_dir("/etc/ssl").expect_err("listing the trust stores was allowed");
+        }
+        if abi >= 4 {
+            let err = std::net::TcpStream::connect(tcp).expect_err("TCP connect was allowed");
+            assert_eq!(err.raw_os_error(), Some(libc::EACCES), "{err}");
+        } else {
+            println!("Landlock ABI < 4; skipping the TCP port check");
+        }
+        println!("{RESOLVER_PROBE_PASSED}");
+    }
+
+    /// The resolver's sandbox really allows only what it claims to: run
+    /// [`resolver_sandbox_probe`] in a fresh process, and check it passed
+    /// rather than died.
+    #[test]
+    fn the_resolver_sandbox_is_enforced() {
+        let dir = TempDir::with_prefix("kiki-resolver-probe").expect("create tempdir");
+        std::fs::write(dir.path().join("secret"), "hidden").expect("write secret");
+        let api = std::os::unix::net::UnixListener::bind(dir.path().join("api.sock"))
+            .expect("bind the API socket");
+        let tcp = TcpListener::bind("127.0.0.1:0").expect("bind a TCP listener");
+
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "fetch_isolation::resolver_sandbox_probe",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(RESOLVER_PROBE_ENV, dir.path())
+            .env(
+                RESOLVER_PROBE_TCP_ENV,
+                tcp.local_addr().expect("addr").to_string(),
+            )
+            .output()
+            .expect("run the probe");
+        drop(api);
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains(RESOLVER_PROBE_PASSED),
+            "probe failed ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
+    }
+
+    /// Feeds are parsed in a process of their own, which installs a
+    /// stricter sandbox on top of the one it inherits from the
+    /// supervisor.
+    #[test]
+    fn feeds_are_parsed_in_a_separate_process_with_a_stricter_sandbox() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&[]);
+        let feed_id = create_feed(&mut kiki, addr);
+        refresh_until_entries(&mut kiki, feed_id, 1);
+
+        let worker = kiki.wait_for_fetcher_worker(None);
+        let parser = kiki.wait_for_fetcher_parser(None);
+        assert_ne!(worker, parser);
+        assert_eq!(seccomp_mode(parser), Some(2));
+        // The server's environment, which may hold credentials, is not
+        // passed on: the parser gets only what the supervisor tells it.
+        let environ = std::fs::read(format!("/proc/{parser}/environ")).expect("read environ");
+        let names: Vec<String> = environ
+            .split(|&b| b == 0)
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                String::from_utf8_lossy(v)
+                    .split('=')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        assert!(
+            names.iter().all(|name| {
+                [
+                    "RUST_LOG",
+                    feed_fetcher::PARSER_FD_ENV,
+                    feed_fetcher::PARSER_THREADS_ENV,
+                ]
+                .contains(&name.as_str())
+            }),
+            "the parser got more of the environment than it needs: {names:?}"
+        );
+        assert_stricter_than_the_supervisor(&kiki, parser, "parser");
+        kiki.shutdown();
+    }
+
+    /// A parser that dies is replaced, and parsing carries on.
+    #[test]
+    fn a_killed_parser_is_replaced_and_fetching_continues() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&[]);
+        let first_feed = create_feed(&mut kiki, addr);
+        refresh_until_entries(&mut kiki, first_feed, 1);
+        let worker = kiki.wait_for_fetcher_worker(None);
+        let first = kiki.wait_for_fetcher_parser(None);
+
+        // SAFETY: SIGKILL to a process of our own; at worst ESRCH.
+        unsafe {
+            libc::kill(first as libc::pid_t, libc::SIGKILL);
+        }
+        assert!(wait_for_exit(first, Duration::from_secs(5)));
+
+        let (other, _other_server) = spawn_local_rss_server();
+        let second_feed = create_feed(&mut kiki, other);
+        refresh_until_entries(&mut kiki, second_feed, 1);
+        let second = kiki.wait_for_fetcher_parser(Some(first));
+        assert_ne!(first, second);
+        assert_eq!(
+            kiki.wait_for_fetcher_worker(None),
+            worker,
+            "the worker must survive the parser"
+        );
+        kiki.shutdown();
+    }
+
+    /// Set to a directory to make [`parser_sandbox_probe`] run.
+    const PROBE_ENV: &str = "KIKI_PARSER_SANDBOX_PROBE";
+
+    /// Printed by the probe once the filesystem checks have passed, just
+    /// before it tries to make a socket.
+    const PROBE_FILES_DENIED: &str = "parser sandbox probe: files denied";
+
+    /// Not a test of its own: [`the_parser_sandbox_is_enforced`] runs it in
+    /// a process of its own. It installs the parser's sandbox as the
+    /// parser does, on top of the fetcher's, checks that no file can be
+    /// read, then tries to make a socket, which must kill it.
+    #[test]
+    fn parser_sandbox_probe() {
+        use kiki_rss::sandbox::{apply, SandboxConfig};
+        let Some(dir) = std::env::var_os(PROBE_ENV).map(PathBuf::from) else {
+            return;
+        };
+        // Asked before the sandbox goes up, whose allowlist leaves out
+        // the query.
+        let abi = landlock_abi();
+        apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
+        apply(&SandboxConfig::feed_parser(false)).expect("install the parser sandbox");
+
+        // The fetcher may read the TLS trust stores; the parser may not
+        // read anything, where the kernel has Landlock.
+        if abi >= 1 {
+            std::fs::read(dir.join("secret")).expect_err("reading a file was allowed");
+            std::fs::read_dir("/etc/ssl").expect_err("listing the trust stores was allowed");
+        } else {
+            println!("Landlock unavailable; skipping the filesystem checks");
+        }
+        println!("{PROBE_FILES_DENIED}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        // Seccomp kills the process here.
+        let _ = std::net::UdpSocket::bind("127.0.0.1:0");
+        println!("parser sandbox probe: a socket was allowed");
+    }
+
+    /// The parser's sandbox really denies what it claims to: run
+    /// [`parser_sandbox_probe`] in a fresh process, and check that it got
+    /// past the filesystem checks and was then killed for making a socket.
+    #[test]
+    fn the_parser_sandbox_is_enforced() {
+        let dir = TempDir::with_prefix("kiki-parser-probe").expect("create tempdir");
+        std::fs::write(dir.path().join("secret"), "hidden").expect("write secret");
+
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "fetch_isolation::parser_sandbox_probe",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE_ENV, dir.path())
+            .output()
+            .expect("run the probe");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains(PROBE_FILES_DENIED),
+            "probe failed the filesystem checks ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGSYS),
+            "probe was not killed for making a socket ({}):\n{stdout}\n{stderr}",
+            describe_exit(output.status)
+        );
+    }
+
+    /// None of the fetcher's processes may outlive the server.
     #[test]
     fn the_fetcher_exits_with_the_server() {
+        let (addr, _server) = spawn_local_rss_server();
         let mut kiki = Kiki::spawn(&[]);
+        let created = kiki
+            .post_json(
+                "/v1/feeds/create",
+                &format!(
+                    r#"{{"title":"by name","url":"http://localhost:{}/feed.xml"}}"#,
+                    addr.port()
+                ),
+            )
+            .assert_success();
+        let feed_id = created.json()["id"].as_i64().expect("id");
+        refresh_until_entries(&mut kiki, feed_id, 1);
         let supervisor = kiki.fetcher_supervisor_pids()[0];
         let worker = kiki.wait_for_fetcher_worker(None);
+        let parser = kiki.wait_for_fetcher_parser(None);
+        let resolver = kiki.wait_for_fetcher_resolver(None);
         kiki.shutdown();
 
-        for pid in [supervisor, worker] {
+        for pid in [supervisor, worker, parser, resolver] {
             assert!(
                 wait_for_exit(pid, Duration::from_secs(5)),
                 "fetcher pid {pid} outlived the server"
@@ -1388,8 +2011,8 @@ mod web_ui {
         }
     }
 
-    /// Every page renders with the web UI sandboxed — a newly denied
-    /// syscall on a handler's path would kill it with SIGSYS — and the
+    /// Every page renders with the web UI sandboxed — a syscall the
+    /// allowlist leaves out on a handler's path would kill it with SIGSYS — and the
     /// sandbox is really installed.
     #[test]
     fn the_sandboxed_web_ui_serves_every_page() {
@@ -1490,6 +2113,9 @@ mod web_ui {
             .expect("valid probe TCP address");
         let secret = dir.join("secret");
 
+        // Asked before the sandbox goes up, whose allowlist leaves out
+        // the query.
+        let abi = landlock_abi();
         kiki_rss::sandbox::apply(&kiki_rss::sandbox::SandboxConfig::web_ui(false))
             .expect("install the web UI sandbox");
 
@@ -1503,7 +2129,7 @@ mod web_ui {
         std::net::UdpSocket::bind("127.0.0.1:0").expect_err("UDP socket was allowed");
 
         // Nor does the filesystem, where the kernel has Landlock.
-        if landlock_abi() >= 1 {
+        if abi >= 1 {
             std::fs::read(&secret).expect_err("reading a file was allowed");
             std::fs::read_dir("/").expect_err("listing / was allowed");
             std::fs::write(dir.join("new"), "x").expect_err("creating a file was allowed");
