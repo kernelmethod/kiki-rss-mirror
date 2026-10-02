@@ -6,7 +6,7 @@ use crate::scripting::{ScriptRunnerHandle, ScriptSource};
 #[cfg(feature = "lua")]
 use std::sync::Arc;
 #[cfg(feature = "lua")]
-use tracing::{error, warn};
+use tracing::warn;
 
 /// Dispatch `fetch.error` to the scripting engine, if one is installed.
 pub(super) fn fire_fetch_error(
@@ -136,7 +136,7 @@ pub fn load_script_runner(
             Err(e) => {
                 // The channel itself is gone. Nothing can bring it back:
                 // the server denied itself `execve` when it sandboxed.
-                error!(
+                tracing::error!(
                     "script host is gone ({}); scripting is disabled until the server restarts",
                     e
                 );

@@ -6,7 +6,6 @@ use anyhow::anyhow;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Arguments for the `kiki serve` subcommand.
@@ -290,8 +289,7 @@ fn ensure_socket_dir(socket_path: &Path) -> Result<PathBuf> {
     if !dir.exists() {
         fs::create_dir_all(&dir)
             .with_context(|| format!("unable to create socket directory {dir:?}"))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("unable to set permissions on socket directory {dir:?}"))?;
+        paths::restrict_permissions(&dir, 0o700)?;
     }
 
     Ok(dir)
@@ -327,9 +325,7 @@ fn ensure_temp_dir(dir: &Path) -> Result<PathBuf> {
     if !dir.exists() {
         fs::create_dir_all(dir)
             .with_context(|| format!("unable to create SQLite temp directory {dir:?}"))?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| {
-            format!("unable to set permissions on SQLite temp directory {dir:?}")
-        })?;
+        paths::restrict_permissions(dir, 0o700)?;
     }
     Ok(dir.to_path_buf())
 }
@@ -404,6 +400,8 @@ mod tests {
     use super::*;
     use crate::sandbox::SandboxProfile;
     use clap::Parser;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     /// Wrapper so the `Args`-derived [`ServeArgs`] can be exercised
@@ -637,6 +635,7 @@ mod tests {
             .is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_dir_is_created_owner_only() -> Result<()> {
         let td = TempDir::with_prefix("kiki_")?;
@@ -654,6 +653,7 @@ mod tests {
 
     /// An existing directory keeps whatever mode its owner gave it — under
     /// systemd that is `RuntimeDirectory=`/`RuntimeDirectoryMode=`.
+    #[cfg(unix)]
     #[test]
     fn socket_dir_that_already_exists_is_left_alone() -> Result<()> {
         let td = TempDir::with_prefix("kiki_")?;

@@ -1523,6 +1523,7 @@ dependencies = [
  "url",
  "utoipa",
  "utoipa-scalar",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 

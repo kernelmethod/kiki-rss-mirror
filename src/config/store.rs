@@ -3,6 +3,7 @@ use super::{ConfigError, Overrides, Settings};
 use arc_swap::ArcSwap;
 use std::fs;
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -182,21 +183,22 @@ fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     tmp_name.push(".tmp");
     let tmp_path = dir.join(tmp_name);
 
-    // Create the temporary file no more permissive than the original, so
-    // the new contents are never more widely readable, even briefly. The
-    // umask may strip bits from `mode`; they are restored below.
     let existing = fs::metadata(path).ok().map(|m| m.permissions());
-    let mode = existing.as_ref().map_or(0o666, |p| p.mode() & 0o777);
 
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .open(&tmp_path)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // Create the temporary file no more permissive than the original,
+        // so the new contents are never more widely readable, even briefly.
+        // The umask may strip bits from `mode`; they are restored below.
+        #[cfg(unix)]
+        let mode = existing.as_ref().map_or(0o666, |p| p.mode() & 0o777);
+        #[cfg(unix)]
+        options.mode(mode);
+        let mut file = options.open(&tmp_path)?;
         // A leftover temporary file from a crash keeps its old mode, so
         // set it explicitly.
+        #[cfg(unix)]
         file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(contents.as_bytes())?;
         if let Some(perms) = existing {
@@ -205,8 +207,11 @@ fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp_path, path)?;
-        // Persist the rename itself.
-        fs::File::open(dir)?.sync_all()
+        // Persist the rename itself. Windows cannot open a directory as a
+        // file, and journals the rename's metadata on its own.
+        #[cfg(unix)]
+        fs::File::open(dir)?.sync_all()?;
+        Ok(())
     })();
 
     if result.is_err() {
@@ -330,6 +335,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn save_preserves_file_permissions() {
         let (_td, store) = store();
