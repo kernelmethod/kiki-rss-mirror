@@ -939,18 +939,25 @@ mod fetch_isolation {
     /// Not a test of its own: [`the_supervisor_may_execute_only_kiki`]
     /// runs it in a process of its own. It installs the supervisor's
     /// sandbox, then runs this executable again, as the supervisor runs
-    /// kiki to start its children, and tries to run another.
+    /// kiki to start its children, and tries to run a copy of it: one
+    /// that certainly exists and could run, but is not the file the
+    /// sandbox lets the supervisor execute.
     #[test]
     fn supervisor_exec_probe() {
         use kiki_rss::sandbox::{apply, SandboxConfig};
         if std::env::var_os(EXEC_PROBE_ENV).is_none() {
             return;
         }
+        let exe = std::env::current_exe().expect("test binary");
+        let dir = TempDir::with_prefix("kiki-exec-probe").expect("create tempdir");
+        let copy = dir.path().join("copy");
+        std::fs::copy(&exe, &copy).expect("copy this executable");
+
         apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
 
         // With the standard streams inherited, as the supervisor's children
         // have them: the sandbox grants no `/dev/null`.
-        let listed = Command::new(std::env::current_exe().expect("test binary"))
+        let listed = Command::new(&exe)
             .arg("--list")
             .status()
             .expect("run this executable again");
@@ -959,9 +966,10 @@ mod fetch_isolation {
             "running this executable again failed: {listed}"
         );
 
-        let err = Command::new("/bin/true")
+        let err = Command::new(&copy)
+            .arg("--list")
             .status()
-            .expect_err("another executable was run");
+            .expect_err("a copy of this executable was run");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
         println!("{EXEC_PROBE_PASSED}");
     }
