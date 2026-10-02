@@ -508,7 +508,6 @@ fn the_childrens_logs_reach_the_servers_stderr() {
     let log = std::fs::File::create(&path).expect("create the log file");
     let mut kiki = Kiki::spawn_logging_to(&[], log, "info");
     kiki.wait_for_log(&path, &["\"feed-fetcher\"", "\"feed-worker\""]);
-    #[cfg(feature = "lua")]
     kiki.wait_for_log(&path, &["\"script-host\""]);
     kiki.shutdown();
 }
@@ -724,10 +723,7 @@ fn process_metric(body: &str, name: &str, process: &str) -> Option<f64> {
 #[test]
 fn the_sandboxed_server_reports_its_childrens_memory() {
     let mut kiki = Kiki::spawn_unprivileged(&[]);
-    let mut children = vec!["feed_fetcher"];
-    if cfg!(feature = "lua") {
-        children.push("script_host");
-    }
+    let children = ["feed_fetcher", "script_host"];
     // The first sample is taken as the server starts.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -1357,7 +1353,7 @@ mod fetch_isolation {
 // Script host isolation
 // --------------------------------------------------------------------
 
-#[cfg(all(feature = "lua", feature = "metrics"))]
+#[cfg(feature = "metrics")]
 mod script_isolation {
     use super::*;
     use kiki_rss::process::script_host;

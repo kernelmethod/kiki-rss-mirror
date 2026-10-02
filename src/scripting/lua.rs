@@ -1,7 +1,5 @@
 //! Lua-based [`ScriptRunner`] implementation.
 //!
-//! This module is compiled only when the `lua` feature is enabled.
-//!
 //! # Architecture
 //!
 //! A single [`LuaScriptRunner`] is built at server startup and shared across every worker

@@ -17,9 +17,8 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli", "lua", "systemd", "api-docs", "metrics", "web-ui", "default-plugins"]
+default = ["cli", "systemd", "api-docs", "metrics", "web-ui", "default-plugins"]
 cli = ["clap"]
-lua = ["mlua"]
 systemd = []
 api-docs = ["utoipa-scalar"]
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
@@ -51,7 +50,7 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 serde_bytes = "0.11"
 metrics = { version = "0.24", optional = true }
 metrics-exporter-prometheus = { version = "0.17", default-features = false, optional = true }
-mlua = { version = "0.10", features = ["lua54", "vendored", "send"], optional = true }
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 regex = "1"
 thiserror = "2.0.18"
 utoipa = { version = "5", features = ["axum_extras"] }

@@ -70,11 +70,11 @@ pub mod runtime;
 pub mod services;
 pub mod settings;
 
-#[cfg(all(test, feature = "lua"))]
+#[cfg(test)]
 mod auto_tag_tests;
-#[cfg(all(test, feature = "lua"))]
+#[cfg(test)]
 mod filter_tests;
-#[cfg(all(test, feature = "lua"))]
+#[cfg(test)]
 mod strip_tracking_tests;
 
 use crate::scripting::{ScriptModule, ScriptSource};
@@ -171,7 +171,7 @@ impl PluginEngine {
     /// Whether this build of Kiki can run plugins written for the engine.
     pub fn is_supported(self) -> bool {
         match self {
-            Self::Lua => cfg!(feature = "lua"),
+            Self::Lua => true,
         }
     }
 }

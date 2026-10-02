@@ -541,7 +541,7 @@ fn strings(conn: &Connection, sql: &str, entry_id: i64) -> rusqlite::Result<Vec<
         .collect()
 }
 
-#[cfg(all(test, feature = "lua"))]
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;

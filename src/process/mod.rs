@@ -83,7 +83,7 @@ pub mod ipc;
 #[cfg(unix)]
 pub mod feed_fetcher;
 
-#[cfg(all(unix, feature = "lua"))]
+#[cfg(unix)]
 pub mod script_host;
 
 #[cfg(target_os = "linux")]
@@ -99,13 +99,13 @@ pub const CHILD_FD: std::os::unix::io::RawFd = 3;
 /// server process.
 ///
 /// Aliased so that call sites which only pass the handle along do not
-/// need to be `cfg`-gated: on platforms or builds without an isolated
+/// need to be `cfg`-gated: on platforms without an isolated
 /// host the alias degrades to a unit that is always `None`.
-#[cfg(all(unix, feature = "lua"))]
+#[cfg(unix)]
 pub type ScriptHostHandle = Option<std::sync::Arc<script_host::ScriptHost>>;
 
-/// See the `unix` + `lua` variant of this alias.
-#[cfg(not(all(unix, feature = "lua")))]
+/// See the `unix` variant of this alias.
+#[cfg(not(unix))]
 pub type ScriptHostHandle = Option<()>;
 
 /// A shared handle to the feed fetcher, or `None` when feeds are fetched

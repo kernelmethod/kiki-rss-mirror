@@ -43,8 +43,8 @@ pub struct SharedAppState {
     /// [`crate::plugins::runtime`].
     pub plugins: Arc<plugins::runtime::PluginRuntime>,
 
-    /// Shared handle to the currently-installed scripting engine. Empty when the `lua`
-    /// feature is disabled or when no scripts have been loaded.
+    /// Shared handle to the currently-installed scripting engine. Empty when no scripts
+    /// have been loaded.
     pub script_runner: ScriptRunnerHandle,
 
     /// The server's settings, backed by the config file. The settings
@@ -883,7 +883,7 @@ pub struct Liveness {
     // accessors below report `InProcess` without looking at them.
     #[cfg_attr(not(unix), allow(dead_code))]
     feed_fetcher: crate::process::FeedFetcherHandle,
-    #[cfg_attr(not(all(unix, feature = "lua")), allow(dead_code))]
+    #[cfg_attr(not(unix), allow(dead_code))]
     script_host: crate::process::ScriptHostHandle,
     workers: tokio::sync::watch::Receiver<usize>,
 }
@@ -904,7 +904,7 @@ impl Liveness {
 
     /// The state of the isolated script host.
     pub fn script_host(&self) -> ComponentState {
-        #[cfg(all(unix, feature = "lua"))]
+        #[cfg(unix)]
         if let Some(host) = &self.script_host {
             return if host.is_alive() {
                 ComponentState::Ok

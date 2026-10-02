@@ -1,11 +1,7 @@
-#[cfg(feature = "lua")]
 use crate::metrics::Metrics;
 use crate::scripting::ScriptRunner;
-#[cfg(feature = "lua")]
 use crate::scripting::{ScriptRunnerHandle, ScriptSource};
-#[cfg(feature = "lua")]
 use std::sync::Arc;
-#[cfg(feature = "lua")]
 use tracing::warn;
 
 /// Dispatch `fetch.error` to the scripting engine, if one is installed.
@@ -53,7 +49,6 @@ pub(super) fn fire_fetch_success(
 }
 
 /// Error returned when plugins could not be loaded into a script runner.
-#[cfg(feature = "lua")]
 #[derive(Debug, thiserror::Error)]
 pub enum LoadPluginsError {
     /// A plugin's code failed to compile or its top-level chunk failed to run. The
@@ -91,7 +86,6 @@ pub enum LoadPluginsError {
 /// if the script host has gone away.
 ///
 /// [`SubprocessScriptRunner`]: crate::process::script_host::SubprocessScriptRunner
-#[cfg(feature = "lua")]
 pub fn load_script_runner(
     discovery: &crate::plugins::Discovery,
     metrics: &Metrics,
@@ -108,7 +102,7 @@ pub fn load_script_runner(
     // ingested entry two IPC round trips that could only ever be no-ops.
     let empty = sources.is_empty();
 
-    #[cfg(all(unix, feature = "lua"))]
+    #[cfg(unix)]
     if let Some(host) = host {
         use crate::process::script_host::SubprocessScriptRunner;
 
@@ -170,7 +164,6 @@ pub fn load_script_runner(
 }
 
 /// Dispatch `plugin.load` to the runner in `handle`, if there is one.
-#[cfg(feature = "lua")]
 fn fire_plugin_load(handle: &ScriptRunnerHandle) {
     if let Some(runner) = handle.current() {
         runner.dispatch_observe(
@@ -181,7 +174,6 @@ fn fire_plugin_load(handle: &ScriptRunnerHandle) {
 }
 
 /// Read the source of every enabled Lua plugin in `discovery`.
-#[cfg(feature = "lua")]
 pub(super) fn load_lua_sources(discovery: &crate::plugins::Discovery) -> Vec<ScriptSource> {
     crate::plugins::load_sources(discovery, crate::plugins::PluginEngine::Lua)
 }

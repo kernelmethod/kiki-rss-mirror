@@ -17,7 +17,6 @@ mod worker;
 pub(crate) use backoff::same_origin;
 pub use command::TaskManagerCommand;
 pub use error::FetchError;
-#[cfg(feature = "lua")]
 pub use scripting::{load_script_runner, LoadPluginsError};
 pub use worker::{spawn_workers, worker_count};
 
