@@ -10,23 +10,26 @@
 //! * **Landlock** restricts filesystem access to the paths the profile
 //!   actually needs — for the server that is the data directory holding
 //!   the SQLite DB and cached assets, the Unix socket's parent directory,
-//!   SQLite's temp directory (normally inside the data directory), and a
-//!   small read-only set of system paths needed for DNS. The feed fetcher,
-//!   which makes all of Kiki's HTTP(S) requests, gets only the TLS trust
-//!   stores (it has the server resolve hostnames for it), and the script
+//!   SQLite's temp directory (normally inside the data directory), and
+//!   time zone data. The feed fetcher, which makes all of Kiki's HTTP(S)
+//!   requests, gets only the TLS trust stores, its resolver only the
+//!   resolver's configuration, and the feed fetcher's parser, the script
 //!   host and the web UI get *nothing at all*. Where the kernel
 //!   supports it (Linux 6.12+), every profile is also barred from
 //!   reaching abstract Unix sockets outside its own sandbox, and every
 //!   profile but the web UI from signalling processes outside it — its
 //!   own children, whose sandboxes nest inside its own, excepted. The
-//!   feed fetcher is barred from binding TCP ports, and the web UI from
-//!   binding or connecting to them.
+//!   feed fetcher is barred from binding TCP ports, its resolver from
+//!   binding them or connecting to any but DNS's, and its parser and the
+//!   web UI from binding or connecting to them.
 //! * **seccomp-bpf** blocks a denylist of syscalls the profile never uses
 //!   (`ptrace`, `mount`, `unshare`, `bpf`, `kexec_load`, module loading,
 //!   `io_uring`, `userfaultfd`, and friends; plus, for the server,
-//!   creating any socket but a Unix, IPv4 or IPv6 one; for the script
-//!   host, every socket call; for the feed fetcher, binding, listening,
-//!   accepting, and creating Unix sockets; and for the web UI, binding,
+//!   creating any socket but a Unix one; for the script host and the
+//!   feed fetcher's parser, every socket call; for the feed fetcher,
+//!   binding, listening, accepting, and creating Unix sockets; for its
+//!   resolver, listening, accepting, and creating any socket but an IPv4
+//!   or IPv6 one; and for the web UI, binding,
 //!   listening, and creating any socket but a Unix one).
 //!   The default action for unmatched syscalls is `Allow` — this is a
 //!   defence-in-depth layer that eliminates the most dangerous escape
@@ -43,7 +46,8 @@
 //! the children, before they read their first byte of IPC; for the web
 //! UI, before it accepts its first connection. They are
 //! inherited by every thread and task spawned later, and by the feed
-//! fetcher's forked workers. The server installs them one at a time, with
+//! fetcher's forked worker, parser and resolver, each of which adds a
+//! stricter set of its own on top. The server installs them one at a time, with
 //! its children started in between; see [`restrict_filesystem`].
 //!
 //! On non-Linux platforms [`apply`] is a no-op that logs a warning.
@@ -57,16 +61,16 @@ use std::path::PathBuf;
 /// set of privileges to inherit by accident.
 pub enum SandboxProfile {
     /// The main `kiki serve` process: owns the SQLite database, the asset
-    /// cache, and the listening socket, and resolves hostnames for the
-    /// feed fetcher. It makes no HTTP(S) requests of its own, may create
-    /// only Unix, IPv4 and IPv6 sockets, and may signal no process but
-    /// itself and its children.
+    /// cache, and the listening socket. It makes no network connections of
+    /// its own — no HTTP(S) requests and no DNS lookups — may create only
+    /// Unix sockets, and may signal no process but itself and its
+    /// children.
     ///
     /// Its children are started under its filesystem rules (see
     /// [`restrict_filesystem`]), so besides the paths below it is granted
     /// what they need: to read and execute the kiki executable and the
     /// libraries it loads, to open `/dev/null`, and to read the TLS trust
-    /// stores.
+    /// stores and the resolver's configuration.
     Server {
         /// Directory containing the SQLite database, its WAL/SHM
         /// companions, and the cached assets tree. Granted read-write
@@ -94,17 +98,57 @@ pub enum SandboxProfile {
     /// and is used through plain `read`/`write`.
     ScriptHost,
 
-    /// The feed fetcher: retrieves feeds over HTTP(S) and parses them,
-    /// downloads their assets and favicons, and talks to the server over an
-    /// inherited socket pair.
+    /// The feed fetcher's supervisor: talks to the server over an
+    /// inherited socket pair, and forks the processes that do the
+    /// fetcher's work, each of which installs a profile of its own on top
+    /// of this one — [`Self::FeedWorker`], [`Self::FeedParser`] and
+    /// [`Self::FeedResolver`].
     ///
-    /// This profile grants read-only access to the TLS trust stores and
-    /// nothing else — no data directory, no resolver configuration, no
-    /// `/proc`; the server resolves hostnames on its behalf. It may make
-    /// outbound TCP connections, but may not bind, listen for or accept
-    /// them, or create a Unix socket: the last keeps it away from the
-    /// server's API socket, whose only access control is reachability.
+    /// A process forked from it can have no more than it has, so this
+    /// profile holds what its children need between them, and no more:
+    /// read-only access to the TLS trust stores and the resolver's
+    /// configuration, and nothing else — no data directory, no `/proc`.
+    /// It may make outbound connections, and bind UDP sockets, which the
+    /// resolver needs, but may not bind TCP ports, listen for or accept
+    /// connections, or create a Unix socket: the last keeps the fetcher's
+    /// processes away from the server's API socket, whose only access
+    /// control is reachability.
     FeedFetcher,
+
+    /// The feed fetcher's worker: retrieves feeds over HTTP(S), downloads
+    /// their assets and favicons, and hands what it downloads to the
+    /// parser, all through the supervisor.
+    ///
+    /// Forked from the supervisor, it installs this profile on top of
+    /// [`Self::FeedFetcher`], which takes away what only the resolver
+    /// needs: it may read the TLS trust stores and nothing else, and may
+    /// not bind any socket.
+    FeedWorker,
+
+    /// The feed fetcher's parser: parses what the fetcher downloads —
+    /// feeds, web pages, SVG images, entries' HTML — and talks to the
+    /// fetcher's supervisor over a socket pair it inherited, nothing else.
+    ///
+    /// Forked from the feed fetcher's supervisor, it starts out under the
+    /// [`Self::FeedFetcher`] profile and installs this one on top, which
+    /// takes away what parsing does not need: like the script host's, it
+    /// grants **no filesystem access whatsoever**, denies every syscall
+    /// that could open a socket, and bars TCP binds and connections — so
+    /// a parser compromised by a hostile feed can reach neither the
+    /// network nor any file.
+    FeedParser,
+
+    /// The feed fetcher's resolver: looks up hostnames for the worker with
+    /// the C library's resolver, and talks to the fetcher's supervisor over
+    /// a socket pair it inherited.
+    ///
+    /// Forked from the supervisor, it installs this profile on top of
+    /// [`Self::FeedFetcher`]. It may read the resolver's configuration
+    /// files and nothing else, create only IPv4 and IPv6 sockets, and make
+    /// TCP connections only to port 53. With no Unix sockets it cannot
+    /// reach the server's API socket — nor a local resolver daemon, so
+    /// lookups go to the name servers in `resolv.conf`.
+    FeedResolver,
 
     /// The `kiki web` UI: accepts browser connections on a TCP listener it
     /// bound before the sandbox went up, and turns each request into calls
@@ -166,6 +210,30 @@ impl SandboxConfig {
         }
     }
 
+    /// Configuration for the feed fetcher's worker process.
+    pub fn feed_worker(log_only: bool) -> Self {
+        SandboxConfig {
+            profile: SandboxProfile::FeedWorker,
+            log_only,
+        }
+    }
+
+    /// Configuration for the feed fetcher's parser process.
+    pub fn feed_parser(log_only: bool) -> Self {
+        SandboxConfig {
+            profile: SandboxProfile::FeedParser,
+            log_only,
+        }
+    }
+
+    /// Configuration for the feed fetcher's resolver process.
+    pub fn feed_resolver(log_only: bool) -> Self {
+        SandboxConfig {
+            profile: SandboxProfile::FeedResolver,
+            log_only,
+        }
+    }
+
     /// Configuration for the `kiki web` UI process.
     pub fn web_ui(log_only: bool) -> Self {
         SandboxConfig {
@@ -180,6 +248,9 @@ impl SandboxConfig {
             SandboxProfile::Server { .. } => "server",
             SandboxProfile::ScriptHost => "script-host",
             SandboxProfile::FeedFetcher => "feed-fetcher",
+            SandboxProfile::FeedWorker => "feed-worker",
+            SandboxProfile::FeedParser => "feed-parser",
+            SandboxProfile::FeedResolver => "feed-resolver",
             SandboxProfile::WebUi => "web-ui",
         }
     }

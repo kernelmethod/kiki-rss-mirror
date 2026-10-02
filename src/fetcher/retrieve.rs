@@ -1,6 +1,8 @@
 //! The HTTP half of a feed fetch.
 
-use super::{parse_off_thread, FetchReply, FetchSpec, FetchedBody, ResponseHeaders, MAX_REDIRECTS};
+use super::{
+    FetchReply, FetchSpec, FetchedBody, ParseFailure, Parsers, ResponseHeaders, MAX_REDIRECTS,
+};
 use crate::http::{read_body_capped, CappedBody, FeedAuthType};
 use crate::tasks::same_origin;
 use reqwest::Url;
@@ -8,14 +10,23 @@ use std::time::Duration;
 use tracing::debug;
 
 /// Fetch the feed described by `spec`, following redirects by hand, and
-/// parse the body if the server answered `200 OK`.
+/// have `parsers` parse the body if the server answered `200 OK`.
 ///
 /// Redirects are followed here rather than by reqwest so that credentials
 /// are only ever sent to the feed's own origin, and so that a permanent
 /// redirect can be reported back for the stored URL to be updated.
 ///
-/// Never fails: every way a fetch can end is a [`FetchReply`] variant.
-pub async fn retrieve(client: &reqwest::Client, spec: &FetchSpec) -> FetchReply {
+/// Every way a fetch can end is a [`FetchReply`] variant.
+///
+/// # Errors
+///
+/// Fails only if the body could not be parsed at all; see
+/// [`Parsers::run`].
+pub async fn retrieve(
+    client: &reqwest::Client,
+    parsers: &Parsers,
+    spec: &FetchSpec,
+) -> Result<FetchReply, ParseFailure> {
     let feed_id = spec.feed_id;
     let feed_url = spec.url.as_str();
     let timeout = Duration::from_secs(spec.timeout_secs);
@@ -52,11 +63,11 @@ pub async fn retrieve(client: &reqwest::Client, spec: &FetchSpec) -> FetchReply 
             let resp = match request.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    return FetchReply::Network {
+                    return Ok(FetchReply::Network {
                         message: format!("{}", e),
                         timeout: e.is_timeout(),
                         redirects,
-                    };
+                    });
                 }
             };
 
@@ -64,9 +75,9 @@ pub async fn retrieve(client: &reqwest::Client, spec: &FetchSpec) -> FetchReply 
             {
                 let Some(location) = resp.headers().get("location").and_then(|h| h.to_str().ok())
                 else {
-                    return FetchReply::Failed {
+                    return Ok(FetchReply::Failed {
                         message: "Redirect response missing Location header".to_string(),
-                    };
+                    });
                 };
 
                 // 301 Moved Permanently and 308 Permanent Redirect both
@@ -82,9 +93,9 @@ pub async fn retrieve(client: &reqwest::Client, spec: &FetchSpec) -> FetchReply 
                 match Url::parse(&current_url).and_then(|base| base.join(location)) {
                     Ok(next) => current_url = next.to_string(),
                     Err(e) => {
-                        return FetchReply::Failed {
+                        return Ok(FetchReply::Failed {
                             message: format!("{}", e),
-                        }
+                        })
                     }
                 }
                 redirects += 1;
@@ -94,23 +105,23 @@ pub async fn retrieve(client: &reqwest::Client, spec: &FetchSpec) -> FetchReply 
             break 'redirect resp;
         }
 
-        return FetchReply::TooManyRedirects { redirects };
+        return Ok(FetchReply::TooManyRedirects { redirects });
     };
 
     match resp.status() {
         reqwest::StatusCode::NOT_MODIFIED => {
-            return FetchReply::NotModified {
+            return Ok(FetchReply::NotModified {
                 headers: ResponseHeaders::capture(resp.headers()),
                 redirects,
-            };
+            });
         }
         reqwest::StatusCode::OK => {}
         status => {
-            return FetchReply::HttpStatus {
+            return Ok(FetchReply::HttpStatus {
                 status: status.as_u16(),
                 headers: ResponseHeaders::capture(resp.headers()),
                 redirects,
-            };
+            });
         }
     }
 
@@ -122,24 +133,24 @@ pub async fn retrieve(client: &reqwest::Client, spec: &FetchSpec) -> FetchReply 
     let content = match read_body_capped(resp, spec.max_feed_bytes).await {
         Ok(CappedBody::Complete(bytes)) => bytes,
         Ok(CappedBody::TooLarge { seen }) => {
-            return FetchReply::BodyTooLarge {
+            return Ok(FetchReply::BodyTooLarge {
                 final_url: current_url,
                 seen,
                 redirects,
-            };
+            });
         }
         Err(e) => {
-            return FetchReply::Failed {
+            return Ok(FetchReply::Failed {
                 message: format!("{}", e),
-            }
+            })
         }
     };
 
     let body_len = content.len() as u64;
     let body_hash = blake3::hash(&content).to_hex().to_string();
-    let parsed = parse_off_thread(feed_id, content).await;
+    let parsed = parsers.feed(feed_id, content).await?;
 
-    FetchReply::Body(Box::new(FetchedBody {
+    Ok(FetchReply::Body(Box::new(FetchedBody {
         final_url: current_url,
         permanent_redirect,
         redirects,
@@ -147,5 +158,5 @@ pub async fn retrieve(client: &reqwest::Client, spec: &FetchSpec) -> FetchReply 
         body_len,
         body_hash,
         parsed,
-    }))
+    })))
 }

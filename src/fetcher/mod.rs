@@ -16,11 +16,18 @@
 //! handle and no writable filesystem. [`Fetcher`] hides which of the two
 //! places the work actually happens in, so callers do not change.
 //!
+//! Within that work, downloading and parsing are split once more: the
+//! functions that download take a [`Parsers`] and hand it everything they
+//! need parsed — a feed body, an SVG image, a web page, an entry's HTML —
+//! so that in the isolated fetcher the parsing happens in a process of its
+//! own, with no network access; see [`parsing`].
+//!
 //! Everything that crosses the process boundary is plain data, and all of
 //! it is `Serialize` + `Deserialize` so it can be sent over the IPC channel.
 
 pub mod assets;
 pub mod parse;
+pub mod parsing;
 pub mod retrieve;
 pub mod svg;
 
@@ -33,6 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use parse::parse_feed;
+pub use parsing::{ParseFailure, Parsers};
 pub use retrieve::retrieve;
 
 /// How many redirects a single fetch follows before giving up.
@@ -442,7 +450,8 @@ pub enum FetcherError {
 
     /// The isolated fetcher's worker died while serving this request and
     /// nothing else, even when it was retried on its own: the request
-    /// itself is what kills it. Carries how the worker died.
+    /// itself is what kills it. The same goes for the parser process and
+    /// what the request gave it to parse. Carries how the process died.
     #[error("{0} while handling only this request")]
     Crashed(String),
 
@@ -497,7 +506,9 @@ impl Fetcher {
     /// itself could not serve the request; see [`FetcherError`].
     pub async fn fetch(&self, spec: FetchSpec) -> Result<FetchReply, FetcherError> {
         match self {
-            Fetcher::InProcess { feeds, .. } => Ok(fetch_with(feeds, &spec).await),
+            Fetcher::InProcess { feeds, .. } => {
+                Ok(fetch_with(feeds, &Parsers::InProcess, &spec).await?)
+            }
             #[cfg(unix)]
             Fetcher::Isolated(host) => host.fetch(spec).await,
         }
@@ -511,7 +522,7 @@ impl Fetcher {
     /// As for [`Self::fetch`].
     pub async fn parse(&self, feed_id: i64, body: Vec<u8>) -> Result<ParseOutcome, FetcherError> {
         match self {
-            Fetcher::InProcess { .. } => Ok(parse_off_thread(feed_id, body).await),
+            Fetcher::InProcess { .. } => Ok(Parsers::InProcess.feed(feed_id, body).await?),
             #[cfg(unix)]
             Fetcher::Isolated(host) => host.parse(feed_id, body).await,
         }
@@ -527,7 +538,7 @@ impl Fetcher {
         match self {
             Fetcher::InProcess {
                 assets: clients, ..
-            } => Ok(assets::fetch_asset(clients, &spec).await),
+            } => Ok(assets::fetch_asset(clients, &Parsers::InProcess, &spec).await?),
             #[cfg(unix)]
             Fetcher::Isolated(host) => host.fetch_asset(spec).await,
         }
@@ -542,7 +553,7 @@ impl Fetcher {
         match self {
             Fetcher::InProcess {
                 assets: clients, ..
-            } => Ok(assets::find_page_icons(clients, &spec).await),
+            } => Ok(assets::find_page_icons(clients, &Parsers::InProcess, &spec).await?),
             #[cfg(unix)]
             Fetcher::Isolated(host) => host.find_page_icons(spec).await,
         }
@@ -560,10 +571,9 @@ impl Fetcher {
         base: &reqwest::Url,
     ) -> Result<Vec<String>, FetcherError> {
         match self {
-            Fetcher::InProcess { .. } => Ok(assets::extract_asset_urls(&content, base)
-                .into_iter()
-                .map(String::from)
-                .collect()),
+            Fetcher::InProcess { .. } => {
+                Ok(Parsers::InProcess.images(content, base.to_string()).await?)
+            }
             #[cfg(unix)]
             Fetcher::Isolated(host) => host.extract_images(content, base.to_string()).await,
         }
@@ -677,34 +687,34 @@ pub fn apply_proxy(
     Ok(builder.proxy(reqwest::Proxy::all(url.trim())?.no_proxy(no_proxy)))
 }
 
-/// Fetch `spec` with the client for its proxy settings.
-pub async fn fetch_with(clients: &ProxiedClient, spec: &FetchSpec) -> FetchReply {
-    match clients.get(&spec.proxy) {
-        Ok(client) => retrieve(&client, spec).await,
-        // Settings are validated before they reach a fetch, so this is
-        // not expected; the error is not shown as it may contain the URL.
-        Err(_) => FetchReply::Failed {
-            message: "could not configure the HTTP client for the proxy".to_string(),
-        },
+impl From<ParseFailure> for FetcherError {
+    fn from(failure: ParseFailure) -> Self {
+        match failure {
+            ParseFailure::Crashed(why) => FetcherError::Crashed(why),
+            ParseFailure::Unavailable(message) => FetcherError::Unavailable(message),
+        }
     }
 }
 
-/// Run [`parse_feed`] on the blocking pool, timing it.
+/// Fetch `spec` with the client for its proxy settings, having `parsers`
+/// parse the body.
 ///
-/// Parsing a large feed is CPU-bound, so it stays off the async workers.
-/// A panic in the parser is reported as an unparseable body rather than
-/// propagated.
-pub async fn parse_off_thread(feed_id: i64, body: Vec<u8>) -> ParseOutcome {
-    let start = std::time::Instant::now();
-    let feed = tokio::task::spawn_blocking(move || parse_feed(feed_id, &body))
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("Feed {}: parser failed: {}", feed_id, e);
-            None
-        });
-    ParseOutcome {
-        feed,
-        seconds: start.elapsed().as_secs_f64(),
+/// # Errors
+///
+/// Fails only if the body could not be parsed at all; see
+/// [`Parsers::run`].
+pub async fn fetch_with(
+    clients: &ProxiedClient,
+    parsers: &Parsers,
+    spec: &FetchSpec,
+) -> Result<FetchReply, ParseFailure> {
+    match clients.get(&spec.proxy) {
+        Ok(client) => retrieve(&client, parsers, spec).await,
+        // Settings are validated before they reach a fetch, so this is
+        // not expected; the error is not shown as it may contain the URL.
+        Err(_) => Ok(FetchReply::Failed {
+            message: "could not configure the HTTP client for the proxy".to_string(),
+        }),
     }
 }
 
@@ -808,7 +818,9 @@ pub(crate) mod tests {
             url: Some(format!("http://{addr}")),
             no_proxy: None,
         };
-        let reply = fetch_with(&clients, &proxied_spec(proxy.clone())).await;
+        let reply = fetch_with(&clients, &Parsers::InProcess, &proxied_spec(proxy.clone()))
+            .await
+            .unwrap();
         assert!(matches!(reply, FetchReply::Body(_)), "got {reply:?}");
 
         // Hosts listed in `no_proxy` are fetched directly, and so fail.
@@ -816,7 +828,9 @@ pub(crate) mod tests {
             no_proxy: Some("localhost, feed.invalid".into()),
             ..proxy
         };
-        let reply = fetch_with(&clients, &proxied_spec(bypassed)).await;
+        let reply = fetch_with(&clients, &Parsers::InProcess, &proxied_spec(bypassed))
+            .await
+            .unwrap();
         assert!(matches!(reply, FetchReply::Network { .. }), "got {reply:?}");
     }
 
@@ -831,14 +845,18 @@ pub(crate) mod tests {
             url: Some(format!("socks5h://{addr}")),
             no_proxy: None,
         };
-        let reply = fetch_with(&clients, &proxied_spec(proxy)).await;
+        let reply = fetch_with(&clients, &Parsers::InProcess, &proxied_spec(proxy))
+            .await
+            .unwrap();
         assert!(matches!(reply, FetchReply::Body(_)), "got {reply:?}");
 
         let local_dns = ProxySettings {
             url: Some(format!("socks5://{addr}")),
             no_proxy: None,
         };
-        let reply = fetch_with(&clients, &proxied_spec(local_dns)).await;
+        let reply = fetch_with(&clients, &Parsers::InProcess, &proxied_spec(local_dns))
+            .await
+            .unwrap();
         assert!(matches!(reply, FetchReply::Network { .. }), "got {reply:?}");
     }
 

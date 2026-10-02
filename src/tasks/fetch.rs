@@ -383,9 +383,9 @@ fn store_refresh(
             rec.outcome("fetcher_gone");
             return Ok(());
         }
-        // The feed is what kills the fetcher's worker: it waits the full
-        // backoff cap, like any other permanent error, rather than
-        // crashing the worker again at the next opportunity.
+        // The feed is what kills the fetcher's worker, or its parser: it
+        // waits the full backoff cap, like any other permanent error,
+        // rather than crashing it again at the next opportunity.
         Err(FetcherError::Crashed(message)) => {
             let url = row.url.clone();
             rec.fail(
