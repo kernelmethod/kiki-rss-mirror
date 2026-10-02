@@ -34,7 +34,7 @@ pub struct ServeArgs {
     no_sandbox: bool,
 
     /// Run the seccomp filter in log-only mode instead of killing on
-    /// violation. Useful when tightening the denylist or diagnosing an
+    /// violation. Useful when tightening the allowlist or diagnosing an
     /// unexpected SIGSYS in production. Landlock is unaffected.
     #[arg(long)]
     seccomp_log_only: bool,

@@ -22,19 +22,23 @@
 //!   feed fetcher is barred from binding TCP ports, its resolver from
 //!   binding them or connecting to any but DNS's, and its parser and the
 //!   web UI from binding or connecting to them.
-//! * **seccomp-bpf** blocks a denylist of syscalls the profile never uses
-//!   (`ptrace`, `mount`, `unshare`, `bpf`, `kexec_load`, module loading,
-//!   `io_uring`, `userfaultfd`, and friends; plus, for the server,
-//!   creating any socket but a Unix one; for the script host and the
-//!   feed fetcher's parser, every socket call; for the feed fetcher,
-//!   binding, listening, accepting, and creating Unix sockets; for its
-//!   resolver, listening, accepting, and creating any socket but an IPv4
-//!   or IPv6 one; and for the web UI, binding,
-//!   listening, and creating any socket but a Unix one).
-//!   The default action for unmatched syscalls is `Allow` — this is a
-//!   defence-in-depth layer that eliminates the most dangerous escape
-//!   primitives without risking that a benign syscall we forgot about
-//!   will kill the process.
+//! * **seccomp-bpf** allows only the syscalls the profile uses, and kills
+//!   the process on any other — so `execve`, `ptrace`, `mount`,
+//!   `unshare`, `bpf`, module loading, `io_uring`, `userfaultfd` and the
+//!   rest of the kernel's surface are out of reach without being named.
+//!   Every profile gets what the runtime needs for memory, threads,
+//!   signals, time and the descriptors it holds; on top of that, the
+//!   server may change files, make Unix sockets, and bind, listen and
+//!   accept on them; the feed fetcher's worker may make and connect IPv4
+//!   and IPv6 sockets, its resolver bind them too, and its supervisor
+//!   whatever the three of those may, and fork and sandbox them; the web
+//!   UI may accept on its listener and make and connect Unix sockets; and
+//!   the script host and the feed fetcher's parser may make no socket at
+//!   all. A few allowed calls are narrowed by their arguments: `clone`
+//!   may not create namespaces (`clone3`, whose flags seccomp cannot see,
+//!   fails with `ENOSYS`, and the C library falls back to `clone`),
+//!   `ioctl` is limited to a handful of harmless requests, and `socket`
+//!   to the address families above.
 //! * **`PR_SET_MDWE`** (Linux 6.3+) makes the kernel refuse memory that is
 //!   writable and executable, and refuse making any mapping executable
 //!   that was not already, so injected code cannot be written and then
