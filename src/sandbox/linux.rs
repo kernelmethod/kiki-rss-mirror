@@ -579,6 +579,10 @@ const ALLOWED_COMMON: &[i64] = &[
     libc::SYS_rt_sigreturn,
     libc::SYS_sigaltstack,
     libc::SYS_tgkill,
+    // How the kernel resumes a sleep or wait a signal interrupted — a
+    // `clock_nanosleep`, say — once the handler returns. Seccomp sees it
+    // like any other syscall.
+    libc::SYS_restart_syscall,
     // Time.
     libc::SYS_clock_gettime,
     libc::SYS_clock_getres,
@@ -639,6 +643,9 @@ const ALLOWED_EVENT_LOOP: &[i64] = &[
     libc::SYS_epoll_pwait2,
     libc::SYS_eventfd2,
     libc::SYS_pipe2,
+    // tokio's signal handling wakes the runtime over a socket pair it
+    // makes when the runtime starts.
+    libc::SYS_socketpair,
     #[cfg(target_arch = "x86_64")]
     libc::SYS_epoll_wait,
 ];
@@ -646,9 +653,12 @@ const ALLOWED_EVENT_LOOP: &[i64] = &[
 /// Syscalls for making sockets of the profile's own and connecting them.
 /// Which address families it may make them in is narrowed separately: see
 /// [`socket_domains`].
+///
+/// Not granted to the server, which binds its API socket before its filter
+/// goes up, and the service manager's notification socket is connected
+/// before that: from then on it only accepts connections.
 const ALLOWED_SOCKETS: &[i64] = &[
     libc::SYS_socket,
-    libc::SYS_socketpair,
     libc::SYS_connect,
     libc::SYS_getsockname,
     libc::SYS_getpeername,
@@ -658,20 +668,19 @@ const ALLOWED_SOCKETS: &[i64] = &[
     libc::SYS_recvmmsg,
 ];
 
-/// Binding a socket to an address. The server binds its API socket, and
-/// musl's resolver binds every UDP socket it sends a query from (to port
-/// 0), so the feed fetcher's resolver may bind too — and so may its
-/// supervisor, as a process forked from it can do nothing the supervisor
-/// may not. Landlock denies the two of them TCP binds where the kernel
-/// supports it (6.7+).
+/// Binding a socket to an address. musl's resolver binds every UDP socket
+/// it sends a query from (to port 0), so the feed fetcher's resolver may
+/// bind — and so may its supervisor, as a process forked from it can do
+/// nothing the supervisor may not. Landlock denies the two of them TCP
+/// binds where the kernel supports it (6.7+).
+///
+/// No profile may `listen`: the server's API socket and the web UI's
+/// listener are both listening before their filters go up.
 const ALLOWED_BIND: &[i64] = &[libc::SYS_bind];
 
-/// Listening on a bound socket. Only the server does: the web UI's
-/// listener is listening before its sandbox goes up.
-const ALLOWED_LISTEN: &[i64] = &[libc::SYS_listen];
-
 /// Accepting connections on a listening socket, for the server's API
-/// socket and the web UI's listener. `accept` is a distinct syscall only on
+/// socket and the web UI's listener, both bound and listening before the
+/// sandbox goes up. `accept` is a distinct syscall only on
 /// the architectures that predate `accept4`.
 const ALLOWED_ACCEPT: &[i64] = &[
     libc::SYS_accept4,
@@ -791,9 +800,6 @@ fn allowed_syscalls(profile: &SandboxProfile) -> Vec<i64> {
     let extra: &[&[i64]] = match profile {
         SandboxProfile::Server { .. } => &[
             ALLOWED_EVENT_LOOP,
-            ALLOWED_SOCKETS,
-            ALLOWED_BIND,
-            ALLOWED_LISTEN,
             ALLOWED_ACCEPT,
             ALLOWED_FILE_WRITES,
             ALLOWED_CHILDREN,
@@ -830,13 +836,6 @@ fn allowed_syscalls(profile: &SandboxProfile) -> Vec<i64> {
     allowed
 }
 
-/// The only address family the server may create sockets in: Unix, for
-/// its API listener and the service manager's notification socket. It
-/// makes no network connections of its own — the feed fetcher downloads
-/// everything, and its resolver looks every hostname up — so everything
-/// else, IPv4 and IPv6 included, is refused.
-const SERVER_SOCKET_FAMILIES: &[i32] = &[libc::AF_UNIX];
-
 /// The only address families the feed fetcher's processes may create
 /// sockets in: IPv4 and IPv6, for HTTP(S) requests, and for DNS queries
 /// sent straight to a name server.
@@ -863,13 +862,14 @@ const WEB_UI_SOCKET_FAMILIES: &[i32] = &[libc::AF_UNIX];
 /// [`ALLOWED_SOCKETS`] is granted to.
 fn socket_domains(profile: &SandboxProfile) -> Option<&'static [i32]> {
     match profile {
-        SandboxProfile::Server { .. } => Some(SERVER_SOCKET_FAMILIES),
         SandboxProfile::FeedFetcher | SandboxProfile::FeedWorker | SandboxProfile::FeedResolver => {
             Some(FETCHER_SOCKET_FAMILIES)
         }
         SandboxProfile::WebUi => Some(WEB_UI_SOCKET_FAMILIES),
         // `socket` is not on their allowlist at all.
-        SandboxProfile::ScriptHost | SandboxProfile::FeedParser => None,
+        SandboxProfile::Server { .. } | SandboxProfile::ScriptHost | SandboxProfile::FeedParser => {
+            None
+        }
     }
 }
 
@@ -1237,29 +1237,31 @@ mod tests {
     }
 
     /// The script host and the feed fetcher's parser may make no socket of
-    /// their own, nor attach the ones they have to a peer.
+    /// their own, nor attach the ones they have to a peer; and every
+    /// profile that may make sockets has its address families narrowed.
     #[test]
-    fn only_the_script_host_and_the_parser_may_not_make_sockets() {
+    fn the_script_host_and_the_parser_may_not_make_sockets() {
         for profile in every_profile() {
             let allowed = allowed_syscalls(&profile);
-            let isolated = matches!(
+            if matches!(
                 profile,
                 SandboxProfile::ScriptHost | SandboxProfile::FeedParser
-            );
-            for nr in [
-                libc::SYS_socket,
-                libc::SYS_socketpair,
-                libc::SYS_connect,
-                libc::SYS_bind,
-                libc::SYS_listen,
-                libc::SYS_accept4,
-            ] {
-                if isolated {
+            ) {
+                for nr in [
+                    libc::SYS_socket,
+                    libc::SYS_socketpair,
+                    libc::SYS_connect,
+                    libc::SYS_bind,
+                    libc::SYS_listen,
+                    libc::SYS_accept4,
+                ] {
                     assert!(!allowed.contains(&nr), "{nr} allowed");
                 }
             }
-            assert_eq!(allowed.contains(&libc::SYS_socket), !isolated);
-            assert_eq!(socket_domains(&profile).is_some(), !isolated);
+            assert_eq!(
+                allowed.contains(&libc::SYS_socket),
+                socket_domains(&profile).is_some()
+            );
         }
     }
 
@@ -1423,11 +1425,33 @@ mod tests {
         assert_eq!(WEB_UI_SOCKET_FAMILIES, [libc::AF_UNIX]);
     }
 
-    /// The server keeps the families its API listener and the system
-    /// resolver need, and nothing else.
+    /// The server's API socket is bound and listening before its filter
+    /// goes up, so all it may do with sockets is accept connections.
     #[test]
-    fn the_server_may_only_create_unix_sockets() {
-        assert_eq!(SERVER_SOCKET_FAMILIES, [libc::AF_UNIX]);
+    fn the_server_may_accept_but_not_make_sockets() {
+        let allowed = allowed_syscalls(&SandboxProfile::Server {
+            data_dir: PathBuf::from("/var/lib/kiki"),
+            socket_dir: PathBuf::from("/var/lib/kiki"),
+            temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
+        });
+        assert!(allowed.contains(&libc::SYS_accept4));
+        for nr in [
+            libc::SYS_socket,
+            libc::SYS_connect,
+            libc::SYS_bind,
+            libc::SYS_listen,
+        ] {
+            assert!(!allowed.contains(&nr), "syscall {nr} allowed");
+        }
+    }
+
+    /// No profile may listen: the server and the web UI listen before
+    /// their filters go up.
+    #[test]
+    fn no_profile_may_listen() {
+        for profile in every_profile() {
+            assert!(!allowed_syscalls(&profile).contains(&libc::SYS_listen));
+        }
     }
 
     #[test]
