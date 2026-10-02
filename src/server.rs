@@ -61,6 +61,7 @@ pub type AppState = Arc<SharedAppState>;
 pub struct ServerBuilder<'a> {
     db_path: &'a Path,
     socket_path: Option<PathBuf>,
+    listener: Option<std::os::unix::net::UnixListener>,
     config_path: Option<PathBuf>,
     plugins_dir: Option<PathBuf>,
     autofetch: bool,
@@ -76,6 +77,7 @@ impl<'a> ServerBuilder<'a> {
         ServerBuilder {
             db_path,
             socket_path: None,
+            listener: None,
             config_path: None,
             plugins_dir: None,
             autofetch: false,
@@ -89,6 +91,18 @@ impl<'a> ServerBuilder<'a> {
 
     pub fn socket_path(mut self, p: &'a Path) -> Self {
         self.socket_path = Some(p.to_path_buf());
+        self
+    }
+
+    /// Serve the API on `listener`, already bound to the socket path with
+    /// [`bind_socket`], instead of binding it when the server starts.
+    ///
+    /// `kiki serve` binds its socket before it installs its seccomp
+    /// filter, so the filter need not allow creating or binding sockets.
+    /// The socket path should still be set with [`Self::socket_path`]:
+    /// the server removes the socket file there when it stops.
+    pub fn listener(mut self, listener: std::os::unix::net::UnixListener) -> Self {
+        self.listener = Some(listener);
         self
     }
 
@@ -180,6 +194,7 @@ impl<'a> ServerBuilder<'a> {
             plugins_dir,
             data_dir,
             socket_path,
+            listener: self.listener,
             autofetch: self.autofetch,
             single_threaded: self.single_threaded,
             worker_count: self.worker_count,
@@ -231,6 +246,10 @@ pub struct Server {
 
     /// Path of the Unix domain socket the server listens on.
     socket_path: PathBuf,
+
+    /// The socket, if the caller bound it already; see
+    /// [`ServerBuilder::listener`].
+    listener: Option<std::os::unix::net::UnixListener>,
 
     /// Whether or not to automatically fetch feed contents.
     autofetch: bool,
@@ -509,8 +528,12 @@ impl Server {
             ));
         }
 
-        claim_socket_path(&self.socket_path)?;
+        let listener = match self.listener {
+            Some(listener) => listener,
+            None => bind_socket(&self.socket_path)?,
+        };
         tokio::spawn(uds_server(
+            listener,
             self.socket_path,
             tx.clone(),
             db.clone(),
@@ -1147,9 +1170,54 @@ fn claim_socket_path(socket_path: &Path) -> Result<()> {
         .with_context(|| format!("Unable to delete stale socket file at {socket_path:?}"))
 }
 
+/// Bind the API's Unix domain socket at `socket_path`, clearing a stale
+/// socket file first, and make it readable and
+/// writable by its owner and group alone.
+///
+/// The listener is put in non-blocking mode, ready for the server's
+/// runtime to take over with [`ServerBuilder::listener`].
+///
+/// # Errors
+///
+/// Returns an error if the path cannot be claimed — another server is
+/// listening on it, say, or it is not a socket — or if the socket cannot
+/// be bound or its permissions set.
+///
+/// # Examples
+///
+/// ```no_run
+/// # fn main() -> anyhow::Result<()> {
+/// use std::path::Path;
+/// let socket = Path::new("/run/user/1000/kiki/kiki.sock");
+/// let listener = kiki_rss::server::bind_socket(socket)?;
+/// let server = kiki_rss::server::ServerBuilder::new(Path::new("kiki.db"))
+///     .socket_path(socket)
+///     .listener(listener)
+///     .build();
+/// # Ok(())
+/// # }
+/// ```
+pub fn bind_socket(socket_path: &Path) -> Result<std::os::unix::net::UnixListener> {
+    claim_socket_path(socket_path)?;
+    let listener = std::os::unix::net::UnixListener::bind(socket_path)
+        .with_context(|| format!("Unable to bind to Unix socket at {:?}", socket_path))?;
+
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660)).with_context(|| {
+        format!(
+            "Unable to set permissions on Unix socket at {:?}",
+            socket_path
+        )
+    })?;
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("Unable to configure Unix socket at {:?}", socket_path))?;
+    Ok(listener)
+}
+
 /// Parent function for the Unix domain socket web worker threads.
 #[allow(clippy::too_many_arguments)]
 async fn uds_server(
+    listener: std::os::unix::net::UnixListener,
     socket_path: PathBuf,
     tx: async_channel::Sender<TaskManagerCommand>,
     db: crate::db::Db,
@@ -1175,15 +1243,8 @@ async fn uds_server(
     });
     let app = routes::create_router(metrics).with_state(shared_state);
 
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("Unable to bind to Unix socket at {:?}", socket_path))?;
-
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o660)).with_context(|| {
-        format!(
-            "Unable to set permissions on Unix socket at {:?}",
-            socket_path
-        )
-    })?;
+    let listener = UnixListener::from_std(listener)
+        .with_context(|| format!("Unable to listen on Unix socket at {:?}", socket_path))?;
 
     let absolute_path = fs::canonicalize(&socket_path).unwrap_or(socket_path.clone());
     tracing::info!("Listening on {}", absolute_path.display());

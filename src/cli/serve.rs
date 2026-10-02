@@ -123,6 +123,11 @@ impl ServeArgs {
         #[cfg(all(unix, feature = "lua"))]
         let script_host = self.spawn_script_host()?;
 
+        // Bound before the syscall filter goes up, so that the filter need
+        // not let the server create, bind or listen on a socket at all.
+        // Landlock is already up, and grants the socket's directory.
+        let listener = server::bind_socket(&socket_path)?;
+
         if let Some(config) = &sandbox_config {
             sandbox::restrict_syscalls(config).context("failed to install sandbox")?;
             check_temp_dir_is_writable(&temp_dir)?;
@@ -137,14 +142,23 @@ impl ServeArgs {
             .autofetch()
             .feed_fetcher(feed_fetcher)
             .notifier(notifier)
-            .socket_path(&socket_path);
+            .socket_path(&socket_path)
+            .listener(listener);
         #[cfg(all(unix, feature = "lua"))]
         let builder = builder.script_host(script_host);
         let server = builder.build();
 
-        std::thread::spawn(|| server.run())
+        let result = std::thread::spawn(|| server.run())
             .join()
-            .map_err(|_| anyhow::anyhow!("panic in server thread"))?
+            .map_err(|_| anyhow::anyhow!("panic in server thread"))
+            .and_then(|r| r);
+        // A server that stops cleanly removes its socket file itself; one
+        // that failed — on a pending migration, say — may not have got far
+        // enough to, and the file is ours, as `bind_socket` succeeded.
+        if result.is_err() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+        result
     }
 
     /// Resolve the socket the server will listen on, from the flags and

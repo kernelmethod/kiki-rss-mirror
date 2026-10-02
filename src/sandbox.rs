@@ -28,8 +28,9 @@
 //!   rest of the kernel's surface are out of reach without being named.
 //!   Every profile gets what the runtime needs for memory, threads,
 //!   signals, time and the descriptors it holds; on top of that, the
-//!   server may change files, make Unix sockets, and bind, listen and
-//!   accept on them; the feed fetcher's worker may make and connect IPv4
+//!   server may change files and accept connections on its API socket,
+//!   which it binds before its filter goes up, but may make no socket of
+//!   its own; the feed fetcher's worker may make and connect IPv4
 //!   and IPv6 sockets, its resolver bind them too, and its supervisor
 //!   whatever the three of those may, and fork and sandbox them; the web
 //!   UI may accept on its listener and make and connect Unix sockets; and
@@ -46,7 +47,7 @@
 //!   systemd's `MemoryDenyWriteExecute=`.
 //!
 //! All three are installed before the process touches untrusted
-//! input — for the server, before it opens its listening socket(s); for
+//! input — for the server, just after it binds its listening socket; for
 //! the children, before they read their first byte of IPC; for the web
 //! UI, before it accepts its first connection. They are
 //! inherited by every thread and task spawned later, and by the feed
@@ -66,8 +67,9 @@ use std::path::PathBuf;
 pub enum SandboxProfile {
     /// The main `kiki serve` process: owns the SQLite database, the asset
     /// cache, and the listening socket. It makes no network connections of
-    /// its own — no HTTP(S) requests and no DNS lookups — may create only
-    /// Unix sockets, and may signal no process but itself and its
+    /// its own — no HTTP(S) requests and no DNS lookups — and once its
+    /// API socket is bound, before its seccomp filter goes up, may create
+    /// no socket at all, and may signal no process but itself and its
     /// children.
     ///
     /// Its children are started under its filesystem rules (see
