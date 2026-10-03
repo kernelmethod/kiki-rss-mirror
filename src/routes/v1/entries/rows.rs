@@ -10,8 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// The columns [`entry_from_row`] reads, in order, for the entries table
-/// aliased `e`. Columns selected after these start at index
-/// [`ENTRY_COLUMN_COUNT`].
+/// aliased `e`.
 pub(crate) fn entry_columns() -> String {
     format!(
         "e.id, e.feed_id, e.source_id, e.syndication_format, e.guid, e.published_at, \
@@ -20,9 +19,6 @@ pub(crate) fn entry_columns() -> String {
         favicon_hash_sql("e.feed_id")
     )
 }
-
-/// The number of columns in [`entry_columns`].
-pub(crate) const ENTRY_COLUMN_COUNT: usize = 12;
 
 /// Format a Unix timestamp as RFC3339, as entries' times are reported.
 pub(crate) fn rfc3339(secs: i64) -> Option<String> {
@@ -91,6 +87,44 @@ pub(crate) fn attach_tags(
         entry.tags = tags.remove(&entry.id).unwrap_or_default();
     }
     Ok(())
+}
+
+/// Load the entries `ids`, with their tags, in the order of `ids`.
+///
+/// Ids with no entry are left out, and an id given more than once is
+/// loaded once, at its first position. Finding the ids of a page first and
+/// then loading only those entries keeps a query that sorts many rows from
+/// building every column of each, `content` above all, just to throw most
+/// of them away.
+///
+/// # Errors
+///
+/// Returns any error SQLite reports.
+pub(crate) fn load_entries(
+    conn: &Connection,
+    ids: &[i64],
+) -> rusqlite::Result<Vec<ListEntriesResponseEntry>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json = serde_json::to_string(ids)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+    let mut entries = conn
+        .prepare_cached(&format!(
+            "SELECT {} FROM entries e
+             WHERE e.id IN (SELECT value FROM json_each(?1))",
+            entry_columns()
+        ))?
+        .query_map([json], entry_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut position = HashMap::new();
+    for (i, id) in ids.iter().enumerate() {
+        position.entry(*id).or_insert(i);
+    }
+    entries.sort_by_key(|e| position.get(&e.id).copied());
+    attach_tags(conn, &mut entries)?;
+    Ok(entries)
 }
 
 /// The order to list entries in.
