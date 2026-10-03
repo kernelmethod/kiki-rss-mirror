@@ -67,7 +67,7 @@ fn in_progress_len(set: &InProgressSet) -> f64 {
 #[derive(Clone)]
 struct Worker {
     rx: async_channel::Receiver<TaskManagerCommand>,
-    tx: async_channel::Sender<TaskManagerCommand>,
+    tx: crate::tasks::TaskSender,
     db: Db,
     token: CancellationToken,
     refresh_in_progress: InProgressSet,
@@ -128,7 +128,7 @@ pub fn worker_count() -> usize {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_workers(
     rx: async_channel::Receiver<TaskManagerCommand>,
-    tx: async_channel::Sender<TaskManagerCommand>,
+    tx: crate::tasks::TaskSender,
     db: Db,
     token: CancellationToken,
     num_workers: usize,
@@ -177,6 +177,8 @@ async fn run_worker(worker_id: usize, w: Worker) {
             }
             _ = w.token.cancelled() => return,
         };
+        // Off the queue: the same refresh may be queued again from now on.
+        w.tx.dequeued(&command);
 
         w.metrics.inc_workers_busy();
         let task_start = Instant::now();

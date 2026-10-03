@@ -352,13 +352,13 @@ fn mark_dropped_entries(
 /// Enqueue a [`TaskManagerCommand::CacheEntryAssets`] for each of the given
 /// entry IDs. Best-effort: a full or closed queue is logged and ignored.
 pub(super) fn enqueue_asset_caching(
-    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_tx: &crate::tasks::TaskSender,
     metrics: &Metrics,
     entry_ids: &[i64],
 ) {
     for &entry_id in entry_ids {
         match task_tx.try_send(TaskManagerCommand::CacheEntryAssets { entry_id }) {
-            Ok(()) => metrics.record_task_enqueued("cache_entry_assets"),
+            Ok(_) => metrics.record_task_enqueued("cache_entry_assets"),
             Err(e) => debug!(
                 "failed to queue CacheEntryAssets for entry {}: {:?}",
                 entry_id, e
@@ -370,12 +370,12 @@ pub(super) fn enqueue_asset_caching(
 /// Enqueue a [`TaskManagerCommand::CacheFeedFavicon`] for feed `feed_id`.
 /// Best-effort, like [`enqueue_asset_caching`].
 pub(super) fn enqueue_favicon_caching(
-    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_tx: &crate::tasks::TaskSender,
     metrics: &Metrics,
     feed_id: i64,
 ) {
     match task_tx.try_send(TaskManagerCommand::CacheFeedFavicon { feed_id }) {
-        Ok(()) => metrics.record_task_enqueued("cache_feed_favicon"),
+        Ok(_) => metrics.record_task_enqueued("cache_feed_favicon"),
         Err(e) => debug!(
             "failed to queue CacheFeedFavicon for feed {}: {:?}",
             feed_id, e

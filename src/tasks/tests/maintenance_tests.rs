@@ -214,6 +214,7 @@ async fn maintenance_commands_end_to_end_via_worker() -> Result<()> {
     };
 
     let (tx, rx) = async_channel::bounded(16);
+    let tx = crate::tasks::TaskSender::from(tx);
     let token = CancellationToken::new();
     let handles = spawn_workers(
         rx,

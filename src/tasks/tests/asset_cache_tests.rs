@@ -105,6 +105,7 @@ async fn asset_cache_refresh_ingests_inline_and_enclosure() -> Result<()> {
     // Wire up a real channel so post-refresh `CacheEntryAssets` tasks are
     // buffered for us to execute manually.
     let (tx, rx) = async_channel::bounded::<TaskManagerCommand>(64);
+    let tx = crate::tasks::TaskSender::from(tx);
     refresh_feed(
         &client,
         feed_id,
@@ -196,6 +197,7 @@ async fn asset_cache_disabled_skips_fetches() -> Result<()> {
     let pool = make_pool(&tc.database_path())?;
 
     let (tx, rx) = async_channel::bounded::<TaskManagerCommand>(64);
+    let tx = crate::tasks::TaskSender::from(tx);
     refresh_feed(
         &client,
         feed_id,
@@ -285,6 +287,7 @@ async fn asset_cache_rejects_disallowed_content_type() -> Result<()> {
     let pool = make_pool(&tc.database_path())?;
 
     let (tx, rx) = async_channel::bounded::<TaskManagerCommand>(64);
+    let tx = crate::tasks::TaskSender::from(tx);
     refresh_feed(
         &client,
         feed_id,
@@ -341,6 +344,7 @@ async fn asset_cache_evicts_when_over_cap() -> Result<()> {
     let pool = make_pool(&tc.database_path())?;
 
     let (tx, rx) = async_channel::bounded::<TaskManagerCommand>(64);
+    let tx = crate::tasks::TaskSender::from(tx);
     refresh_feed(
         &client,
         feed_id,
