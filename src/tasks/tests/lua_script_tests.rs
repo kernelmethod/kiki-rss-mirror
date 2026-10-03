@@ -396,6 +396,7 @@ async fn integration_scripts_can_skip_asset_caching() -> Result<()> {
         crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     let (tx, rx) = async_channel::unbounded();
+    let tx = crate::tasks::TaskSender::from(tx);
     refresh_feed(
         &client,
         feed_id,

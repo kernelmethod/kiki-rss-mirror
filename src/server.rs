@@ -23,7 +23,7 @@ use tracing::{debug, span, Level};
 pub struct SharedAppState {
     /// An [`async_channel::Sender`] instance that may be used to send commands
     /// to worker tasks used to fetch and process feeds.
-    pub task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    pub task_manager_tx: crate::tasks::TaskSender,
 
     /// The SQLite database; see [`crate::db::Db`].
     pub db: crate::db::Db,
@@ -373,6 +373,7 @@ impl Server {
         // Create a multi-producer, multi-consumer channel so that web
         // service workers can send tasks to the feed-fetcher workers.
         let (tx, rx) = async_channel::bounded(1024);
+        let tx = crate::tasks::TaskSender::from(tx);
 
         // Shared scripting engine handle; workers and HTTP handlers dispatch events
         // through it.
@@ -599,7 +600,7 @@ fn warn_pss_unreadable(role: crate::process::stats::Role) {
 /// cheap to read (feed/entry counts, feeds with fetch errors, database size),
 /// and the CPU and memory used by kiki's processes.
 async fn metrics_sampler_loop(
-    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: crate::tasks::TaskSender,
     db: crate::db::Db,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
@@ -688,7 +689,7 @@ async fn metrics_sampler_loop(
 }
 
 async fn check_feeds_loop(
-    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: crate::tasks::TaskSender,
     db: crate::db::Db,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
@@ -713,7 +714,7 @@ async fn check_feeds_loop(
 /// Periodically sends a [`TaskManagerCommand::CleanupAll`] command to
 /// trigger retention cleanup. Runs every hour.
 async fn cleanup_loop(
-    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: crate::tasks::TaskSender,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
@@ -722,7 +723,7 @@ async fn cleanup_loop(
         tokio::select! {
             _ = interval.tick() => {
                 match task_manager_tx.try_send(TaskManagerCommand::CleanupAll) {
-                    Ok(()) => metrics.record_task_enqueued("cleanup_all"),
+                    Ok(_) => metrics.record_task_enqueued("cleanup_all"),
                     Err(e) => tracing::warn!("Failed to queue periodic cleanup: {:?}", e),
                 }
             }
@@ -747,7 +748,7 @@ const ENTRY_ASSETS_RETRY_BATCH: usize = 128;
 /// dropped from a full queue, failed, or was lost to a restart. See
 /// [`crate::db::pending_assets`].
 async fn retry_entry_assets_loop(
-    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: crate::tasks::TaskSender,
     db: crate::db::Db,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
@@ -767,7 +768,7 @@ async fn retry_entry_assets_loop(
 
 /// Queue one batch of the entries whose asset caching has fallen due.
 async fn retry_entry_assets(
-    task_manager_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: &crate::tasks::TaskSender,
     db: &crate::db::Db,
     metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
@@ -802,7 +803,7 @@ async fn retry_entry_assets(
         // Should the queue be full after all, the entry is simply due
         // again later.
         match task_manager_tx.try_send(TaskManagerCommand::CacheEntryAssets { entry_id }) {
-            Ok(()) => metrics.record_task_enqueued("cache_entry_assets"),
+            Ok(_) => metrics.record_task_enqueued("cache_entry_assets"),
             Err(e) => debug!(
                 "Failed to requeue asset caching for entry {}: {:?}",
                 entry_id, e
@@ -983,7 +984,7 @@ fn compute_initial_delay(period: Duration, last_run_at: i64, now: i64) -> Durati
 /// the period.
 #[allow(clippy::too_many_arguments)]
 async fn periodic_command_loop(
-    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: crate::tasks::TaskSender,
     db: crate::db::Db,
     cancel_token: CancellationToken,
     period: Duration,
@@ -1024,7 +1025,7 @@ async fn periodic_command_loop(
         tokio::select! {
             _ = interval.tick() => {
                 match task_manager_tx.try_send(cmd.clone()) {
-                    Ok(()) => metrics.record_task_enqueued(task_type),
+                    Ok(_) => metrics.record_task_enqueued(task_type),
                     Err(e) => tracing::warn!("Failed to queue {} task: {:?}", task_type, e),
                 }
             }
@@ -1043,7 +1044,7 @@ async fn periodic_command_loop(
 /// This is the same test `refresh_feed` applies before fetching, so feeds
 /// that are not due are left out rather than queued only to be skipped.
 async fn check_feeds(
-    task_manager_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: &crate::tasks::TaskSender,
     db: &crate::db::Db,
     metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
@@ -1068,7 +1069,8 @@ async fn check_feeds(
             manual: false,
         };
         match task_manager_tx.try_send(cmd) {
-            Ok(()) => metrics.record_task_enqueued("refresh_feed"),
+            Ok(crate::tasks::Enqueue::Queued) => metrics.record_task_enqueued("refresh_feed"),
+            Ok(crate::tasks::Enqueue::AlreadyQueued) => {}
             Err(e) => tracing::error!(
                 "Failed to send RefreshFeed command for feed {}: {:?}",
                 feed_id,
@@ -1245,7 +1247,7 @@ pub fn bind_socket(socket_path: &Path) -> Result<std::os::unix::net::UnixListene
 async fn uds_server(
     listener: std::os::unix::net::UnixListener,
     socket_path: PathBuf,
-    tx: async_channel::Sender<TaskManagerCommand>,
+    tx: crate::tasks::TaskSender,
     db: crate::db::Db,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
@@ -1537,6 +1539,34 @@ mod test {
         assert_eq!(delay, Duration::from_secs(3600));
     }
 
+    /// A feed whose refresh is still waiting in the queue is not queued
+    /// again by the next tick, so workers that fall behind do not see the
+    /// queue fill with copies of the same refreshes; once a worker takes
+    /// it, the feed can be queued again.
+    #[tokio::test]
+    async fn check_feeds_does_not_queue_a_refresh_twice() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        let pool = make_pool(&tc.database_path())?;
+        let conn = pool.connect();
+        conn.execute(
+            "INSERT INTO feeds (title, url) VALUES ('feed', 'https://example.com/a.xml')",
+            [],
+        )?;
+        drop(conn);
+
+        let (tx, rx) = async_channel::bounded(16);
+        let tx = crate::tasks::TaskSender::from(tx);
+        let metrics = crate::metrics::Metrics::new()?;
+        check_feeds(&tx, &pool, &metrics).await?;
+        check_feeds(&tx, &pool, &metrics).await?;
+        assert_eq!(rx.len(), 1);
+
+        tx.dequeued(&rx.try_recv()?);
+        check_feeds(&tx, &pool, &metrics).await?;
+        assert_eq!(rx.len(), 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn check_feeds_queues_only_due_feeds() -> Result<()> {
         let tc = TestBuilder::default().init_database().build()?;
@@ -1557,6 +1587,7 @@ mod test {
         drop(conn);
 
         let (tx, rx) = async_channel::bounded(16);
+        let tx = crate::tasks::TaskSender::from(tx);
         check_feeds(&tx, &pool, &crate::metrics::Metrics::new()?).await?;
 
         let mut queued = Vec::new();
@@ -1588,6 +1619,7 @@ mod test {
         crate::db::pending_assets::add(&conn, entry_id)?;
         let metrics = crate::metrics::Metrics::new()?;
         let (tx, rx) = async_channel::bounded(16);
+        let tx = crate::tasks::TaskSender::from(tx);
 
         // Not yet due: the task queued alongside it may still be running.
         retry_entry_assets(&tx, &pool, &metrics).await?;
@@ -1628,6 +1660,7 @@ mod test {
         }
 
         let (tx, rx) = async_channel::bounded(4);
+        let tx = crate::tasks::TaskSender::from(tx);
         let token = CancellationToken::new();
         let handle = tokio::spawn(periodic_command_loop(
             tx,
@@ -1663,6 +1696,7 @@ mod test {
         }
 
         let (tx, rx) = async_channel::bounded(4);
+        let tx = crate::tasks::TaskSender::from(tx);
         let token = CancellationToken::new();
         let handle = tokio::spawn(periodic_command_loop(
             tx,
@@ -1704,6 +1738,7 @@ mod test {
 
         let before = chrono::Utc::now().timestamp();
         let (tx, _rx) = async_channel::bounded(4);
+        let tx = crate::tasks::TaskSender::from(tx);
         let token = CancellationToken::new();
         let handle = tokio::spawn(periodic_command_loop(
             tx,

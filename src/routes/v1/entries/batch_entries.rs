@@ -1,4 +1,4 @@
-use crate::routes::v1::entries::rows::{attach_tags, entry_columns, entry_from_row};
+use crate::routes::v1::entries::rows::load_entries;
 use crate::routes::v1::entries::ListEntriesResponseEntry;
 use crate::server::AppState;
 use axum::{
@@ -8,7 +8,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use tracing::{event, Level};
 
 /// The most entries one batch request may ask for.
@@ -60,26 +59,7 @@ pub async fn batch_entries(
     let result = state
         .db
         .read(move |conn| {
-            let ids = serde_json::to_string(&request.ids)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
-            let mut entries = conn
-                .prepare(&format!(
-                    "SELECT {} FROM entries e
-                     WHERE e.id IN (SELECT value FROM json_each(?1))",
-                    entry_columns()
-                ))
-                .inspect_err(|e| {
-                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-                })?
-                .query_map([ids], entry_from_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let mut position = HashMap::new();
-            for (i, id) in request.ids.iter().enumerate() {
-                position.entry(*id).or_insert(i);
-            }
-            entries.sort_by_key(|e| position.get(&e.id).copied());
-            attach_tags(conn, &mut entries)?;
+            let entries = load_entries(conn, &request.ids)?;
 
             Ok::<BatchEntriesResponse, rusqlite::Error>(BatchEntriesResponse { entries })
         })

@@ -1,8 +1,6 @@
 use crate::db::tags::SystemTag;
 use crate::routes::v1::entries::list_entries::{ListEntriesResponseEntry, DEFAULT_LIMIT};
-use crate::routes::v1::entries::rows::{
-    entry_columns, entry_from_row, load_entry_tags, EntrySort, ENTRY_COLUMN_COUNT,
-};
+use crate::routes::v1::entries::rows::{load_entries, EntrySort};
 use crate::server::AppState;
 use axum::{
     extract::State,
@@ -12,7 +10,7 @@ use axum::{
 };
 use rusqlite::types::ToSqlOutput;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use tracing::{event, Level};
 
@@ -191,8 +189,8 @@ fn tag_filter_to_sql(
         // [`walked_tags`].
         TagFilter::Single(name) if walked.contains(name) => {
             let sql = format!(
-                "EXISTS (SELECT 1 FROM entry_tags et JOIN tags t ON et.tag_id = t.id \
-                 WHERE et.entry_id = e.id AND t.name = ?{})",
+                "EXISTS (SELECT 1 FROM entry_tags et WHERE et.entry_id = e.id \
+                 AND et.tag_id IN (SELECT id FROM tags WHERE name = ?{}))",
                 idx
             );
             params.push(SqlParam::from_string(name.clone()));
@@ -250,14 +248,17 @@ fn tag_filter_to_sql(
                 // looked at. `NOT (e.id IN (SELECT ...))` would collect the
                 // ID of every entry with the tags on each query first, which
                 // costs as much for a page of 25 entries as for a full count.
+                // The tags' IDs are looked up once, rather than joining the
+                // tags table for every entry, which a search for a common
+                // word does tens of thousands of times.
                 if let Some(names) = tag_names(inner) {
                     let placeholders: Vec<String> = (idx..idx + names.len())
                         .map(|i| format!("?{}", i))
                         .collect();
                     let sql = format!(
                         "NOT EXISTS (SELECT 1 FROM entry_tags et \
-                         JOIN tags t ON et.tag_id = t.id \
-                         WHERE et.entry_id = e.id AND t.name IN ({}))",
+                         WHERE et.entry_id = e.id \
+                         AND et.tag_id IN (SELECT id FROM tags WHERE name IN ({})))",
                         placeholders.join(", ")
                     );
                     let next_idx = idx + names.len();
@@ -742,30 +743,35 @@ pub async fn search_entries(
             let walked = walked_tags(conn, &payload, limit, offset)?;
             let search = CompiledSearch::new(&payload, &walked)?;
             let count = search.count(conn)?;
-            let columns = format!("{}, {}", entry_columns(), search.rank_expr);
+            // The page is found by id and rank alone, and only its entries
+            // are then loaded: sorting by date or relevance means looking
+            // at every match, and selecting every column of each one, as a
+            // common word matches most entries, costs more than the rest of
+            // the search.
+            let columns = format!("e.id, {}", search.rank_expr);
             let (sql, params) = search.page(&columns, limit, offset);
-
-            let mut entries = conn
+            let page = conn
                 .prepare(&sql)
                 .inspect_err(|e| {
                     event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
                 })?
                 .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                    Ok(SearchEntriesResponseEntry {
-                        entry: entry_from_row(row)?,
-                        rank: row.get(ENTRY_COLUMN_COUNT)?,
-                    })
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?))
                 })?
                 .collect::<Result<Vec<_>, _>>()
                 .inspect_err(|e| {
                     event!(Level::ERROR, "failed to collect search results: {:?}", e);
                 })?;
 
-            let ids: Vec<i64> = entries.iter().map(|e| e.entry.id).collect();
-            let mut tags = load_entry_tags(conn, &ids)?;
-            for e in &mut entries {
-                e.entry.tags = tags.remove(&e.entry.id).unwrap_or_default();
-            }
+            let ids: Vec<i64> = page.iter().map(|(id, _)| *id).collect();
+            let mut ranks: HashMap<i64, Option<f64>> = page.into_iter().collect();
+            let entries = load_entries(conn, &ids)?
+                .into_iter()
+                .map(|entry| SearchEntriesResponseEntry {
+                    rank: ranks.remove(&entry.id).flatten(),
+                    entry,
+                })
+                .collect();
 
             Ok::<SearchEntriesResponse, SearchEntriesError>(SearchEntriesResponse {
                 count,

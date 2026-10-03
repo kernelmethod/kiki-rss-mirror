@@ -14,7 +14,6 @@ use crate::tasks::backoff::{
 use crate::tasks::cache::{
     corrected_max_age, extract_server_hints, parse_http_date, CacheControl, ServerHints,
 };
-use crate::tasks::command::TaskManagerCommand;
 use crate::tasks::error::FetchError;
 use crate::tasks::error_recording::{clear_feed_error, defer_feed, set_feed_error_with_schedule};
 use crate::tasks::favicons::resolve_site_url;
@@ -27,6 +26,7 @@ use chrono::Utc;
 use reqwest::header::HeaderMap;
 use rusqlite::Connection;
 use std::time::Instant;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 /// Snapshot of a `feeds` row loaded at the start of a refresh: the URL,
@@ -193,7 +193,8 @@ pub(crate) async fn refresh_feed(
     settings: &Settings,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
-    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_tx: &crate::tasks::TaskSender,
+    store_permits: &Semaphore,
 ) -> Result<()> {
     let fetch_start = Instant::now();
     let fetch_settings = &settings.feed_fetch;
@@ -304,6 +305,12 @@ pub(crate) async fn refresh_feed(
         Retrieved::Http(fetcher.fetch(spec).await)
     };
 
+    // Many refreshes fetch at once, but only a few store at once: every
+    // store goes through the one writer connection, and each refresh
+    // waiting on it is one more ahead of a request that marks an entry
+    // read. The permit is only refused once the semaphore is closed, which
+    // nothing does.
+    let _permit = store_permits.acquire().await?;
     crate::db::blocking(|| {
         store_refresh(
             &rec,
@@ -336,7 +343,7 @@ fn store_refresh(
     retrieved: Retrieved,
     force_conditionals_off: bool,
     settings: &Settings,
-    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_tx: &crate::tasks::TaskSender,
 ) -> Result<()> {
     let (feed_id, metrics) = (rec.feed_id, rec.metrics);
 
@@ -459,7 +466,7 @@ fn store_refresh(
 fn queue_favicon_if_due(
     settings: &Settings,
     conn: &rusqlite::Connection,
-    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_tx: &crate::tasks::TaskSender,
     metrics: &Metrics,
     feed_id: i64,
 ) {

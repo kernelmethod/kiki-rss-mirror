@@ -11,14 +11,16 @@ mod fetch;
 mod maintenance;
 mod parsing;
 mod processing;
+mod queue;
 mod scripting;
 mod worker;
 
 pub(crate) use backoff::same_origin;
 pub use command::TaskManagerCommand;
 pub use error::FetchError;
+pub use queue::{Enqueue, TaskSender};
 pub use scripting::{load_script_runner, LoadPluginsError};
-pub use worker::{spawn_workers, worker_count};
+pub use worker::{spawn_workers, worker_count, MIN_WORKERS, STORE_CONCURRENCY, WORKERS_PER_CPU};
 
 // Re-exported for use from tests (which reach them via `crate::tasks::*`).
 // The #[allow] keeps the `cargo build` / clippy on the lib target green —
@@ -37,7 +39,7 @@ pub(crate) async fn refresh_feed(
     pool: crate::db::Db,
     script_runner: Option<&dyn crate::scripting::ScriptRunner>,
     metrics: &crate::metrics::Metrics,
-    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_tx: &crate::tasks::TaskSender,
 ) -> anyhow::Result<()> {
     let settings = crate::config::Settings::default();
     refresh_feed_with_settings(
@@ -61,7 +63,7 @@ pub(crate) async fn refresh_feed_with_settings(
     settings: &crate::config::Settings,
     script_runner: Option<&dyn crate::scripting::ScriptRunner>,
     metrics: &crate::metrics::Metrics,
-    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_tx: &crate::tasks::TaskSender,
 ) -> anyhow::Result<()> {
     refresh_feed_inner(
         client,
@@ -84,7 +86,7 @@ pub(crate) async fn refresh_feed_manual(
     feed_id: i64,
     pool: crate::db::Db,
     metrics: &crate::metrics::Metrics,
-    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_tx: &crate::tasks::TaskSender,
 ) -> anyhow::Result<()> {
     let settings = crate::config::Settings::default();
     refresh_feed_inner(
@@ -103,9 +105,10 @@ async fn refresh_feed_inner(
     settings: &crate::config::Settings,
     script_runner: Option<&dyn crate::scripting::ScriptRunner>,
     metrics: &crate::metrics::Metrics,
-    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_tx: &crate::tasks::TaskSender,
 ) -> anyhow::Result<()> {
     let fetcher = test_fetcher(client);
+    let store_permits = tokio::sync::Semaphore::new(STORE_CONCURRENCY);
     fetch::refresh_feed(
         &fetcher,
         feed_id,
@@ -115,6 +118,7 @@ async fn refresh_feed_inner(
         script_runner,
         metrics,
         task_tx,
+        &store_permits,
     )
     .await
 }

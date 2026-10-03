@@ -685,6 +685,7 @@ async fn a_gone_fetcher_is_not_charged_to_the_feed() -> Result<()> {
         None,
         &super::test_metrics(),
         &super::test_tx(),
+        &tokio::sync::Semaphore::new(crate::tasks::STORE_CONCURRENCY),
     )
     .await?;
 
@@ -735,6 +736,7 @@ async fn a_feed_that_crashes_the_fetcher_is_a_permanent_error() -> Result<()> {
         None,
         &super::test_metrics(),
         &super::test_tx(),
+        &tokio::sync::Semaphore::new(crate::tasks::STORE_CONCURRENCY),
     )
     .await?;
 

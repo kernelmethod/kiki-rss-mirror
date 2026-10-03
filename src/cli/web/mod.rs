@@ -130,6 +130,13 @@ impl WebArgs {
     /// keeps shutdown in one order no matter how it was asked for. (On
     /// Windows, a new process group also ignores Ctrl+C, but still hears the
     /// Ctrl+Break [`stop_server`] sends it.)
+    ///
+    /// On Linux the child is also sent `SIGTERM` if this process dies
+    /// without stopping it, e.g. when it is killed with `SIGKILL`, so the
+    /// server shuts down rather than living on, orphaned, holding the
+    /// database and the socket. The signal follows the thread that spawned
+    /// the child, so this must run on the main thread, which lives as long
+    /// as the process does.
     fn spawn_server(&self, socket_path: &Path) -> Result<ServerProcess> {
         let exe = std::env::current_exe().context("locating the kiki executable")?;
         let mut cmd = std::process::Command::new(exe);
@@ -138,6 +145,27 @@ impl WebArgs {
         {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let parent = std::process::id();
+            // SAFETY: the closure runs between fork and exec, where only
+            // async-signal-safe calls are permitted; `prctl` and `getppid`
+            // are plain syscalls that neither allocate nor take a lock.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // Checked after the `prctl`, in case this process died
+                    // before it took effect.
+                    if libc::getppid() as u32 != parent {
+                        return Err(std::io::Error::other("the web UI has exited"));
+                    }
+                    Ok(())
+                });
+            }
         }
         #[cfg(windows)]
         {
