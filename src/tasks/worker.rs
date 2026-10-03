@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -77,13 +78,44 @@ struct Worker {
     script_runner: ScriptRunnerHandle,
     /// Retrieves feeds and downloads their assets.
     fetcher: Fetcher,
+    /// Taken by a refresh to store what it fetched; see
+    /// [`STORE_CONCURRENCY`].
+    store_permits: Arc<Semaphore>,
 }
 
-/// Determine the number of worker tasks to spawn.
+/// The fewest worker tasks [`worker_count`] chooses, however few CPUs
+/// there are.
+pub const MIN_WORKERS: usize = 16;
+
+/// Worker tasks [`worker_count`] chooses for each CPU.
+pub const WORKERS_PER_CPU: usize = 4;
+
+/// The most feed refreshes that store what they fetched at the same time;
+/// the rest wait their turn once their fetch is done. See [`worker_count`].
+pub const STORE_CONCURRENCY: usize = 2;
+
+/// Determine the number of worker tasks to spawn: [`WORKERS_PER_CPU`] for
+/// each CPU, and at least [`MIN_WORKERS`].
+///
+/// A worker spends nearly all of a refresh waiting on the feed's server,
+/// not on a CPU, so sizing the pool by CPUs alone left a few slow servers
+/// holding every worker while the queue filled up behind them. The work a
+/// refresh does do here, storing what it fetched, goes through the one
+/// writer connection, so only [`STORE_CONCURRENCY`] refreshes store at
+/// once, however many workers there are.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::tasks::{worker_count, MIN_WORKERS};
+///
+/// assert!(worker_count() >= MIN_WORKERS);
+/// ```
 pub fn worker_count() -> usize {
-    std::thread::available_parallelism()
+    let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4)
+        .unwrap_or(4);
+    cpus.saturating_mul(WORKERS_PER_CPU).max(MIN_WORKERS)
 }
 
 /// Spawn multiple worker tasks that pull from a shared channel.
@@ -118,6 +150,7 @@ pub fn spawn_workers(
         config,
         script_runner,
         fetcher,
+        store_permits: Arc::new(Semaphore::new(STORE_CONCURRENCY)),
     };
     let mut handles = Vec::with_capacity(num_workers);
 
@@ -266,6 +299,7 @@ async fn handle_command(
                 script_runner,
                 &w.metrics,
                 &w.tx,
+                &w.store_permits,
             )
             .await
             {

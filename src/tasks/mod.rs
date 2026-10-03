@@ -18,7 +18,7 @@ pub(crate) use backoff::same_origin;
 pub use command::TaskManagerCommand;
 pub use error::FetchError;
 pub use scripting::{load_script_runner, LoadPluginsError};
-pub use worker::{spawn_workers, worker_count};
+pub use worker::{spawn_workers, worker_count, MIN_WORKERS, STORE_CONCURRENCY, WORKERS_PER_CPU};
 
 // Re-exported for use from tests (which reach them via `crate::tasks::*`).
 // The #[allow] keeps the `cargo build` / clippy on the lib target green —
@@ -106,6 +106,7 @@ async fn refresh_feed_inner(
     task_tx: &async_channel::Sender<TaskManagerCommand>,
 ) -> anyhow::Result<()> {
     let fetcher = test_fetcher(client);
+    let store_permits = tokio::sync::Semaphore::new(STORE_CONCURRENCY);
     fetch::refresh_feed(
         &fetcher,
         feed_id,
@@ -115,6 +116,7 @@ async fn refresh_feed_inner(
         script_runner,
         metrics,
         task_tx,
+        &store_permits,
     )
     .await
 }
