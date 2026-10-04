@@ -25,6 +25,7 @@
 
 - [Command line](cli.md)
 - [Settings](settings.md)
+- [Threat model](threat-model.md)
 
 # Development
 
