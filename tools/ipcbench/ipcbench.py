@@ -31,7 +31,7 @@ import threading
 import time
 
 CLK_TCK = os.sysconf("SC_CLK_TCK")
-CONTENT = "<p>" + "Lorem ipsum dolor sit amet, consectetur adipiscing. " * 40 + "</p>"
+LOREM = "Lorem ipsum dolor sit amet, consectetur adipiscing. "
 # Processes are named by their hidden subcommand, e.g. `kiki __script-host`.
 ROLES = ["server", "script-host", "feed-fetcher", "feed-worker", "feed-parser", "feed-resolver"]
 TRACED = ["server", "script-host", "feed-fetcher", "feed-worker"]
@@ -41,10 +41,12 @@ TRACED = ["server", "script-host", "feed-fetcher", "feed-worker"]
 
 
 class FeedServer:
-    """Serves /feed/<n>.xml: `items` items whose guids change every round."""
+    """Serves /feed/<n>.xml: `items` items of about `content_bytes` of HTML
+    each, whose guids change every round."""
 
-    def __init__(self, items):
+    def __init__(self, items, content_bytes):
         self.items = items
+        self.content = "<p>" + LOREM * max(1, content_bytes // len(LOREM)) + "</p>"
         self.round = 0
         bench = self
 
@@ -76,7 +78,7 @@ class FeedServer:
             f"<item><title>Item {r}-{n}-{i}</title><guid>r{r}-f{n}-i{i}</guid>"
             f"<link>http://example.com/{r}/{n}/{i}?utm_source=bench</link>"
             f"<pubDate>Mon, 01 Jan 2024 00:00:00 GMT</pubDate>"
-            f"<description><![CDATA[{CONTENT}]]></description></item>"
+            f"<description><![CDATA[{self.content}]]></description></item>"
             for i in range(self.items)
         )
         return (
@@ -169,8 +171,8 @@ def parse_strace(path):
 # --- A run ----------------------------------------------------------------
 
 
-def run(kiki, label, feeds, items, rounds, trace, serve_args):
-    feeds_srv = FeedServer(items)
+def run(kiki, label, feeds, items, content_bytes, rounds, trace, serve_args):
+    feeds_srv = FeedServer(items, content_bytes)
     home = tempfile.mkdtemp(prefix="kiki-ipcbench-")
     env = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
     env.update(KIKI_HOME=home, RUST_LOG=os.environ.get("KIKI_LOG", "warn"))
@@ -318,6 +320,8 @@ def main():
     def sizes(sp):
         sp.add_argument("--feeds", type=int, default=40)
         sp.add_argument("--items", type=int, default=250, help="items per feed")
+        sp.add_argument("--content-bytes", type=int, default=2048,
+                        help="approximate size of each item's HTML")
         sp.add_argument("--rounds", type=int, default=3, help="measured refreshes per run")
         sp.add_argument("--strace", action="store_true",
                         help="count system calls in the first round (slows it down)")
@@ -345,7 +349,7 @@ def main():
         summarize([json.loads(l) for l in open(args.results) if l.strip()])
         return
 
-    common = (args.feeds, args.items, args.rounds)
+    common = (args.feeds, args.items, args.content_bytes, args.rounds)
     if args.cmd == "run":
         res = run(args.kiki, args.label, *common, args.strace, args.serve_arg)
         print(json.dumps(res))
@@ -368,7 +372,8 @@ def main():
     if args.strace:
         for kiki, label in zip(bins, labels):
             print(f"strace run: {label}", file=sys.stderr)
-            res = run(kiki, label, args.feeds, args.items, 1, True, args.serve_arg)
+            res = run(kiki, label, args.feeds, args.items, args.content_bytes, 1, True,
+                      args.serve_arg)
             results.append(res)
             if out:
                 out.write(json.dumps(res) + "\n")

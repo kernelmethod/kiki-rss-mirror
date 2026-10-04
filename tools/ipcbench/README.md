@@ -56,7 +56,8 @@ directory, which is left there so its `kiki.log` can be read afterwards.
 | Option         | Default | Meaning                                                    |
 |----------------|---------|------------------------------------------------------------|
 | `--feeds`      | 40      | Feeds to create                                            |
-| `--items`      | 250     | Items per feed, each about 2 KiB of HTML                   |
+| `--items`      | 250     | Items per feed                                             |
+| `--content-bytes` | 2048 | Approximate size of each item's HTML                      |
 | `--rounds`     | 3       | Refreshes measured per run, after one warm-up refresh      |
 | `--runs`       | 3       | Runs of each binary (`compare` only)                       |
 | `--strace`     | off     | Also count system calls, in one extra run of each binary   |
