@@ -13,7 +13,7 @@
 //! to open a socket (seccomp). Its entire view of the world is one
 //! inherited socket pair and whatever the server chooses to send down it.
 //! What plugins ask of the server (`kiki.store`, `kiki.entries`,
-//! `kiki.feeds`) goes back up that socket as a [`HostResponse::Call`], and
+//! `kiki.feeds`) goes back up that socket as a [`FromHost::Call`], and
 //! the server decides how to answer: the child never touches the database
 //! itself.
 //!
@@ -21,7 +21,10 @@
 //!
 //! * [`ScriptHost`] and [`SubprocessScriptRunner`] run in the server.
 //!   The runner implements [`ScriptRunner`], so callers dispatch events
-//!   exactly as they did against the in-process VM.
+//!   exactly as they did against the in-process VM. Every response says
+//!   which events the child's plugins have handlers for, and the runner
+//!   sends nothing for the rest: an event no handler would see costs no
+//!   round trip.
 //! * [`run_child`] is the child's entire main loop, reached through the
 //!   hidden `kiki __script-host` subcommand.
 //!
@@ -40,17 +43,18 @@
 //! in-process runner already documents.
 
 use crate::process::ipc::{
-    decode, encode, read_frame, write_frame, HostRequest, HostResponse, MAX_FRAME_BYTES,
+    decode, encode, read_frame, write_frame, FromHost, HostRequest, HostResponse, MAX_FRAME_BYTES,
 };
 use crate::scripting::{
-    Event, EventPayload, FeedEntry, ScanSummary, ScriptRunner, ScriptServices, ScriptSource,
-    ServiceCall, ServiceReply,
+    Event, EventPayload, EventSet, FeedEntry, ScanSummary, ScriptRunner, ScriptServices,
+    ScriptSource, ServiceCall, ServiceReply,
 };
 use anyhow::{Context, Result};
-use std::io;
+use std::io::{self, BufReader};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::process::Child;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -120,9 +124,29 @@ impl HostError {
     }
 }
 
+/// One end of the script host's socket.
+///
+/// Reads are buffered, so that a frame small enough for the buffer — most
+/// of them — arrives in one `recv` rather than one for its length and
+/// another for its body. The protocol is lockstep, so the peer never sends
+/// ahead of what this side is about to read.
+struct Channel {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+}
+
+impl Channel {
+    fn new(stream: UnixStream) -> io::Result<Self> {
+        Ok(Channel {
+            writer: stream.try_clone()?,
+            reader: BufReader::new(stream),
+        })
+    }
+}
+
 /// The live half of a [`ScriptHost`]: the child and the socket to it.
 struct Live {
-    stream: UnixStream,
+    channel: Channel,
     child: Child,
 }
 
@@ -146,6 +170,10 @@ pub struct ScriptHost {
     /// Answers the calls plugins make while a request is served. Calls
     /// fail until the server sets it with [`Self::set_services`].
     services: RwLock<Option<Arc<dyn ScriptServices>>>,
+    /// The [`EventSet::to_bits`] of the events the child's plugins have
+    /// handlers for, as of its last response: every event until it has
+    /// answered once, and none once the host is retired.
+    subscribed: AtomicU8,
 }
 
 impl ScriptHost {
@@ -172,13 +200,13 @@ impl ScriptHost {
         ours.set_write_timeout(Some(IPC_TIMEOUT))
             .context("setting the script host write timeout")?;
 
+        let channel = Channel::new(ours).context("cloning the script host socket")?;
+
         info!(pid = child.id(), "script host: spawned");
         Ok(ScriptHost {
-            state: Mutex::new(Some(Live {
-                stream: ours,
-                child,
-            })),
+            state: Mutex::new(Some(Live { channel, child })),
             services: RwLock::new(None),
+            subscribed: AtomicU8::new(EventSet::ALL.to_bits()),
         })
     }
 
@@ -204,10 +232,14 @@ impl ScriptHost {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let result = exchange(&mut live.stream, request, services.as_deref());
+        let result = exchange(&mut live.channel, request, services.as_deref());
+        if let Ok((_, subscribed)) = &result {
+            self.subscribed
+                .store(subscribed.to_bits(), Ordering::Relaxed);
+        }
         match result {
-            Ok(HostResponse::Failed { message }) => Err(HostError::Failed(message)),
-            Ok(response) => Ok(response),
+            Ok((HostResponse::Failed { message }, _)) => Err(HostError::Failed(message)),
+            Ok((response, _)) => Ok(response),
             Err(e) if e.is_fatal() => {
                 // The channel is unusable; retire the host so we stop
                 // paying an IPC timeout on every subsequent entry. Done
@@ -222,6 +254,8 @@ impl ScriptHost {
                     let _ = live.child.kill();
                     let _ = live.child.wait();
                 }
+                self.subscribed
+                    .store(EventSet::default().to_bits(), Ordering::Relaxed);
                 Err(e)
             }
             Err(e) => Err(e),
@@ -242,6 +276,13 @@ impl ScriptHost {
         }
     }
 
+    /// The events the child's plugins had handlers for as of its last
+    /// response. Every event until it has answered once; none once the
+    /// host is retired, since nothing sent to it would be served.
+    pub fn subscribed(&self) -> EventSet {
+        EventSet::from_bits(self.subscribed.load(Ordering::Relaxed))
+    }
+
     /// Whether the channel to the child is still usable.
     pub fn is_alive(&self) -> bool {
         self.state
@@ -257,22 +298,23 @@ impl Drop for ScriptHost {
         if let Some(live) = live {
             // Closing our end is the child's shutdown signal: its next
             // read returns EOF and it exits.
-            drop(live.stream);
+            drop(live.channel);
             crate::process::reap(live.child);
         }
     }
 }
 
 /// Write one request and read its response, answering the calls the host
-/// makes with `services` along the way.
+/// makes with `services` along the way. Returns the response, and the
+/// events the host has handlers for now that it has served the request.
 ///
 /// Failures before the first byte goes out are [`HostError::Failed`], not
 /// [`HostError::Io`] — see [`HostError::is_fatal`].
 fn exchange(
-    stream: &mut UnixStream,
+    channel: &mut Channel,
     request: &HostRequest,
     services: Option<&dyn ScriptServices>,
-) -> Result<HostResponse, HostError> {
+) -> Result<(HostResponse, EventSet), HostError> {
     let encoded =
         encode(request).map_err(|e| HostError::Failed(format!("could not encode request: {e}")))?;
     if encoded.len() > MAX_FRAME_BYTES {
@@ -282,13 +324,17 @@ fn exchange(
             MAX_FRAME_BYTES
         )));
     }
-    write_frame(stream, &encoded)?;
+    write_frame(&mut channel.writer, &encoded)?;
     loop {
-        let frame = read_frame(stream)?;
-        let response: HostResponse =
-            decode(&frame).map_err(|e| HostError::Protocol(format!("decoding response: {e}")))?;
-        let HostResponse::Call { plugin, call } = response else {
-            return Ok(response);
+        let frame = read_frame(&mut channel.reader)?;
+        let (plugin, call) = match decode(&frame)
+            .map_err(|e| HostError::Protocol(format!("decoding response: {e}")))?
+        {
+            FromHost::Done {
+                response,
+                subscribed,
+            } => return Ok((response, subscribed)),
+            FromHost::Call { plugin, call } => (plugin, call),
         };
         let result = match services {
             Some(services) => services.call(&plugin, call),
@@ -298,7 +344,7 @@ fn exchange(
         // one, so failing to send it is fatal to the channel.
         let encoded = encode(&HostRequest::CallResult { result })
             .map_err(|e| HostError::Protocol(format!("encoding a call result: {e}")))?;
-        write_frame(stream, &encoded)?;
+        write_frame(&mut channel.writer, &encoded)?;
     }
 }
 
@@ -319,7 +365,14 @@ impl SubprocessScriptRunner {
 }
 
 impl ScriptRunner for SubprocessScriptRunner {
+    fn handles(&self, event: Event) -> bool {
+        self.host.subscribed().contains(event)
+    }
+
     fn dispatch_transform_entry(&self, entry: FeedEntry) -> Result<Option<FeedEntry>> {
+        if !self.handles(Event::EntryIngest) {
+            return Ok(Some(entry));
+        }
         let request = HostRequest::TransformEntry {
             entry: entry.clone(),
         };
@@ -338,6 +391,9 @@ impl ScriptRunner for SubprocessScriptRunner {
     }
 
     fn dispatch_observe(&self, event: Event, payload: EventPayload) {
+        if !self.handles(event) {
+            return;
+        }
         let request = HostRequest::Observe { event, payload };
         if let Err(e) = self.host.request(&request) {
             warn!(event = event.name(), error = %e, "script host: observe dispatch failed");
@@ -457,15 +513,18 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
             .context("failed to install the script host sandbox")?;
     }
 
-    let stream = Arc::new(Mutex::new(crate::process::take_parent_socket(SUBCOMMAND)?));
+    let channel = Channel::new(crate::process::take_parent_socket(SUBCOMMAND)?)
+        .context("cloning the parent socket")?;
+    let channel = Arc::new(Mutex::new(channel));
     let services: Arc<dyn ScriptServices> = Arc::new(IpcServices {
-        stream: stream.clone(),
+        channel: channel.clone(),
     });
 
     let mut runner: Option<crate::scripting::lua::LuaScriptRunner> = None;
 
     loop {
-        let frame = match read_frame(&mut *stream.lock().unwrap_or_else(|e| e.into_inner())) {
+        let frame = match read_frame(&mut channel.lock().unwrap_or_else(|e| e.into_inner()).reader)
+        {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 debug!("script host: server closed the channel, exiting");
@@ -484,7 +543,13 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
             },
         };
 
-        let encoded = match encode(&response) {
+        let subscribed = runner
+            .as_ref()
+            .map_or_else(EventSet::default, |r| r.subscriptions());
+        let encoded = match encode(&FromHost::Done {
+            response,
+            subscribed,
+        }) {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "script host: could not encode a response, exiting");
@@ -492,7 +557,7 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
             }
         };
         if let Err(e) = write_frame(
-            &mut *stream.lock().unwrap_or_else(|e| e.into_inner()),
+            &mut channel.lock().unwrap_or_else(|e| e.into_inner()).writer,
             &encoded,
         ) {
             warn!(error = %e, "script host: write failed, exiting");
@@ -504,21 +569,21 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
 /// Answers plugins' calls in the child by asking the server over the
 /// channel, in the middle of the request being served.
 struct IpcServices {
-    stream: Arc<Mutex<UnixStream>>,
+    channel: Arc<Mutex<Channel>>,
 }
 
 impl ScriptServices for IpcServices {
     fn call(&self, plugin: &str, call: ServiceCall) -> Result<ServiceReply, String> {
-        let mut stream = self.stream.lock().unwrap_or_else(|e| e.into_inner());
-        let encoded = encode(&HostResponse::Call {
+        let mut channel = self.channel.lock().unwrap_or_else(|e| e.into_inner());
+        let encoded = encode(&FromHost::Call {
             plugin: plugin.to_string(),
             call,
         })
         .map_err(|e| format!("could not encode the call: {e}"))?;
-        write_frame(&mut *stream, &encoded)
+        write_frame(&mut channel.writer, &encoded)
             .map_err(|e| format!("could not reach the server: {e}"))?;
-        let frame =
-            read_frame(&mut *stream).map_err(|e| format!("could not reach the server: {e}"))?;
+        let frame = read_frame(&mut channel.reader)
+            .map_err(|e| format!("could not reach the server: {e}"))?;
         match decode::<HostRequest>(&frame) {
             Ok(HostRequest::CallResult { result }) => result,
             Ok(other) => Err(format!(

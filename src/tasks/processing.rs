@@ -232,11 +232,17 @@ fn run_scripts(
     let Some(runner) = script_runner else {
         return Some(feed_entry);
     };
+    // Checked first to spare cloning the entry for events nothing handles.
+    if runner.handles(crate::scripting::Event::EntryParsed) {
+        runner.dispatch_observe(
+            crate::scripting::Event::EntryParsed,
+            crate::scripting::EventPayload::Entry(feed_entry.clone()),
+        );
+    }
+    if !runner.handles(crate::scripting::Event::EntryIngest) {
+        return Some(feed_entry);
+    }
     let format = feed_entry.syndication_format.clone();
-    runner.dispatch_observe(
-        crate::scripting::Event::EntryParsed,
-        crate::scripting::EventPayload::Entry(feed_entry.clone()),
-    );
     let original = feed_entry.clone();
     let script_start = Instant::now();
     match runner.dispatch_transform_entry(feed_entry) {

@@ -1525,6 +1525,34 @@ mod script_isolation {
         kiki.shutdown();
     }
 
+    /// The server skips sending the script host events nothing handles,
+    /// going by the handlers the host reports with each response. A handler
+    /// registered after loading, here by a `plugin.load` handler, must
+    /// still be reached.
+    #[test]
+    fn a_handler_registered_after_loading_still_runs() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = spawn_with_script(
+            &[],
+            r#"
+            kiki.on("plugin.load", function()
+                kiki.on("entry.ingest", function(entry)
+                    entry.title = "[late] " .. entry.title
+                    return entry
+                end)
+            end)
+            "#,
+        );
+
+        let feed_id = create_local_feed(&mut kiki, addr);
+        let title = refresh_and_read_title(&mut kiki, feed_id);
+        assert!(
+            title.starts_with("[late] "),
+            "a handler registered by plugin.load did not run: {title:?}"
+        );
+        kiki.shutdown();
+    }
+
     /// A script's config crosses the IPC channel to the script host and
     /// reaches the script's top-level chunk.
     #[test]

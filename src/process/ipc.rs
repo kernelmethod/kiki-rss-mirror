@@ -3,9 +3,11 @@
 //!
 //! Frames are a little-endian `u32` byte count followed by that many
 //! bytes of [postcard]-encoded message, written with [`encode`] and read
-//! with [`decode`]. Postcard is compact and not self-describing: fields
-//! are written in declaration order with no names, and enum variants by
-//! index. That is safe here because both ends of every channel are the
+//! with [`decode`]. The count and the body go out in a single vectored
+//! write, so a frame costs the writer one system call and never reaches
+//! the peer as a lone length prefix. Postcard is compact and not
+//! self-describing: fields are written in declaration order with no
+//! names, and enum variants by index. That is safe here because both ends of every channel are the
 //! same binary, so the message types can never disagree.
 //!
 //! Both directions cap the frame size: the parent because a
@@ -17,8 +19,11 @@
 //! The script host protocol is strictly request/response — every request
 //! written by the server is answered by exactly one response from the
 //! script host, including for observe-only events whose result is
-//! discarded. While it works on a request, the script host may ask the
-//! server for something on a plugin's behalf with [`HostResponse::Call`];
+//! discarded. Each response travels as a [`FromHost::Done`], which also
+//! names the events the host has handlers for, so the server can skip
+//! sending events nothing would see. While it works on a request, the
+//! script host may ask the server for something on a plugin's behalf with
+//! [`FromHost::Call`];
 //! the server answers with [`HostRequest::CallResult`] and goes back to
 //! waiting for the response, so calls nest inside a request without the
 //! two sides ever getting out of step. Keeping them in lockstep means a
@@ -27,10 +32,10 @@
 //! multiplexed instead; see [`crate::process::feed_fetcher`].
 
 use crate::scripting::{
-    Event, EventPayload, FeedEntry, ScanSummary, ScriptSource, ServiceCall, ServiceReply,
+    Event, EventPayload, EventSet, FeedEntry, ScanSummary, ScriptSource, ServiceCall, ServiceReply,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Largest frame either side will write or accept.
@@ -71,13 +76,16 @@ pub enum HostRequest {
         summary: Option<ScanSummary>,
     },
 
-    /// The server's answer to a [`HostResponse::Call`].
+    /// The server's answer to a [`FromHost::Call`].
     CallResult {
         result: Result<ServiceReply, String>,
     },
 }
 
 /// A message from the script host back to the server.
+// One is alive per request at a time, so boxing the entry would cost an
+// allocation per entry to save a few hundred bytes of stack.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HostResponse {
     /// The VM was rebuilt; `loaded` is the number of scripts compiled.
@@ -96,16 +104,29 @@ pub enum HostResponse {
         entries: Option<Vec<Option<FeedEntry>>>,
     },
 
-    /// Not a response: a plugin asks the server for something while the
-    /// request is being served. The server answers with
-    /// [`HostRequest::CallResult`] and keeps waiting for the response.
-    Call { plugin: String, call: ServiceCall },
-
     /// The request could not be served. The server treats this as a
     /// script-level failure, not a dead host: for `entry.ingest` the
     /// entry passes through unmodified, matching the in-process
     /// runner's contract.
     Failed { message: String },
+}
+
+/// A frame from the script host to the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FromHost {
+    /// The answer to the request being served, which ends it.
+    Done {
+        response: HostResponse,
+        /// The events the host's VM has at least one handler for once the
+        /// request has been served. Plugins may register handlers at any
+        /// time, so this is reported with every response.
+        subscribed: EventSet,
+    },
+
+    /// Not a response: a plugin asks the server for something while the
+    /// request is being served. The server answers with
+    /// [`HostRequest::CallResult`] and keeps waiting for the response.
+    Call { plugin: String, call: ServiceCall },
 }
 
 /// Why a frame body could not be encoded or decoded.
@@ -197,9 +218,17 @@ pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
 ///
 /// As for [`write_frame`], with `max` as the limit.
 pub fn write_frame_limited<W: Write>(w: &mut W, payload: &[u8], max: usize) -> io::Result<()> {
-    let len = frame_len(payload, max)?;
-    w.write_all(&len.to_le_bytes())?;
-    w.write_all(payload)?;
+    let len = frame_len(payload, max)?.to_le_bytes();
+    let mut bufs = [IoSlice::new(&len), IoSlice::new(payload)];
+    let mut bufs = &mut bufs[..];
+    while !bufs.is_empty() {
+        match w.write_vectored(bufs) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => IoSlice::advance_slices(&mut bufs, n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
     w.flush()
 }
 
@@ -213,9 +242,17 @@ pub async fn write_frame_async<W: AsyncWrite + Unpin>(
     payload: &[u8],
     max: usize,
 ) -> io::Result<()> {
-    let len = frame_len(payload, max)?;
-    w.write_all(&len.to_le_bytes()).await?;
-    w.write_all(payload).await?;
+    let len = frame_len(payload, max)?.to_le_bytes();
+    let mut bufs = [IoSlice::new(&len), IoSlice::new(payload)];
+    let mut bufs = &mut bufs[..];
+    while !bufs.is_empty() {
+        match w.write_vectored(bufs).await {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => IoSlice::advance_slices(&mut bufs, n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
     w.flush().await
 }
 
@@ -313,6 +350,52 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         assert_eq!(read_frame(&mut cursor).unwrap(), b"hello");
         assert_eq!(read_frame(&mut cursor).unwrap(), b"world");
+    }
+
+    /// A writer that takes at most three bytes per call, as a socket with a
+    /// full buffer might.
+    struct Trickle(Vec<u8>);
+
+    impl Write for Trickle {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let n = buf.len().min(3);
+            self.0.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A short vectored write resumes where it stopped, within and across
+    /// the length prefix and the body.
+    #[test]
+    fn short_writes_are_resumed() {
+        let mut w = Trickle(Vec::new());
+        write_frame(&mut w, b"hello, world").unwrap();
+        let mut cursor = std::io::Cursor::new(w.0);
+        assert_eq!(read_frame(&mut cursor).unwrap(), b"hello, world");
+    }
+
+    /// Frames go through a real socket intact, read through a buffer that
+    /// may hold more than one of them.
+    #[test]
+    fn frames_cross_a_socket() {
+        let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let big = vec![7u8; 300_000];
+        let writer = std::thread::spawn(move || {
+            write_frame(&mut a, b"one").unwrap();
+            write_frame(&mut a, &big).unwrap();
+            write_frame(&mut a, b"").unwrap();
+            write_frame(&mut a, b"three").unwrap();
+        });
+        let mut r = std::io::BufReader::new(b);
+        assert_eq!(read_frame(&mut r).unwrap(), b"one");
+        assert_eq!(read_frame(&mut r).unwrap(), vec![7u8; 300_000]);
+        assert!(read_frame(&mut r).unwrap().is_empty());
+        assert_eq!(read_frame(&mut r).unwrap(), b"three");
+        writer.join().unwrap();
     }
 
     #[test]
