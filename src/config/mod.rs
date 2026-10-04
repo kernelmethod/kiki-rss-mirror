@@ -23,6 +23,9 @@
 //! [proxy]
 //! url = "http://proxy.example:3128"   # or "socks5h://127.0.0.1:9050" for Tor
 //! no_proxy = "localhost, .internal.example"
+//!
+//! [web_ui]
+//! allowed_hosts = ["kiki.lan", "*.home.example"]
 //! ```
 //!
 //! The proxy can also be set with environment variables, which take
@@ -33,9 +36,11 @@
 //! comments and formatting are not preserved. Edits made to the file from
 //! outside the server are picked up by [`watch::spawn_watcher`].
 
+pub mod hosts;
 mod store;
 pub mod watch;
 
+pub use hosts::{HostPattern, HostPatternError};
 pub use store::{ConfigHandle, ConfigStore};
 
 use serde::{Deserialize, Serialize};
@@ -91,6 +96,8 @@ pub struct Settings {
     pub retention: RetentionSettings,
     #[serde(default)]
     pub proxy: ProxySettings,
+    #[serde(default)]
+    pub web_ui: WebUiSettings,
 }
 
 /// Settings governing how and how often feeds are fetched.
@@ -186,6 +193,36 @@ pub struct ProxySettings {
     /// or `*` for every host. Has no effect without `url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_proxy: Option<String>,
+}
+
+/// Settings for the web UI that `kiki web` serves.
+///
+/// `kiki web` reads these once, as it starts, so a change takes effect
+/// when it is restarted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebUiSettings {
+    /// Hosts the web UI answers to besides `localhost`, `127.0.0.1` and
+    /// `::1`, on top of any given to `kiki web --allowed-host`: exact
+    /// host names or IP addresses, `*.example.com` for every subdomain of
+    /// `example.com`, or `*` for any host at all. Requests naming any
+    /// other host in their `Host` header are refused, so that a site
+    /// cannot reach the web UI by pointing its own domain at this machine
+    /// (DNS rebinding).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::{HostPattern, Overrides};
+    ///
+    /// let o = Overrides::parse("[web_ui]\nallowed_hosts = [\"kiki.lan\", \"*\"]\n").unwrap();
+    /// assert_eq!(
+    ///     o.resolve().unwrap().web_ui.allowed_hosts,
+    ///     [HostPattern::Exact("kiki.lan".into()), HostPattern::Any]
+    /// );
+    /// ```
+    #[serde(default)]
+    pub allowed_hosts: Vec<HostPattern>,
 }
 
 /// Environment variable overriding [`ProxySettings::url`].
@@ -289,6 +326,7 @@ impl Default for Settings {
             },
             retention: RetentionSettings::default(),
             proxy: ProxySettings::default(),
+            web_ui: WebUiSettings::default(),
         }
     }
 }
@@ -627,6 +665,44 @@ mod tests {
         ]));
         assert_eq!(s.url.as_deref(), Some("http://env:2"));
         assert_eq!(s.no_proxy.as_deref(), Some("env.example"));
+    }
+
+    #[test]
+    fn web_ui_allowed_hosts_are_read_from_the_file() {
+        assert!(Settings::default().web_ui.allowed_hosts.is_empty());
+
+        let o = Overrides::parse(
+            "[web_ui]\nallowed_hosts = [\"Kiki.LAN\", \"*.example.com\", \"[::1]\", \"*\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            o.resolve().unwrap().web_ui.allowed_hosts,
+            [
+                HostPattern::Exact("kiki.lan".into()),
+                HostPattern::Subdomains("example.com".into()),
+                HostPattern::Exact("::1".into()),
+                HostPattern::Any,
+            ]
+        );
+
+        let mut o = Overrides::default();
+        o.set("web_ui", "allowed_hosts", ["kiki.lan", "*.example.com"])
+            .unwrap();
+        let reparsed = Overrides::parse(&o.to_toml_string().unwrap()).unwrap();
+        assert_eq!(reparsed.resolve().unwrap(), o.resolve().unwrap());
+
+        for text in [
+            "[web_ui]\nallowed_hosts = [\"kiki.lan:8080\"]\n",
+            "[web_ui]\nallowed_hosts = [\"\"]\n",
+            "[web_ui]\nallowed_hosts = \"kiki.lan\"\n",
+            "[web_ui]\nallowed_host = [\"kiki.lan\"]\n",
+        ] {
+            let o = Overrides::parse(text).unwrap();
+            assert!(
+                matches!(o.resolve(), Err(ConfigError::Invalid(_))),
+                "{text:?} should be rejected"
+            );
+        }
     }
 
     #[test]
