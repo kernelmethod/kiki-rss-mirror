@@ -2,6 +2,7 @@ mod api;
 mod assets;
 mod entries;
 mod feeds;
+mod hosts;
 mod layout;
 mod listing;
 mod plugins;
@@ -16,6 +17,7 @@ use crate::cli::serve::ServeArgs;
 use crate::sandbox::{self, SandboxConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
+use hosts::{AllowedHosts, HostPattern};
 use server::{api_client, serve_ui, shutdown_signal, stop_server, ServerProcess};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -52,6 +54,17 @@ pub struct WebArgs {
     )]
     listen: SocketAddr,
 
+    /// Also answer requests for HOST, besides `localhost`, `127.0.0.1` and
+    /// `::1`. May be given more than once. `*.example.com` allows every
+    /// subdomain of `example.com`, and `*` allows any host at all.
+    ///
+    /// The web UI refuses requests whose `Host` header names any other
+    /// host, so that a site cannot reach it by pointing its own domain at
+    /// this machine (DNS rebinding). When the web UI is reached by another
+    /// name, such as `kiki.lan` or a LAN address, give that name here.
+    #[arg(long = "allowed-host", value_name = "HOST")]
+    allowed_hosts: Vec<HostPattern>,
+
     #[command(flatten)]
     serve: ServeArgs,
 }
@@ -87,6 +100,7 @@ impl WebArgs {
             .with_context(|| format!("unable to bind the web UI to {}", self.listen))?;
         listener.set_nonblocking(true)?;
         tracing::info!("web UI listening on http://{}", listener.local_addr()?);
+        let allowed_hosts = self.allowed_hosts();
 
         let server = self.spawn_server(&socket_path)?;
 
@@ -99,7 +113,27 @@ impl WebArgs {
             .worker_threads(workers)
             .enable_all()
             .build()?
-            .block_on(run_async(listener, api, server))
+            .block_on(run_async(listener, api, allowed_hosts, server))
+    }
+
+    /// The hosts the web UI answers to, going by `--allowed-host`. Warns
+    /// when that leaves the web UI open to DNS rebinding, or when it
+    /// listens beyond loopback but can only be reached as `localhost`.
+    fn allowed_hosts(&self) -> AllowedHosts {
+        let allowed = AllowedHosts::new(self.allowed_hosts.clone());
+        if allowed.allows_any() {
+            tracing::warn!(
+                "--allowed-host '*' given; the web UI answers to any host name, so other \
+                 sites may reach it through DNS rebinding"
+            );
+        } else if allowed.only_localhost() && !self.listen.ip().is_loopback() {
+            tracing::warn!(
+                "the web UI listens on {} but only answers to localhost; pass \
+                 --allowed-host with the name or address it is reached at",
+                self.listen
+            );
+        }
+        allowed
     }
 
     /// Install the web UI's sandbox, unless `--no-sandbox` was given.
@@ -183,11 +217,12 @@ impl WebArgs {
 async fn run_async(
     listener: std::net::TcpListener,
     api: reqwest::Client,
+    allowed_hosts: AllowedHosts,
     mut server: ServerProcess,
 ) -> Result<()> {
     let listener = TcpListener::from_std(listener)?;
     let cancel = CancellationToken::new();
-    let web = tokio::spawn(serve_ui(listener, api, cancel.clone()));
+    let web = tokio::spawn(serve_ui(listener, api, allowed_hosts, cancel.clone()));
 
     let status = tokio::select! {
         status = server.wait() => {
