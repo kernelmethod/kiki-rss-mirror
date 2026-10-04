@@ -1,0 +1,75 @@
+/* Inline SVG diagrams in the guide, such as the process model in
+   threat-model.md. Colours come from mdBook's theme variables, so the
+   diagrams follow whichever theme the reader picks. */
+
+/* Narrow screens scroll the figure sideways rather than shrink its text
+   past reading. */
+.diagram-figure {
+    overflow-x: auto;
+}
+
+.diagram {
+    display: block;
+    width: 100%;
+    min-width: 600px;
+    max-width: 800px;
+    height: auto;
+    margin: 1.5em auto;
+    font-family: inherit;
+    font-size: 12px;
+}
+
+.diagram text {
+    fill: var(--fg);
+}
+
+.diagram .title {
+    font-size: 13px;
+    font-weight: bold;
+}
+
+.diagram .note {
+    font-size: 11px;
+    font-style: italic;
+}
+
+/* A Kiki process. */
+.diagram .proc {
+    fill: var(--quote-bg);
+    stroke: var(--fg);
+    stroke-width: 1.5;
+}
+
+/* A Kiki process that handles bytes straight from the internet. */
+.diagram .exposed {
+    fill: rgba(230, 126, 34, 0.15);
+    stroke: #e67e22;
+    stroke-width: 2;
+}
+
+/* Something outside Kiki: a client, the internet, the filesystem. */
+.diagram .external {
+    fill: none;
+    stroke: var(--fg);
+    stroke-width: 1.5;
+    stroke-dasharray: 2 3;
+}
+
+/* A group of processes. */
+.diagram .group {
+    fill: none;
+    stroke: var(--fg);
+    stroke-width: 1;
+    stroke-dasharray: 6 4;
+    opacity: 0.7;
+}
+
+.diagram .link {
+    fill: none;
+    stroke: var(--fg);
+    stroke-width: 1.5;
+}
+
+.diagram .arrowhead {
+    fill: var(--fg);
+}
