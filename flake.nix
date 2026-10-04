@@ -26,10 +26,14 @@
               # Bundled plugins, packed into a .tar.zst by build.rs and pulled
               # into tests via include_str! (e.g. plugins/filter/main.lua)
               pluginsFilter = path: _type: builtins.match ".*/plugins(/.*)?" path != null;
-              customOrCargo = path: type:
+              # The guide in book/ is built separately (see `book` below);
+              # leaving it out means editing it doesn't rebuild the crate.
+              notBook = path: path != toString ./book
+                && !(pkgs.lib.hasPrefix (toString ./book + "/") path);
+              customOrCargo = path: type: (notBook path) && (
                 (sqlFilter path type) || (xmlFilter path type) || (docsFilter path type)
                 || (webUiFilter path type) || (pluginsFilter path type)
-                || (craneLib.filterCargoSources path type);
+                || (craneLib.filterCargoSources path type));
             in
               pkgs.lib.cleanSourceWith {
                 src = ./.;
@@ -99,6 +103,46 @@
             dontStrip = true;
           });
 
+          # The user guide (an mdBook in book/) under $out/guide, with the
+          # landing page in book/landing/ in front of it. kiki-publish puts
+          # the rustdoc, API reference and coverage report beside them, in
+          # docs/, api/ and coverage/.
+          book = pkgs.stdenvNoCC.mkDerivation {
+            pname = "kiki-rss-book";
+            version = (craneLib.crateNameFromCargoToml { cargoToml = ./Cargo.toml; }).version;
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                (pkgs.lib.fileset.difference ./book (pkgs.lib.fileset.maybeMissing ./book/build))
+                # Included by book/src/writing-plugins.md.
+                ./src/docs/scripting.md
+              ];
+            };
+            # lychee builds its HTTP client even when offline, and needs CA
+            # certificates to do so.
+            nativeBuildInputs = [ pkgs.mdbook pkgs.lychee pkgs.cacert ];
+            buildPhase = ''
+              runHook preBuild
+              mdbook build book --dest-dir "$out/guide"
+              cp book/landing/* "$out/"
+              runHook postBuild
+            '';
+            # Check every link within the site, anchors included. Links to
+            # the reports kiki-publish adds are skipped, as are external
+            # links, which would need the network, and mdBook's 404 page,
+            # whose links assume the site is served from the root.
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              lychee --offline --include-fragments --no-progress \
+                --exclude "^file://$out/(api|docs|coverage)(/|$)" \
+                --exclude-path "$out/guide/404.html" \
+                "$out"
+              runHook postCheck
+            '';
+            dontInstall = true;
+          };
+
           # rustdoc for the kiki_rss crate, including the guides pulled in
           # from src/docs/*.md. The HTML lands in $out/share/doc.
           docs = craneLib.cargoDoc (commonArgs // {
@@ -144,7 +188,7 @@
         in
         {
           checks = {
-            inherit kiki;
+            inherit kiki book;
 
             fmt = craneLib.cargoFmt {
               inherit (commonArgs) src;
@@ -171,7 +215,7 @@
 
           packages = {
             default = kiki;
-            inherit docs coverage profiling;
+            inherit book docs coverage profiling;
           } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
             inherit static;
             static-profiling = staticProfiling;
@@ -182,6 +226,7 @@
 
             packages = with pkgs; [
               cargo-deb
+              mdbook
             ];
           };
         }
