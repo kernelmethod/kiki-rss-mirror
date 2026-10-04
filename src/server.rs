@@ -370,10 +370,10 @@ impl Server {
             );
         }
 
-        // Create a multi-producer, multi-consumer channel so that web
+        // Create a multi-producer, multi-consumer queue so that web
         // service workers can send tasks to the feed-fetcher workers.
-        let (tx, rx) = async_channel::bounded(1024);
-        let tx = crate::tasks::TaskSender::from(tx);
+        // Asset caching gets a lane of its own; see `crate::tasks::queue`.
+        let (tx, rx) = crate::tasks::queue(1024);
 
         // Shared scripting engine handle; workers and HTTP handlers dispatch events
         // through it.
@@ -772,13 +772,18 @@ async fn retry_entry_assets(
     db: &crate::db::Db,
     metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
-    // Leave room in the queue for feed refreshes.
-    let room = task_manager_tx
-        .capacity()
-        .map_or(ENTRY_ASSETS_RETRY_BATCH, |cap| {
-            (cap / 2).saturating_sub(task_manager_tx.len())
-        })
-        .min(ENTRY_ASSETS_RETRY_BATCH);
+    let room = match task_manager_tx.asset_queue_len() {
+        // The asset lane has no bound, and anything already in it is ahead
+        // of what is retried, so keep it to a batch at a time.
+        Some(queued) => ENTRY_ASSETS_RETRY_BATCH.saturating_sub(queued),
+        // Leave room in a queue shared with feed refreshes for them.
+        None => task_manager_tx
+            .capacity()
+            .map_or(ENTRY_ASSETS_RETRY_BATCH, |cap| {
+                (cap / 2).saturating_sub(task_manager_tx.len())
+            })
+            .min(ENTRY_ASSETS_RETRY_BATCH),
+    };
     if room == 0 {
         return Ok(());
     }
@@ -800,13 +805,14 @@ async fn retry_entry_assets(
         );
     }
     for entry_id in due.retry {
-        // Should the queue be full after all, the entry is simply due
+        // Should it not be queued after all, the entry is simply due
         // again later.
         match task_manager_tx.try_send(TaskManagerCommand::CacheEntryAssets { entry_id }) {
             Ok(_) => metrics.record_task_enqueued("cache_entry_assets"),
-            Err(e) => debug!(
+            Err(e) => tracing::error!(
                 "Failed to requeue asset caching for entry {}: {:?}",
-                entry_id, e
+                entry_id,
+                e
             ),
         }
     }
@@ -1642,6 +1648,53 @@ mod test {
             |r| r.get(0),
         )?;
         assert_eq!(attempts, 1);
+        Ok(())
+    }
+
+    /// With asset caching in a lane of its own, retries are held back while
+    /// a batch's worth is already waiting there, rather than by how full
+    /// the main lane is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retried_asset_caching_waits_for_the_asset_lane() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        let pool = make_pool(&tc.database_path())?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (NULL, 'rss', 'g', 0, 't', 'https://example.com/')",
+            [],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+        crate::db::pending_assets::add(&conn, entry_id)?;
+        conn.execute(
+            "UPDATE pending_entry_assets SET next_attempt_at = unixepoch() - 1",
+            [],
+        )?;
+        let metrics = crate::metrics::Metrics::new()?;
+        let (tx, rx) = crate::tasks::queue(1);
+        // A full main lane does not hold retries back...
+        tx.try_send(TaskManagerCommand::CleanupAll)?;
+        // ...but a batch already waiting in the asset lane does.
+        for queued in 0..ENTRY_ASSETS_RETRY_BATCH as i64 {
+            tx.try_send(TaskManagerCommand::CacheEntryAssets {
+                entry_id: -1 - queued,
+            })?;
+        }
+        retry_entry_assets(&tx, &pool, &metrics).await?;
+        assert_eq!(tx.asset_queue_len(), Some(ENTRY_ASSETS_RETRY_BATCH));
+
+        // Once that is taken, the due entry is queued.
+        rx.recv().await?;
+        for _ in 0..ENTRY_ASSETS_RETRY_BATCH {
+            rx.recv().await?;
+        }
+        retry_entry_assets(&tx, &pool, &metrics).await?;
+        match rx.recv().await? {
+            TaskManagerCommand::CacheEntryAssets { entry_id: queued } => {
+                assert_eq!(queued, entry_id)
+            }
+            other => anyhow::bail!("unexpected command {other:?}"),
+        }
         Ok(())
     }
 
