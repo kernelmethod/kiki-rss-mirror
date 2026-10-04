@@ -66,7 +66,7 @@ fn in_progress_len(set: &InProgressSet) -> f64 {
 /// from refreshing (or cleaning up) the same feed simultaneously.
 #[derive(Clone)]
 struct Worker {
-    rx: async_channel::Receiver<TaskManagerCommand>,
+    rx: crate::tasks::TaskReceiver,
     tx: crate::tasks::TaskSender,
     db: Db,
     token: CancellationToken,
@@ -118,7 +118,10 @@ pub fn worker_count() -> usize {
     cpus.saturating_mul(WORKERS_PER_CPU).max(MIN_WORKERS)
 }
 
-/// Spawn multiple worker tasks that pull from a shared channel.
+/// Spawn multiple worker tasks that pull from a shared queue.
+///
+/// `rx` is a [`crate::tasks::TaskReceiver`], or a plain receiver for a
+/// queue with a single lane.
 ///
 /// All workers share a single [`ScriptRunnerHandle`], installed when the server starts.
 /// They also share one [`Fetcher`], through which every feed refresh
@@ -127,7 +130,7 @@ pub fn worker_count() -> usize {
 /// applies to the next one.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_workers(
-    rx: async_channel::Receiver<TaskManagerCommand>,
+    rx: impl Into<crate::tasks::TaskReceiver>,
     tx: crate::tasks::TaskSender,
     db: Db,
     token: CancellationToken,
@@ -139,7 +142,7 @@ pub fn spawn_workers(
     fetcher: Fetcher,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let worker = Worker {
-        rx,
+        rx: rx.into(),
         tx,
         db,
         token,

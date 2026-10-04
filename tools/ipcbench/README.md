@@ -11,12 +11,15 @@ entries (10,000 by default), each of which crosses the fetcher's channels
 and the script host's. For every round it records:
 
 - the wall time from asking for the refresh to the last entry being stored;
+- the settle time, from asking for the refresh until Kiki's processes go
+  quiet, which also covers what storing the entries sets off, such as
+  finding the images in each entry's content to cache them;
 - the CPU time and context switches of each Kiki process, read from
-  `/proc`, summed over its threads.
+  `/proc`, summed over its threads, up to the moment the round settled.
 
 With `--strace`, it also counts every system call each of the server, the
-script host, the fetcher's supervisor and its worker makes over one round,
-in runs of its own, since tracing slows the processes it traces.
+script host, the fetcher's supervisor, its worker and its parser makes over
+one round, in runs of its own, since tracing slows the processes it traces.
 
 ## Running
 
@@ -73,4 +76,6 @@ Compare medians over several runs rather than single rounds.
 
 The server's numbers include its SQLite work, which dominates them; the
 script host does nothing but serve the server's requests, so its numbers
-are the most direct measure of the script host channel.
+are the most direct measure of the script host channel. Likewise the
+fetcher's supervisor does nothing but relay frames and watch its children,
+so its numbers are what the relay costs it.
