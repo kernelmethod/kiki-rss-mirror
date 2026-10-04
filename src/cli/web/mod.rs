@@ -13,11 +13,13 @@ mod tags;
 #[cfg(test)]
 mod tests;
 
+use crate::cli::paths::{self, Env};
 use crate::cli::serve::ServeArgs;
+use crate::config::{self, ConfigStore, HostPattern};
 use crate::sandbox::{self, SandboxConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
-use hosts::{AllowedHosts, HostPattern};
+use hosts::AllowedHosts;
 use server::{api_client, serve_ui, shutdown_signal, stop_server, ServerProcess};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -55,7 +57,8 @@ pub struct WebArgs {
     listen: SocketAddr,
 
     /// Also answer requests for HOST, besides `localhost`, `127.0.0.1` and
-    /// `::1`. May be given more than once. `*.example.com` allows every
+    /// `::1`, and any listed in `kiki.toml`'s `web_ui.allowed_hosts`. May
+    /// be given more than once. `*.example.com` allows every
     /// subdomain of `example.com`, and `*` allows any host at all.
     ///
     /// The web UI refuses requests whose `Host` header names any other
@@ -100,7 +103,7 @@ impl WebArgs {
             .with_context(|| format!("unable to bind the web UI to {}", self.listen))?;
         listener.set_nonblocking(true)?;
         tracing::info!("web UI listening on http://{}", listener.local_addr()?);
-        let allowed_hosts = self.allowed_hosts();
+        let allowed_hosts = self.allowed_hosts(&configured_allowed_hosts()?);
 
         let server = self.spawn_server(&socket_path)?;
 
@@ -116,20 +119,23 @@ impl WebArgs {
             .block_on(run_async(listener, api, allowed_hosts, server))
     }
 
-    /// The hosts the web UI answers to, going by `--allowed-host`. Warns
-    /// when that leaves the web UI open to DNS rebinding, or when it
+    /// The hosts the web UI answers to: those given to `--allowed-host`,
+    /// and `configured`, from the config file's `web_ui.allowed_hosts`.
+    /// Warns when that leaves the web UI open to DNS rebinding, or when it
     /// listens beyond loopback but can only be reached as `localhost`.
-    fn allowed_hosts(&self) -> AllowedHosts {
-        let allowed = AllowedHosts::new(self.allowed_hosts.clone());
+    fn allowed_hosts(&self, configured: &[HostPattern]) -> AllowedHosts {
+        let mut patterns = self.allowed_hosts.clone();
+        patterns.extend_from_slice(configured);
+        let allowed = AllowedHosts::new(patterns);
         if allowed.allows_any() {
             tracing::warn!(
-                "--allowed-host '*' given; the web UI answers to any host name, so other \
-                 sites may reach it through DNS rebinding"
+                "the web UI answers to any host name ('*' in --allowed-host or \
+                 web_ui.allowed_hosts), so other sites may reach it through DNS rebinding"
             );
         } else if allowed.only_localhost() && !self.listen.ip().is_loopback() {
             tracing::warn!(
-                "the web UI listens on {} but only answers to localhost; pass \
-                 --allowed-host with the name or address it is reached at",
+                "the web UI listens on {} but only answers to localhost; add the name or \
+                 address it is reached at with --allowed-host or web_ui.allowed_hosts",
                 self.listen
             );
         }
@@ -210,6 +216,22 @@ impl WebArgs {
         tracing::info!(pid = child.id(), "started Kiki server");
         Ok(ServerProcess(child))
     }
+}
+
+/// The config file's `web_ui.allowed_hosts`, read from `kiki.toml` in
+/// the data directory, where the `kiki serve` child reads its own
+/// settings. Read once, before the sandbox hides the file.
+///
+/// # Errors
+///
+/// Returns an error if the data directory cannot be found, or if the
+/// config file cannot be read or holds an invalid setting.
+fn configured_allowed_hosts() -> Result<Vec<HostPattern>> {
+    let data_dir = paths::resolve_data_dir(&Env::from_process())?;
+    let path = data_dir.path.join(config::CONFIG_FILE_NAME);
+    let store =
+        ConfigStore::open(&path).with_context(|| format!("failed to load config file {path:?}"))?;
+    Ok(store.current().web_ui.allowed_hosts.clone())
 }
 
 /// Serve the web UI on `listener` alongside the Kiki `server`, until one of

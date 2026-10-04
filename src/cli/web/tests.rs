@@ -1,11 +1,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::feeds::{render_favicon, render_meta};
-use super::hosts::{AllowedHosts, HostPattern, HostPatternError};
+use super::hosts::AllowedHosts;
 use super::layout::SCRIPT_SRC;
 use super::listing::fts_query;
 use super::server::{api_client, serve_ui};
 use super::WebArgs;
+use crate::config::{HostPattern, HostPatternError};
 use crate::db::tags::SystemTag;
 use anyhow::{Context, Result};
 use axum::http::{header, StatusCode};
@@ -2521,4 +2522,20 @@ async fn requests_for_other_hosts_are_refused() -> Result<()> {
     let status = get_with_host(tc.client()?, any, "evil.example").await?;
     assert_eq!(status, StatusCode::OK);
     Ok(())
+}
+
+/// Hosts from `--allowed-host` and from the config file's
+/// `web_ui.allowed_hosts` are both allowed.
+#[test]
+fn allowed_hosts_combine_flags_and_config() {
+    let args = parse(&["--allowed-host", "kiki.lan"]);
+    let allowed = args.allowed_hosts(&["*.example.com".parse().unwrap()]);
+    assert!(allowed.allows("localhost"));
+    assert!(allowed.allows("kiki.lan"));
+    assert!(allowed.allows("a.example.com"));
+    assert!(!allowed.allows("evil.example"));
+
+    let allowed = parse(&[]).allowed_hosts(&[HostPattern::Any]);
+    assert!(allowed.allows("evil.example"));
+    assert!(parse(&[]).allowed_hosts(&[]).only_localhost());
 }
