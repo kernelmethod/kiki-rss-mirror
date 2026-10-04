@@ -17,9 +17,10 @@ Kiki ships with:
 - **`kiki serve`**, the server. It fetches feeds, honours their caching
   headers and backs off from misbehaving servers, caches images and
   enclosures, and runs plugins over new entries.
-- **Plugins** written in Lua, three of which are installed by default: one
+- **Plugins** written in Lua, four of which are installed by default: one
   [hides entries](plugins/filter.md) matching rules you set, one
-  [tags entries](plugins/auto-tag.md) automatically, and one
+  [tags entries](plugins/auto-tag.md) automatically, one
+  [sanitizes entries' HTML](plugins/sanitize.md), and one
   [strips tracking parameters](plugins/strip-tracking.md) and pixels.
 - **`kiki web`**, a small [web UI](web-ui.md) for reading feeds in a browser.
 - **OPML import and export**, for moving feeds in from, or out to, another

@@ -22,11 +22,12 @@
 //!
 //! Timeouts surface as execution errors; for `entry.ingest` handlers the entry passes
 //! through unmodified, for observe handlers the failure is dropped. Regexes compiled through
-//! `kiki.regex` live outside the Lua allocator and have limits of their own; see
-//! the `regex_api` module.
+//! `kiki.regex`, and the HTML `kiki.html.rewrite` works on, live outside the Lua allocator
+//! and have limits of their own; see the `regex_api` and `html_api` modules.
 
 mod api;
 mod config;
+mod html_api;
 mod regex_api;
 
 use super::{
@@ -359,6 +360,7 @@ impl LuaScriptRunner {
         }
 
         regex_api::install(&lua, &kiki).map_err(ScriptError::ScriptLoadError)?;
+        html_api::install(&lua, &kiki).map_err(ScriptError::ScriptLoadError)?;
 
         lua.globals()
             .set("kiki", kiki)

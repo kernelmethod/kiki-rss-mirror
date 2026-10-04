@@ -168,6 +168,26 @@ echo 'skip_assets = [3, "https://example.com/feed.xml"]' | kiki plugin config se
 
 See [`plugins/strip-tracking/main.lua`](plugins/strip-tracking/main.lua) for the details.
 
+### Sanitizing entries' HTML
+
+The `sanitize` plugin, in [`plugins/sanitize`](plugins/sanitize), is also
+installed by default. It rewrites each new entry's content so that what Kiki
+stores, and hands to API clients, is safe to show: it keeps an allowlist of
+formatting elements and attributes, unwraps other elements, and removes
+scripts, styles, frames, embedded objects, comments, event handlers, and links
+and images whose URLs use a scheme other than `http`, `https` or `mailto`.
+It only sanitizes entries as they are downloaded, not the ones already stored.
+To keep more, or less, start from its defaults:
+
+```bash
+kiki plugin config get sanitize --defaults > sanitize.toml
+# edit sanitize.toml: add names to `elements` or `attributes` ("a:href" keeps
+# href on <a> only), or schemes to `url_schemes`
+kiki plugin config set sanitize sanitize.toml
+```
+
+See [`plugins/sanitize/main.lua`](plugins/sanitize/main.lua) for the details.
+
 ## Where Kiki keeps its files
 
 | | Default |

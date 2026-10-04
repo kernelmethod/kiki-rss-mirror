@@ -6,16 +6,17 @@ its own directory under `plugins/` in Kiki's [data directory](../files.md).
 
 ## Plugins installed by default
 
-`kiki init` installs three plugins, bundled into the `kiki` binary:
+`kiki init` installs four plugins, bundled into the `kiki` binary:
 
 | Plugin | What it does |
 | ------ | ------------ |
 | [`filter`](filter.md) | Hides entries matching rules you set. |
 | [`auto-tag`](auto-tag.md) | Tags entries matching rules you set. |
+| [`sanitize`](sanitize.md) | Removes scripts, styles, embedded content and unsafe links from entries' HTML. |
 | [`strip-tracking`](strip-tracking.md) | Removes tracking parameters from links, and tracking pixels from content. |
 
 `filter` and `auto-tag` do nothing until you give them rules.
-`strip-tracking` works out of the box.
+`sanitize` and `strip-tracking` work out of the box.
 
 Pass `kiki init --no-default-plugins` to skip them. `kiki init --check`,
 which the packaged services run before every start, installs default plugins
