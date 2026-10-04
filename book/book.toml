@@ -1,0 +1,23 @@
+# The Kiki user guide. Build it with `nix build .#book`, which also adds the
+# landing page in landing/ and checks the links, or preview it with
+# `mdbook serve book` from the dev shell.
+
+[book]
+title = "Kiki"
+description = "A guide to running and configuring the Kiki RSS/Atom feed engine"
+language = "en"
+
+[build]
+# Published under guide/, beside the landing page (see flake.nix).
+build-dir = "build"
+create-missing = false
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/kernelmethod/kiki-rss"
+edit-url-template = "https://github.com/kernelmethod/kiki-rss/edit/main/book/{path}"
+additional-js = ["theme/home-link.js"]
+
+[output.html.search]
+limit-results = 20

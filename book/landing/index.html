@@ -1,0 +1,135 @@
+<!doctype html>
+<!-- Kiki's landing page, published in front of the guide (guide/), the API
+     reference (api/), the Rust API documentation (docs/) and the coverage
+     report (coverage/). See flake.nix and kiki-publish in the homelab repo. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kiki</title>
+  <meta name="description" content="Kiki is an RSS/Atom feed engine: it fetches, stores, filters and tags feeds, and serves them over an HTTP API.">
+  <link rel="stylesheet" href="landing.css">
+</head>
+<body>
+  <header class="top">
+    <a class="wordmark" href="./">kiki</a>
+    <nav>
+      <a href="guide/">Guide</a>
+      <a href="api/">API</a>
+      <a href="https://github.com/kernelmethod/kiki-rss">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h1>The feed engine<br>behind your reader.</h1>
+      <p class="lede">
+        Kiki fetches RSS and Atom feeds on a polite schedule, stores their
+        entries, filters and tags them with plugins, and serves it all over
+        a small HTTP API. Build a reader on top, sync it into the one you
+        already use, or just point scripts at it.
+      </p>
+      <div class="actions">
+        <a class="button primary" href="guide/getting-started.html">Get started</a>
+        <a class="button" href="guide/">Read the guide</a>
+      </div>
+    </section>
+
+    <section class="quickstart" aria-label="Quick start">
+      <pre><code><span class="prompt">$</span> kiki init
+<span class="prompt">$</span> kiki opml import subscriptions.opml
+<span class="prompt">$</span> kiki web
+<span class="comment"># reading at http://localhost:8080</span></code></pre>
+    </section>
+
+    <section class="features">
+      <article>
+        <h2>Polite fetching</h2>
+        <p>Honours caching headers and <code>Retry-After</code>, backs off
+          from errors, and learns which feeds rarely change.</p>
+        <a href="guide/settings.html#feed_fetch">Fetch settings</a>
+      </article>
+      <article>
+        <h2>Lua plugins</h2>
+        <p>Hide sponsored posts, tag entries by topic, strip tracking
+          parameters, or write your own handlers.</p>
+        <a href="guide/plugins/">Plugins</a>
+      </article>
+      <article>
+        <h2>Built for clients</h2>
+        <p>Tags instead of fixed read/saved flags, monotonic entry IDs, and
+          batch endpoints make syncing straightforward.</p>
+        <a href="guide/api.html">The HTTP API</a>
+      </article>
+      <article>
+        <h2>Locked down</h2>
+        <p>Serves only on a Unix socket, and sandboxes itself with Landlock
+          and seccomp, with fetching and plugins in separate processes.</p>
+        <a href="guide/deployment.html#sandboxing">Sandboxing</a>
+      </article>
+    </section>
+
+    <section class="technical">
+      <h2>For developers</h2>
+      <div class="cards">
+        <a class="card" href="api/">
+          <span class="card-title">HTTP API reference</span>
+          <span class="card-body">Every endpoint, with schemas and examples.</span>
+        </a>
+        <a class="card" href="docs/kiki_rss/">
+          <span class="card-title">Rust API docs</span>
+          <span class="card-body">The <code>kiki_rss</code> crate and its internals.</span>
+        </a>
+        <a class="card" href="coverage/">
+          <span class="card-title">Test coverage</span>
+          <span class="card-body"><span id="coverage">Line coverage across the test suite.</span></span>
+        </a>
+        <a class="card" href="guide/development.html">
+          <span class="card-title">Building and testing</span>
+          <span class="card-body">Toolchain, Nix checks, benchmarks.</span>
+        </a>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>MIT licensed</span>
+    <span id="revision"></span>
+  </footer>
+
+  <script>
+    // Fill in the build's revision and coverage from the files kiki-publish
+    // writes beside this page. Both are optional: the page reads fine
+    // without them, as it does when previewed from the Nix build alone.
+    (async function () {
+      async function text(path) {
+        try {
+          const response = await fetch(path);
+          return response.ok ? await response.text() : null;
+        } catch {
+          return null;
+        }
+      }
+
+      const revision = await text("REVISION");
+      if (revision && /^[0-9a-f]{7,40}$/.test(revision.trim())) {
+        const rev = revision.trim();
+        const link = document.createElement("a");
+        link.href = "https://github.com/kernelmethod/kiki-rss/commit/" + rev;
+        link.textContent = "Built from " + rev.slice(0, 7);
+        document.getElementById("revision").append(link);
+      }
+
+      // `cargo llvm-cov report --summary-only` ends with a TOTAL row whose
+      // percentages are, in order, regions, functions and lines.
+      const summary = await text("coverage/summary.txt");
+      const total = summary && summary.split("\n").find((line) => line.startsWith("TOTAL"));
+      const percents = total ? total.match(/[\d.]+%/g) : null;
+      if (percents && percents.length >= 3) {
+        document.getElementById("coverage").textContent =
+          percents[2] + " of lines covered by the test suite.";
+      }
+    })();
+  </script>
+</body>
+</html>

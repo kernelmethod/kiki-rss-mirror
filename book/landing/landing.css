@@ -1,0 +1,226 @@
+/* Colours follow the guide's mdBook themes: "light", and "navy" in dark
+   mode, so moving between the landing page and the guide doesn't jar. */
+:root {
+  --bg: #ffffff;
+  --fg: #1d1d1f;
+  --muted: #5b5b66;
+  --links: #20609f;
+  --surface: #f6f7f9;
+  --border: #e3e5e8;
+  --code-bg: #f6f7f9;
+  --accent: #20609f;
+  --accent-fg: #ffffff;
+  --mono: "Source Code Pro", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: "Open Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: hsl(226, 23%, 11%);
+    --fg: #bcbdd0;
+    --muted: #8f90a6;
+    --links: #2b79a2;
+    --surface: #282d3f;
+    --border: #3a4057;
+    --code-bg: #1d1f2d;
+    --accent: #2b79a2;
+    --accent-fg: #ffffff;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 1rem;
+  line-height: 1.6;
+}
+
+a {
+  color: var(--links);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+
+.top,
+main,
+footer {
+  max-width: 64rem;
+  margin: 0 auto;
+  padding-left: 1rem;
+  padding-right: 1rem;
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 1.25rem;
+  padding-bottom: 1.25rem;
+}
+
+.wordmark {
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 1.4rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.wordmark:hover {
+  text-decoration: none;
+}
+
+.top nav {
+  display: flex;
+  gap: 1.25rem;
+}
+
+.top nav a {
+  color: var(--muted);
+}
+
+.hero {
+  padding: 3.5rem 0 2rem;
+}
+
+.hero h1 {
+  margin: 0 0 1.25rem;
+  font-size: clamp(2.2rem, 6vw, 3.5rem);
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+}
+
+.lede {
+  max-width: 40rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: 1.15rem;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 2rem;
+}
+
+.button {
+  display: inline-block;
+  padding: 0.6rem 1.2rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.button:hover {
+  border-color: var(--accent);
+  text-decoration: none;
+}
+
+.button.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+.quickstart pre {
+  margin: 1rem 0 3rem;
+  padding: 1.25rem 1.5rem;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--code-bg);
+  line-height: 1.7;
+}
+
+.prompt,
+.comment {
+  color: var(--muted);
+  user-select: none;
+}
+
+.features {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 2rem;
+  padding: 1rem 0 3.5rem;
+}
+
+.features h2 {
+  margin: 0 0 0.4rem;
+  font-size: 1.1rem;
+}
+
+.features p {
+  margin: 0 0 0.6rem;
+  color: var(--muted);
+}
+
+.technical {
+  padding: 2rem 0 3rem;
+  border-top: 1px solid var(--border);
+}
+
+.technical h2 {
+  margin: 0 0 1.25rem;
+  font-size: 1.3rem;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 1rem;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 1.1rem 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--fg);
+}
+
+.card:hover {
+  border-color: var(--accent);
+  text-decoration: none;
+}
+
+.card-title {
+  font-weight: 600;
+}
+
+.card-body {
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding-top: 1.5rem;
+  padding-bottom: 2rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.9rem;
+}

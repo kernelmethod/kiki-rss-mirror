@@ -46,7 +46,7 @@ with
 curl \
     --unix-socket "$XDG_RUNTIME_DIR/kiki/kiki.sock" \
     --request POST \
-    http://localhost/v1/feeds/fetch/$id
+    http://localhost/v1/feeds/refresh/$id
 ```
 
 To move feeds in or out of Kiki from another aggregator, use OPML. Folders in

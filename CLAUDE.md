@@ -13,6 +13,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 # Testing commands
 cargo test
+
+# Documentation site (user guide and landing page)
+mdbook serve book       # Preview the guide while editing (from `nix develop`)
+nix build .#book        # Build the guide and landing page, and check their links
 ```
 
 ## Codebase Organization
@@ -25,6 +29,7 @@ Modules in the codebase are structured as follows:
   - `routes/` - HTTP route handlers organized by API version
   - `cli/` - Command-line interface commands
   - `test/` - Test modules and test data
+- `book/` - The user guide (an mdBook), published with the landing page in `book/landing/`
 
 ## Code Style Guidelines
 
@@ -41,6 +46,7 @@ Modules in the codebase are structured as follows:
 - Don't call back into `Db` from inside a closure passed to it: the nested checkout is refused with `DbError::Nested`, since waiting for it could deadlock
 
 ### Documentation
+- User-facing documentation (usage, configuration, plugins) goes in the guide under `book/src/`; keep `book/src/settings.md` in sync with `src/config/mod.rs`
 - Document all public functions with doc comments (`///`) using `rustdoc`-style documentation
 - Include examples for public APIs
 - Document error cases and return values

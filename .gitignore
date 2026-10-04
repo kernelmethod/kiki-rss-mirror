@@ -11,3 +11,6 @@
 
 # Standalone tools build into their own target directories
 /tools/*/target
+
+# mdBook output from `mdbook build book` (Nix builds into the store instead)
+/book/build
