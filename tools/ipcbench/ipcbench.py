@@ -34,7 +34,12 @@ CLK_TCK = os.sysconf("SC_CLK_TCK")
 LOREM = "Lorem ipsum dolor sit amet, consectetur adipiscing. "
 # Processes are named by their hidden subcommand, e.g. `kiki __script-host`.
 ROLES = ["server", "script-host", "feed-fetcher", "feed-worker", "feed-parser", "feed-resolver"]
-TRACED = ["server", "script-host", "feed-fetcher", "feed-worker"]
+TRACED = ["server", "script-host", "feed-fetcher", "feed-worker", "feed-parser"]
+# A round has settled once Kiki's processes have used less than this much CPU
+# between samples, for SETTLE_QUIET samples in a row, SETTLE_STEP apart.
+SETTLE_CPU = 0.02
+SETTLE_QUIET = 3
+SETTLE_STEP = 0.2
 
 
 # --- The feed server ------------------------------------------------------
@@ -156,6 +161,27 @@ def sample(server):
     return totals
 
 
+def settle(server, start):
+    """Wait for the work a round set off, entries' asset caching among it,
+    to finish: until Kiki's processes go quiet. Returns the last sample and
+    the seconds from `start` to the last one in which they were busy."""
+    last = sample(server)
+    busy_at = time.time()
+    quiet = 0
+    deadline = time.time() + 300
+    while quiet < SETTLE_QUIET and time.time() < deadline:
+        time.sleep(SETTLE_STEP)
+        now = sample(server)
+        used = sum(now[k][0] - last.get(k, [0, 0])[0] for k in now)
+        last = now
+        if used < SETTLE_CPU:
+            quiet += 1
+        else:
+            quiet = 0
+            busy_at = time.time()
+    return last, busy_at - start
+
+
 def parse_strace(path):
     calls = {}
     for line in open(path):
@@ -234,10 +260,10 @@ def run(kiki, label, feeds, items, content_bytes, rounds, trace, serve_args):
             api(sock, "POST", "/v1/feeds/refresh")
             wait_for(r)
             wall = time.time() - start
-            time.sleep(0.5)  # let the last responses be counted
-            after = sample(proc.pid)
+            after, settled = settle(proc.pid, start)
             result = {
                 "wall": round(wall, 3),
+                "settle": round(max(wall, settled), 3),
                 "procs": {
                     k: [round(after[k][i] - before.get(k, [0, 0])[i], 3) for i in range(2)]
                     for k in after
@@ -282,7 +308,12 @@ def summarize(results, out=sys.stdout):
     print(f"Medians over rounds of {size:,} new entries "
           f"({', '.join(f'{l}: {len(rounds.get(l, []))}' for l in labels)} rounds)\n",
           file=out)
-    rows = [("wall time (s)", lambda r: r["wall"], "{:.2f}")]
+    rows = [
+        ("wall time (s)", lambda r: r["wall"], "{:.2f}"),
+        ("settle time (s)", lambda r: r.get("settle", 0), "{:.2f}"),
+        ("all processes CPU (s)", lambda r: sum(v[0] for v in r["procs"].values()), "{:.2f}"),
+        ("all ctx switches", lambda r: sum(v[1] for v in r["procs"].values()), "{:,.0f}"),
+    ]
     for role_ in ROLES:
         rows.append((f"{role_} CPU (s)", lambda r, k=role_: r["procs"].get(k, [0, 0])[0], "{:.2f}"))
         rows.append((f"{role_} ctx switches", lambda r, k=role_: r["procs"].get(k, [0, 0])[1], "{:,.0f}"))

@@ -26,6 +26,11 @@ web-ui = ["cli"]
 # Bundle the plugins in plugins/ that `kiki init` installs (see build.rs)
 default-plugins = ["dep:tar", "dep:zstd"]
 extra-tests = []
+# Benchmarking only: the feed fetcher's supervisor relays nothing, and its
+# worker talks to the server and its helpers directly, so that
+# tools/ipcbench can measure what the relay costs. Gives up worker and
+# helper replacement; see src/process/feed_fetcher/direct.rs.
+bench-direct-ipc = []
 
 [dependencies]
 anyhow = "1.0"
