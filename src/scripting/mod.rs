@@ -269,6 +269,55 @@ impl Event {
             _ => None,
         }
     }
+
+    /// This event's bit in an [`EventSet`].
+    fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
+}
+
+/// A set of [`Event`]s, such as those some handler is registered for.
+///
+/// Packed into one byte, so the script host can report its subscriptions
+/// on every response for next to nothing.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::scripting::{Event, EventSet};
+///
+/// let mut set = EventSet::default();
+/// set.insert(Event::EntryIngest);
+/// assert!(set.contains(Event::EntryIngest));
+/// assert!(!set.contains(Event::EntryParsed));
+/// assert!(EventSet::ALL.contains(Event::EntryParsed));
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSet(u8);
+
+impl EventSet {
+    /// Every event.
+    pub const ALL: EventSet = EventSet(u8::MAX);
+
+    /// Whether `event` is in the set.
+    pub fn contains(self, event: Event) -> bool {
+        self.0 & event.bit() != 0
+    }
+
+    /// Add `event` to the set.
+    pub fn insert(&mut self, event: Event) {
+        self.0 |= event.bit();
+    }
+
+    /// The set as a byte, for storing in an atomic.
+    pub fn to_bits(self) -> u8 {
+        self.0
+    }
+
+    /// The set a byte from [`Self::to_bits`] stands for.
+    pub fn from_bits(bits: u8) -> Self {
+        EventSet(bits)
+    }
 }
 
 /// Payload variants carried alongside an [`Event`] when dispatched to scripts.
@@ -398,6 +447,16 @@ pub trait ScriptServices: Send + Sync {
 /// [`Self::dispatch_transform_entry`] and may return `Ok(None)` to filter the entry out.
 /// All other events are observe-only and dispatched via [`Self::dispatch_observe`].
 pub trait ScriptRunner: Send + Sync {
+    /// Whether any handler may be registered for `event`.
+    ///
+    /// Dispatching an event no handler is registered for does nothing, so callers check
+    /// this first to skip building the payload. A `false` is a promise that dispatching
+    /// now would do nothing; a `true` promises nothing. The default is always `true`.
+    fn handles(&self, event: Event) -> bool {
+        let _ = event;
+        true
+    }
+
     /// Pass `entry` through each `entry.ingest` handler in registration order.
     ///
     /// # Return values

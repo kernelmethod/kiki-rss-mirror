@@ -582,7 +582,8 @@ impl FeedFetcherHost {
 
         let control = stream.try_clone().context("cloning the fetcher socket")?;
         let mut write_half = stream.try_clone().context("cloning the fetcher socket")?;
-        let mut read_half = stream;
+        // Buffered, so a small frame arrives in one `recv` rather than two.
+        let mut read_half = io::BufReader::new(stream);
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
@@ -1696,7 +1697,9 @@ pub fn run_worker(log_only: bool, no_sandbox: bool) -> Result<()> {
 async fn serve(stream: UnixStream) -> Result<()> {
     stream.set_nonblocking(true)?;
     let stream = tokio::net::UnixStream::from_std(stream)?;
-    let (mut rd, mut wr) = stream.into_split();
+    let (rd, mut wr) = stream.into_split();
+    // Buffered, so a small frame arrives in one `recv` rather than two.
+    let mut rd = tokio::io::BufReader::new(rd);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let writer = tokio::spawn(async move {
@@ -2045,7 +2048,8 @@ fn serve_helper<T: Send + 'static>(
             })?;
     }
 
-    let mut reader = stream;
+    // Buffered, so a small frame arrives in one `recv` rather than two.
+    let mut reader = io::BufReader::new(stream);
     loop {
         let frame = match read_frame_limited(&mut reader, MAX_FRAME_BYTES) {
             Ok(f) => f,

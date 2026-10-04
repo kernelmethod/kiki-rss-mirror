@@ -30,8 +30,8 @@ mod config;
 mod regex_api;
 
 use super::{
-    parse_script_config, Event, EventPayload, FeedEntry, ScanSummary, ScriptRunner, ScriptServices,
-    ScriptSource,
+    parse_script_config, Event, EventPayload, EventSet, FeedEntry, ScanSummary, ScriptRunner,
+    ScriptServices, ScriptSource,
 };
 use api::{ApiContext, Budget};
 use mlua::prelude::*;
@@ -410,6 +410,21 @@ impl LuaScriptRunner {
         }
         out
     }
+
+    /// The events at least one handler is registered for.
+    pub fn subscriptions(&self) -> EventSet {
+        let guard = self
+            .handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut set = EventSet::default();
+        for (event, keys) in guard.iter() {
+            if !keys.is_empty() {
+                set.insert(*event);
+            }
+        }
+        set
+    }
 }
 
 /// Run a plugin's entrypoint, passing it its config.
@@ -525,6 +540,10 @@ fn call_with_timeout<R: FromLua>(
 }
 
 impl ScriptRunner for LuaScriptRunner {
+    fn handles(&self, event: Event) -> bool {
+        self.subscriptions().contains(event)
+    }
+
     fn dispatch_transform_entry(&self, entry: FeedEntry) -> anyhow::Result<Option<FeedEntry>> {
         let lua = self
             .lua
@@ -727,6 +746,32 @@ mod tests {
             tags: vec![],
             cache_assets: true,
         }
+    }
+
+    /// A runner reports the events it has handlers for, including those
+    /// registered after loading.
+    #[test]
+    fn subscriptions_track_registered_handlers() {
+        let runner = LuaScriptRunner::new(&[r#"
+            kiki.on("entry.ingest", function(entry) return entry end)
+            kiki.on("plugin.load", function()
+                kiki.on("fetch.error", function() end)
+            end)
+        "#
+        .to_string()])
+        .unwrap();
+        let subscribed = runner.subscriptions();
+        assert!(subscribed.contains(Event::EntryIngest));
+        assert!(subscribed.contains(Event::PluginLoad));
+        assert!(!subscribed.contains(Event::EntryParsed));
+        assert!(!runner.handles(Event::FetchError));
+
+        runner.dispatch_observe(Event::PluginLoad, EventPayload::PluginLoad);
+        assert!(runner.handles(Event::FetchError));
+        assert!(!runner.handles(Event::EntryParsed));
+
+        let empty = LuaScriptRunner::new(&[]).unwrap();
+        assert_eq!(empty.subscriptions(), EventSet::default());
     }
 
     #[test]
