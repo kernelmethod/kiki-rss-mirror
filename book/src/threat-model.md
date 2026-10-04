@@ -267,7 +267,10 @@ Kiki's TLS, HTTP, decompression or parsing code.
 Content that is merely unpleasant, rather than an exploit, reaches you
 through clients. Kiki stores entries' HTML as the feed wrote it. The web UI
 sanitizes it before display, but **other API clients must sanitize entry
-content themselves** before showing it in a browser.
+content themselves** before showing it in a browser. The
+[`strip-tracking`](plugins/strip-tracking.md) plugin removes tracking pixels
+and tracking parameters from entries' content, but it isn't a sanitizer: it
+leaves scripts, event handlers and the like where they are.
 
 ### A hostile name server
 
