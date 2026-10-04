@@ -181,6 +181,7 @@ impl Harness {
             ..Default::default()
         };
         let (tx, rx) = async_channel::bounded::<TaskManagerCommand>(64);
+        let tx = crate::tasks::TaskSender::from(tx);
         refresh_feed_with_settings(
             &self.client,
             self.feed_id,

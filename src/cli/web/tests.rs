@@ -1,10 +1,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::feeds::{render_favicon, render_meta};
+use super::hosts::AllowedHosts;
 use super::layout::SCRIPT_SRC;
 use super::listing::fts_query;
 use super::server::{api_client, serve_ui};
 use super::WebArgs;
+use crate::config::{HostPattern, HostPatternError};
 use crate::db::tags::SystemTag;
 use anyhow::{Context, Result};
 use axum::http::{header, StatusCode};
@@ -71,7 +73,12 @@ async fn get_page(api: reqwest::Client, path: &str) -> Result<(StatusCode, Strin
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(serve_ui(listener, api, cancel.clone()));
+    let task = tokio::spawn(serve_ui(
+        listener,
+        api,
+        AllowedHosts::default(),
+        cancel.clone(),
+    ));
 
     let resp = reqwest::get(format!("http://{addr}{path}")).await?;
     let status = resp.status();
@@ -635,7 +642,12 @@ async fn send_request(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(serve_ui(listener, api, cancel.clone()));
+    let task = tokio::spawn(serve_ui(
+        listener,
+        api,
+        AllowedHosts::default(),
+        cancel.clone(),
+    ));
 
     let mut req = reqwest::Client::new().request(method, format!("http://{addr}{path}"));
     for (name, value) in headers {
@@ -1252,7 +1264,12 @@ async fn only_media_assets_are_shown_inline() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
+    let task = tokio::spawn(serve_ui(
+        listener,
+        tc.client()?,
+        AllowedHosts::default(),
+        cancel.clone(),
+    ));
 
     for ((content_type, disposition), hash) in cases.iter().zip(&hashes) {
         let resp = reqwest::get(format!("http://{addr}/assets/{hash}")).await?;
@@ -1293,7 +1310,12 @@ async fn entry_images_are_served_from_the_asset_cache() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
+    let task = tokio::spawn(serve_ui(
+        listener,
+        tc.client()?,
+        AllowedHosts::default(),
+        cancel.clone(),
+    ));
 
     let resp = reqwest::get(format!("http://{addr}/entries/1")).await?;
     let csp = resp.headers()[header::CONTENT_SECURITY_POLICY].to_str()?;
@@ -1357,7 +1379,12 @@ async fn pages_only_run_their_own_script() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
+    let task = tokio::spawn(serve_ui(
+        listener,
+        tc.client()?,
+        AllowedHosts::default(),
+        cancel.clone(),
+    ));
 
     for path in ["/", "/entries/1", "/feeds", "/feeds/1", "/plugins"] {
         let resp = reqwest::get(format!("http://{addr}{path}")).await?;
@@ -1680,7 +1707,12 @@ async fn post_form(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(serve_ui(listener, api, cancel.clone()));
+    let task = tokio::spawn(serve_ui(
+        listener,
+        api,
+        AllowedHosts::default(),
+        cancel.clone(),
+    ));
 
     let body = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(form)
@@ -1730,7 +1762,12 @@ async fn the_plugin_page_shows_the_config() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let cancel = CancellationToken::new();
-    let task = tokio::spawn(serve_ui(listener, tc.client()?, cancel.clone()));
+    let task = tokio::spawn(serve_ui(
+        listener,
+        tc.client()?,
+        AllowedHosts::default(),
+        cancel.clone(),
+    ));
     let resp = reqwest::get(format!("http://{addr}/plugins/hello")).await?;
     let csp = resp.headers()[header::CONTENT_SECURITY_POLICY]
         .to_str()?
@@ -2313,4 +2350,192 @@ async fn an_unreachable_server_is_reported_on_the_page() -> Result<()> {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert!(body.contains("unavailable"), "{body}");
     Ok(())
+}
+
+#[test]
+fn allowed_hosts_are_parsed() {
+    let parsed = parse(&[
+        "--allowed-host",
+        "Kiki.LAN.",
+        "--allowed-host",
+        "*.example.com",
+        "--allowed-host",
+        "[fe80::1]",
+        "--allowed-host",
+        "*",
+    ]);
+    assert_eq!(
+        parsed.allowed_hosts,
+        [
+            HostPattern::Exact("kiki.lan".into()),
+            HostPattern::Subdomains("example.com".into()),
+            HostPattern::Exact("fe80::1".into()),
+            HostPattern::Any,
+        ]
+    );
+    assert!(parse(&[]).allowed_hosts.is_empty());
+
+    assert_eq!("".parse::<HostPattern>(), Err(HostPatternError::Empty));
+    for bad in [
+        "kiki.lan:8080",
+        "http://kiki.lan",
+        "kiki.lan/x",
+        "*.[::1]",
+        "a b",
+    ] {
+        assert!(
+            matches!(
+                bad.parse::<HostPattern>(),
+                Err(HostPatternError::Invalid(_))
+            ),
+            "{bad}"
+        );
+    }
+}
+
+/// Only the localhost names are allowed by default, with or without a
+/// port; `--allowed-host` adds to them, and `*` allows anything.
+#[test]
+fn allowed_hosts_are_matched() {
+    let localhost = AllowedHosts::default();
+    for host in [
+        "localhost",
+        "LOCALHOST:8080",
+        "localhost.",
+        "127.0.0.1:8080",
+        "[::1]",
+        "[::1]:8080",
+    ] {
+        assert!(localhost.allows(host), "{host}");
+    }
+    for host in [
+        "evil.example",
+        "evil.example:8080",
+        "localhost.evil.example",
+        "127.0.0.2",
+        "[fe80::1]:8080",
+        "",
+        ":8080",
+        "localhost:",
+        "localhost:http",
+        "[::1",
+        "[not-v6]:8080",
+    ] {
+        assert!(!localhost.allows(host), "{host}");
+    }
+
+    let patterns = ["kiki.lan", "*.example.com", "192.168.1.5"]
+        .map(|p| p.parse().unwrap())
+        .to_vec();
+    let allowed = AllowedHosts::new(patterns);
+    for host in [
+        "localhost:8080",
+        "Kiki.Lan:8080",
+        "a.example.com",
+        "a.b.example.com",
+        "192.168.1.5",
+    ] {
+        assert!(allowed.allows(host), "{host}");
+    }
+    for host in [
+        "example.com",
+        "badexample.com",
+        "kiki.lan.evil.example",
+        "192.168.1.6",
+    ] {
+        assert!(!allowed.allows(host), "{host}");
+    }
+
+    let any = AllowedHosts::new(vec![HostPattern::Any]);
+    assert!(any.allows("evil.example:8080"));
+    assert!(!any.allows("evil.example:port"));
+}
+
+/// Fetch `/` from a web UI that answers to `allowed`, naming `host` in the
+/// request's `Host` header, and return the response's status.
+async fn get_with_host(
+    api: reqwest::Client,
+    allowed: AllowedHosts,
+    host: &str,
+) -> Result<StatusCode> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(serve_ui(listener, api, allowed, cancel.clone()));
+
+    let status = reqwest::Client::new()
+        .get(format!("http://{addr}/"))
+        .header(header::HOST, host)
+        .send()
+        .await?
+        .status();
+
+    cancel.cancel();
+    task.await??;
+    Ok(status)
+}
+
+/// Requests naming a host the web UI was not told to answer to, as a site
+/// rebinding its domain to this machine would send, are refused, page
+/// loads and changes alike.
+#[tokio::test]
+async fn requests_for_other_hosts_are_refused() -> Result<()> {
+    let tc = TestBuilder::all().build()?;
+
+    for host in ["localhost:8080", "127.0.0.1", "[::1]:8080"] {
+        let status = get_with_host(tc.client()?, AllowedHosts::default(), host).await?;
+        assert_eq!(status, StatusCode::OK, "{host}");
+    }
+    for host in ["evil.example", "evil.example:8080", "kiki.lan"] {
+        let status = get_with_host(tc.client()?, AllowedHosts::default(), host).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{host}");
+    }
+
+    // A same-origin change from a rebound domain is refused too.
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(serve_ui(
+        listener,
+        tc.client()?,
+        AllowedHosts::default(),
+        cancel.clone(),
+    ));
+    let status = reqwest::Client::new()
+        .post(format!("http://{addr}/entries/read"))
+        .header(header::HOST, "evil.example")
+        .header("Sec-Fetch-Site", "same-origin")
+        .send()
+        .await?
+        .status();
+    cancel.cancel();
+    task.await??;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let allowed = AllowedHosts::new(vec!["kiki.lan".parse()?]);
+    let status = get_with_host(tc.client()?, allowed.clone(), "kiki.lan:8080").await?;
+    assert_eq!(status, StatusCode::OK);
+    let status = get_with_host(tc.client()?, allowed, "evil.example").await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let any = AllowedHosts::new(vec![HostPattern::Any]);
+    let status = get_with_host(tc.client()?, any, "evil.example").await?;
+    assert_eq!(status, StatusCode::OK);
+    Ok(())
+}
+
+/// Hosts from `--allowed-host` and from the config file's
+/// `web_ui.allowed_hosts` are both allowed.
+#[test]
+fn allowed_hosts_combine_flags_and_config() {
+    let args = parse(&["--allowed-host", "kiki.lan"]);
+    let allowed = args.allowed_hosts(&["*.example.com".parse().unwrap()]);
+    assert!(allowed.allows("localhost"));
+    assert!(allowed.allows("kiki.lan"));
+    assert!(allowed.allows("a.example.com"));
+    assert!(!allowed.allows("evil.example"));
+
+    let allowed = parse(&[]).allowed_hosts(&[HostPattern::Any]);
+    assert!(allowed.allows("evil.example"));
+    assert!(parse(&[]).allowed_hosts(&[]).only_localhost());
 }

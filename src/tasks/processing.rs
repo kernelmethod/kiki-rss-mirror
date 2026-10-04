@@ -9,7 +9,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeSet;
 use std::time::Instant;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// The entries a refresh wrote.
 #[derive(Debug, Default)]
@@ -232,11 +232,17 @@ fn run_scripts(
     let Some(runner) = script_runner else {
         return Some(feed_entry);
     };
+    // Checked first to spare cloning the entry for events nothing handles.
+    if runner.handles(crate::scripting::Event::EntryParsed) {
+        runner.dispatch_observe(
+            crate::scripting::Event::EntryParsed,
+            crate::scripting::EventPayload::Entry(feed_entry.clone()),
+        );
+    }
+    if !runner.handles(crate::scripting::Event::EntryIngest) {
+        return Some(feed_entry);
+    }
     let format = feed_entry.syndication_format.clone();
-    runner.dispatch_observe(
-        crate::scripting::Event::EntryParsed,
-        crate::scripting::EventPayload::Entry(feed_entry.clone()),
-    );
     let original = feed_entry.clone();
     let script_start = Instant::now();
     match runner.dispatch_transform_entry(feed_entry) {
@@ -350,16 +356,21 @@ fn mark_dropped_entries(
 }
 
 /// Enqueue a [`TaskManagerCommand::CacheEntryAssets`] for each of the given
-/// entry IDs. Best-effort: a full or closed queue is logged and ignored.
+/// entry IDs.
+///
+/// Asset caching has a lane of its own in the server's queue, which has no
+/// bound, so this only fails once the queue has been closed. A failure is
+/// logged as an error, and [`crate::db::pending_assets`] queues the entry
+/// again later.
 pub(super) fn enqueue_asset_caching(
-    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_tx: &crate::tasks::TaskSender,
     metrics: &Metrics,
     entry_ids: &[i64],
 ) {
     for &entry_id in entry_ids {
         match task_tx.try_send(TaskManagerCommand::CacheEntryAssets { entry_id }) {
-            Ok(()) => metrics.record_task_enqueued("cache_entry_assets"),
-            Err(e) => debug!(
+            Ok(_) => metrics.record_task_enqueued("cache_entry_assets"),
+            Err(e) => error!(
                 "failed to queue CacheEntryAssets for entry {}: {:?}",
                 entry_id, e
             ),
@@ -368,15 +379,17 @@ pub(super) fn enqueue_asset_caching(
 }
 
 /// Enqueue a [`TaskManagerCommand::CacheFeedFavicon`] for feed `feed_id`.
-/// Best-effort, like [`enqueue_asset_caching`].
+/// Like [`enqueue_asset_caching`], it only fails once the queue has been
+/// closed, which is logged as an error; the favicon is looked for again on
+/// the feed's next refresh.
 pub(super) fn enqueue_favicon_caching(
-    task_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_tx: &crate::tasks::TaskSender,
     metrics: &Metrics,
     feed_id: i64,
 ) {
     match task_tx.try_send(TaskManagerCommand::CacheFeedFavicon { feed_id }) {
-        Ok(()) => metrics.record_task_enqueued("cache_feed_favicon"),
-        Err(e) => debug!(
+        Ok(_) => metrics.record_task_enqueued("cache_feed_favicon"),
+        Err(e) => error!(
             "failed to queue CacheFeedFavicon for feed {}: {:?}",
             feed_id, e
         ),

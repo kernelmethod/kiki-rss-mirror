@@ -23,7 +23,7 @@ use tracing::{debug, span, Level};
 pub struct SharedAppState {
     /// An [`async_channel::Sender`] instance that may be used to send commands
     /// to worker tasks used to fetch and process feeds.
-    pub task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    pub task_manager_tx: crate::tasks::TaskSender,
 
     /// The SQLite database; see [`crate::db::Db`].
     pub db: crate::db::Db,
@@ -43,8 +43,8 @@ pub struct SharedAppState {
     /// [`crate::plugins::runtime`].
     pub plugins: Arc<plugins::runtime::PluginRuntime>,
 
-    /// Shared handle to the currently-installed scripting engine. Empty when the `lua`
-    /// feature is disabled or when no scripts have been loaded.
+    /// Shared handle to the currently-installed scripting engine. Empty when no scripts
+    /// have been loaded.
     pub script_runner: ScriptRunnerHandle,
 
     /// The server's settings, backed by the config file. The settings
@@ -370,9 +370,10 @@ impl Server {
             );
         }
 
-        // Create a multi-producer, multi-consumer channel so that web
+        // Create a multi-producer, multi-consumer queue so that web
         // service workers can send tasks to the feed-fetcher workers.
-        let (tx, rx) = async_channel::bounded(1024);
+        // Asset caching gets a lane of its own; see `crate::tasks::queue`.
+        let (tx, rx) = crate::tasks::queue(1024);
 
         // Shared scripting engine handle; workers and HTTP handlers dispatch events
         // through it.
@@ -599,7 +600,7 @@ fn warn_pss_unreadable(role: crate::process::stats::Role) {
 /// cheap to read (feed/entry counts, feeds with fetch errors, database size),
 /// and the CPU and memory used by kiki's processes.
 async fn metrics_sampler_loop(
-    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: crate::tasks::TaskSender,
     db: crate::db::Db,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
@@ -688,7 +689,7 @@ async fn metrics_sampler_loop(
 }
 
 async fn check_feeds_loop(
-    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: crate::tasks::TaskSender,
     db: crate::db::Db,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
@@ -713,7 +714,7 @@ async fn check_feeds_loop(
 /// Periodically sends a [`TaskManagerCommand::CleanupAll`] command to
 /// trigger retention cleanup. Runs every hour.
 async fn cleanup_loop(
-    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: crate::tasks::TaskSender,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
@@ -722,7 +723,7 @@ async fn cleanup_loop(
         tokio::select! {
             _ = interval.tick() => {
                 match task_manager_tx.try_send(TaskManagerCommand::CleanupAll) {
-                    Ok(()) => metrics.record_task_enqueued("cleanup_all"),
+                    Ok(_) => metrics.record_task_enqueued("cleanup_all"),
                     Err(e) => tracing::warn!("Failed to queue periodic cleanup: {:?}", e),
                 }
             }
@@ -747,7 +748,7 @@ const ENTRY_ASSETS_RETRY_BATCH: usize = 128;
 /// dropped from a full queue, failed, or was lost to a restart. See
 /// [`crate::db::pending_assets`].
 async fn retry_entry_assets_loop(
-    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: crate::tasks::TaskSender,
     db: crate::db::Db,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
@@ -767,17 +768,22 @@ async fn retry_entry_assets_loop(
 
 /// Queue one batch of the entries whose asset caching has fallen due.
 async fn retry_entry_assets(
-    task_manager_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: &crate::tasks::TaskSender,
     db: &crate::db::Db,
     metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
-    // Leave room in the queue for feed refreshes.
-    let room = task_manager_tx
-        .capacity()
-        .map_or(ENTRY_ASSETS_RETRY_BATCH, |cap| {
-            (cap / 2).saturating_sub(task_manager_tx.len())
-        })
-        .min(ENTRY_ASSETS_RETRY_BATCH);
+    let room = match task_manager_tx.asset_queue_len() {
+        // The asset lane has no bound, and anything already in it is ahead
+        // of what is retried, so keep it to a batch at a time.
+        Some(queued) => ENTRY_ASSETS_RETRY_BATCH.saturating_sub(queued),
+        // Leave room in a queue shared with feed refreshes for them.
+        None => task_manager_tx
+            .capacity()
+            .map_or(ENTRY_ASSETS_RETRY_BATCH, |cap| {
+                (cap / 2).saturating_sub(task_manager_tx.len())
+            })
+            .min(ENTRY_ASSETS_RETRY_BATCH),
+    };
     if room == 0 {
         return Ok(());
     }
@@ -799,13 +805,14 @@ async fn retry_entry_assets(
         );
     }
     for entry_id in due.retry {
-        // Should the queue be full after all, the entry is simply due
+        // Should it not be queued after all, the entry is simply due
         // again later.
         match task_manager_tx.try_send(TaskManagerCommand::CacheEntryAssets { entry_id }) {
-            Ok(()) => metrics.record_task_enqueued("cache_entry_assets"),
-            Err(e) => debug!(
+            Ok(_) => metrics.record_task_enqueued("cache_entry_assets"),
+            Err(e) => tracing::error!(
                 "Failed to requeue asset caching for entry {}: {:?}",
-                entry_id, e
+                entry_id,
+                e
             ),
         }
     }
@@ -883,7 +890,7 @@ pub struct Liveness {
     // accessors below report `InProcess` without looking at them.
     #[cfg_attr(not(unix), allow(dead_code))]
     feed_fetcher: crate::process::FeedFetcherHandle,
-    #[cfg_attr(not(all(unix, feature = "lua")), allow(dead_code))]
+    #[cfg_attr(not(unix), allow(dead_code))]
     script_host: crate::process::ScriptHostHandle,
     workers: tokio::sync::watch::Receiver<usize>,
 }
@@ -904,7 +911,7 @@ impl Liveness {
 
     /// The state of the isolated script host.
     pub fn script_host(&self) -> ComponentState {
-        #[cfg(all(unix, feature = "lua"))]
+        #[cfg(unix)]
         if let Some(host) = &self.script_host {
             return if host.is_alive() {
                 ComponentState::Ok
@@ -983,7 +990,7 @@ fn compute_initial_delay(period: Duration, last_run_at: i64, now: i64) -> Durati
 /// the period.
 #[allow(clippy::too_many_arguments)]
 async fn periodic_command_loop(
-    task_manager_tx: async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: crate::tasks::TaskSender,
     db: crate::db::Db,
     cancel_token: CancellationToken,
     period: Duration,
@@ -1024,7 +1031,7 @@ async fn periodic_command_loop(
         tokio::select! {
             _ = interval.tick() => {
                 match task_manager_tx.try_send(cmd.clone()) {
-                    Ok(()) => metrics.record_task_enqueued(task_type),
+                    Ok(_) => metrics.record_task_enqueued(task_type),
                     Err(e) => tracing::warn!("Failed to queue {} task: {:?}", task_type, e),
                 }
             }
@@ -1043,7 +1050,7 @@ async fn periodic_command_loop(
 /// This is the same test `refresh_feed` applies before fetching, so feeds
 /// that are not due are left out rather than queued only to be skipped.
 async fn check_feeds(
-    task_manager_tx: &async_channel::Sender<TaskManagerCommand>,
+    task_manager_tx: &crate::tasks::TaskSender,
     db: &crate::db::Db,
     metrics: &crate::metrics::Metrics,
 ) -> Result<()> {
@@ -1068,7 +1075,8 @@ async fn check_feeds(
             manual: false,
         };
         match task_manager_tx.try_send(cmd) {
-            Ok(()) => metrics.record_task_enqueued("refresh_feed"),
+            Ok(crate::tasks::Enqueue::Queued) => metrics.record_task_enqueued("refresh_feed"),
+            Ok(crate::tasks::Enqueue::AlreadyQueued) => {}
             Err(e) => tracing::error!(
                 "Failed to send RefreshFeed command for feed {}: {:?}",
                 feed_id,
@@ -1245,7 +1253,7 @@ pub fn bind_socket(socket_path: &Path) -> Result<std::os::unix::net::UnixListene
 async fn uds_server(
     listener: std::os::unix::net::UnixListener,
     socket_path: PathBuf,
-    tx: async_channel::Sender<TaskManagerCommand>,
+    tx: crate::tasks::TaskSender,
     db: crate::db::Db,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
@@ -1537,6 +1545,34 @@ mod test {
         assert_eq!(delay, Duration::from_secs(3600));
     }
 
+    /// A feed whose refresh is still waiting in the queue is not queued
+    /// again by the next tick, so workers that fall behind do not see the
+    /// queue fill with copies of the same refreshes; once a worker takes
+    /// it, the feed can be queued again.
+    #[tokio::test]
+    async fn check_feeds_does_not_queue_a_refresh_twice() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        let pool = make_pool(&tc.database_path())?;
+        let conn = pool.connect();
+        conn.execute(
+            "INSERT INTO feeds (title, url) VALUES ('feed', 'https://example.com/a.xml')",
+            [],
+        )?;
+        drop(conn);
+
+        let (tx, rx) = async_channel::bounded(16);
+        let tx = crate::tasks::TaskSender::from(tx);
+        let metrics = crate::metrics::Metrics::new()?;
+        check_feeds(&tx, &pool, &metrics).await?;
+        check_feeds(&tx, &pool, &metrics).await?;
+        assert_eq!(rx.len(), 1);
+
+        tx.dequeued(&rx.try_recv()?);
+        check_feeds(&tx, &pool, &metrics).await?;
+        assert_eq!(rx.len(), 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn check_feeds_queues_only_due_feeds() -> Result<()> {
         let tc = TestBuilder::default().init_database().build()?;
@@ -1557,6 +1593,7 @@ mod test {
         drop(conn);
 
         let (tx, rx) = async_channel::bounded(16);
+        let tx = crate::tasks::TaskSender::from(tx);
         check_feeds(&tx, &pool, &crate::metrics::Metrics::new()?).await?;
 
         let mut queued = Vec::new();
@@ -1588,6 +1625,7 @@ mod test {
         crate::db::pending_assets::add(&conn, entry_id)?;
         let metrics = crate::metrics::Metrics::new()?;
         let (tx, rx) = async_channel::bounded(16);
+        let tx = crate::tasks::TaskSender::from(tx);
 
         // Not yet due: the task queued alongside it may still be running.
         retry_entry_assets(&tx, &pool, &metrics).await?;
@@ -1613,6 +1651,53 @@ mod test {
         Ok(())
     }
 
+    /// With asset caching in a lane of its own, retries are held back while
+    /// a batch's worth is already waiting there, rather than by how full
+    /// the main lane is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retried_asset_caching_waits_for_the_asset_lane() -> Result<()> {
+        let tc = TestBuilder::default().init_database().build()?;
+        let pool = make_pool(&tc.database_path())?;
+        let conn = tc.database_conn()?;
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (NULL, 'rss', 'g', 0, 't', 'https://example.com/')",
+            [],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+        crate::db::pending_assets::add(&conn, entry_id)?;
+        conn.execute(
+            "UPDATE pending_entry_assets SET next_attempt_at = unixepoch() - 1",
+            [],
+        )?;
+        let metrics = crate::metrics::Metrics::new()?;
+        let (tx, rx) = crate::tasks::queue(1);
+        // A full main lane does not hold retries back...
+        tx.try_send(TaskManagerCommand::CleanupAll)?;
+        // ...but a batch already waiting in the asset lane does.
+        for queued in 0..ENTRY_ASSETS_RETRY_BATCH as i64 {
+            tx.try_send(TaskManagerCommand::CacheEntryAssets {
+                entry_id: -1 - queued,
+            })?;
+        }
+        retry_entry_assets(&tx, &pool, &metrics).await?;
+        assert_eq!(tx.asset_queue_len(), Some(ENTRY_ASSETS_RETRY_BATCH));
+
+        // Once that is taken, the due entry is queued.
+        rx.recv().await?;
+        for _ in 0..ENTRY_ASSETS_RETRY_BATCH {
+            rx.recv().await?;
+        }
+        retry_entry_assets(&tx, &pool, &metrics).await?;
+        match rx.recv().await? {
+            TaskManagerCommand::CacheEntryAssets { entry_id: queued } => {
+                assert_eq!(queued, entry_id)
+            }
+            other => anyhow::bail!("unexpected command {other:?}"),
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn periodic_command_loop_fires_immediately_when_overdue() -> Result<()> {
         let tc = TestBuilder::default().init_database().build()?;
@@ -1628,6 +1713,7 @@ mod test {
         }
 
         let (tx, rx) = async_channel::bounded(4);
+        let tx = crate::tasks::TaskSender::from(tx);
         let token = CancellationToken::new();
         let handle = tokio::spawn(periodic_command_loop(
             tx,
@@ -1663,6 +1749,7 @@ mod test {
         }
 
         let (tx, rx) = async_channel::bounded(4);
+        let tx = crate::tasks::TaskSender::from(tx);
         let token = CancellationToken::new();
         let handle = tokio::spawn(periodic_command_loop(
             tx,
@@ -1704,6 +1791,7 @@ mod test {
 
         let before = chrono::Utc::now().timestamp();
         let (tx, _rx) = async_channel::bounded(4);
+        let tx = crate::tasks::TaskSender::from(tx);
         let token = CancellationToken::new();
         let handle = tokio::spawn(periodic_command_loop(
             tx,

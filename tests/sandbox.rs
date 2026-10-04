@@ -508,7 +508,6 @@ fn the_childrens_logs_reach_the_servers_stderr() {
     let log = std::fs::File::create(&path).expect("create the log file");
     let mut kiki = Kiki::spawn_logging_to(&[], log, "info");
     kiki.wait_for_log(&path, &["\"feed-fetcher\"", "\"feed-worker\""]);
-    #[cfg(feature = "lua")]
     kiki.wait_for_log(&path, &["\"script-host\""]);
     kiki.shutdown();
 }
@@ -724,10 +723,7 @@ fn process_metric(body: &str, name: &str, process: &str) -> Option<f64> {
 #[test]
 fn the_sandboxed_server_reports_its_childrens_memory() {
     let mut kiki = Kiki::spawn_unprivileged(&[]);
-    let mut children = vec!["feed_fetcher"];
-    if cfg!(feature = "lua") {
-        children.push("script_host");
-    }
+    let children = ["feed_fetcher", "script_host"];
     // The first sample is taken as the server starts.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -1357,7 +1353,7 @@ mod fetch_isolation {
 // Script host isolation
 // --------------------------------------------------------------------
 
-#[cfg(all(feature = "lua", feature = "metrics"))]
+#[cfg(feature = "metrics")]
 mod script_isolation {
     use super::*;
     use kiki_rss::process::script_host;
@@ -1525,6 +1521,34 @@ mod script_isolation {
         assert!(
             title.starts_with("[scripted] "),
             "entry title was not transformed by the isolated script host: {title:?}"
+        );
+        kiki.shutdown();
+    }
+
+    /// The server skips sending the script host events nothing handles,
+    /// going by the handlers the host reports with each response. A handler
+    /// registered after loading, here by a `plugin.load` handler, must
+    /// still be reached.
+    #[test]
+    fn a_handler_registered_after_loading_still_runs() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = spawn_with_script(
+            &[],
+            r#"
+            kiki.on("plugin.load", function()
+                kiki.on("entry.ingest", function(entry)
+                    entry.title = "[late] " .. entry.title
+                    return entry
+                end)
+            end)
+            "#,
+        );
+
+        let feed_id = create_local_feed(&mut kiki, addr);
+        let title = refresh_and_read_title(&mut kiki, feed_id);
+        assert!(
+            title.starts_with("[late] "),
+            "a handler registered by plugin.load did not run: {title:?}"
         );
         kiki.shutdown();
     }

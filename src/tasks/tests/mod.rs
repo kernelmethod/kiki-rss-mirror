@@ -1,4 +1,3 @@
-#[cfg(feature = "lua")]
 mod lua_script_tests;
 
 mod adaptive_tests;
@@ -32,7 +31,7 @@ pub(crate) fn test_metrics() -> crate::metrics::Metrics {
 /// dropped, so `try_send` fills to capacity and then fails silently — which
 /// is the behaviour `refresh_feed` already treats as non-fatal.
 #[allow(dead_code)]
-pub(crate) fn test_tx() -> async_channel::Sender<crate::tasks::TaskManagerCommand> {
+pub(crate) fn test_tx() -> crate::tasks::TaskSender {
     let (tx, _rx) = async_channel::bounded(1024);
-    tx
+    tx.into()
 }

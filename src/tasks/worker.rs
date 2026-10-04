@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -65,8 +66,8 @@ fn in_progress_len(set: &InProgressSet) -> f64 {
 /// from refreshing (or cleaning up) the same feed simultaneously.
 #[derive(Clone)]
 struct Worker {
-    rx: async_channel::Receiver<TaskManagerCommand>,
-    tx: async_channel::Sender<TaskManagerCommand>,
+    rx: crate::tasks::TaskReceiver,
+    tx: crate::tasks::TaskSender,
     db: Db,
     token: CancellationToken,
     refresh_in_progress: InProgressSet,
@@ -77,16 +78,50 @@ struct Worker {
     script_runner: ScriptRunnerHandle,
     /// Retrieves feeds and downloads their assets.
     fetcher: Fetcher,
+    /// Taken by a refresh to store what it fetched; see
+    /// [`STORE_CONCURRENCY`].
+    store_permits: Arc<Semaphore>,
 }
 
-/// Determine the number of worker tasks to spawn.
+/// The fewest worker tasks [`worker_count`] chooses, however few CPUs
+/// there are.
+pub const MIN_WORKERS: usize = 16;
+
+/// Worker tasks [`worker_count`] chooses for each CPU.
+pub const WORKERS_PER_CPU: usize = 4;
+
+/// The most feed refreshes that store what they fetched at the same time;
+/// the rest wait their turn once their fetch is done. See [`worker_count`].
+pub const STORE_CONCURRENCY: usize = 2;
+
+/// Determine the number of worker tasks to spawn: [`WORKERS_PER_CPU`] for
+/// each CPU, and at least [`MIN_WORKERS`].
+///
+/// A worker spends nearly all of a refresh waiting on the feed's server,
+/// not on a CPU, so sizing the pool by CPUs alone left a few slow servers
+/// holding every worker while the queue filled up behind them. The work a
+/// refresh does do here, storing what it fetched, goes through the one
+/// writer connection, so only [`STORE_CONCURRENCY`] refreshes store at
+/// once, however many workers there are.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::tasks::{worker_count, MIN_WORKERS};
+///
+/// assert!(worker_count() >= MIN_WORKERS);
+/// ```
 pub fn worker_count() -> usize {
-    std::thread::available_parallelism()
+    let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4)
+        .unwrap_or(4);
+    cpus.saturating_mul(WORKERS_PER_CPU).max(MIN_WORKERS)
 }
 
-/// Spawn multiple worker tasks that pull from a shared channel.
+/// Spawn multiple worker tasks that pull from a shared queue.
+///
+/// `rx` is a [`crate::tasks::TaskReceiver`], or a plain receiver for a
+/// queue with a single lane.
 ///
 /// All workers share a single [`ScriptRunnerHandle`], installed when the server starts.
 /// They also share one [`Fetcher`], through which every feed refresh
@@ -95,8 +130,8 @@ pub fn worker_count() -> usize {
 /// applies to the next one.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_workers(
-    rx: async_channel::Receiver<TaskManagerCommand>,
-    tx: async_channel::Sender<TaskManagerCommand>,
+    rx: impl Into<crate::tasks::TaskReceiver>,
+    tx: crate::tasks::TaskSender,
     db: Db,
     token: CancellationToken,
     num_workers: usize,
@@ -107,7 +142,7 @@ pub fn spawn_workers(
     fetcher: Fetcher,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let worker = Worker {
-        rx,
+        rx: rx.into(),
         tx,
         db,
         token,
@@ -118,6 +153,7 @@ pub fn spawn_workers(
         config,
         script_runner,
         fetcher,
+        store_permits: Arc::new(Semaphore::new(STORE_CONCURRENCY)),
     };
     let mut handles = Vec::with_capacity(num_workers);
 
@@ -144,6 +180,8 @@ async fn run_worker(worker_id: usize, w: Worker) {
             }
             _ = w.token.cancelled() => return,
         };
+        // Off the queue: the same refresh may be queued again from now on.
+        w.tx.dequeued(&command);
 
         w.metrics.inc_workers_busy();
         let task_start = Instant::now();
@@ -266,6 +304,7 @@ async fn handle_command(
                 script_runner,
                 &w.metrics,
                 &w.tx,
+                &w.store_permits,
             )
             .await
             {

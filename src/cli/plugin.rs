@@ -439,14 +439,9 @@ mod tests {
             lines.next().unwrap(),
             ["NAME", "VERSION", "ENGINE", "STATUS", "DESCRIPTION"]
         );
-        let status = if cfg!(feature = "lua") {
-            "enabled"
-        } else {
-            "unsupported"
-        };
         assert_eq!(
             lines.next().unwrap(),
-            ["hello", "1.0.0", "lua", status, "Says", "hello"]
+            ["hello", "1.0.0", "lua", "enabled", "Says", "hello"]
         );
         assert!(lines.next().is_none());
         assert!(String::from_utf8(err).unwrap().contains("broken"));

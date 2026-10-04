@@ -1436,6 +1436,92 @@ mod test {
         Ok(())
     }
 
+    /// A page is found by id and then loaded, so the entries must come back
+    /// in the order the search sorted them, each with its own rank and tags,
+    /// however the pages are cut.
+    #[tokio::test]
+    async fn test_search_fts5_pages_keep_their_order() -> Result<()> {
+        let tc = TestBuilder::all().build()?;
+        let client = tc.client()?;
+        {
+            let conn = tc.database_conn()?;
+            conn.execute(
+                "INSERT INTO feeds (title, url, syndication_format) VALUES (?, ?, ?)",
+                ["Test Feed", "http://example.com/feed", "rss"],
+            )?;
+            // Entry `i` mentions "widget" `i` times, so the newest entries
+            // are the least relevant ones.
+            for i in 1..=6i64 {
+                conn.execute(
+                    "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url, content)
+                     VALUES (1, 'rss', ?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        format!("g{i}"),
+                        1_700_000_000 - i * 3600,
+                        format!("Entry {i}"),
+                        format!("http://example.com/{i}"),
+                        format!("{} filler text", "widget ".repeat(i as usize)),
+                    ],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO entry_tags (entry_id, tag_id)
+                 SELECT 4, id FROM tags WHERE name = 'system:saved'",
+                [],
+            )?;
+        }
+
+        let search = |body: serde_json::Value| {
+            let client = &client;
+            async move {
+                let resp = client
+                    .post("http://localhost/v1/entries/search")
+                    .json(&body)
+                    .send()
+                    .await?;
+                assert_eq!(resp.status(), StatusCode::OK);
+                Ok::<_, anyhow::Error>(resp.json::<search_entries::SearchEntriesResponse>().await?)
+            }
+        };
+        let ids = |body: &search_entries::SearchEntriesResponse| -> Vec<i64> {
+            body.entries.iter().map(|e| e.entry.id).collect()
+        };
+
+        let newest = search(serde_json::json!({"query": "widget"})).await?;
+        assert_eq!(newest.count, 6);
+        assert_eq!(ids(&newest), vec![1, 2, 3, 4, 5, 6]);
+        assert!(newest.entries.iter().all(|e| e.rank.is_some()));
+        let saved: Vec<i64> = newest
+            .entries
+            .iter()
+            .filter(|e| e.entry.tags.iter().any(|t| t.name == "system:saved"))
+            .map(|e| e.entry.id)
+            .collect();
+        assert_eq!(saved, vec![4]);
+
+        let relevant = search(serde_json::json!({"query": "widget", "sort": "relevance"})).await?;
+        assert_eq!(ids(&relevant), vec![6, 5, 4, 3, 2, 1]);
+        let ranks: Vec<f64> = relevant.entries.iter().filter_map(|e| e.rank).collect();
+        assert_eq!(ranks.len(), 6);
+        assert!(ranks.windows(2).all(|w| w[0] <= w[1]), "{ranks:?}");
+
+        let page = search(serde_json::json!({
+            "query": "widget", "sort": "relevance", "limit": 2, "offset": 2
+        }))
+        .await?;
+        assert_eq!(page.count, 6);
+        assert_eq!(ids(&page), vec![4, 3]);
+        assert_eq!(
+            page.entries.iter().map(|e| e.rank).collect::<Vec<_>>(),
+            relevant.entries[2..4]
+                .iter()
+                .map(|e| e.rank)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_search_title_regex() -> Result<()> {
         let tc = TestBuilder::all().build()?;

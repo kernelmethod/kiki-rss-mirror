@@ -4,15 +4,18 @@ use super::entries::{
     search_page,
 };
 use super::feeds::{feed_page, feeds_page};
+use super::hosts::{check_host, AllowedHosts};
 use super::plugins::{plugin_page, plugins_page, update_plugin_config};
 use super::tags::{delete_tag, tag_page, tags_page};
 use anyhow::{bail, Context, Result};
 use axum::{
+    middleware,
     routing::{get, post, put},
     Router,
 };
 use std::path::Path;
 use std::process::ExitStatus;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -75,10 +78,11 @@ pub(super) fn api_client(socket_path: &Path) -> Result<reqwest::Client> {
 }
 
 /// Serve the web UI on `listener` until `cancel` fires, talking to the Kiki
-/// API through `api`.
+/// API through `api`, and answering only requests for `allowed_hosts`.
 pub(super) async fn serve_ui(
     listener: TcpListener,
     api: reqwest::Client,
+    allowed_hosts: AllowedHosts,
     cancel: CancellationToken,
 ) -> Result<()> {
     let app = Router::new()
@@ -98,7 +102,11 @@ pub(super) async fn serve_ui(
         .route("/plugins/{name}", get(plugin_page))
         .route("/plugins/{name}/config", post(update_plugin_config))
         .route("/assets/{hash}", get(asset))
-        .with_state(api);
+        .with_state(api)
+        .layer(middleware::from_fn_with_state(
+            Arc::new(allowed_hosts),
+            check_host,
+        ));
     axum::serve(listener, app)
         .with_graceful_shutdown(cancel.cancelled_owned())
         .await

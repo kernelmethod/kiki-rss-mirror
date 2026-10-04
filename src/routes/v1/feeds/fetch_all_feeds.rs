@@ -1,5 +1,5 @@
 use crate::server::AppState;
-use crate::tasks::TaskManagerCommand;
+use crate::tasks::{Enqueue, TaskManagerCommand};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -33,7 +33,7 @@ pub async fn fetch_all_feeds(State(state): State<AppState>) -> Result<Response, 
     // Collect all feed IDs
     let feed_ids = state
         .db
-        .write(move |conn| {
+        .read(move |conn| {
             let ids = conn
                 .prepare("SELECT id FROM feeds")
                 .inspect_err(|e| {
@@ -58,10 +58,12 @@ pub async fn fetch_all_feeds(State(state): State<AppState>) -> Result<Response, 
         }
     };
 
-    // Queue refresh commands for each feed
+    // Queue refresh commands for each feed. A feed whose manual refresh is
+    // already queued counts as queued, without being queued again, so that
+    // asking again and again cannot fill the queue with the same refreshes.
     let mut queued = 0;
     for id in &feed_ids {
-        if let Err(e) = state
+        match state
             .task_manager_tx
             .send(TaskManagerCommand::RefreshFeed {
                 feed_id: *id,
@@ -69,15 +71,18 @@ pub async fn fetch_all_feeds(State(state): State<AppState>) -> Result<Response, 
             })
             .await
         {
-            event!(
+            Ok(enqueued) => {
+                if enqueued == Enqueue::Queued {
+                    state.metrics.record_task_enqueued("refresh_feed");
+                }
+                queued += 1;
+            }
+            Err(e) => event!(
                 Level::ERROR,
                 "failed to send fetch command for feed {}: {:?}",
                 id,
                 e
-            );
-        } else {
-            state.metrics.record_task_enqueued("refresh_feed");
-            queued += 1;
+            ),
         }
     }
 

@@ -83,7 +83,6 @@ impl Role {
         if arg == super::feed_fetcher::SUBCOMMAND.as_bytes() {
             return Role::FeedFetcher;
         }
-        #[cfg(feature = "lua")]
         if arg == super::script_host::SUBCOMMAND.as_bytes() {
             return Role::ScriptHost;
         }
@@ -373,7 +372,6 @@ mod tests {
     #[test]
     fn subcommands_name_the_role_of_the_servers_children() {
         assert_eq!(Role::of_child(b"__feed-fetcher"), Role::FeedFetcher);
-        #[cfg(feature = "lua")]
         assert_eq!(Role::of_child(b"__script-host"), Role::ScriptHost);
         assert_eq!(Role::of_child(b"serve"), Role::Other);
     }

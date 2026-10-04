@@ -57,6 +57,7 @@ async fn a_panicking_refresh_is_recorded_and_the_worker_survives() -> Result<()>
     let runner = ScriptRunnerHandle::empty();
     runner.set(Some(Arc::new(PanickingRunner) as Arc<dyn ScriptRunner>));
     let (tx, rx) = async_channel::bounded(16);
+    let tx = crate::tasks::TaskSender::from(tx);
     let token = CancellationToken::new();
     // A single worker, so the second command only runs if it survived.
     let handles = spawn_workers(
@@ -129,6 +130,7 @@ async fn cached_entry_assets_are_no_longer_pending() -> Result<()> {
     crate::db::pending_assets::add(&conn, entry_id)?;
 
     let (tx, rx) = async_channel::bounded(16);
+    let tx = crate::tasks::TaskSender::from(tx);
     let token = CancellationToken::new();
     let handles = spawn_workers(
         rx,
@@ -179,6 +181,7 @@ async fn the_integrity_check_runs_and_is_recorded() -> Result<()> {
     let baseline = backdate_task(&conn, TASK_INTEGRITY_CHECK, 10)?;
 
     let (tx, rx) = async_channel::bounded(16);
+    let tx = crate::tasks::TaskSender::from(tx);
     let token = CancellationToken::new();
     let handles = spawn_workers(
         rx,

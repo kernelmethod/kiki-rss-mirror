@@ -1,5 +1,5 @@
 use crate::server::AppState;
-use crate::tasks::TaskManagerCommand;
+use crate::tasks::{Enqueue, TaskManagerCommand};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -27,7 +27,9 @@ use tracing::{event, Level};
 #[axum::debug_handler]
 pub async fn fetch_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     // Send a command to the feed fetcher workers to refresh this feed
-    if let Err(e) = state
+    // A refresh of the feed that is already queued answers this request
+    // too, so it is not queued twice.
+    match state
         .task_manager_tx
         .send(TaskManagerCommand::RefreshFeed {
             feed_id: id,
@@ -35,16 +37,18 @@ pub async fn fetch_feed(State(state): State<AppState>, Path(id): Path<i64>) -> R
         })
         .await
     {
-        event!(
-            Level::ERROR,
-            "failed to send fetch command for feed {}: {:?}",
-            id,
-            e
-        );
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to queue fetch").into_response();
+        Ok(Enqueue::Queued) => state.metrics.record_task_enqueued("refresh_feed"),
+        Ok(Enqueue::AlreadyQueued) => {}
+        Err(e) => {
+            event!(
+                Level::ERROR,
+                "failed to send fetch command for feed {}: {:?}",
+                id,
+                e
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to queue fetch").into_response();
+        }
     }
-
-    state.metrics.record_task_enqueued("refresh_feed");
 
     event!(
         Level::INFO,

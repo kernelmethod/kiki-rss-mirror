@@ -2,6 +2,7 @@ mod api;
 mod assets;
 mod entries;
 mod feeds;
+mod hosts;
 mod layout;
 mod listing;
 mod plugins;
@@ -12,10 +13,13 @@ mod tags;
 #[cfg(test)]
 mod tests;
 
+use crate::cli::paths::{self, Env};
 use crate::cli::serve::ServeArgs;
+use crate::config::{self, ConfigStore, HostPattern};
 use crate::sandbox::{self, SandboxConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
+use hosts::AllowedHosts;
 use server::{api_client, serve_ui, shutdown_signal, stop_server, ServerProcess};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -52,6 +56,18 @@ pub struct WebArgs {
     )]
     listen: SocketAddr,
 
+    /// Also answer requests for HOST, besides `localhost`, `127.0.0.1` and
+    /// `::1`, and any listed in `kiki.toml`'s `web_ui.allowed_hosts`. May
+    /// be given more than once. `*.example.com` allows every
+    /// subdomain of `example.com`, and `*` allows any host at all.
+    ///
+    /// The web UI refuses requests whose `Host` header names any other
+    /// host, so that a site cannot reach it by pointing its own domain at
+    /// this machine (DNS rebinding). When the web UI is reached by another
+    /// name, such as `kiki.lan` or a LAN address, give that name here.
+    #[arg(long = "allowed-host", value_name = "HOST")]
+    allowed_hosts: Vec<HostPattern>,
+
     #[command(flatten)]
     serve: ServeArgs,
 }
@@ -87,6 +103,7 @@ impl WebArgs {
             .with_context(|| format!("unable to bind the web UI to {}", self.listen))?;
         listener.set_nonblocking(true)?;
         tracing::info!("web UI listening on http://{}", listener.local_addr()?);
+        let allowed_hosts = self.allowed_hosts(&configured_allowed_hosts()?);
 
         let server = self.spawn_server(&socket_path)?;
 
@@ -99,7 +116,30 @@ impl WebArgs {
             .worker_threads(workers)
             .enable_all()
             .build()?
-            .block_on(run_async(listener, api, server))
+            .block_on(run_async(listener, api, allowed_hosts, server))
+    }
+
+    /// The hosts the web UI answers to: those given to `--allowed-host`,
+    /// and `configured`, from the config file's `web_ui.allowed_hosts`.
+    /// Warns when that leaves the web UI open to DNS rebinding, or when it
+    /// listens beyond loopback but can only be reached as `localhost`.
+    fn allowed_hosts(&self, configured: &[HostPattern]) -> AllowedHosts {
+        let mut patterns = self.allowed_hosts.clone();
+        patterns.extend_from_slice(configured);
+        let allowed = AllowedHosts::new(patterns);
+        if allowed.allows_any() {
+            tracing::warn!(
+                "the web UI answers to any host name ('*' in --allowed-host or \
+                 web_ui.allowed_hosts), so other sites may reach it through DNS rebinding"
+            );
+        } else if allowed.only_localhost() && !self.listen.ip().is_loopback() {
+            tracing::warn!(
+                "the web UI listens on {} but only answers to localhost; add the name or \
+                 address it is reached at with --allowed-host or web_ui.allowed_hosts",
+                self.listen
+            );
+        }
+        allowed
     }
 
     /// Install the web UI's sandbox, unless `--no-sandbox` was given.
@@ -130,6 +170,13 @@ impl WebArgs {
     /// keeps shutdown in one order no matter how it was asked for. (On
     /// Windows, a new process group also ignores Ctrl+C, but still hears the
     /// Ctrl+Break [`stop_server`] sends it.)
+    ///
+    /// On Linux the child is also sent `SIGTERM` if this process dies
+    /// without stopping it, e.g. when it is killed with `SIGKILL`, so the
+    /// server shuts down rather than living on, orphaned, holding the
+    /// database and the socket. The signal follows the thread that spawned
+    /// the child, so this must run on the main thread, which lives as long
+    /// as the process does.
     fn spawn_server(&self, socket_path: &Path) -> Result<ServerProcess> {
         let exe = std::env::current_exe().context("locating the kiki executable")?;
         let mut cmd = std::process::Command::new(exe);
@@ -138,6 +185,27 @@ impl WebArgs {
         {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let parent = std::process::id();
+            // SAFETY: the closure runs between fork and exec, where only
+            // async-signal-safe calls are permitted; `prctl` and `getppid`
+            // are plain syscalls that neither allocate nor take a lock.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // Checked after the `prctl`, in case this process died
+                    // before it took effect.
+                    if libc::getppid() as u32 != parent {
+                        return Err(std::io::Error::other("the web UI has exited"));
+                    }
+                    Ok(())
+                });
+            }
         }
         #[cfg(windows)]
         {
@@ -150,16 +218,33 @@ impl WebArgs {
     }
 }
 
+/// The config file's `web_ui.allowed_hosts`, read from `kiki.toml` in
+/// the data directory, where the `kiki serve` child reads its own
+/// settings. Read once, before the sandbox hides the file.
+///
+/// # Errors
+///
+/// Returns an error if the data directory cannot be found, or if the
+/// config file cannot be read or holds an invalid setting.
+fn configured_allowed_hosts() -> Result<Vec<HostPattern>> {
+    let data_dir = paths::resolve_data_dir(&Env::from_process())?;
+    let path = data_dir.path.join(config::CONFIG_FILE_NAME);
+    let store =
+        ConfigStore::open(&path).with_context(|| format!("failed to load config file {path:?}"))?;
+    Ok(store.current().web_ui.allowed_hosts.clone())
+}
+
 /// Serve the web UI on `listener` alongside the Kiki `server`, until one of
 /// them stops.
 async fn run_async(
     listener: std::net::TcpListener,
     api: reqwest::Client,
+    allowed_hosts: AllowedHosts,
     mut server: ServerProcess,
 ) -> Result<()> {
     let listener = TcpListener::from_std(listener)?;
     let cancel = CancellationToken::new();
-    let web = tokio::spawn(serve_ui(listener, api, cancel.clone()));
+    let web = tokio::spawn(serve_ui(listener, api, allowed_hosts, cancel.clone()));
 
     let status = tokio::select! {
         status = server.wait() => {

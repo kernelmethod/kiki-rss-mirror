@@ -265,3 +265,22 @@ is access control Kiki does not have to implement or authenticate. To expose
 it over the network, put a reverse proxy in front of the socket and let that
 own the TLS and authentication the job needs; nginx spells it
 `proxy_pass http://unix:/run/user/1000/kiki/kiki.sock:;`.
+
+#### Web UI
+
+`kiki web` serves the web UI on `127.0.0.1:8080` (change it with
+`--listen`). The web UI has no login, so it answers only requests whose
+`Host` header names `localhost`, `127.0.0.1` or `::1`. That way a site
+can't reach it by pointing its own domain at your machine (DNS rebinding).
+To reach the web UI by another name, such as a LAN host name or address,
+allow that name in `kiki.toml`:
+
+```toml
+[web_ui]
+allowed_hosts = ["kiki.lan", "192.168.1.5", "*.home.example"]
+```
+
+or with `--allowed-host`, which can be given more than once and adds to
+the file's list. `*.home.example` allows every subdomain of `home.example`,
+and `*` allows any host at all, which turns the check off. `kiki web`
+reads the file as it starts, so restart it after changing the list.
