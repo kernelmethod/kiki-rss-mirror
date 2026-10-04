@@ -159,9 +159,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, warn};
 
-#[cfg(feature = "bench-direct-ipc")]
-mod direct;
-
 /// The hidden subcommand the server re-execs itself with.
 pub const SUBCOMMAND: &str = "__feed-fetcher";
 
@@ -906,10 +903,6 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
             .context("failed to install the feed fetcher sandbox")?;
     }
 
-    #[cfg(feature = "bench-direct-ipc")]
-    return direct::supervise(&spawner, crate::process::take_parent_socket(SUBCOMMAND)?);
-
-    #[cfg_attr(feature = "bench-direct-ipc", allow(unreachable_code))]
     let mut server = crate::process::take_parent_socket(SUBCOMMAND)?;
 
     let threads = parser_threads();
@@ -1696,12 +1689,7 @@ pub fn run_worker(log_only: bool, no_sandbox: bool) -> Result<()> {
         .thread_name("fetcher-worker")
         .build()
         .context("starting the worker runtime")?
-        .block_on(async {
-            #[cfg(feature = "bench-direct-ipc")]
-            return direct::serve(stream).await;
-            #[cfg_attr(feature = "bench-direct-ipc", allow(unreachable_code))]
-            serve(stream).await
-        })
+        .block_on(serve(stream))
 }
 
 /// Serve requests from the supervisor, each on its own task, until the

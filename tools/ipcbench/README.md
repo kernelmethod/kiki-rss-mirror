@@ -66,28 +66,6 @@ directory, which is left there so its `kiki.log` can be read afterwards.
 | `--strace`     | off     | Also count system calls, in one extra run of each binary   |
 | `--serve-arg`  | —       | Pass an argument to `kiki serve`; repeatable               |
 
-## Without the supervisor's relay
-
-The feed fetcher's supervisor relays every frame between the server, the
-worker, and the worker's parser and resolver. Building with the
-`bench-direct-ipc` feature wires the worker straight to the server and to
-the helpers instead, leaving the supervisor idle, so comparing the two
-builds measures what the relay costs:
-
-```bash
-cargo build --profile profiling
-cp target/profiling/kiki /tmp/kiki-relay
-cargo build --profile profiling --features bench-direct-ipc
-cp target/profiling/kiki /tmp/kiki-direct
-
-tools/ipcbench/ipcbench.py compare /tmp/kiki-relay /tmp/kiki-direct \
-    --labels relay,direct --runs 5 --strace
-```
-
-That build is for benchmarking only: it gives up replacing a worker or
-helper that dies, and the isolation between them that the relay provides
-(see `src/process/feed_fetcher/direct.rs`).
-
 ## Reading the results
 
 Wall time is the noisiest measure: a round is short, and its length depends
@@ -100,6 +78,4 @@ The server's numbers include its SQLite work, which dominates them; the
 script host does nothing but serve the server's requests, so its numbers
 are the most direct measure of the script host channel. Likewise the
 fetcher's supervisor does nothing but relay frames and watch its children,
-so its numbers are what the relay costs it directly. The rest of the
-relay's cost shows up as extra wakeups in the worker and the parser, which
-wait on one more process per frame, and in the latency it adds to every job.
+so its numbers are what the relay costs it.
