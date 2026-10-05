@@ -10,7 +10,8 @@ with no configuration:
 
 The data directory holds `kiki.db` (the database), `kiki.toml` (the
 [settings](settings.md) that differ from the defaults), `plugins/` (the
-installed [plugins](../plugins/index.md)) and `assets/` (cached images and
+installed [plugins](../plugins/index.md): in `system/` if bundled with Kiki,
+in `user/` if you installed them) and `assets/` (cached images and
 enclosures).
 
 ## Environment variables

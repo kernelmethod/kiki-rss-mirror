@@ -1667,7 +1667,7 @@ async fn the_feed_page_pages_through_the_entries() -> Result<()> {
 async fn the_plugins_page_lists_every_plugin() -> Result<()> {
     let tc = TestBuilder::default().init_database().build()?;
     tc.install_lua_plugin("passthrough", "", serde_json::json!({}))?;
-    std::fs::create_dir_all(tc.plugins_dir().join("broken"))?;
+    std::fs::create_dir_all(tc.user_plugins_dir().join("broken"))?;
     let tc = tc.init_server()?;
 
     let (status, body) = get_page(tc.client()?, "/plugins").await?;
@@ -1896,7 +1896,7 @@ async fn settings_can_be_changed_from_the_plugin_page() -> Result<()> {
 /// boolean, a choice and a list of objects. The server is running.
 fn rules_plugin() -> Result<crate::test::TestConfig> {
     let tc = TestBuilder::default().init_database().build()?;
-    let dir = tc.plugins_dir().join("rules");
+    let dir = tc.user_plugins_dir().join("rules");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(
         dir.join("manifest.toml"),

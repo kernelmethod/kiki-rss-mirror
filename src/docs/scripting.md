@@ -6,18 +6,30 @@ when something interesting happens.
 
 ## Plugins
 
-A plugin is a directory inside the `plugins/` directory in Kiki's home (next
-to `kiki.db`; `kiki init` creates it). Every plugin has a manifest,
-`manifest.toml`, at its root, and its code alongside:
+Plugins live in the `plugins/` directory in Kiki's home (next to `kiki.db`;
+`kiki init` creates it), which holds two directories: `system/`, for the
+plugins bundled with Kiki, which `kiki init` installs and updates, and
+`user/`, for the plugins you install yourself. A plugin is a directory
+inside one of them. Every plugin has a manifest, `manifest.toml`, at its
+root, and its code alongside:
 
 ```text
 plugins/
-└── hide-sponsored/
-    ├── manifest.toml
-    ├── main.lua
-    └── lib/
-        └── rules.lua
+├── system/
+│   └── filter/
+│       ├── manifest.toml
+│       └── main.lua
+└── user/
+    └── hide-sponsored/
+        ├── manifest.toml
+        ├── main.lua
+        └── lib/
+            └── rules.lua
 ```
+
+Both kinds load, run and take config the same way. The API shows which kind
+each plugin is in its `source` field, `"system"` or `"user"`, and
+`kiki plugin ls` and the web UI show it too.
 
 The manifest is a [TOML](https://toml.io) file declaring the plugin's name,
 its version, and the engine its code is written for:
@@ -57,17 +69,20 @@ may give meaning to new fields in later versions, as it did to `settings`,
 so a plugin's own metadata is best kept under a name unlikely to clash, such
 as a table named after the plugin.
 
-To install a plugin, copy its directory into `plugins/`; to remove one, delete
-its directory. A running server watches the plugins directory and reloads its
+To install a plugin, copy its directory into `plugins/user/`; to remove one,
+delete its directory. A directory placed directly in `plugins/` isn't loaded,
+and is listed under `errors` in `GET /v1/plugins`. A running server watches the plugins directory and reloads its
 plugins whenever a file in it changes (hidden files, such as editors' swap
 files, are ignored), and whenever a plugin's config is changed. A reload
 rebuilds every plugin: each entrypoint runs again, and then the
 [`plugin.load`](#events) handlers run. If the plugins fail to load, say
 because of a syntax error or a bad regex in a config, the plugins that were
 running keep running, as they were, and the error is logged.
-Plugins load in the order of their directory names, so
+Plugins load in the order of their directory names, system and user plugins
+together (a system plugin first, if two directories have the same name), so
 prefixing directory names with numbers (`10-filter`, `20-tag`) controls the
-order their handlers run in.
+order their handlers run in. Two plugins with the same name can't both be
+installed: the one that loads second is skipped.
 
 A plugin whose manifest is missing or invalid is skipped with a warning in the
 server log, and listed with the reason under `errors` in `GET /v1/plugins`;

@@ -1,16 +1,25 @@
 //! Discovery of plugins installed in Kiki's home directory.
 //!
-//! A plugin is a directory inside [`PLUGINS_DIR_NAME`] (`plugins/` in Kiki's
-//! home directory, next to the database) with a manifest,
-//! [`MANIFEST_FILE_NAME`], at its root:
+//! The plugins directory, [`PLUGINS_DIR_NAME`] (`plugins/` in Kiki's home
+//! directory, next to the database), holds two directories of plugins:
+//! [`SYSTEM_PLUGINS_DIR_NAME`] (`system/`), for the plugins bundled with
+//! Kiki, which Kiki installs and updates itself, and
+//! [`USER_PLUGINS_DIR_NAME`] (`user/`), for the plugins installed by
+//! whoever runs Kiki; see [`PluginSource`]. A plugin is a directory inside
+//! one of them with a manifest, [`MANIFEST_FILE_NAME`], at its root:
 //!
 //! ```text
 //! plugins/
-//! └── hide-sponsored/
-//!     ├── manifest.toml
-//!     ├── main.lua
-//!     └── lib/
-//!         └── rules.lua
+//! ├── system/
+//! │   └── filter/
+//! │       ├── manifest.toml
+//! │       └── main.lua
+//! └── user/
+//!     └── hide-sponsored/
+//!         ├── manifest.toml
+//!         ├── main.lua
+//!         └── lib/
+//!             └── rules.lua
 //! ```
 //!
 //! The manifest names the plugin, gives its version, and declares the
@@ -53,9 +62,10 @@
 //!
 //! The server discovers plugins when it starts, and again whenever a file in
 //! the plugins directory or a plugin's config changes (see [`runtime`]).
-//! Plugins are loaded in the order of their directory names, so prefixing
-//! directory names with a number (`10-filter`, `20-tag`) controls the order
-//! their handlers run in.
+//! Plugins are loaded in the order of their directory names, wherever the
+//! directory is, so prefixing directory names with a number (`10-filter`,
+//! `20-tag`) controls the order their handlers run in, across system and
+//! user plugins alike.
 //!
 //! The calls plugins make to the server through the `kiki` Lua API, such as
 //! scanning stored entries, are answered by [`services`].
@@ -93,6 +103,14 @@ pub const PLUGINS_DIR_NAME: &str = "plugins";
 
 /// Name of the manifest file at the root of every plugin directory.
 pub const MANIFEST_FILE_NAME: &str = "manifest.toml";
+
+/// Name of the directory, inside the plugins directory, that holds system
+/// plugins.
+pub const SYSTEM_PLUGINS_DIR_NAME: &str = "system";
+
+/// Name of the directory, inside the plugins directory, that holds user
+/// plugins.
+pub const USER_PLUGINS_DIR_NAME: &str = "user";
 
 /// Largest manifest file that will be read.
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -177,6 +195,78 @@ impl PluginEngine {
         match self {
             Self::Lua => true,
         }
+    }
+}
+
+/// Which of the plugins directory's two directories a plugin is installed
+/// in.
+///
+/// Both kinds are discovered, configured and run the same way; the
+/// difference is who looks after them. Kiki installs and updates system
+/// plugins itself, while user plugins are installed, updated and removed
+/// by whoever runs Kiki.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginSource {
+    /// A plugin in [`SYSTEM_PLUGINS_DIR_NAME`]: one bundled with Kiki and
+    /// installed by `kiki init`.
+    System,
+    /// A plugin in [`USER_PLUGINS_DIR_NAME`]: one installed by hand.
+    #[default]
+    User,
+}
+
+impl PluginSource {
+    /// Every source, in the order a tie between directory names is broken
+    /// in when plugins are loaded.
+    pub const ALL: [Self; 2] = [Self::System, Self::User];
+
+    /// The source's name, as the API and CLI show it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+        }
+    }
+
+    /// The name of the directory, inside the plugins directory, that holds
+    /// plugins from this source.
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Self::System => SYSTEM_PLUGINS_DIR_NAME,
+            Self::User => USER_PLUGINS_DIR_NAME,
+        }
+    }
+
+    /// The directory, inside the plugins directory `plugins_dir`, that
+    /// holds plugins from this source.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::plugins::PluginSource;
+    /// use std::path::Path;
+    ///
+    /// assert_eq!(
+    ///     PluginSource::User.dir(Path::new("/var/lib/kiki/plugins")),
+    ///     Path::new("/var/lib/kiki/plugins/user"),
+    /// );
+    /// ```
+    pub fn dir(self, plugins_dir: &Path) -> PathBuf {
+        plugins_dir.join(self.dir_name())
     }
 }
 
@@ -501,6 +591,14 @@ pub enum PluginError {
     #[error("{0} is not valid UTF-8")]
     NotUtf8(PathBuf),
 
+    /// A directory is directly inside the plugins directory, rather than in
+    /// its system or user directory.
+    #[error(
+        "plugins go in the {USER_PLUGINS_DIR_NAME}/ directory inside the plugins directory \
+         (or {SYSTEM_PLUGINS_DIR_NAME}/, for those bundled with Kiki), not directly in it"
+    )]
+    Misplaced,
+
     /// Another plugin with the same name was discovered first.
     #[error("another plugin named {name:?} is installed at {other}")]
     DuplicateName { name: String, other: PathBuf },
@@ -513,6 +611,9 @@ pub struct Plugin {
     pub dir: PathBuf,
     /// The plugin's manifest.
     pub manifest: PluginManifest,
+    /// Which directory the plugin is installed in: whether it was installed
+    /// by Kiki or by hand.
+    pub source: PluginSource,
     /// The plugin's config: the manifest's default config, with the
     /// plugin's overrides applied over it by
     /// [`Discovery::apply_config_overrides`]. Until then, just the defaults.
@@ -520,8 +621,8 @@ pub struct Plugin {
 }
 
 impl Plugin {
-    /// Loads the plugin in directory `dir`, reading and validating its
-    /// manifest. Its config is the manifest's defaults.
+    /// Loads the plugin from `source` in directory `dir`, reading and
+    /// validating its manifest. Its config is the manifest's defaults.
     ///
     /// Source files are not read until [`Self::load_source`].
     ///
@@ -529,7 +630,7 @@ impl Plugin {
     ///
     /// Returns an error if the manifest is missing, unreadable or invalid, or
     /// if the manifest's entrypoint does not exist.
-    pub fn load(dir: &Path) -> Result<Self, PluginError> {
+    pub fn load(dir: &Path, source: PluginSource) -> Result<Self, PluginError> {
         let manifest_path = dir.join(MANIFEST_FILE_NAME);
         let manifest = match read_small_file(&manifest_path)? {
             Some(text) => PluginManifest::parse(&text)?,
@@ -546,6 +647,7 @@ impl Plugin {
             dir: dir.to_path_buf(),
             config: manifest.config.clone(),
             manifest,
+            source,
         })
     }
 
@@ -790,8 +892,8 @@ impl Discovery {
     /// use std::collections::HashMap;
     ///
     /// let dir = tempfile::tempdir().unwrap();
-    /// let plugin = dir.path().join("hello");
-    /// std::fs::create_dir(&plugin).unwrap();
+    /// let plugin = dir.path().join("user").join("hello");
+    /// std::fs::create_dir_all(&plugin).unwrap();
     /// std::fs::write(
     ///     plugin.join("manifest.toml"),
     ///     "name = 'hello'\nversion = '1.0.0'\nengine = 'lua'\n[config]\na = 1\nb = 2\n",
@@ -820,28 +922,33 @@ impl Discovery {
     }
 }
 
-/// Scans `plugins_dir` for plugins.
+/// Scans the plugins directory `plugins_dir` for plugins.
 ///
-/// Every directory (or symbolic link to a directory) directly inside
-/// `plugins_dir` whose name does not start with `.` is a plugin; other files
-/// are ignored. Plugins are returned in the order of their directory names.
+/// Every directory (or symbolic link to a directory) directly inside one of
+/// its two directories, [`SYSTEM_PLUGINS_DIR_NAME`] and
+/// [`USER_PLUGINS_DIR_NAME`], whose name does not start with `.` is a
+/// plugin; other files are ignored. Plugins are returned in the order of
+/// their directory names, with system plugins first where names tie.
 /// A directory that cannot be loaded, or whose plugin has the same name as
-/// one found before it, is reported in [`Discovery::errors`] and skipped.
+/// one found before it, is reported in [`Discovery::errors`] and skipped, as
+/// is any other directory directly inside `plugins_dir`
+/// ([`PluginError::Misplaced`]).
 ///
-/// A missing `plugins_dir` holds no plugins.
+/// A missing directory holds no plugins.
 ///
 /// # Errors
 ///
-/// Returns an error only if `plugins_dir` exists but cannot be listed.
+/// Returns an error only if one of the directories exists but cannot be
+/// listed.
 ///
 /// # Examples
 ///
 /// ```
-/// use kiki_rss::plugins::discover;
+/// use kiki_rss::plugins::{discover, PluginSource};
 ///
 /// let dir = tempfile::tempdir().unwrap();
-/// let plugin = dir.path().join("hello");
-/// std::fs::create_dir(&plugin).unwrap();
+/// let plugin = PluginSource::User.dir(dir.path()).join("hello");
+/// std::fs::create_dir_all(&plugin).unwrap();
 /// std::fs::write(
 ///     plugin.join("manifest.toml"),
 ///     "name = 'hello'\nversion = '1.0.0'\nengine = 'lua'\n",
@@ -851,36 +958,34 @@ impl Discovery {
 /// let found = discover(dir.path()).unwrap();
 /// assert_eq!(found.plugins.len(), 1);
 /// assert_eq!(found.plugins[0].manifest.name, "hello");
+/// assert_eq!(found.plugins[0].source, PluginSource::User);
 /// assert!(found.errors.is_empty());
 /// ```
 pub fn discover(plugins_dir: &Path) -> Result<Discovery, PluginError> {
-    let io_err = |source| PluginError::Io {
-        path: plugins_dir.to_path_buf(),
-        source,
-    };
-    let entries = match std::fs::read_dir(plugins_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Discovery::default()),
-        Err(e) => return Err(io_err(e)),
-    };
+    let mut discovery = Discovery::default();
+    for dir in list_dirs(plugins_dir)? {
+        let is_source_dir = PluginSource::ALL
+            .iter()
+            .any(|source| dir.file_name() == Some(source.dir_name().as_ref()));
+        if !is_source_dir {
+            discovery.errors.push(DiscoveryError {
+                dir,
+                error: PluginError::Misplaced,
+            });
+        }
+    }
 
     let mut dirs = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(io_err)?;
-        if entry.file_name().to_string_lossy().starts_with('.') {
-            continue;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            dirs.push(path);
+    for source in PluginSource::ALL {
+        for dir in list_dirs(&source.dir(plugins_dir))? {
+            dirs.push((dir.file_name().map(ToOwned::to_owned), source, dir));
         }
     }
     dirs.sort();
 
-    let mut discovery = Discovery::default();
     let mut names = HashSet::new();
-    for dir in dirs {
-        match Plugin::load(&dir) {
+    for (_, source, dir) in dirs {
+        match Plugin::load(&dir, source) {
             Ok(plugin) if !names.insert(plugin.manifest.name.clone()) => {
                 let other = discovery
                     .plugins
@@ -901,6 +1006,33 @@ pub fn discover(plugins_dir: &Path) -> Result<Discovery, PluginError> {
         }
     }
     Ok(discovery)
+}
+
+/// Returns the directories (and symbolic links to directories) directly
+/// inside `dir` whose names do not start with `.`, in no particular order.
+/// A missing `dir` holds none.
+fn list_dirs(dir: &Path) -> Result<Vec<PathBuf>, PluginError> {
+    let io_err = |source| PluginError::Io {
+        path: dir.to_path_buf(),
+        source,
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io_err(e)),
+    };
+    let mut dirs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(io_err)?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push(path);
+        }
+    }
+    Ok(dirs)
 }
 
 /// Reads the source of every enabled plugin in `discovery` whose engine is
@@ -933,8 +1065,9 @@ pub fn load_sources(discovery: &Discovery, engine: PluginEngine) -> Vec<ScriptSo
     sources
 }
 
-/// Installs a plugin into `plugins_dir`, in a directory named after it:
-/// writes its manifest and its entrypoint, containing `text`.
+/// Installs a plugin into `plugins_dir`, the system or user directory inside
+/// the plugins directory, in a directory named after it: writes its
+/// manifest and its entrypoint, containing `text`.
 ///
 /// The manifest's config must be representable in TOML, so it may not
 /// contain `null`.
@@ -987,6 +1120,16 @@ mod tests {
             time_budget_ms: None,
             config: Default::default(),
             settings: vec![],
+        }
+    }
+
+    /// A user plugins directory, standing in for a [`TempDir`] in tests that
+    /// install plugins into it and discover them from its parent.
+    struct Plugins(PathBuf);
+
+    impl Plugins {
+        fn path(&self) -> &Path {
+            &self.0
         }
     }
 
@@ -1131,7 +1274,7 @@ mod tests {
         m.config = serde_json::from_str(r#"{"x": 1, "nested": {"y": [1, 2]}, "z": "s"}"#).unwrap();
         install(td.path(), &m, "").unwrap();
 
-        let plugin = Plugin::load(&td.path().join("a")).unwrap();
+        let plugin = Plugin::load(&td.path().join("a"), PluginSource::User).unwrap();
         assert_eq!(plugin.manifest, m);
     }
 
@@ -1175,7 +1318,7 @@ mod tests {
             let mut m = manifest(name);
             m.time_budget_ms = budget;
             install(td.path(), &m, "").unwrap();
-            let plugin = Plugin::load(&td.path().join(name)).unwrap();
+            let plugin = Plugin::load(&td.path().join(name), PluginSource::User).unwrap();
             assert_eq!(plugin.manifest.time_budget_ms, budget);
             assert_eq!(
                 plugin.load_source().unwrap().time_budget,
@@ -1201,32 +1344,84 @@ mod tests {
     #[test]
     fn plugins_are_discovered_in_directory_order() {
         let td = TempDir::new().unwrap();
-        for (dir, name) in [("20-b", "b"), ("10-c", "c"), ("30-a", "a")] {
+        let system = PluginSource::System.dir(td.path());
+        let user = PluginSource::User.dir(td.path());
+        for (parent, dir, name) in [
+            (&user, "20-b", "b"),
+            (&system, "10-c", "c"),
+            (&user, "30-a", "a"),
+            (&system, "40-d", "d"),
+        ] {
             write(
-                &td.path().join(dir).join(MANIFEST_FILE_NAME),
+                &parent.join(dir).join(MANIFEST_FILE_NAME),
                 &toml::to_string(&manifest(name)).unwrap(),
             );
-            write(&td.path().join(dir).join("main.lua"), "");
+            write(&parent.join(dir).join("main.lua"), "");
         }
         // Hidden directories and plain files are not plugins.
-        write(&td.path().join(".hidden").join(MANIFEST_FILE_NAME), "{}");
+        write(&user.join(".hidden").join(MANIFEST_FILE_NAME), "{}");
+        write(&user.join("README.md"), "");
         write(&td.path().join("README.md"), "");
+        write(&td.path().join(".hidden").join("x"), "");
 
         let found = discover(td.path()).unwrap();
         let names: Vec<_> = found
             .plugins
             .iter()
-            .map(|p| p.manifest.name.as_str())
+            .map(|p| (p.manifest.name.as_str(), p.source))
             .collect();
-        assert_eq!(names, ["c", "b", "a"]);
+        assert_eq!(
+            names,
+            [
+                ("c", PluginSource::System),
+                ("b", PluginSource::User),
+                ("a", PluginSource::User),
+                ("d", PluginSource::System),
+            ]
+        );
         assert!(found.errors.is_empty(), "{:?}", found.errors);
     }
 
     #[test]
-    fn broken_plugins_are_reported_and_skipped() {
+    fn system_plugins_win_name_ties() {
         let td = TempDir::new().unwrap();
+        install(&PluginSource::User.dir(td.path()), &manifest("a"), "").unwrap();
+        install(&PluginSource::System.dir(td.path()), &manifest("a"), "").unwrap();
+
+        let found = discover(td.path()).unwrap();
+        assert_eq!(found.plugins.len(), 1);
+        assert_eq!(found.plugins[0].source, PluginSource::System);
+        assert_eq!(found.errors.len(), 1);
+        assert_eq!(
+            found.errors[0].dir,
+            PluginSource::User.dir(td.path()).join("a")
+        );
+        assert!(matches!(
+            found.errors[0].error,
+            PluginError::DuplicateName { .. }
+        ));
+    }
+
+    #[test]
+    fn plugins_outside_the_system_and_user_directories_are_reported() {
+        let td = TempDir::new().unwrap();
+        install(td.path(), &manifest("stray"), "").unwrap();
+        install(&PluginSource::User.dir(td.path()), &manifest("a"), "").unwrap();
+
+        let found = discover(td.path()).unwrap();
+        assert_eq!(found.plugins.len(), 1);
+        assert_eq!(found.plugins[0].manifest.name, "a");
+        assert_eq!(found.errors.len(), 1);
+        assert_eq!(found.errors[0].dir, td.path().join("stray"));
+        assert!(matches!(found.errors[0].error, PluginError::Misplaced));
+    }
+
+    #[test]
+    fn broken_plugins_are_reported_and_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let td = Plugins(PluginSource::User.dir(tmp.path()));
         // No manifest.
-        std::fs::create_dir(td.path().join("empty")).unwrap();
+        std::fs::create_dir_all(td.path().join("empty")).unwrap();
         // No entrypoint.
         write(
             &td.path().join("no-main").join(MANIFEST_FILE_NAME),
@@ -1241,7 +1436,7 @@ mod tests {
             write(&td.path().join(dir).join("main.lua"), "");
         }
 
-        let found = discover(td.path()).unwrap();
+        let found = discover(tmp.path()).unwrap();
         assert_eq!(found.plugins.len(), 1);
         assert_eq!(found.plugins[0].dir, td.path().join("a1"));
 
@@ -1264,13 +1459,14 @@ mod tests {
 
     #[test]
     fn config_overrides_replace_manifest_defaults() {
-        let td = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let td = Plugins(PluginSource::User.dir(tmp.path()));
         let mut m = manifest("a");
         m.config = serde_json::from_str(r#"{"x": 1, "y": 2}"#).unwrap();
         install(td.path(), &m, "").unwrap();
         install(td.path(), &manifest("b"), "").unwrap();
 
-        let mut found = discover(td.path()).unwrap();
+        let mut found = discover(tmp.path()).unwrap();
         assert_eq!(found.plugins[0].config, m.config);
 
         let overrides = |v: serde_json::Value| v.as_object().unwrap().clone();
@@ -1298,7 +1494,10 @@ mod tests {
         write(&dir.join("notes.txt"), "not lua");
         write(&dir.join(".hidden.lua"), "-- hidden");
 
-        let source = Plugin::load(&dir).unwrap().load_source().unwrap();
+        let source = Plugin::load(&dir, PluginSource::User)
+            .unwrap()
+            .load_source()
+            .unwrap();
         assert_eq!(source.name, "a");
         assert_eq!(source.text, "-- main");
         assert_eq!(source.config, "{}");
@@ -1324,19 +1523,23 @@ mod tests {
         let big = "-".repeat(MAX_PLUGIN_SOURCE_BYTES as usize + 1);
         write(&dir.join("big.lua"), &big);
 
-        let err = Plugin::load(&dir).unwrap().load_source().unwrap_err();
+        let err = Plugin::load(&dir, PluginSource::User)
+            .unwrap()
+            .load_source()
+            .unwrap_err();
         assert!(matches!(err, PluginError::TooLarge { .. }), "{err}");
     }
 
     #[test]
     fn load_sources_skips_disabled_plugins() {
-        let td = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let td = Plugins(PluginSource::User.dir(tmp.path()));
         install(td.path(), &manifest("on"), "-- on").unwrap();
         let mut off = manifest("off");
         off.enabled = false;
         install(td.path(), &off, "-- off").unwrap();
 
-        let sources = load_sources(&discover(td.path()).unwrap(), PluginEngine::Lua);
+        let sources = load_sources(&discover(tmp.path()).unwrap(), PluginEngine::Lua);
         let names: Vec<_> = sources.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["on"]);
     }
