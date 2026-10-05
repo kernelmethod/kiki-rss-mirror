@@ -1,4 +1,4 @@
-use crate::plugins::{DiscoveryError, Plugin, PluginEngine};
+use crate::plugins::{DiscoveryError, Permission, Plugin, PluginEngine, PluginSource};
 use crate::server::AppState;
 use axum::{
     extract::State,
@@ -23,10 +23,18 @@ pub struct PluginResponse {
     pub entrypoint: String,
     /// The name of the plugin's directory inside the plugins directory.
     pub directory: String,
+    /// Whether the plugin is a system plugin, bundled with Kiki and
+    /// installed by `kiki init`, or a user plugin, installed by hand.
+    #[serde(default)]
+    pub source: PluginSource,
     pub description: Option<String>,
     pub authors: Vec<String>,
     pub license: Option<String>,
     pub homepage: Option<String>,
+    /// What the plugin's manifest asks to be allowed to do beyond what every
+    /// plugin can, such as `"entries.delete"`.
+    #[serde(default)]
+    pub permissions: Vec<Permission>,
     /// The config the plugin is running with: the defaults from its manifest,
     /// with its config overrides applied, as they were when plugins were last
     /// loaded.
@@ -45,10 +53,12 @@ impl From<&Plugin> for PluginResponse {
             enabled: m.enabled,
             entrypoint: m.entrypoint().to_string(),
             directory: plugin.dir_name(),
+            source: plugin.source,
             description: m.description.clone(),
             authors: m.authors.clone(),
             license: m.license.clone(),
             homepage: m.homepage.clone(),
+            permissions: m.permissions.clone(),
             config: plugin.config.clone(),
         }
     }
@@ -134,7 +144,7 @@ mod test {
             r#"kiki.on("entry.ingest", function(entry) return entry end)"#,
             serde_json::json!({"x": 1}),
         )?;
-        std::fs::create_dir_all(tc.plugins_dir().join("broken"))?;
+        std::fs::create_dir_all(tc.user_plugins_dir().join("broken"))?;
         let tc = tc.init_server()?;
         let client = tc.client()?;
 
@@ -148,6 +158,7 @@ mod test {
         assert_eq!(plugin.version, "1.0.0");
         assert_eq!(plugin.engine, PluginEngine::Lua);
         assert_eq!(plugin.entrypoint, "main.lua");
+        assert_eq!(plugin.source, PluginSource::User);
         assert_eq!(plugin.directory, "passthrough");
         assert!(plugin.enabled);
         assert_eq!(

@@ -340,7 +340,7 @@ async fn stress_concurrent_tag_creation() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// D. Feed Refresh vs. Retention Cleanup Race
+// D. Feed Refresh vs. Plugin Deletion Race
 // ---------------------------------------------------------------------------
 #[tokio::test]
 #[serial_test::serial]
@@ -355,14 +355,6 @@ async fn stress_refresh_vs_cleanup_race() -> Result<()> {
         let feed_ids = populate_n_feeds(&conn, 5, &feed_url);
 
         drop(conn);
-
-        // Set a retention policy so cleanup has work to do
-        let resp = client
-            .put(format!("{BASE}/v1/settings/retention"))
-            .json(&serde_json::json!({"max_age_days": 1}))
-            .send()
-            .await?;
-        assert_eq!(resp.status(), 200);
 
         // Trigger initial fetches and wait
         for fid in &feed_ids {
@@ -395,15 +387,22 @@ async fn stress_refresh_vs_cleanup_race() -> Result<()> {
             });
         }
 
+        // Deletions, as the retention plugin makes them, of every entry
+        // dropped from its feed.
+        let db = crate::db::Db::open(&tc.database_path(), Default::default())?;
         for _ in 0..10 {
-            let c = client.clone();
+            let db = db.clone();
             js.spawn(async move {
-                let resp = c
-                    .post(format!("{BASE}/v1/entries/cleanup"))
-                    .send()
-                    .await
-                    .unwrap();
-                ("cleanup", resp.status().as_u16())
+                let filter = crate::scripting::DeleteFilter {
+                    dropped_before: i64::MAX,
+                    ..Default::default()
+                };
+                let deleted = tokio::task::spawn_blocking(move || {
+                    crate::plugins::services::delete_entries(&db, &filter)
+                })
+                .await
+                .unwrap();
+                ("delete", u16::from(deleted.is_ok()))
             });
         }
 
@@ -411,7 +410,7 @@ async fn stress_refresh_vs_cleanup_race() -> Result<()> {
             let (kind, status) = result?;
             match kind {
                 "fetch" => assert_eq!(status, 202, "fetch should return 202"),
-                "cleanup" => assert_eq!(status, 200, "cleanup should return 200"),
+                "delete" => assert_eq!(status, 1, "deleting entries should succeed"),
                 _ => unreachable!(),
             }
         }

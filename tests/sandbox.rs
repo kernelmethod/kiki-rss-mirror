@@ -1424,7 +1424,7 @@ mod script_isolation {
         });
         let manifest = toml::to_string(&manifest).expect("serialize manifest.toml");
         let mut kiki = Kiki::spawn_with(extra_args, |home| {
-            let plugin = home.join("plugins").join("test-plugin");
+            let plugin = home.join("plugins").join("user").join("test-plugin");
             std::fs::create_dir_all(&plugin).expect("create plugin directory");
             std::fs::write(plugin.join("main.lua"), source).expect("write main.lua");
             std::fs::write(plugin.join("manifest.toml"), manifest).expect("write manifest.toml");
@@ -1703,7 +1703,7 @@ mod script_isolation {
                 )
                 .expect("insert entry");
             }
-            let plugin = home.join("plugins").join("scanner");
+            let plugin = home.join("plugins").join("user").join("scanner");
             std::fs::create_dir_all(&plugin).expect("create plugin directory");
             std::fs::write(plugin.join("manifest.toml"), manifest).expect("write manifest");
             std::fs::write(plugin.join("main.lua"), SCRIPT).expect("write main.lua");
@@ -1753,7 +1753,10 @@ mod script_isolation {
         // Editing the plugin reloads it, through the plugins directory
         // watcher, and its new scan hides ham too.
         std::fs::write(
-            home.join("plugins").join("scanner").join("main.lua"),
+            home.join("plugins")
+                .join("user")
+                .join("scanner")
+                .join("main.lua"),
             SCRIPT.replace(r#"local pattern = "spam""#, r#"local pattern = "ham""#),
         )
         .expect("rewrite main.lua");
@@ -1803,7 +1806,7 @@ mod script_isolation {
             }
             insert("huge".to_string(), &huge);
             insert("small".to_string(), "x");
-            let plugin = home.join("plugins").join("scanner");
+            let plugin = home.join("plugins").join("user").join("scanner");
             std::fs::create_dir_all(&plugin).expect("create plugin directory");
             std::fs::write(plugin.join("manifest.toml"), manifest).expect("write manifest");
             std::fs::write(plugin.join("main.lua"), SCRIPT).expect("write main.lua");

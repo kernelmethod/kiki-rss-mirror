@@ -78,6 +78,8 @@
 
 pub mod lua;
 
+use crate::db::tags::SystemTag;
+use crate::plugins::Permission;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
@@ -87,7 +89,7 @@ use std::time::Duration;
 ///
 /// Each plugin's entrypoint is called with its config as its only argument, so a
 /// plugin reads it with `local config = ...`. That keeps one plugin's config out of reach
-/// of the others that share its VM.
+/// of the others that share its VM: the plugins that ask for the same [`Permission`]s.
 ///
 /// A plugin's other source files travel with it as [`ScriptModule`]s, which its code
 /// loads with `require`.
@@ -107,6 +109,11 @@ pub struct ScriptSource {
     pub modules: Vec<ScriptModule>,
     /// How long each call of one of the plugin's handlers may run.
     pub time_budget: TimeBudget,
+    /// The permissions the plugin's manifest asks for.
+    ///
+    /// The server decides what a plugin may do; the runner only keeps plugins that ask for
+    /// different permissions apart, so that none can tamper with code running with more.
+    pub permissions: Vec<Permission>,
 }
 
 /// How long each call of a plugin's handlers may run before it is stopped.
@@ -191,6 +198,7 @@ impl ScriptSource {
     /// assert_eq!(source.config, "{}");
     /// assert!(source.modules.is_empty());
     /// assert_eq!(source.time_budget, TimeBudget::DEFAULT);
+    /// assert!(source.permissions.is_empty());
     /// ```
     pub fn new(text: impl Into<String>) -> Self {
         Self {
@@ -199,6 +207,7 @@ impl ScriptSource {
             config: Self::EMPTY_CONFIG.to_string(),
             modules: Vec::new(),
             time_budget: TimeBudget::DEFAULT,
+            permissions: Vec::new(),
         }
     }
 }
@@ -307,7 +316,15 @@ pub enum Event {
     /// hint has it fetched again sooner than its interval. Handlers may lengthen the wait
     /// by returning a number of seconds; see [`FetchSchedule`].
     FetchSchedule,
+    /// Fires every [`TIMER_TICK`] while any plugin has a timer, started with
+    /// `kiki.every(secs, handler)`. Runs the timers that are due. Plugins cannot register
+    /// for it with `kiki.on`: it has no name [`Event::from_name`] accepts.
+    Timer,
 }
+
+/// How often the server fires [`Event::Timer`], and so the granularity of plugins' timers:
+/// a timer runs on the first tick at least its interval after it last ran.
+pub const TIMER_TICK: Duration = Duration::from_secs(60);
 
 impl Event {
     /// Returns the public string name of the event (e.g. `"entry.ingest"`).
@@ -321,10 +338,13 @@ impl Event {
             Self::FeedRemoved => "feed.removed",
             Self::PluginLoad => "plugin.load",
             Self::FetchSchedule => "fetch.schedule",
+            Self::Timer => "timer",
         }
     }
 
     /// Parses an event name as used by `kiki.on(name, ...)` into its enum value.
+    ///
+    /// [`Event::Timer`] has no such name: plugins use timers through `kiki.every`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "entry.ingest" => Some(Self::EntryIngest),
@@ -340,16 +360,16 @@ impl Event {
     }
 
     /// This event's bit in an [`EventSet`].
-    fn bit(self) -> u8 {
-        1 << (self as u8)
+    fn bit(self) -> u16 {
+        1 << (self as u16)
     }
 }
 
 /// A set of [`Event`]s, such as those some handler is registered for.
 ///
-/// Packed into one byte, so the script host can report its subscriptions
-/// on every response for next to nothing. That holds eight events, which
-/// [`Event`] has; another one needs a wider integer here.
+/// Packed into two bytes, so the script host can report its subscriptions
+/// on every response for next to nothing. That holds sixteen events;
+/// [`Event`] has nine.
 ///
 /// # Examples
 ///
@@ -363,11 +383,11 @@ impl Event {
 /// assert!(EventSet::ALL.contains(Event::EntryParsed));
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventSet(u8);
+pub struct EventSet(u16);
 
 impl EventSet {
     /// Every event.
-    pub const ALL: EventSet = EventSet(u8::MAX);
+    pub const ALL: EventSet = EventSet(u16::MAX);
 
     /// Whether `event` is in the set.
     pub fn contains(self, event: Event) -> bool {
@@ -379,13 +399,13 @@ impl EventSet {
         self.0 |= event.bit();
     }
 
-    /// The set as a byte, for storing in an atomic.
-    pub fn to_bits(self) -> u8 {
+    /// The set as an integer, for storing in an atomic.
+    pub fn to_bits(self) -> u16 {
         self.0
     }
 
-    /// The set a byte from [`Self::to_bits`] stands for.
-    pub fn from_bits(bits: u8) -> Self {
+    /// The set an integer from [`Self::to_bits`] stands for.
+    pub fn from_bits(bits: u16) -> Self {
         EventSet(bits)
     }
 }
@@ -419,6 +439,8 @@ pub enum EventPayload {
     Feed { id: i64, url: String, title: String },
     /// Used for [`Event::PluginLoad`]. Handlers are called with no argument.
     PluginLoad,
+    /// Used for [`Event::Timer`]. Timer handlers are called with no argument.
+    Timer,
 }
 
 /// What a fetch revealed about a feed's content, as `fetch.schedule` handlers see it in
@@ -513,6 +535,36 @@ pub struct ScanOptions {
     pub include_hidden: bool,
 }
 
+/// Which stored entries to delete. See [`ServiceCall::DeleteEntries`].
+///
+/// Only entries their feed has stopped listing are ever deleted: an entry still in its
+/// feed would be fetched again on the feed's next refresh, and stored as a new, unread
+/// entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteFilter {
+    /// Delete entries their feed stopped listing before this Unix timestamp.
+    pub dropped_before: i64,
+    /// Only delete the entries of this feed.
+    pub feed_id: Option<i64>,
+    /// Only delete entries published before this Unix timestamp. Entries with no
+    /// publication date are kept.
+    pub published_before: Option<i64>,
+    /// Keep entries tagged with any of these tags, by name. Defaults to
+    /// `system:saved`; empty deletes entries however they are tagged.
+    pub keep_tagged: Vec<String>,
+}
+
+impl Default for DeleteFilter {
+    fn default() -> Self {
+        Self {
+            dropped_before: 0,
+            feed_id: None,
+            published_before: None,
+            keep_tagged: vec![SystemTag::Saved.name().to_string()],
+        }
+    }
+}
+
 /// How a scan went, handed to its `on_done` callback when it finishes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanSummary {
@@ -548,6 +600,10 @@ pub enum ServiceCall {
     StartScan { options: ScanOptions },
     /// Look up the feed with id `feed_id`. Answered with [`ServiceReply::Feed`].
     GetFeed { feed_id: i64 },
+    /// Delete the stored entries `filter` describes. Needs the plugin to have the
+    /// [`entries.delete`](crate::plugins::Permission::EntriesDelete) permission. Answered
+    /// with [`ServiceReply::Deleted`].
+    DeleteEntries { filter: DeleteFilter },
 }
 
 /// A feed, as plugins see it through `kiki.feeds.get`.
@@ -572,6 +628,8 @@ pub enum ServiceReply {
     ScanStarted(u64),
     /// A feed, or `None` if there is no feed with the id asked for.
     Feed(Option<FeedInfo>),
+    /// How many entries were deleted.
+    Deleted(u64),
     /// The call succeeded and has nothing to report.
     Done,
 }

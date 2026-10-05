@@ -151,7 +151,7 @@ impl PluginArgs {
 fn list(home: &Path, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
     let discovery = discover(home)?;
 
-    let rows: Vec<[String; 5]> = discovery
+    let rows: Vec<[String; 7]> = discovery
         .plugins
         .iter()
         .map(|p| {
@@ -167,7 +167,9 @@ fn list(home: &Path, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
                 m.name.clone(),
                 m.version.clone(),
                 m.engine.name().to_string(),
+                p.source.name().to_string(),
                 status.to_string(),
+                permissions(&m.permissions),
                 m.description.clone().unwrap_or_default(),
             ]
         })
@@ -176,8 +178,17 @@ fn list(home: &Path, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
     if rows.is_empty() {
         writeln!(out, "No plugins installed.")?;
     } else {
-        let header = ["NAME", "VERSION", "ENGINE", "STATUS", "DESCRIPTION"].map(String::from);
-        let mut widths = [0; 5];
+        let header = [
+            "NAME",
+            "VERSION",
+            "ENGINE",
+            "SOURCE",
+            "STATUS",
+            "PERMISSIONS",
+            "DESCRIPTION",
+        ]
+        .map(String::from);
+        let mut widths = [0; 7];
         for row in std::iter::once(&header).chain(&rows) {
             for (width, cell) in widths.iter_mut().zip(row) {
                 *width = (*width).max(cell.chars().count());
@@ -196,6 +207,19 @@ fn list(home: &Path, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
         writeln!(err, "warning: skipped {:?}: {}", e.dir, e.error)?;
     }
     Ok(())
+}
+
+/// The permissions a plugin asks for, as `kiki plugin ls` shows them: their
+/// names, separated by commas, or `-` for none.
+fn permissions(permissions: &[plugins::Permission]) -> String {
+    if permissions.is_empty() {
+        return "-".to_string();
+    }
+    permissions
+        .iter()
+        .map(|p| p.name())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 impl GetArgs {
@@ -400,7 +424,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let dir = plugins::plugins_dir(home.path()).join("hello");
+        let dir = plugins::PluginSource::User
+            .dir(&plugins::plugins_dir(home.path()))
+            .join("hello");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(plugins::MANIFEST_FILE_NAME),
@@ -437,7 +463,12 @@ mod tests {
     #[test]
     fn test_list() {
         let home = home();
-        std::fs::create_dir(plugins::plugins_dir(home.path()).join("broken")).unwrap();
+        std::fs::create_dir(
+            plugins::PluginSource::User
+                .dir(&plugins::plugins_dir(home.path()))
+                .join("broken"),
+        )
+        .unwrap();
 
         let (mut out, mut err) = (Vec::new(), Vec::new());
         list(home.path(), &mut out, &mut err).unwrap();
@@ -447,11 +478,19 @@ mod tests {
             .map(|l| l.split_whitespace().collect::<Vec<_>>());
         assert_eq!(
             lines.next().unwrap(),
-            ["NAME", "VERSION", "ENGINE", "STATUS", "DESCRIPTION"]
+            [
+                "NAME",
+                "VERSION",
+                "ENGINE",
+                "SOURCE",
+                "STATUS",
+                "PERMISSIONS",
+                "DESCRIPTION"
+            ]
         );
         assert_eq!(
             lines.next().unwrap(),
-            ["hello", "1.0.0", "lua", "enabled", "Says", "hello"]
+            ["hello", "1.0.0", "lua", "user", "enabled", "-", "Says", "hello"]
         );
         assert!(lines.next().is_none());
         assert!(String::from_utf8(err).unwrap().contains("broken"));

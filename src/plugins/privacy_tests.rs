@@ -1,4 +1,4 @@
-//! Tests for the `strip-tracking` plugin shipped in `plugins/strip-tracking/`.
+//! Tests for the `privacy` plugin shipped in `plugins/privacy/`.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
@@ -11,13 +11,13 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-const MANIFEST: &str = include_str!("../../plugins/strip-tracking/manifest.toml");
-const MAIN: &str = include_str!("../../plugins/strip-tracking/main.lua");
+const MANIFEST: &str = include_str!("../../plugins/privacy/manifest.toml");
+const MAIN: &str = include_str!("../../plugins/privacy/main.lua");
 
 /// The plugin, loaded with `config`.
 fn plugin(config: Value) -> Result<LuaScriptRunner, crate::scripting::lua::ScriptError> {
     let mut source = ScriptSource::new(MAIN);
-    source.name = "strip-tracking".to_string();
+    source.name = "privacy".to_string();
     source.config = config.to_string();
     LuaScriptRunner::from_sources(&[source])
 }
@@ -62,7 +62,7 @@ fn clean_content(runner: &LuaScriptRunner, content: &str) -> String {
 #[test]
 fn the_manifest_is_valid() {
     let manifest = crate::plugins::PluginManifest::parse(MANIFEST).unwrap();
-    assert_eq!(manifest.name, "strip-tracking");
+    assert_eq!(manifest.name, "privacy");
     let names: Vec<_> = manifest.settings.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(
         names,
@@ -194,7 +194,7 @@ fn bad_params_fail_to_load() {
         json!({"params": [3]}),
     ] {
         let err = plugin(config.clone()).err().unwrap().to_string();
-        assert!(err.contains("strip-tracking: "), "{config}: {err}");
+        assert!(err.contains("privacy: "), "{config}: {err}");
     }
 }
 
@@ -319,7 +319,7 @@ fn bad_trackers_fail_to_load() {
         json!({"trackers": [3]}),
     ] {
         let err = plugin(config.clone()).err().unwrap().to_string();
-        assert!(err.contains("strip-tracking: "), "{config}: {err}");
+        assert!(err.contains("privacy: "), "{config}: {err}");
     }
 }
 
@@ -379,7 +379,7 @@ impl ScriptServices for Feeds {
 fn assets_are_not_cached_for_feeds_given_by_url() {
     let feeds = Arc::new(Feeds::default());
     let mut source = ScriptSource::new(MAIN);
-    source.name = "strip-tracking".to_string();
+    source.name = "privacy".to_string();
     source.config = json!({"skip_assets": ["https://example.com/feed2", 3]}).to_string();
     let runner = LuaScriptRunner::from_sources_with(
         &[source],
@@ -422,6 +422,6 @@ fn bad_skip_assets_fail_to_load() {
         json!({"skip_assets": [true]}),
     ] {
         let err = plugin(config.clone()).err().unwrap().to_string();
-        assert!(err.contains("strip-tracking: "), "{config}: {err}");
+        assert!(err.contains("privacy: "), "{config}: {err}");
     }
 }

@@ -1,4 +1,4 @@
-name = "strip-tracking"
+name = "privacy"
 version = "1.2.0"
 engine = "lua"
 description = "Strip tracking parameters, such as utm_source, from the URLs in new entries, and tracking pixels from their content, and skip downloading images for chosen feeds"
@@ -15,8 +15,8 @@ homepage = "https://github.com/kernelmethod/kiki-rss"
 # and enclosures at all. See main.lua for the details.
 #
 # To strip more parameters, add them to the list, for example with
-# `kiki plugin config get strip-tracking --defaults`, editing its output and
-# passing it to `kiki plugin config set strip-tracking`.
+# `kiki plugin config get privacy --defaults`, editing its output and
+# passing it to `kiki plugin config set privacy`.
 [config]
 params = [
     # Google Analytics campaigns, and Google Ads, Microsoft Ads, Meta,

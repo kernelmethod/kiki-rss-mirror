@@ -16,8 +16,8 @@ curl --unix-socket "$XDG_RUNTIME_DIR/kiki/kiki.sock" http://localhost/v1/feeds
 
 - **Feeds** are the RSS or Atom feeds Kiki fetches, under `/v1/feeds`.
 - **Entries** are the items in those feeds, under `/v1/entries`. Kiki keeps
-  an entry after it drops out of its feed, until
-  [`retention.max_age_days`](settings.md#retention) says otherwise.
+  an entry after it drops out of its feed, until the
+  [`retention`](plugins/retention.md) plugin deletes it, if you've set it to.
 - **Tags** label both feeds and entries, under `/v1/tags`. There are two
   kinds:
   - **User tags** are created, renamed, and deleted by you, by plugins, or

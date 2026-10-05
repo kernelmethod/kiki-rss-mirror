@@ -15,7 +15,7 @@ use anyhow::Result;
 use chrono::Utc;
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -63,7 +63,7 @@ async fn setup(state: FeedServerState, config: Option<Value>, interval: i64) -> 
                 ScriptRunnerHandle::empty(),
                 CancellationToken::new(),
             );
-            services.set_loaded(HashSet::from([PLUGIN.to_string()]));
+            services.set_loaded(HashMap::from([(PLUGIN.to_string(), vec![])]));
             let mut source = ScriptSource::new(MAIN);
             source.name = PLUGIN.to_string();
             source.config = config.to_string();

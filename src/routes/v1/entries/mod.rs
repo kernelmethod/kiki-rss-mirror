@@ -1,5 +1,4 @@
 pub mod batch_entries;
-pub mod cleanup;
 pub mod delete_entry;
 pub mod entry_assets;
 pub mod entry_tags;
@@ -10,7 +9,6 @@ pub mod rows;
 pub mod search_entries;
 
 use batch_entries::batch_entries;
-use cleanup::cleanup;
 use delete_entry::delete_entry;
 use entry_assets::list_entry_assets;
 use entry_tags::{add_entry_system_tag, get_entry_tags, remove_entry_system_tag, set_entry_tags};
@@ -28,7 +26,6 @@ use axum::{
 pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_entries))
-        .route("/cleanup", post(cleanup))
         .route("/batch", post(batch_entries))
         .route("/search", post(search_entries))
         .route("/search/ids", post(search_entry_ids))

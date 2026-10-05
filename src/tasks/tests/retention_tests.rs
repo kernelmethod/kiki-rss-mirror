@@ -1,10 +1,12 @@
 //! Retention as driven by feed refreshes: entries are updated in place,
-//! marked dropped when their feed stops listing them, and only deleted
-//! once they have been dropped for longer than the retention period.
+//! marked dropped when their feed stops listing them, and only deleted, by
+//! plugins calling `kiki.entries.delete_where`, once they have been
+//! dropped.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::super::*;
-use crate::db::retention;
+use crate::plugins::services::delete_entries;
+use crate::scripting::DeleteFilter;
 use crate::test::{TestBuilder, TestConfig};
 use anyhow::Result;
 use rusqlite::Connection;
@@ -217,33 +219,48 @@ async fn empty_feed_marks_nothing_dropped() -> Result<()> {
     Ok(())
 }
 
+/// Deletes, as `kiki.entries.delete_where` does, the entries `filter`
+/// describes.
+fn delete(f: &FileFeed, filter: DeleteFilter) -> u64 {
+    let db = make_pool(&f.tc.database_path()).unwrap();
+    delete_entries(&db, &filter).unwrap()
+}
+
+/// Seven days ago.
+fn week_ago() -> i64 {
+    chrono::Utc::now().timestamp() - 7 * DAY
+}
+
 #[tokio::test]
-async fn retention_deletes_only_long_dropped_entries() -> Result<()> {
+async fn deleting_takes_only_long_dropped_entries() -> Result<()> {
     let f = FileFeed::new()?;
     f.refresh(&[("current", "C"), ("recent", "R"), ("old", "O")])
         .await?;
     f.refresh(&[("current", "C")]).await?;
 
     // "old" left the feed ten days ago; "recent" just now. All three were
-    // published in 2001.
+    // published in 2001, so "current" is old too, but still in the feed.
     f.conn().execute(
         "UPDATE entries SET dropped_at = dropped_at - 10 * ?1 WHERE guid = 'old'",
         [DAY],
     )?;
 
-    let conn = f.conn();
-    assert_eq!(retention::cleanup_feed(&conn, f.feed_id, Some(7))?, 1);
+    let filter = DeleteFilter {
+        dropped_before: week_ago(),
+        ..Default::default()
+    };
+    assert_eq!(delete(&f, filter.clone()), 1);
     assert_eq!(f.guids(), ["current", "recent"]);
-    assert_eq!(retention::cleanup_all(&conn, Some(7))?, 0);
+    assert_eq!(delete(&f, filter), 0);
     assert_eq!(f.guids(), ["current", "recent"]);
 
     Ok(())
 }
 
-/// A saved entry the feed stopped listing survives cleanup for as long as it
-/// stays saved.
+/// A saved entry the feed stopped listing is kept for as long as it stays
+/// saved, unless the filter asks for saved entries too.
 #[tokio::test]
-async fn cleanup_keeps_saved_entries_dropped_from_the_feed() -> Result<()> {
+async fn deleting_keeps_saved_entries_unless_asked() -> Result<()> {
     let f = FileFeed::new()?;
     f.refresh(&[("saved", "s"), ("unsaved", "u"), ("current", "c")])
         .await?;
@@ -262,7 +279,77 @@ async fn cleanup_keeps_saved_entries_dropped_from_the_feed() -> Result<()> {
         [DAY],
     )?;
 
-    assert_eq!(retention::cleanup_all(&conn, Some(7))?, 1);
+    let filter = DeleteFilter {
+        dropped_before: week_ago(),
+        ..Default::default()
+    };
+    assert_eq!(delete(&f, filter.clone()), 1);
     assert_eq!(f.guids(), ["current", "saved"]);
+
+    let filter = DeleteFilter {
+        keep_tagged: vec![],
+        ..filter
+    };
+    assert_eq!(delete(&f, filter), 1);
+    assert_eq!(f.guids(), ["current"]);
+    Ok(())
+}
+
+/// `feed_id` and `published_before` narrow a deletion down.
+#[tokio::test]
+async fn deleting_can_be_narrowed_by_feed_and_publication_date() -> Result<()> {
+    let f = FileFeed::new()?;
+    f.refresh(&[("a", "A"), ("b", "B"), ("current", "C")])
+        .await?;
+    f.refresh(&[("current", "C")]).await?;
+    let conn = f.conn();
+    conn.execute(
+        "UPDATE entries SET dropped_at = dropped_at - 10 * ?1",
+        [DAY],
+    )?;
+    // "b" was published recently; "a" in 2001.
+    conn.execute(
+        "UPDATE entries SET published_at = ?1 WHERE guid = 'b'",
+        [chrono::Utc::now().timestamp()],
+    )?;
+
+    let other_feed = DeleteFilter {
+        dropped_before: week_ago(),
+        feed_id: Some(f.feed_id + 1),
+        ..Default::default()
+    };
+    assert_eq!(delete(&f, other_feed), 0);
+
+    let published_long_ago = DeleteFilter {
+        dropped_before: week_ago(),
+        feed_id: Some(f.feed_id),
+        published_before: Some(week_ago()),
+        ..Default::default()
+    };
+    assert_eq!(delete(&f, published_long_ago), 1);
+    assert_eq!(f.guids(), ["b", "current"]);
+    Ok(())
+}
+
+/// More entries than fit in one batch are all deleted, by one call.
+#[tokio::test]
+async fn deleting_goes_through_every_batch() -> Result<()> {
+    let f = FileFeed::new()?;
+    let count = crate::plugins::services::DELETE_BATCH as usize * 2 + 3;
+    let guids: Vec<String> = (0..count).map(|i| format!("g{i}")).collect();
+    let items: Vec<(&str, &str)> = guids.iter().map(|g| (g.as_str(), "t")).collect();
+    f.refresh(&items).await?;
+    f.refresh(&[("current", "c")]).await?;
+    f.conn().execute(
+        "UPDATE entries SET dropped_at = dropped_at - 10 * ?1",
+        [DAY],
+    )?;
+
+    let filter = DeleteFilter {
+        dropped_before: week_ago(),
+        ..Default::default()
+    };
+    assert_eq!(delete(&f, filter), count as u64);
+    assert_eq!(f.guids(), ["current"]);
     Ok(())
 }

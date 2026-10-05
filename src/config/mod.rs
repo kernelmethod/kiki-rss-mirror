@@ -17,9 +17,6 @@
 //! [asset_cache]
 //! enabled = false
 //!
-//! [retention]
-//! max_age_days = 30
-//!
 //! [proxy]
 //! url = "http://proxy.example:3128"   # or "socks5h://127.0.0.1:9050" for Tor
 //! no_proxy = "localhost, .internal.example"
@@ -96,7 +93,6 @@ pub enum ConfigError {
 pub struct Settings {
     pub feed_fetch: FeedFetchSettings,
     pub asset_cache: AssetCacheSettings,
-    pub retention: RetentionSettings,
     #[serde(default)]
     pub proxy: ProxySettings,
     #[serde(default)]
@@ -148,17 +144,6 @@ pub struct AssetCacheSettings {
 
     /// Total size, in bytes, the cache is evicted down to.
     pub max_bytes: i64,
-}
-
-/// Settings for deleting old entries.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RetentionSettings {
-    /// Entries are deleted once their feed has stopped listing them for
-    /// more than this many days; entries still in their feed, and entries
-    /// tagged `system:saved`, are never deleted. `None` keeps entries forever.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_age_days: Option<i64>,
 }
 
 /// The proxy used for outbound HTTP(S): feed fetches and asset downloads.
@@ -380,12 +365,6 @@ pub const DEFAULT_FETCH_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 /// Default for [`AssetCacheSettings::max_bytes`]: 1 GiB.
 pub const DEFAULT_ASSET_CACHE_MAX_BYTES: i64 = 1024 * 1024 * 1024;
 
-/// Largest accepted [`RetentionSettings::max_age_days`]: 100 years.
-///
-/// Anything longer is indistinguishable from keeping entries forever, and
-/// an unbounded value would overflow when converted to seconds.
-pub const MAX_RETENTION_DAYS: i64 = 100 * 365;
-
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -401,7 +380,6 @@ impl Default for Settings {
                 enabled: true,
                 max_bytes: DEFAULT_ASSET_CACHE_MAX_BYTES,
             },
-            retention: RetentionSettings::default(),
             proxy: ProxySettings::default(),
             web_ui: WebUiSettings::default(),
             api: ApiSettings::default(),
@@ -437,19 +415,6 @@ impl Settings {
         }
         if self.asset_cache.max_bytes < 0 {
             return invalid("asset_cache.max_bytes must be non-negative");
-        }
-        // Zero days would delete every entry on the next cleanup.
-        if self.retention.max_age_days.is_some_and(|d| d < 1) {
-            return invalid("retention.max_age_days must be at least 1");
-        }
-        if self
-            .retention
-            .max_age_days
-            .is_some_and(|d| d > MAX_RETENTION_DAYS)
-        {
-            return Err(ConfigError::Invalid(format!(
-                "retention.max_age_days must be at most {MAX_RETENTION_DAYS}"
-            )));
         }
         self.proxy.validate()
     }
@@ -564,13 +529,27 @@ impl Overrides {
 
 /// Settings Kiki no longer has, as `(section, key)`, with what replaced
 /// each. A config file that still sets one is accepted, and the key
-/// ignored with a warning, rather than refused.
-const RETIRED_KEYS: &[(&str, &str, &str)] = &[(
-    "feed_fetch",
-    "adaptive_fetch",
-    "adaptive fetching is now the adaptive-fetch plugin; set its \
-     `feeds` or `exclude`, or disable it in its manifest",
-)];
+/// ignored with a warning, rather than refused. A section left empty is
+/// ignored too.
+const RETIRED_KEYS: &[(&str, &str, &str)] = &[
+    (
+        "feed_fetch",
+        "adaptive_fetch",
+        "adaptive fetching is now the adaptive-fetch plugin; set its \
+         `feeds` or `exclude`, or disable it in its manifest",
+    ),
+    (
+        RETIRED_RETENTION.0,
+        RETIRED_RETENTION.1,
+        "deleting old entries is now the retention plugin; set its \
+         `max_age_days`. The server moves this setting there when it starts",
+    ),
+];
+
+/// The retired `retention.max_age_days`, as `(section, key)`, which the
+/// server moves into the retention plugin's config when it starts; see
+/// [`crate::plugins::migrate_retention_setting`].
+pub const RETIRED_RETENTION: (&str, &str) = ("retention", "max_age_days");
 
 impl Overrides {
     /// The overrides without any of the [`RETIRED_KEYS`], warning about
@@ -583,16 +562,20 @@ impl Overrides {
     ///
     /// let o = Overrides::parse("[feed_fetch]\nadaptive_fetch = false\n").unwrap();
     /// assert_eq!(o.resolve().unwrap(), Settings::default());
+    /// let o = Overrides::parse("[retention]\nmax_age_days = 30\n").unwrap();
+    /// assert_eq!(o.resolve().unwrap(), Settings::default());
     /// ```
     fn without_retired_keys(&self) -> toml::Table {
         let mut table = self.0.clone();
         for (section, key, replacement) in RETIRED_KEYS {
-            let removed = table
-                .get_mut(*section)
-                .and_then(toml::Value::as_table_mut)
-                .and_then(|t| t.remove(*key));
-            if removed.is_some() {
+            let Some(t) = table.get_mut(*section).and_then(toml::Value::as_table_mut) else {
+                continue;
+            };
+            if t.remove(*key).is_some() {
                 tracing::warn!("ignoring the retired setting {section}.{key}: {replacement}");
+            }
+            if t.is_empty() {
+                table.remove(*section);
             }
         }
         table
@@ -630,18 +613,21 @@ mod tests {
     #[test]
     fn overrides_apply_per_key() {
         let o = Overrides::parse(
-            "[feed_fetch]\nmax_feed_bytes = 4096\n\n[retention]\nmax_age_days = 30\n",
+            "[feed_fetch]\nmax_feed_bytes = 4096\n\n[asset_cache]\nenabled = false\n",
         )
         .unwrap();
         let s = o.resolve().unwrap();
         assert_eq!(s.feed_fetch.max_feed_bytes, 4096);
-        assert_eq!(s.retention.max_age_days, Some(30));
+        assert!(!s.asset_cache.enabled);
         // Keys not overridden keep their defaults.
         assert_eq!(
             s.feed_fetch.timeout_seconds,
             Settings::default().feed_fetch.timeout_seconds
         );
-        assert_eq!(s.asset_cache, Settings::default().asset_cache);
+        assert_eq!(
+            s.asset_cache.max_bytes,
+            Settings::default().asset_cache.max_bytes
+        );
     }
 
     #[test]
@@ -650,6 +636,21 @@ mod tests {
         assert!(matches!(o.resolve(), Err(ConfigError::Invalid(_))));
 
         let o = Overrides::parse("[nonsense]\nx = 1\n").unwrap();
+        assert!(matches!(o.resolve(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn retired_keys_are_ignored_but_their_sections_other_keys_are_not() {
+        for text in [
+            "[retention]\nmax_age_days = 30\n",
+            // Retired keys are ignored whatever their value.
+            "[retention]\nmax_age_days = 0\n",
+            "[feed_fetch]\nadaptive_fetch = false\n",
+        ] {
+            let o = Overrides::parse(text).unwrap();
+            assert_eq!(o.resolve().unwrap(), Settings::default(), "{text:?}");
+        }
+        let o = Overrides::parse("[retention]\nmax_age_days = 30\nother = 1\n").unwrap();
         assert!(matches!(o.resolve(), Err(ConfigError::Invalid(_))));
     }
 
@@ -667,10 +668,6 @@ mod tests {
             "[feed_fetch]\ndefault_fetch_interval_seconds = 0\n",
             "[feed_fetch]\nmax_feed_bytes = -1\n",
             "[asset_cache]\nmax_bytes = -1\n",
-            "[retention]\nmax_age_days = 0\n",
-            "[retention]\nmax_age_days = 36501\n",
-            // Would overflow `max_age_days * 86400`.
-            "[retention]\nmax_age_days = 200000000000000\n",
         ] {
             let o = Overrides::parse(text).unwrap();
             assert!(

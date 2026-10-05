@@ -21,14 +21,16 @@ pub(crate) fn default_directory() -> Result<PathBuf> {
     paths::default_data_dir(&Env::from_process())
 }
 
-/// Installs the plugins bundled with Kiki into `plugins_dir`, and updates
-/// the ones an earlier release installed, printing what changed. See
+/// Installs the plugins bundled with Kiki into the system directory of the
+/// plugins directory `plugins_dir`, and updates the ones an earlier release
+/// installed, printing what changed. See
 /// [`crate::plugins::defaults::sync_default_plugins`].
 #[cfg(feature = "default-plugins")]
 fn sync_default_plugins(plugins_dir: &Path) -> Result<()> {
     use crate::plugins::defaults::SyncOutcome;
 
-    let outcomes = crate::plugins::defaults::sync_default_plugins(plugins_dir)
+    let system_dir = crate::plugins::PluginSource::System.dir(plugins_dir);
+    let outcomes = crate::plugins::defaults::sync_default_plugins(&system_dir)
         .context("failed to install the default plugins")?;
     for (name, outcome) in outcomes {
         match outcome {
@@ -135,8 +137,11 @@ impl InitArgs {
         paths::restrict_permissions(&db_path, 0o660)?;
 
         let plugins_dir = crate::plugins::plugins_dir(directory);
-        fs::create_dir_all(&plugins_dir)
-            .with_context(|| format!("unable to create plugins directory {plugins_dir:?}"))?;
+        for source in crate::plugins::PluginSource::ALL {
+            let dir = source.dir(&plugins_dir);
+            fs::create_dir_all(&dir)
+                .with_context(|| format!("unable to create plugins directory {dir:?}"))?;
+        }
         if !self.no_default_plugins {
             sync_default_plugins(&plugins_dir)?;
         }
@@ -216,9 +221,18 @@ mod test {
         let path = td.path().join("nested").join("home");
         assert!(args().run_in(&path).is_ok());
         assert!(path.join(paths::DB_FILE_NAME).exists());
-        assert!(path.join(crate::plugins::PLUGINS_DIR_NAME).is_dir());
+        let plugins_dir = crate::plugins::plugins_dir(&path);
+        for source in crate::plugins::PluginSource::ALL {
+            assert!(source.dir(&plugins_dir).is_dir());
+        }
 
         Ok(())
+    }
+
+    /// The system plugins directory of the Kiki home directory `home`.
+    #[cfg(feature = "default-plugins")]
+    fn system_plugins_dir(home: &Path) -> PathBuf {
+        crate::plugins::PluginSource::System.dir(&crate::plugins::plugins_dir(home))
     }
 
     /// `kiki init` installs the bundled plugins, unless told not to.
@@ -228,7 +242,7 @@ mod test {
         let td = TempDir::with_prefix("kiki_")?;
         let path = td.path().join("with");
         args().run_in(&path)?;
-        let filter = crate::plugins::plugins_dir(&path).join("filter");
+        let filter = system_plugins_dir(&path).join("filter");
         assert!(filter.join(crate::plugins::MANIFEST_FILE_NAME).is_file());
         assert!(filter.join("main.lua").is_file());
 
@@ -238,8 +252,7 @@ mod test {
             ..args()
         }
         .run_in(&path)?;
-        let plugins_dir = crate::plugins::plugins_dir(&path);
-        assert_eq!(fs::read_dir(plugins_dir)?.count(), 0);
+        assert_eq!(fs::read_dir(system_plugins_dir(&path))?.count(), 0);
 
         Ok(())
     }
@@ -256,7 +269,7 @@ mod test {
             ..args()
         }
         .run_in(path)?;
-        let filter = crate::plugins::plugins_dir(path).join("filter");
+        let filter = system_plugins_dir(path).join("filter");
         assert!(!filter.exists());
 
         InitArgs::with_check().run_in(path)?;

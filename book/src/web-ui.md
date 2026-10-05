@@ -32,8 +32,9 @@ require_login = true
 
 The web UI then asks for an [API token](tokens.md) before showing anything,
 and acts with that token's scopes: someone who logged in with a `reader`
-token can read entries and mark them read or saved, but sees no plugin
-pages and can't delete tags. Create a token for each person or device:
+token can read entries and mark them read or saved, but sees no settings
+or plugin pages and can't delete tags. Create a token for each person or
+device:
 
 ```bash
 kiki token create laptop --scopes reader

@@ -572,7 +572,7 @@ mod test {
     #[tokio::test]
     async fn test_overrides_must_match_settings() -> Result<()> {
         let tc = TestBuilder::default().init_database().build()?;
-        let dir = tc.plugins_dir().join("hello");
+        let dir = tc.user_plugins_dir().join("hello");
         std::fs::create_dir_all(&dir)?;
         std::fs::write(
             dir.join("manifest.toml"),

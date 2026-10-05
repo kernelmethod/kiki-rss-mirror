@@ -30,8 +30,8 @@ echo 'exclude = [3, "https://example.com/feed.xml"]' | kiki plugin config set ad
 To back off from only some feeds, list them in `feeds` instead; with `feeds`
 empty, every feed is backed off from.
 
-To turn adaptive fetching off altogether, delete `plugins/adaptive-fetch`
-from Kiki's [data directory](../files.md), or set `enabled = false` in its
+To turn adaptive fetching off altogether, delete `plugins/system/adaptive-fetch`
+from Kiki's [data directory](../configuration/environment.md), or set `enabled = false` in its
 `manifest.toml`. Either way, `kiki init --check` leaves it as you left it.
 
 The plugin uses the [`fetch.schedule`](../writing-plugins.md#scheduling-fetches)

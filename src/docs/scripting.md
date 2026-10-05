@@ -6,18 +6,30 @@ when something interesting happens.
 
 ## Plugins
 
-A plugin is a directory inside the `plugins/` directory in Kiki's home (next
-to `kiki.db`; `kiki init` creates it). Every plugin has a manifest,
-`manifest.toml`, at its root, and its code alongside:
+Plugins live in the `plugins/` directory in Kiki's home (next to `kiki.db`;
+`kiki init` creates it), which holds two directories: `system/`, for the
+plugins bundled with Kiki, which `kiki init` installs and updates, and
+`user/`, for the plugins you install yourself. A plugin is a directory
+inside one of them. Every plugin has a manifest, `manifest.toml`, at its
+root, and its code alongside:
 
 ```text
 plugins/
-└── hide-sponsored/
-    ├── manifest.toml
-    ├── main.lua
-    └── lib/
-        └── rules.lua
+├── system/
+│   └── filter/
+│       ├── manifest.toml
+│       └── main.lua
+└── user/
+    └── hide-sponsored/
+        ├── manifest.toml
+        ├── main.lua
+        └── lib/
+            └── rules.lua
 ```
+
+Both kinds load, run and take config the same way. The API shows which kind
+each plugin is in its `source` field, `"system"` or `"user"`, and
+`kiki plugin ls` and the web UI show it too.
 
 The manifest is a [TOML](https://toml.io) file declaring the plugin's name,
 its version, and the engine its code is written for:
@@ -49,6 +61,7 @@ flags = "i"
 | `description`, `authors`, `license`, `homepage` | No | Informational; shown by the API. |
 | `enabled`     | No       | Set to `false` to keep a plugin installed without running it. Defaults to `true`. |
 | `time_budget_ms` | No    | How long each call of one of the plugin's handlers may run, in milliseconds, or `"unlimited"`; see [Resource limits](#resource-limits). Defaults to `100`. |
+| `permissions` | No       | What the plugin may do beyond what every plugin can, such as `["entries.delete"]`; see [Permissions](#permissions). Defaults to none. |
 | `config`      | No       | A table holding the plugin's default config; see [Plugin config](#plugin-config). |
 | `settings`    | No       | An array describing the keys of `config`: their types, labels and descriptions; see [Describing settings](#describing-settings). |
 
@@ -57,17 +70,20 @@ may give meaning to new fields in later versions, as it did to `settings`,
 so a plugin's own metadata is best kept under a name unlikely to clash, such
 as a table named after the plugin.
 
-To install a plugin, copy its directory into `plugins/`; to remove one, delete
-its directory. A running server watches the plugins directory and reloads its
+To install a plugin, copy its directory into `plugins/user/`; to remove one,
+delete its directory. A directory placed directly in `plugins/` isn't loaded,
+and is listed under `errors` in `GET /v1/plugins`. A running server watches the plugins directory and reloads its
 plugins whenever a file in it changes (hidden files, such as editors' swap
 files, are ignored), and whenever a plugin's config is changed. A reload
 rebuilds every plugin: each entrypoint runs again, and then the
 [`plugin.load`](#events) handlers run. If the plugins fail to load, say
 because of a syntax error or a bad regex in a config, the plugins that were
 running keep running, as they were, and the error is logged.
-Plugins load in the order of their directory names, so
+Plugins load in the order of their directory names, system and user plugins
+together (a system plugin first, if two directories have the same name), so
 prefixing directory names with numbers (`10-filter`, `20-tag`) controls the
-order their handlers run in.
+order their handlers run in. Two plugins with the same name can't both be
+installed: the one that loads second is skipped.
 
 A plugin whose manifest is missing or invalid is skipped with a warning in the
 server log, and listed with the reason under `errors` in `GET /v1/plugins`;
@@ -94,9 +110,12 @@ that, kiki exposes a single additional global — the `kiki` table:
   parser. See [Rewriting HTML](#rewriting-html) below.
 - `kiki.store` — the plugin's own key-value store, kept in the database. See
   [Storing data](#storing-data).
-- `kiki.entries` — tag the entries already stored, and scan through them.
-  See [Stored entries](#stored-entries).
+- `kiki.entries` — tag the entries already stored, scan through them, and
+  delete them. See [Stored entries](#stored-entries) and
+  [Deleting entries](#deleting-entries).
 - `kiki.feeds` — look up the feeds entries come from. See [Feeds](#feeds).
+- `kiki.every(secs, handler)` — call `handler` every `secs` seconds. See
+  [Timers](#timers).
 
 The sandbox removes `dofile`, `loadfile`, `debug`, `io`, `package`, and the
 destructive `os.*` calls (`execute`, `exit`, `getenv`, `remove`, `rename`,
@@ -105,7 +124,11 @@ processes. `require` loads only the plugin's own modules; see
 [Modules](#modules).
 
 Each plugin runs in an environment of its own: globals a plugin defines are
-not visible to other plugins.
+not visible to other plugins. Plugins that ask for the same
+[permissions](#permissions) share a VM, and with it the standard library
+tables, so one that changes `string` or `table` changes them for the others
+too. Plugins that ask for different permissions run in separate VMs, so a
+plugin can't tamper with code that runs with permissions it lacks.
 
 ## Script structure
 
@@ -304,13 +327,16 @@ the `default-plugins` feature, or `--no-default-plugins` is passed); see its
 `main.lua` for the settings it takes. `kiki init --check` installs it into an
 existing home directory too, and updates it when a new release of Kiki bundles
 a new version, unless its files have been edited. It also installs
-`plugins/strip-tracking`, which uses `entry.ingest` to remove tracking
+`plugins/privacy`, which uses `entry.ingest` to remove tracking
 parameters such as `utm_source` from entries' URLs and the links in their
 content, and tracking pixels from their content, and can keep images from
 being downloaded for chosen feeds with `cache_assets`; `plugins/sanitize`,
 which uses [`kiki.html`](#rewriting-html) to remove scripts, styles and
-unsafe links from entries' content; and `plugins/auto-tag`, which tags
-entries that match regular expressions or come from given feeds.
+unsafe links from entries' content; `plugins/auto-tag`, which tags
+entries that match regular expressions or come from given feeds; and
+`plugins/retention`, which uses [timers](#timers) and
+[`kiki.entries.delete_where`](#deleting-entries) to delete entries some days
+after their feed stops listing them.
 
 ## Events
 
@@ -519,6 +545,81 @@ kiki.on("plugin.load", function()
 end)
 ```
 
+## Deleting entries
+
+`kiki.entries.delete_where(filter)` deletes stored entries, and returns how
+many it deleted. Deleting cannot be undone, so it needs the
+`entries.delete` [permission](#permissions).
+
+It only ever deletes entries their feed has stopped listing: an entry still
+in its feed would be fetched again on the feed's next refresh, and stored as
+a new, unread entry. Kiki notes when a refresh finds that a feed no longer
+lists an entry; `filter` says which of those entries to delete:
+
+| Filter             | Meaning |
+|--------------------|---------|
+| `dropped_before`   | Required. Delete entries their feed stopped listing before this Unix timestamp. |
+| `feed_id`          | Only delete the entries of this feed. |
+| `published_before` | Only delete entries published before this Unix timestamp. Entries with no publication date are kept. |
+| `keep_tagged`      | Keep entries tagged with any of these tags: a tag name, or a list of them. Defaults to `"system:saved"`; `{}` deletes entries however they are tagged. |
+
+An unknown filter raises an error, as does a missing `dropped_before` or a
+`system:` name in `keep_tagged` that is not a system tag. To keep saved
+entries and entries with the user tag `keep` too, pass
+`keep_tagged = { "system:saved", "keep" }`: setting `keep_tagged` replaces
+the default, rather than adding to it. Kiki
+deletes the entries a few hundred at a time, so that a large deletion does
+not hold up feed refreshes for long, but the call returns only once they are
+all deleted; a plugin that may delete many entries at once may need a longer
+[time budget](#resource-limits). This deletes entries that left their feed
+more than 30 days ago, and is most of the bundled `retention` plugin:
+
+```lua
+local DAY = 24 * 60 * 60
+
+local function clean_up()
+    kiki.entries.delete_where({ dropped_before = os.time() - 30 * DAY })
+end
+
+kiki.on("plugin.load", clean_up)
+kiki.every(60 * 60, clean_up)
+```
+
+## Timers
+
+`kiki.every(secs, handler)` calls `handler`, with no arguments, every `secs`
+seconds, the first time `secs` seconds after `kiki.every` is called. Kiki
+checks for timers that are due once a minute, so `secs` must be at least
+`60`, and at most a year, and a timer may run up to a minute late; one that
+runs late does not make the next one late too. Each call has the plugin's
+usual [time budget](#resource-limits), and an error in one is logged, and
+does not stop the timer.
+
+A timer can be started from the top-level chunk or from a handler. Timers
+are not kept across reloads: when plugins reload, every timer stops, and the
+top-level chunk starts its timers again. Since a timer's first call is a
+whole interval away, a plugin that wants to do its work as soon as it loads
+should do it from a `plugin.load` handler as well, as above.
+
+## Permissions
+
+Some calls do what cannot be undone, so a plugin may only make them if its
+manifest asks to, in its `permissions` array:
+
+```toml
+permissions = ["entries.delete"]
+```
+
+| Permission       | Allows |
+|------------------|--------|
+| `entries.delete` | Deleting stored entries, with [`kiki.entries.delete_where`](#deleting-entries). |
+
+A call a plugin has not asked for permission to make raises an error. A
+manifest naming a permission Kiki does not know is invalid. The permissions
+each plugin asks for are shown by `kiki plugin ls`, the web UI and
+`GET /v1/plugins`, so that you can see what a plugin may do before you
+install it.
+
 ## Feeds
 
 An entry names its feed only by `feed_id`. `kiki.feeds.get(id)` looks the
@@ -557,7 +658,8 @@ may be given to a feed added later (listen for `feed.removed` to forget it).
 ## Calls to the server
 
 Calls to `kiki.store`, `kiki.entries` and `kiki.feeds` go to the server,
-which answers them from the database. Time a handler spends waiting on them
+which answers them from the database, and checks that the plugin has the
+[permission](#permissions) a call needs. Time a handler spends waiting on them
 does not count against its [time budget](#resource-limits), up to a second
 per handler call.
 
@@ -736,8 +838,9 @@ Every handler call runs under two hard limits:
   for 10 seconds, the server stops it, and with it every plugin, until Kiki
   restarts. Keep `"unlimited"` for plugins you trust to finish, such as the
   bundled `sanitize`, which every new entry passes through.
-- **Memory**: 16 MiB across the entire VM. Allocations that would exceed this
-  cap fail the handler.
+- **Memory**: 16 MiB for each VM, shared by the plugins that ask for the
+  same [permissions](#permissions). Allocations that would exceed this cap
+  fail the handler.
 - **Regexes**: compiled regexes live outside the VM, so the memory cap does not
   count them. Each is instead limited to 256 KiB of compiled program (plus a
   matching cache of the same size), and at most 128 distinct regexes may be

@@ -2,9 +2,10 @@
 //!
 //! The build script packs each default plugin's directory from `plugins/` in
 //! Kiki's source into a zstd-compressed tarball, [`DEFAULT_PLUGINS_TAR_ZST`],
-//! embedded in the binary. [`sync_default_plugins`] unpacks it into a plugins
-//! directory, where the plugins are discovered like any other plugin, so they
-//! can be configured, disabled in their manifest, edited or deleted.
+//! embedded in the binary. [`sync_default_plugins`] unpacks it into the
+//! system plugins directory (see [`crate::plugins::PluginSource::System`]),
+//! where the plugins are discovered like any other plugin, so they can be
+//! configured, disabled in their manifest, edited or deleted.
 //!
 //! `kiki init --check` syncs them on every run, so a new release of Kiki
 //! brings new default plugins, and updates to the ones already installed,
@@ -19,7 +20,8 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 /// A zstd-compressed tarball of the plugins installed by default: currently
-/// `adaptive-fetch`, `auto-tag`, `filter`, `sanitize` and `strip-tracking`.
+/// `adaptive-fetch`, `auto-tag`, `filter`, `privacy`, `retention` and
+/// `sanitize`.
 ///
 /// Each plugin's directory is stored under its own name at the root of the
 /// archive, and holds only regular files.
@@ -93,10 +95,10 @@ fn bundled_files() -> Result<Vec<BundledFile>> {
     Ok(files)
 }
 
-/// Name of the file, inside the plugins directory, that records the default
-/// plugins [`sync_default_plugins`] has installed and the files each was
-/// installed with. Its name starts with a dot, so [`crate::plugins::discover`]
-/// ignores it.
+/// Name of the file, inside the system plugins directory, that records the
+/// default plugins [`sync_default_plugins`] has installed and the files each
+/// was installed with. Its name starts with a dot, so
+/// [`crate::plugins::discover`] ignores it.
 pub const RECORD_FILE_NAME: &str = ".default-plugins.toml";
 
 /// How deep inside a plugin directory files are compared. Matches the depth
@@ -244,7 +246,9 @@ fn replace_plugin(plugins_dir: &Path, name: &str, files: &[&BundledFile]) -> Res
 
 /// Installs every plugin in [`DEFAULT_PLUGINS_TAR_ZST`] into `plugins_dir`,
 /// creating it if needed, and updates the ones installed by an earlier
-/// version of Kiki.
+/// version of Kiki. `plugins_dir` is normally the system plugins directory,
+/// [`crate::plugins::PluginSource::System`]'s directory inside the plugins
+/// directory.
 ///
 /// Which plugins were installed, and with which files, is kept in
 /// [`RECORD_FILE_NAME`] in `plugins_dir`. For each bundled plugin:
@@ -276,8 +280,9 @@ fn replace_plugin(plugins_dir: &Path, name: &str, files: &[&BundledFile]) -> Res
 ///         ("adaptive-fetch".to_string(), SyncOutcome::Installed),
 ///         ("auto-tag".to_string(), SyncOutcome::Installed),
 ///         ("filter".to_string(), SyncOutcome::Installed),
+///         ("privacy".to_string(), SyncOutcome::Installed),
+///         ("retention".to_string(), SyncOutcome::Installed),
 ///         ("sanitize".to_string(), SyncOutcome::Installed),
-///         ("strip-tracking".to_string(), SyncOutcome::Installed),
 ///     ]
 /// );
 /// // Syncing again finds them up to date.
@@ -349,7 +354,7 @@ pub fn sync_default_plugins(plugins_dir: &Path) -> Result<Vec<(String, SyncOutco
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::plugins::discover;
+    use crate::plugins::{discover, PluginSource};
     use tempfile::TempDir;
 
     #[test]
@@ -365,10 +370,12 @@ mod tests {
                 Path::new("auto-tag/manifest.toml"),
                 Path::new("filter/main.lua"),
                 Path::new("filter/manifest.toml"),
+                Path::new("privacy/main.lua"),
+                Path::new("privacy/manifest.toml"),
+                Path::new("retention/main.lua"),
+                Path::new("retention/manifest.toml"),
                 Path::new("sanitize/main.lua"),
                 Path::new("sanitize/manifest.toml"),
-                Path::new("strip-tracking/main.lua"),
-                Path::new("strip-tracking/manifest.toml"),
             ]
         );
         let plugins: Vec<_> = files.iter().map(|f| f.plugin.as_str()).collect();
@@ -381,10 +388,12 @@ mod tests {
                 "auto-tag",
                 "filter",
                 "filter",
+                "privacy",
+                "privacy",
+                "retention",
+                "retention",
                 "sanitize",
-                "sanitize",
-                "strip-tracking",
-                "strip-tracking"
+                "sanitize"
             ]
         );
         assert_eq!(
@@ -401,11 +410,15 @@ mod tests {
         );
         assert_eq!(
             files[6].contents,
-            include_bytes!("../../plugins/sanitize/main.lua")
+            include_bytes!("../../plugins/privacy/main.lua")
         );
         assert_eq!(
             files[8].contents,
-            include_bytes!("../../plugins/strip-tracking/main.lua")
+            include_bytes!("../../plugins/retention/main.lua")
+        );
+        assert_eq!(
+            files[10].contents,
+            include_bytes!("../../plugins/sanitize/main.lua")
         );
     }
 
@@ -419,8 +432,9 @@ mod tests {
                 "adaptive-fetch",
                 "auto-tag",
                 "filter",
-                "sanitize",
-                "strip-tracking"
+                "privacy",
+                "retention",
+                "sanitize"
             ]
         );
         outcomes[2].1
@@ -446,7 +460,7 @@ mod tests {
     fn installed_plugins_are_discovered() {
         let td = TempDir::new().unwrap();
         let plugins_dir = td.path().join("plugins");
-        let outcomes = sync_default_plugins(&plugins_dir).unwrap();
+        let outcomes = sync_default_plugins(&PluginSource::System.dir(&plugins_dir)).unwrap();
         let installed: Vec<_> = outcomes
             .iter()
             .inspect(|(_, outcome)| assert_eq!(*outcome, SyncOutcome::Installed))
@@ -458,8 +472,9 @@ mod tests {
                 "adaptive-fetch",
                 "auto-tag",
                 "filter",
-                "sanitize",
-                "strip-tracking"
+                "privacy",
+                "retention",
+                "sanitize"
             ]
         );
 
@@ -467,6 +482,7 @@ mod tests {
         assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
         for plugin in &discovery.plugins {
             assert_eq!(plugin.manifest.name, plugin.dir_name());
+            assert_eq!(plugin.source, PluginSource::System);
         }
         let names: Vec<_> = discovery
             .plugins
@@ -510,8 +526,9 @@ mod tests {
                 "adaptive-fetch",
                 "auto-tag",
                 "filter",
-                "sanitize",
-                "strip-tracking"
+                "privacy",
+                "retention",
+                "sanitize"
             ]
         );
     }

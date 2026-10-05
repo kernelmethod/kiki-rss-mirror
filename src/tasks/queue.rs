@@ -39,13 +39,13 @@ pub enum Enqueue {
 ///
 /// # tokio_test_block_on(async {
 /// let (tx, rx) = queue(1);
-/// tx.try_send(TaskManagerCommand::CleanupAll).unwrap();
+/// tx.try_send(TaskManagerCommand::OptimizeFts).unwrap();
 /// // The main lane is full, but asset caching has a lane of its own...
 /// for entry_id in 0..100 {
 ///     tx.try_send(TaskManagerCommand::CacheEntryAssets { entry_id }).unwrap();
 /// }
 /// // ...which is only served once the main lane is empty.
-/// assert!(matches!(rx.recv().await.unwrap(), TaskManagerCommand::CleanupAll));
+/// assert!(matches!(rx.recv().await.unwrap(), TaskManagerCommand::OptimizeFts));
 /// assert!(matches!(
 ///     rx.recv().await.unwrap(),
 ///     TaskManagerCommand::CacheEntryAssets { entry_id: 0 }
@@ -341,7 +341,8 @@ mod tests {
         let tx = TaskSender::from(tx);
         for _ in 0..3 {
             assert_eq!(
-                tx.try_send(TaskManagerCommand::CleanupFeed(1)).unwrap(),
+                tx.try_send(TaskManagerCommand::WalCheckpointAnalyze)
+                    .unwrap(),
                 Enqueue::Queued
             );
         }
@@ -353,7 +354,7 @@ mod tests {
         let (tx, rx) = async_channel::bounded(1);
         let tx = TaskSender::from(tx);
         assert_eq!(
-            tx.try_send(TaskManagerCommand::CleanupAll).unwrap(),
+            tx.try_send(TaskManagerCommand::OptimizeFts).unwrap(),
             Enqueue::Queued
         );
         assert!(matches!(
@@ -398,7 +399,7 @@ mod tests {
         tx.try_send(assets(1)).unwrap();
         tx.try_send(refresh(1, false)).unwrap();
         tx.try_send(assets(2)).unwrap();
-        tx.try_send(TaskManagerCommand::CleanupAll).unwrap();
+        tx.try_send(TaskManagerCommand::OptimizeFts).unwrap();
 
         let mut order = Vec::new();
         for _ in 0..4 {
@@ -408,7 +409,7 @@ mod tests {
             order,
             [
                 "refresh_feed",
-                "cleanup_all",
+                "optimize_fts",
                 "cache_entry_assets",
                 "cache_entry_assets"
             ]

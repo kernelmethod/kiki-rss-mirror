@@ -1440,16 +1440,23 @@ async fn placeholders_in_entries_are_not_filled_in() -> Result<()> {
     Ok(())
 }
 
-/// Every page links to the index, to the list of feeds and to the list
-/// of plugins.
+/// Every page links to the index, to the list of feeds, to the list of
+/// tags and to the settings.
 #[tokio::test]
 async fn pages_link_to_the_site_sections() -> Result<()> {
     let tc = TestBuilder::all().build()?;
     insert_entries(&tc, 1)?;
-    for path in ["/", "/entries/1", "/feeds", "/tags", "/plugins"] {
+    for path in [
+        "/",
+        "/entries/1",
+        "/feeds",
+        "/tags",
+        "/settings",
+        "/plugins",
+    ] {
         let (_, body) = get_page(tc.client()?, path).await?;
         assert!(
-            body.contains(r#"<nav class="site-nav"><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a class="admin-only" href="/plugins">Plugins</a>"#),
+            body.contains(r#"<nav class="site-nav"><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a class="admin-only" href="/settings">Settings</a>"#),
             "{path}: {body}"
         );
     }
@@ -1667,7 +1674,7 @@ async fn the_feed_page_pages_through_the_entries() -> Result<()> {
 async fn the_plugins_page_lists_every_plugin() -> Result<()> {
     let tc = TestBuilder::default().init_database().build()?;
     tc.install_lua_plugin("passthrough", "", serde_json::json!({}))?;
-    std::fs::create_dir_all(tc.plugins_dir().join("broken"))?;
+    std::fs::create_dir_all(tc.user_plugins_dir().join("broken"))?;
     let tc = tc.init_server()?;
 
     let (status, body) = get_page(tc.client()?, "/plugins").await?;
@@ -1681,6 +1688,54 @@ async fn the_plugins_page_lists_every_plugin() -> Result<()> {
     assert!(body.contains("Could not be loaded"), "{body}");
     assert!(body.contains("<strong>broken</strong>"), "{body}");
     assert!(body.contains("manifest.toml"), "{body}");
+    Ok(())
+}
+
+/// The plugins page shows the permissions a plugin asks for.
+#[tokio::test]
+async fn the_plugins_page_shows_permissions() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let manifest = crate::plugins::PluginManifest {
+        permissions: vec![crate::plugins::Permission::EntriesDelete],
+        ..crate::plugins::PluginManifest::parse(
+            "name = 'pruner'\nversion = '1.0.0'\nengine = 'lua'\n",
+        )?
+    };
+    crate::plugins::install(&tc.user_plugins_dir(), &manifest, "")?;
+    tc.install_lua_plugin("passthrough", "", serde_json::json!({}))?;
+    let tc = tc.init_server()?;
+
+    let (status, body) = get_page(tc.client()?, "/plugins").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.matches("permissions: entries.delete").count(),
+        1,
+        "{body}"
+    );
+    Ok(())
+}
+
+/// The settings page links to the plugins page, which links back to it.
+#[tokio::test]
+async fn the_settings_page_links_to_the_plugins_page() -> Result<()> {
+    let tc = TestBuilder::all().build()?;
+    let (status, body) = get_page(tc.client()?, "/settings").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<title>Settings - Kiki</title>"), "{body}");
+    assert!(
+        body.contains(r#"<section class="settings-section admin-only">"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<h3><a href="/plugins">Plugins</a></h3>"#),
+        "{body}"
+    );
+
+    let (_, body) = get_page(tc.client()?, "/plugins").await?;
+    assert!(
+        body.contains(r#"<a href="/settings">&larr; Back to settings</a>"#),
+        "{body}"
+    );
     Ok(())
 }
 
@@ -1896,7 +1951,7 @@ async fn settings_can_be_changed_from_the_plugin_page() -> Result<()> {
 /// boolean, a choice and a list of objects. The server is running.
 fn rules_plugin() -> Result<crate::test::TestConfig> {
     let tc = TestBuilder::default().init_database().build()?;
-    let dir = tc.plugins_dir().join("rules");
+    let dir = tc.user_plugins_dir().join("rules");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(
         dir.join("manifest.toml"),

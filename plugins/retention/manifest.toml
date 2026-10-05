@@ -1,0 +1,36 @@
+name = "retention"
+version = "1.0.0"
+engine = "lua"
+description = "Delete entries once their feed has stopped listing them for a number of days"
+license = "MIT"
+homepage = "https://github.com/kernelmethod/kiki-rss"
+
+# Deleting entries cannot be undone, so it takes a permission.
+permissions = ["entries.delete"]
+
+# A first cleanup on a large database can delete many thousands of
+# entries, which can take longer than the default time budget allows for
+# waiting on the server. The plugin's own code does next to nothing.
+time_budget_ms = "unlimited"
+
+# Entries are kept for as long as their feed lists them. Once it stops,
+# this plugin deletes them after `max_age_days` days, checking every hour.
+# Zero, the default, keeps every entry forever. See main.lua for how.
+[config]
+max_age_days = 0
+keep_tags = ["system:saved"]
+
+[[settings]]
+name = "max_age_days"
+type = "integer"
+label = "Days to keep entries"
+description = "Delete an entry once its feed has stopped listing it for this many days. 0 keeps entries forever."
+min = 0
+max = 36500
+
+[[settings]]
+name = "keep_tags"
+type = "list"
+items = { type = "string" }
+label = "Tags to keep"
+description = "Never delete entries tagged with any of these tags, however long ago their feed stopped listing them. system:saved keeps saved entries."

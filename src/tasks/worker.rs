@@ -71,7 +71,6 @@ struct Worker {
     db: Db,
     token: CancellationToken,
     refresh_in_progress: InProgressSet,
-    cleanup_in_progress: InProgressSet,
     metrics: Arc<Metrics>,
     data_dir: PathBuf,
     config: ConfigHandle,
@@ -147,7 +146,6 @@ pub fn spawn_workers(
         db,
         token,
         refresh_in_progress: Arc::new(Mutex::new(HashSet::new())),
-        cleanup_in_progress: Arc::new(Mutex::new(HashSet::new())),
         metrics,
         data_dir,
         config,
@@ -338,98 +336,6 @@ async fn handle_command(
 
             w.metrics.record_task_processed(
                 "refresh_feed",
-                outcome,
-                task_start.elapsed().as_secs_f64(),
-            );
-
-            // Queue retention cleanup for this feed.
-            if let Err(e) = w.tx.try_send(TaskManagerCommand::CleanupFeed(feed_id)) {
-                warn!("Failed to queue cleanup for feed {}: {:?}", feed_id, e);
-            } else {
-                w.metrics.record_task_enqueued("cleanup_feed");
-            }
-        }
-
-        TaskManagerCommand::CleanupFeed(feed_id) => {
-            let _guard = match InProgressGuard::try_claim(&w.cleanup_in_progress, feed_id) {
-                Some(g) => g,
-                None => {
-                    debug!(
-                        "Worker {}: feed {} already in progress, skipping cleanup",
-                        worker_id, feed_id
-                    );
-                    w.metrics.record_task_processed(
-                        "cleanup_feed",
-                        "skipped_in_progress",
-                        task_start.elapsed().as_secs_f64(),
-                    );
-                    return;
-                }
-            };
-
-            let cleanup_start = Instant::now();
-            let mut outcome = "ok";
-            let cleaned = w.db.write_blocking(|conn| {
-                crate::db::retention::cleanup_feed(conn, feed_id, settings.retention.max_age_days)
-            });
-            if let Ok(cleaned) = cleaned {
-                match cleaned {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        info!(
-                            "Retention cleanup deleted {} old entries for feed {}",
-                            n, feed_id
-                        );
-                        w.metrics.record_retention_cleanup(
-                            "feed",
-                            cleanup_start.elapsed().as_secs_f64(),
-                            n as u64,
-                        );
-                    }
-                    Err(e) => {
-                        warn!("Retention cleanup failed for feed {}: {:?}", feed_id, e);
-                        outcome = "error";
-                    }
-                }
-            } else {
-                outcome = "error";
-            }
-
-            w.metrics.record_task_processed(
-                "cleanup_feed",
-                outcome,
-                task_start.elapsed().as_secs_f64(),
-            );
-        }
-
-        TaskManagerCommand::CleanupAll => {
-            let cleanup_start = Instant::now();
-            let mut outcome = "ok";
-            let cleaned = w.db.write_blocking(|conn| {
-                crate::db::retention::cleanup_all(conn, settings.retention.max_age_days)
-            });
-            if let Ok(cleaned) = cleaned {
-                match cleaned {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        info!("Retention cleanup deleted {} entries", n);
-                        w.metrics.record_retention_cleanup(
-                            "all",
-                            cleanup_start.elapsed().as_secs_f64(),
-                            n as u64,
-                        );
-                    }
-                    Err(e) => {
-                        warn!("Retention cleanup failed: {:?}", e);
-                        outcome = "error";
-                    }
-                }
-            } else {
-                outcome = "error";
-            }
-
-            w.metrics.record_task_processed(
-                "cleanup_all",
                 outcome,
                 task_start.elapsed().as_secs_f64(),
             );

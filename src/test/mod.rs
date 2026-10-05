@@ -694,8 +694,13 @@ impl TestConfig {
         crate::plugins::plugins_dir(self.config_dir())
     }
 
+    /// The user plugins directory inside [`Self::plugins_dir`].
+    pub fn user_plugins_dir(&self) -> PathBuf {
+        crate::plugins::PluginSource::User.dir(&self.plugins_dir())
+    }
+
     /// Install a Lua plugin named `name` whose entrypoint is `text`, with
-    /// config `config`, into [`Self::plugins_dir`].
+    /// config `config`, into [`Self::user_plugins_dir`].
     pub fn install_lua_plugin(
         &self,
         name: &str,
@@ -716,10 +721,11 @@ impl TestConfig {
             homepage: None,
             enabled: true,
             time_budget_ms: None,
+            permissions: Vec::new(),
             config,
             settings: vec![],
         };
-        crate::plugins::install(&self.plugins_dir(), &manifest, text)
+        crate::plugins::install(&self.user_plugins_dir(), &manifest, text)
     }
 
     pub fn socket_path(&self) -> PathBuf {

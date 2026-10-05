@@ -18,7 +18,7 @@
 //! a plugin that needs to apply itself to the entries already stored starts a
 //! scan of them (see [`crate::plugins::services`]).
 
-use super::services::ServerServices;
+use super::services::{LoadedPlugins, ServerServices};
 use super::{discover, Discovery, PluginError};
 use crate::db::plugins::PluginConfigError;
 use crate::metrics::Metrics;
@@ -108,11 +108,10 @@ impl PluginRuntime {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Self, ReloadError> {
         let discovery = ArcSwap::from_pointee(Discovery::default());
-        let services = Arc::new(ServerServices::new(
-            db.clone(),
-            script_runner.clone(),
-            cancel,
-        ));
+        let services = Arc::new(
+            ServerServices::new(db.clone(), script_runner.clone(), cancel)
+                .with_metrics(metrics.clone()),
+        );
         #[cfg(unix)]
         if let Some(host) = &script_host {
             host.set_services(services.clone());
@@ -179,8 +178,7 @@ impl PluginRuntime {
         if changed {
             // Set before the plugins load, since the calls they make while
             // loading are only answered for plugins that are loaded.
-            let names = sources.iter().map(|s| s.name.clone()).collect();
-            let previous = self.services.set_loaded(names);
+            let previous = self.services.set_loaded(loaded_plugins(&sources));
             if let Err(e) = self.load(&discovery) {
                 // The plugins that were running keep running, and keep
                 // being reported, so that what the API reports as running
@@ -231,6 +229,15 @@ impl PluginRuntime {
         }
         result
     }
+}
+
+/// The plugins `sources` were loaded from, with the permissions their
+/// manifests ask for.
+fn loaded_plugins(sources: &[ScriptSource]) -> LoadedPlugins {
+    sources
+        .iter()
+        .map(|source| (source.name.clone(), source.permissions.clone()))
+        .collect()
 }
 
 /// Starts watching the plugins directory of `runtime`, reloading its

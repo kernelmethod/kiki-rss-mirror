@@ -2,29 +2,41 @@
 
 Plugins are small Lua programs that Kiki runs as entries arrive: to hide
 them, tag them, clean them up, or anything else you can write. Each lives in
-its own directory under `plugins/` in Kiki's [data directory](../files.md).
+its own directory under `plugins/` in Kiki's [data
+directory](../configuration/environment.md): in `plugins/system/` if it came
+with Kiki, and in `plugins/user/` if you installed it.
 
 ## Plugins installed by default
 
-`kiki init` installs five plugins, bundled into the `kiki` binary:
+`kiki init` installs six plugins, bundled into the `kiki` binary, into
+`plugins/system/`:
 
 | Plugin | What it does |
 | ------ | ------------ |
 | [`filter`](filter.md) | Hides entries matching rules you set. |
 | [`auto-tag`](auto-tag.md) | Tags entries matching rules you set. |
 | [`sanitize`](sanitize.md) | Removes scripts, styles, embedded content and unsafe links from entries' HTML. |
-| [`strip-tracking`](strip-tracking.md) | Removes tracking parameters from links, and tracking pixels from content. |
+| [`privacy`](privacy.md) | Removes tracking parameters from links, and tracking pixels from content. |
 | [`adaptive-fetch`](adaptive-fetch.md) | Fetches feeds less often while they keep turning out unchanged. |
+| [`retention`](retention.md) | Deletes entries some days after their feed stops listing them. |
 
-`filter` and `auto-tag` do nothing until you give them rules.
-`sanitize`, `strip-tracking` and `adaptive-fetch` work out of the box.
+`filter` and `auto-tag` do nothing until you give them rules, and
+`retention` keeps every entry until you tell it how long to keep them.
+`sanitize`, `privacy` and `adaptive-fetch` work out of the box.
 
 Pass `kiki init --no-default-plugins` to skip them. `kiki init --check`,
 which the packaged services run before every start, installs default plugins
 that are new in this release and updates the ones an earlier release
 installed, unless you've edited their files. A default plugin you delete
-isn't reinstalled; `plugins/.default-plugins.toml` records which were
-installed.
+isn't reinstalled; `plugins/system/.default-plugins.toml` records which
+were installed.
+
+The plugins in `plugins/system/` are *system* plugins, and the ones in
+`plugins/user/` are *user* plugins. Both kinds load, run and take config the
+same way; the only difference is that Kiki looks after system plugins, while
+user plugins are yours to install, update and remove. `kiki plugin ls`, the
+web UI and the API (the `source` field of a plugin, `"system"` or `"user"`)
+all show which kind each plugin is.
 
 ## Managing plugins
 
@@ -45,6 +57,7 @@ as editing the plugin.
 
 A running server reloads its plugins with the new config straight away. It
 also reloads them whenever a file in the plugins directory changes, so
-installing a plugin is a matter of copying its directory into place.
+installing a plugin is a matter of copying its directory into
+`plugins/user/`.
 
 To write your own, see [Writing plugins](../writing-plugins.md).

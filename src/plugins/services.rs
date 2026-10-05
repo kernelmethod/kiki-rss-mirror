@@ -1,7 +1,25 @@
 //! The server's answers to the calls plugins make through the `kiki` Lua
 //! API: their key-value stores (`kiki.store`), tagging stored entries
 //! (`kiki.entries.tag` and `untag`), scans of stored entries
-//! (`kiki.entries.scan`), and looking up feeds (`kiki.feeds.get`).
+//! (`kiki.entries.scan`), deleting stored entries
+//! (`kiki.entries.delete_where`), and looking up feeds (`kiki.feeds.get`).
+//!
+//! # Permissions
+//!
+//! Calls that cannot be undone are answered only for plugins whose manifest
+//! asks for the [`Permission`] they need: deleting entries needs
+//! [`Permission::EntriesDelete`]. The permissions come from the manifests
+//! the server read, not from the script host, which is not trusted to
+//! report them.
+//!
+//! # Deleting entries
+//!
+//! `kiki.entries.delete_where` deletes only entries their feed has stopped
+//! listing (see [`crate::db::retention::mark_dropped`]): an entry still in
+//! its feed would come back, as a new and unread entry, on the feed's next
+//! refresh. Entries are deleted [`DELETE_BATCH`] at a time, each batch in a
+//! transaction of its own, so a large deletion does not hold up feed
+//! refreshes' writes for long.
 //!
 //! # Scans
 //!
@@ -19,13 +37,14 @@
 
 use crate::db::plugins::{store_get, store_set};
 use crate::db::tags::{is_reserved_tag_name, SystemTag};
+use crate::plugins::Permission;
 use crate::scripting::{
-    FeedEntry, FeedInfo, ScanOptions, ScanSummary, ScriptRunnerHandle, ScriptServices, ServiceCall,
-    ServiceReply,
+    DeleteFilter, FeedEntry, FeedInfo, ScanOptions, ScanSummary, ScriptRunnerHandle,
+    ScriptServices, ServiceCall, ServiceReply,
 };
 use arc_swap::ArcSwap;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -45,17 +64,26 @@ const DISPATCH_BATCH: usize = 25;
 /// Longest user tag name a plugin may set.
 const MAX_TAG_NAME_BYTES: usize = 255;
 
+/// Most entries `kiki.entries.delete_where` deletes in one transaction.
+pub const DELETE_BATCH: u64 = 500;
+
 /// Most user tags there may be for a plugin to create another. Plugins can
 /// tag entries with existing user tags past this, but not add new ones.
 pub const MAX_USER_TAGS: i64 = 10_000;
 
 use crate::db::Db;
 
+/// The plugins loaded into the script runner, by name, with the permissions
+/// their manifests ask for.
+pub type LoadedPlugins = HashMap<String, Vec<Permission>>;
+
 /// Answers the calls plugins make. See the [module documentation](self).
 pub struct ServerServices {
     db: Db,
-    /// The names of the plugins loaded into the script runner.
-    loaded: ArcSwap<HashSet<String>>,
+    /// Where entries deleted by plugins are counted, if anywhere.
+    metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// The plugins loaded into the script runner.
+    loaded: ArcSwap<LoadedPlugins>,
     scans: Arc<ScanState>,
 }
 
@@ -83,15 +111,22 @@ impl ServerServices {
                 running: Mutex::new(HashMap::new()),
             }),
             db,
-            loaded: ArcSwap::from_pointee(HashSet::new()),
+            metrics: None,
+            loaded: ArcSwap::from_pointee(HashMap::new()),
         }
     }
 
-    /// Answers calls only from the plugins named in `names`, the plugins
-    /// being loaded into the script runner, and returns the names it
-    /// answered calls from before.
-    pub fn set_loaded(&self, names: HashSet<String>) -> Arc<HashSet<String>> {
-        self.loaded.swap(Arc::new(names))
+    /// Counts the entries plugins delete in `metrics`.
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Answers calls only from the plugins in `plugins`, the plugins being
+    /// loaded into the script runner, with the permissions given there, and
+    /// returns the plugins it answered calls from before.
+    pub fn set_loaded(&self, plugins: LoadedPlugins) -> Arc<LoadedPlugins> {
+        self.loaded.swap(Arc::new(plugins))
     }
 
     /// Runs `f` with a read-only connection.
@@ -113,9 +148,21 @@ impl ScriptServices for ServerServices {
     fn call(&self, plugin: &str, call: ServiceCall) -> Result<ServiceReply, String> {
         // The name comes from the script host, which is not trusted to
         // make it up: only loaded plugins get stores and scans.
-        if !self.loaded.load().contains(plugin) {
+        let loaded = self.loaded.load();
+        let Some(permissions) = loaded.get(plugin) else {
             return Err(format!("no plugin named {plugin:?} is loaded"));
-        }
+        };
+        let require = |permission: Permission| {
+            if permissions.contains(&permission) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "plugin {plugin:?} needs the {permission:?} permission; \
+                     add it to `permissions` in its manifest",
+                    permission = permission.name()
+                ))
+            }
+        };
 
         match call {
             ServiceCall::StoreGet { key } => {
@@ -147,8 +194,71 @@ impl ScriptServices for ServerServices {
             ServiceCall::GetFeed { feed_id } => Ok(ServiceReply::Feed(
                 self.read(|conn| get_feed(conn, feed_id))??,
             )),
+            ServiceCall::DeleteEntries { filter } => {
+                require(Permission::EntriesDelete)?;
+                let deleted = delete_entries(&self.db, &filter)?;
+                if deleted > 0 {
+                    info!(plugin, deleted, "plugin deleted stored entries");
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_entries_deleted(plugin, deleted);
+                    }
+                }
+                Ok(ServiceReply::Deleted(deleted))
+            }
         }
     }
+}
+
+/// Deletes the entries `filter` describes, [`DELETE_BATCH`] at a time, and
+/// returns how many it deleted. See the [module documentation](self).
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be written. The batches deleted
+/// before then stay deleted.
+pub(crate) fn delete_entries(db: &Db, filter: &DeleteFilter) -> Result<u64, String> {
+    let mut total = 0;
+    loop {
+        let deleted = db
+            .write_blocking(|conn| delete_batch(conn, filter))
+            .map_err(|e| format!("database unavailable: {e}"))?
+            .map_err(|e| format!("database error: {e}"))?;
+        total += deleted;
+        if deleted < DELETE_BATCH {
+            return Ok(total);
+        }
+    }
+}
+
+/// Deletes up to [`DELETE_BATCH`] of the entries `filter` describes, oldest
+/// dropped first, and returns how many it deleted.
+fn delete_batch(conn: &Connection, filter: &DeleteFilter) -> rusqlite::Result<u64> {
+    let keep_tagged = serde_json::to_string(&filter.keep_tagged)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+    let deleted = conn
+        .prepare_cached(
+            "DELETE FROM entries WHERE id IN (
+                SELECT id FROM entries e
+                WHERE dropped_at IS NOT NULL AND dropped_at < :dropped_before
+                  AND (:feed_id IS NULL OR feed_id = :feed_id)
+                  AND (:published_before IS NULL OR published_at < :published_before)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+                      WHERE et.entry_id = e.id
+                        AND t.name IN (SELECT value FROM json_each(:keep_tagged))
+                  )
+                ORDER BY dropped_at
+                LIMIT :limit
+            )",
+        )?
+        .execute(rusqlite::named_params! {
+            ":dropped_before": filter.dropped_before,
+            ":feed_id": filter.feed_id,
+            ":published_before": filter.published_before,
+            ":keep_tagged": keep_tagged,
+            ":limit": DELETE_BATCH as i64,
+        })?;
+    Ok(deleted as u64)
 }
 
 /// Looks up the feed with id `feed_id`, returning `None` if there is none.
@@ -606,7 +716,10 @@ mod tests {
                 runner.clone(),
                 CancellationToken::new(),
             ));
-            services.set_loaded(HashSet::from(["p".to_string()]));
+            services.set_loaded(HashMap::from([(
+                "p".to_string(),
+                vec![Permission::EntriesDelete],
+            )]));
             let mut source = ScriptSource::new(text);
             source.name = "p".to_string();
             let lua = LuaScriptRunner::from_sources_with(
@@ -897,7 +1010,7 @@ mod tests {
         let pool = pool();
         let services =
             ServerServices::new(pool, ScriptRunnerHandle::empty(), CancellationToken::new());
-        services.set_loaded(HashSet::from([ScriptSource::new("").name]));
+        services.set_loaded(HashMap::from([(ScriptSource::new("").name, vec![])]));
         let services: Arc<dyn ScriptServices> = Arc::new(services);
         let err = LuaScriptRunner::from_sources_with(
             &[ScriptSource::new("kiki.entries.scan(function() end)")],
@@ -975,11 +1088,180 @@ mod tests {
         assert!(set_entry_tag(&conn, entry, "t1", true).unwrap());
     }
 
+    /// Marks entry `entry_id` dropped from its feed `days` days ago.
+    fn drop_entry(conn: &Connection, entry_id: i64, days: i64) {
+        conn.execute(
+            "UPDATE entries SET dropped_at = unixepoch() - ?2 * 86400 WHERE id = ?1",
+            params![entry_id, days],
+        )
+        .unwrap();
+    }
+
+    fn entry_ids(conn: &Connection) -> Vec<i64> {
+        conn.prepare("SELECT id FROM entries ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn week_ago() -> i64 {
+        chrono::Utc::now().timestamp() - 7 * 86400
+    }
+
+    #[test]
+    fn entries_still_in_their_feed_are_never_deleted() {
+        let pool = pool();
+        let conn = pool.connect();
+        let feed = insert_feed(&conn);
+        // Published in 1970, but still listed by its feed.
+        let current = insert_entry(&conn, feed, "rss", "current");
+        let dropped = insert_entry(&conn, feed, "rss", "dropped");
+        drop_entry(&conn, dropped, 10);
+
+        let filter = DeleteFilter {
+            dropped_before: i64::MAX,
+            published_before: Some(i64::MAX),
+            keep_tagged: vec![],
+            ..Default::default()
+        };
+        assert_eq!(delete_batch(&conn, &filter).unwrap(), 1);
+        assert_eq!(entry_ids(&conn), [current]);
+    }
+
+    #[test]
+    fn saved_entries_are_deleted_once_unsaved() {
+        let pool = pool();
+        let conn = pool.connect();
+        let feed = insert_feed(&conn);
+        let saved = insert_entry(&conn, feed, "rss", "saved");
+        drop_entry(&conn, saved, 10);
+        assert!(set_entry_tag(&conn, saved, "system:saved", true).unwrap());
+
+        let filter = DeleteFilter {
+            dropped_before: week_ago(),
+            ..Default::default()
+        };
+        assert_eq!(delete_batch(&conn, &filter).unwrap(), 0);
+        assert!(set_entry_tag(&conn, saved, "system:saved", false).unwrap());
+        assert_eq!(delete_batch(&conn, &filter).unwrap(), 1);
+        assert!(entry_ids(&conn).is_empty());
+    }
+
+    #[test]
+    fn entries_with_any_kept_tag_are_kept() {
+        let pool = pool();
+        let conn = pool.connect();
+        let feed = insert_feed(&conn);
+        let saved = insert_entry(&conn, feed, "rss", "saved");
+        let pinned = insert_entry(&conn, feed, "rss", "pinned");
+        let other = insert_entry(&conn, feed, "rss", "other");
+        for id in [saved, pinned, other] {
+            drop_entry(&conn, id, 10);
+        }
+        assert!(set_entry_tag(&conn, saved, "system:saved", true).unwrap());
+        assert!(set_entry_tag(&conn, pinned, "pinned", true).unwrap());
+        assert!(set_entry_tag(&conn, other, "other", true).unwrap());
+
+        let filter = DeleteFilter {
+            dropped_before: week_ago(),
+            keep_tagged: vec!["pinned".into(), "system:saved".into(), "missing".into()],
+            ..Default::default()
+        };
+        assert_eq!(delete_batch(&conn, &filter).unwrap(), 1);
+        assert_eq!(entry_ids(&conn), [saved, pinned]);
+
+        // Naming only "pinned" replaces the default, so saved entries go too.
+        let filter = DeleteFilter {
+            keep_tagged: vec!["pinned".into()],
+            ..filter
+        };
+        assert_eq!(delete_batch(&conn, &filter).unwrap(), 1);
+        assert_eq!(entry_ids(&conn), [pinned]);
+    }
+
+    #[test]
+    fn plugins_delete_entries_through_delete_where() {
+        let pool = pool();
+        let conn = pool.connect();
+        let feed = insert_feed(&conn);
+        let old = insert_entry(&conn, feed, "rss", "old");
+        let recent = insert_entry(&conn, feed, "rss", "recent");
+        drop_entry(&conn, old, 10);
+        drop_entry(&conn, recent, 1);
+
+        let h = Harness::new(
+            pool.clone(),
+            r#"
+            kiki.on("plugin.load", function()
+                local week_ago = os.time() - 7 * 86400
+                local deleted = kiki.entries.delete_where { dropped_before = week_ago }
+                kiki.store.set("deleted", deleted)
+                local ok, err = pcall(kiki.entries.delete_where, {})
+                kiki.store.set("missing", not ok and tostring(err):find("dropped_before") ~= nil)
+                ok, err = pcall(kiki.entries.delete_where, { dropped_before = 1, nope = 2 })
+                kiki.store.set("unknown", not ok and tostring(err):find("unknown filter") ~= nil)
+                ok, err = pcall(kiki.entries.delete_where,
+                    { dropped_before = 1, keep_tagged = { "system:nope" } })
+                kiki.store.set("system", not ok and tostring(err):find("not a system tag") ~= nil)
+                local bad = 0
+                for _, tags in ipairs({ { tag = "x" }, { 1 }, true }) do
+                    ok, err = pcall(kiki.entries.delete_where,
+                        { dropped_before = 1, keep_tagged = tags })
+                    if not ok and tostring(err):find("list of them") then
+                        bad = bad + 1
+                    end
+                end
+                kiki.store.set("bad", bad)
+                kiki.store.set("one", kiki.entries.delete_where(
+                    { dropped_before = 1, keep_tagged = "pinned" }))
+            end)
+            "#,
+        );
+        h.load();
+        assert_eq!(entry_ids(&conn), [recent]);
+        for (key, value) in [
+            ("deleted", serde_json::json!(1)),
+            ("missing", serde_json::json!(true)),
+            ("unknown", serde_json::json!(true)),
+            ("system", serde_json::json!(true)),
+            ("bad", serde_json::json!(3)),
+            ("one", serde_json::json!(0)),
+        ] {
+            assert_eq!(store_get(&conn, "p", key).unwrap(), Some(value), "{key}");
+        }
+    }
+
+    #[test]
+    fn deleting_needs_the_permission() {
+        let h = Harness::new(pool(), "");
+        h.services
+            .set_loaded(HashMap::from([("p".to_string(), vec![])]));
+        let call = ServiceCall::DeleteEntries {
+            filter: DeleteFilter {
+                dropped_before: i64::MAX,
+                ..Default::default()
+            },
+        };
+        let err = h.services.call("p", call.clone()).unwrap_err();
+        assert!(err.contains("entries.delete"), "{err}");
+
+        h.services.set_loaded(HashMap::from([(
+            "p".to_string(),
+            vec![Permission::EntriesDelete],
+        )]));
+        assert_eq!(
+            h.services.call("p", call).unwrap(),
+            ServiceReply::Deleted(0)
+        );
+    }
+
     #[test]
     fn plugins_that_are_not_loaded_are_refused() {
         let h = Harness::new(pool(), "");
-        let previous = h.services.set_loaded(HashSet::new());
-        assert!(previous.contains("p"));
+        let previous = h.services.set_loaded(HashMap::new());
+        assert!(previous.contains_key("p"));
         let err = h
             .services
             .call("p", ServiceCall::StoreGet { key: "k".into() })
