@@ -197,7 +197,7 @@ fn compile_bytes(plugin: &str, bytes: &[u8]) -> Result<Component, WasmError> {
         componentized = wit_component::ComponentEncoder::default()
             .validate(true)
             .module(bytes)
-            .and_then(|encoder| encoder.encode())
+            .and_then(|mut encoder| encoder.encode())
             .map_err(|e| err(format!("turning the core module into a component: {e:#}")))?;
         &componentized[..]
     } else {
@@ -837,12 +837,6 @@ impl WasmScriptRunner {
                     message: format!("{e:?}"),
                 }
             })?;
-            linker
-                .define_unknown_imports_as_traps(&component)
-                .map_err(|e| WasmError::Instantiate {
-                    plugin: source.name.clone(),
-                    message: format!("{e:?}"),
-                })?;
             let (live, events) =
                 instantiate(&linker, &component, &name, &source.config, services.clone())?;
             plugins.push(WasmPlugin {

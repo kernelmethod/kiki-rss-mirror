@@ -11,14 +11,16 @@
 //! * `wasi:clocks/wall-clock`'s `now` and `resolution`, and `wasi:clocks/monotonic-clock`'s
 //!   `now` and `resolution`. Waiting on a clock is not supported.
 //!
-//! Everything else a plugin imports traps if called; see
-//! [`wasmtime::component::Linker::define_unknown_imports_as_traps`].
+//! Everything else a plugin imports, Kiki defines as functions that trap if called, so
+//! that a plugin built with a toolchain that imports more of WASI than it uses still
+//! loads; see [`define`].
 
 use super::State;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use wasmtime::component::{Component, ComponentType, Linker, Lower};
+use wasmtime::component::types::ComponentItem;
+use wasmtime::component::{Component, ComponentType, Linker, LinkerInstance, Lower, ResourceType};
 use wasmtime::{Engine, StoreContextMut};
 
 /// Most random bytes a plugin may ask for in one call.
@@ -55,8 +57,14 @@ fn epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)
 }
 
-/// Define, in `linker`, the parts of WASI described in the [module documentation](self)
-/// that `component` imports, skipping those named in `defined` and adding the rest.
+/// Define, in `linker`, every interface `component` imports besides Kiki's own, skipping
+/// those named in `defined` and adding the rest: the parts of WASI described in the
+/// [module documentation](self) as they are, and everything else as functions that trap
+/// if called, and resources that cannot be made.
+///
+/// Each interface is defined whole, the first time a component imports it, since a
+/// linker refuses to define one twice. Components importing the same interface, by
+/// name and version, import the same functions.
 pub(super) fn define(
     linker: &mut Linker<State>,
     engine: &Engine,
@@ -64,74 +72,125 @@ pub(super) fn define(
     defined: &mut HashSet<String>,
 ) -> wasmtime::Result<()> {
     let ty = component.component_type();
-    for (name, _) in ty.imports(engine) {
-        let Some((interface, version)) = name.split_once('@') else {
-            continue;
-        };
-        if !version.starts_with("0.2.") || defined.contains(name) {
+    for (name, item) in ty.imports(engine) {
+        // Kiki's own interfaces are defined by the bindings.
+        if name.starts_with("kiki:plugin/") || defined.contains(name) {
             continue;
         }
-        let mut instance = match interface {
-            "wasi:random/random"
-            | "wasi:random/insecure"
-            | "wasi:random/insecure-seed"
-            | "wasi:clocks/wall-clock"
-            | "wasi:clocks/monotonic-clock" => linker.instance(name)?,
-            _ => continue,
-        };
-        match interface {
-            "wasi:random/random" => {
-                instance.func_wrap(
-                    "get-random-bytes",
-                    |_: StoreContextMut<'_, State>, (len,): (u64,)| Ok((random_bytes(len)?,)),
-                )?;
-                instance.func_wrap("get-random-u64", |_: StoreContextMut<'_, State>, (): ()| {
-                    Ok((random_u64()?,))
-                })?;
+        match item {
+            ComponentItem::ComponentInstance(interface) => {
+                let mut instance = linker.instance(name)?;
+                let provided = define_wasi(&mut instance, name)?;
+                for (export, item) in interface.exports(engine) {
+                    if !provided.contains(&export) {
+                        stub(&mut instance, name, export, &item)?;
+                    }
+                }
             }
-            "wasi:random/insecure" => {
-                instance.func_wrap(
-                    "get-insecure-random-bytes",
-                    |_: StoreContextMut<'_, State>, (len,): (u64,)| Ok((random_bytes(len)?,)),
-                )?;
-                instance.func_wrap(
-                    "get-insecure-random-u64",
-                    |_: StoreContextMut<'_, State>, (): ()| Ok((random_u64()?,)),
-                )?;
-            }
-            "wasi:random/insecure-seed" => {
-                instance.func_wrap("insecure-seed", |_: StoreContextMut<'_, State>, (): ()| {
-                    Ok(((random_u64()?, random_u64()?),))
-                })?;
-            }
-            "wasi:clocks/wall-clock" => {
-                instance.func_wrap("now", |_: StoreContextMut<'_, State>, (): ()| {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default();
-                    Ok((Datetime {
-                        seconds: now.as_secs(),
-                        nanoseconds: now.subsec_nanos(),
-                    },))
-                })?;
-                instance.func_wrap("resolution", |_: StoreContextMut<'_, State>, (): ()| {
-                    Ok((Datetime {
-                        seconds: 0,
-                        nanoseconds: 1,
-                    },))
-                })?;
-            }
-            "wasi:clocks/monotonic-clock" => {
-                instance.func_wrap("now", |_: StoreContextMut<'_, State>, (): ()| {
-                    Ok((epoch().elapsed().as_nanos() as u64,))
-                })?;
-                instance.func_wrap("resolution", |_: StoreContextMut<'_, State>, (): ()| {
-                    Ok((1u64,))
-                })?;
-            }
-            _ => {}
+            item => stub(&mut linker.root(), "", name, &item)?,
         }
         defined.insert(name.to_string());
     }
     Ok(())
+}
+
+/// Define `item`, named `export` in the interface `interface` (empty for the component's
+/// own imports), as a function that traps if called, or a resource that cannot be made.
+fn stub(
+    instance: &mut LinkerInstance<'_, State>,
+    interface: &str,
+    export: &str,
+    item: &ComponentItem,
+) -> wasmtime::Result<()> {
+    match item {
+        ComponentItem::ComponentFunc(_) => {
+            let name = if interface.is_empty() {
+                export.to_string()
+            } else {
+                format!("{interface}#{export}")
+            };
+            instance.func_new(export, move |_, _, _, _| {
+                Err(wasmtime::Error::msg(format!(
+                    "{name} is not available to Kiki plugins"
+                )))
+            })
+        }
+        ComponentItem::Resource(_) => {
+            instance.resource(export, ResourceType::host::<()>(), |_, _| Ok(()))
+        }
+        // Types other than resources, and anything a plugin world can't import, need no
+        // definition, or fail to instantiate with a clear error.
+        _ => Ok(()),
+    }
+}
+
+/// Define in `instance`, the interface named `name`, the WASI functions Kiki provides
+/// for it, if any, returning their names.
+fn define_wasi(
+    instance: &mut LinkerInstance<'_, State>,
+    name: &str,
+) -> wasmtime::Result<&'static [&'static str]> {
+    let Some((interface, version)) = name.split_once('@') else {
+        return Ok(&[]);
+    };
+    if !version.starts_with("0.2.") {
+        return Ok(&[]);
+    }
+    Ok(match interface {
+        "wasi:random/random" => {
+            instance.func_wrap(
+                "get-random-bytes",
+                |_: StoreContextMut<'_, State>, (len,): (u64,)| Ok((random_bytes(len)?,)),
+            )?;
+            instance.func_wrap("get-random-u64", |_: StoreContextMut<'_, State>, (): ()| {
+                Ok((random_u64()?,))
+            })?;
+            &["get-random-bytes", "get-random-u64"]
+        }
+        "wasi:random/insecure" => {
+            instance.func_wrap(
+                "get-insecure-random-bytes",
+                |_: StoreContextMut<'_, State>, (len,): (u64,)| Ok((random_bytes(len)?,)),
+            )?;
+            instance.func_wrap(
+                "get-insecure-random-u64",
+                |_: StoreContextMut<'_, State>, (): ()| Ok((random_u64()?,)),
+            )?;
+            &["get-insecure-random-bytes", "get-insecure-random-u64"]
+        }
+        "wasi:random/insecure-seed" => {
+            instance.func_wrap("insecure-seed", |_: StoreContextMut<'_, State>, (): ()| {
+                Ok(((random_u64()?, random_u64()?),))
+            })?;
+            &["insecure-seed"]
+        }
+        "wasi:clocks/wall-clock" => {
+            instance.func_wrap("now", |_: StoreContextMut<'_, State>, (): ()| {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                Ok((Datetime {
+                    seconds: now.as_secs(),
+                    nanoseconds: now.subsec_nanos(),
+                },))
+            })?;
+            instance.func_wrap("resolution", |_: StoreContextMut<'_, State>, (): ()| {
+                Ok((Datetime {
+                    seconds: 0,
+                    nanoseconds: 1,
+                },))
+            })?;
+            &["now", "resolution"]
+        }
+        "wasi:clocks/monotonic-clock" => {
+            instance.func_wrap("now", |_: StoreContextMut<'_, State>, (): ()| {
+                Ok((epoch().elapsed().as_nanos() as u64,))
+            })?;
+            instance.func_wrap("resolution", |_: StoreContextMut<'_, State>, (): ()| {
+                Ok((1u64,))
+            })?;
+            &["now", "resolution"]
+        }
+        _ => &[],
+    })
 }

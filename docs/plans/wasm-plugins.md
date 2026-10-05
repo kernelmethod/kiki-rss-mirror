@@ -66,10 +66,18 @@ isn't used. Instead, `src/scripting/wasm_wasi.rs` defines `wasi:random/*`
 and `wasi:clocks/{wall,monotonic}-clock`'s `now`/`resolution`, for whichever
 WASI 0.2.x a component imports. Libraries call these without being asked:
 `HashMap`'s default hasher, which `regex` uses, seeds itself from them.
-Every other import is defined as a trap
-(`Linker::define_unknown_imports_as_traps`), so a component built for
-`wasm32-wasip2` loads, and traps only if it touches files, the network, the
-environment or the standard streams.
+Every other import is defined as a function that traps (and resources as
+stubs), so a component built for `wasm32-wasip2` loads, and traps only if it
+touches files, the network, the environment or the standard streams.
+Wasmtime's own `Linker::define_unknown_imports_as_traps` isn't used: in
+Wasmtime 45 it refuses interfaces the linker already partly defines.
+
+### Rust version
+
+CI builds with the nixpkgs toolchain, rustc 1.93, so Wasmtime is pinned to
+45, the newest release that supports it (46 and later need 1.94 or newer),
+with the matching `wit-component` 0.248. Moving to a newer Wasmtime means
+updating nixpkgs first.
 
 ### Components across the IPC channel
 
