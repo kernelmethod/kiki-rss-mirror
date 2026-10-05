@@ -12,7 +12,8 @@
 --
 --   max_age_days  How many days to keep an entry after its feed stops
 --                 listing it. 0 keeps every entry forever.
---   keep_saved    Never delete entries tagged system:saved.
+--   keep_tags     Never delete entries tagged with any of these tags.
+--                 Defaults to { "system:saved" }; {} keeps none.
 
 local config = ...
 
@@ -27,17 +28,25 @@ local days = config.max_age_days or 0
 if math.type(days) ~= "integer" or days < 0 or days > MAX_DAYS then
     fail(string.format("'max_age_days' must be a whole number of days from 0 to %d", MAX_DAYS))
 end
-local keep_saved = config.keep_saved
-if keep_saved == nil then
-    keep_saved = true
-elseif type(keep_saved) ~= "boolean" then
-    fail("'keep_saved' must be true or false")
+local keep_tags = config.keep_tags or { "system:saved" }
+if type(keep_tags) ~= "table" then
+    fail("'keep_tags' must be a list of tag names")
+end
+for k in pairs(keep_tags) do
+    if math.type(k) ~= "integer" then
+        fail("'keep_tags' must be a list of tag names")
+    end
+end
+for i, tag in ipairs(keep_tags) do
+    if type(tag) ~= "string" or tag == "" then
+        fail("'keep_tags' entry " .. i .. " must be a non-empty tag name")
+    end
 end
 
 local function clean_up()
     local deleted = kiki.entries.delete_where({
         dropped_before = os.time() - days * DAY,
-        keep_tagged = keep_saved and { "system:saved" } or {},
+        keep_tagged = keep_tags,
     })
     if deleted > 0 then
         kiki.log("info", string.format("retention: deleted %d entries", deleted))

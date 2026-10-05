@@ -12,13 +12,20 @@ keeps every entry until you set how long to keep them:
 echo 'max_age_days = 30' | kiki plugin config set retention
 ```
 
-or set **Days to keep entries** on the plugin's page in the web UI. It
-deletes entries when plugins load, and then every hour.
+or set **Days to keep entries** on the plugin's page in the web UI, which
+also lists the **Tags to keep**. It deletes entries when plugins load, and
+then every hour.
 
 | Setting | Default | Meaning |
 | ------- | ------- | ------- |
 | `max_age_days` | `0` | Delete an entry once its feed has stopped listing it for this many days, from 1 to 36500. `0` keeps entries forever. |
-| `keep_saved` | `true` | Never delete entries tagged `system:saved`. An entry you unsave is deleted by the next cleanup, if its feed stopped listing it long enough ago. |
+| `keep_tags` | `["system:saved"]` | Never delete entries tagged with any of these tags. An entry that loses its last such tag, such as one you unsave, is deleted by the next cleanup, if its feed stopped listing it long enough ago. `[]` keeps none. |
+
+To keep entries you have tagged `keep` as well as saved ones:
+
+```bash
+echo 'keep_tags = ["system:saved", "keep"]' | kiki plugin config set retention
+```
 
 Entries still in their feed are never deleted, however old they are: they
 would come right back, as new and unread entries, on the feed's next
