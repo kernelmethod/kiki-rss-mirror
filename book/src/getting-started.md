@@ -82,5 +82,5 @@ server starts fetching imported feeds within a few seconds.
 - Hide the entries you don't want with the [filter plugin](plugins/filter.md),
   and organise the rest with [automatic tags](plugins/auto-tag.md).
 - Change how often feeds are fetched, how long entries are kept, and more in
-  [Configuration](configuration.md).
+  [Settings](configuration/settings.md).
 - See every endpoint in the [interactive API reference](../api/).

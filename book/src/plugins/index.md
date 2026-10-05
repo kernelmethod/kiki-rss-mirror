@@ -2,9 +2,9 @@
 
 Plugins are small Lua programs that Kiki runs as entries arrive: to hide
 them, tag them, clean them up, or anything else you can write. Each lives in
-its own directory under `plugins/` in Kiki's [data directory](../files.md):
-in `plugins/system/` if it came with Kiki, and in `plugins/user/` if you
-installed it.
+its own directory under `plugins/` in Kiki's [data
+directory](../configuration/environment.md): in `plugins/system/` if it came
+with Kiki, and in `plugins/user/` if you installed it.
 
 ## Plugins installed by default
 

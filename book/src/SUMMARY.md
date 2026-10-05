@@ -5,10 +5,11 @@
 # User guide
 
 - [Installation](installation.md)
+- [Why Kiki?](why-kiki.md)
 - [Getting started](getting-started.md)
-- [Where Kiki keeps its files](files.md)
-- [Configuration](configuration.md)
-    - [Proxies](proxy.md)
+- [Configuration](configuration/index.md)
+    - [Settings](configuration/settings.md)
+    - [Environment](configuration/environment.md)
 - [The web UI](web-ui.md)
 - [API tokens](tokens.md)
 - [Running as a service](deployment.md)
@@ -27,7 +28,6 @@
 # Reference
 
 - [Command line](cli.md)
-- [Settings](settings.md)
 - [Threat model](threat-model.md)
 
 # Development
