@@ -2,8 +2,8 @@
 
 Everything Kiki does is available over a JSON HTTP API, served on Kiki's
 Unix socket. The [interactive API reference](../api/) lists every endpoint
-with its parameters and responses. A running server also serves the same
-reference itself, at `/docs`.
+with its parameters, responses and the [token scope](tokens.md) it needs. A running
+server also serves the same reference itself, at `/docs`.
 
 With curl, pass the socket's path with `--unix-socket`; the host name in the
 URL is ignored:
@@ -57,10 +57,14 @@ another reader's API, can fetch just what changed:
 
 ## Security
 
-The Kiki API does not implement any sort of authentication. **Anybody** who
-can reach the API can read all feeds and entries, add and delete feeds and
-entries, change settings and plugins' config, and do anything else the API
-permits.
+A request that carries an [API token](tokens.md) may do only what the
+token's scopes allow. By default a token is optional, though: **anybody**
+who can reach the API without one can read all feeds and entries, add and
+delete feeds and entries, change settings and plugins' config, and do
+anything else the API permits. Set `anonymous_access` under `[api]` in
+`kiki.toml` to `"read-only"` or `"token-required"` to limit requests
+without a token; `GET /v1/access` reports the setting to anyone. See
+[Anonymous access](tokens.md#anonymous-access).
 
 By default only your own user can reach the socket. If you widen that, or
 put Kiki behind a reverse proxy (see

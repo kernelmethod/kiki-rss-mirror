@@ -68,8 +68,27 @@ Kiki serves over a Unix socket and nothing else; it does not listen on TCP.
 A socket is reachable only by processes that can reach its path, which is
 access control Kiki does not have to implement.
 
-To reach Kiki from other machines, put a reverse proxy in front of the
-socket and let it handle TLS and authentication. With nginx:
+To reach Kiki from other machines, put a reverse proxy in front and let it
+handle TLS.
+
+For the web UI, run `kiki web` with
+[`--require-login`](web-ui.md#logging-in), so that everyone has to log in
+with an [API token](tokens.md), and point the proxy at its `--listen`
+address. With nginx:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8080;
+}
+```
+
+or with Caddy:
+
+```caddy
+reverse_proxy 127.0.0.1:8080
+```
+
+For the API itself, point the proxy at the socket:
 
 ```nginx
 location / {
@@ -77,17 +96,22 @@ location / {
 }
 ```
 
-or with Caddy:
-
 ```caddy
 reverse_proxy unix//run/kiki/kiki.sock
 ```
 
-Remember that the API has no authentication of its own: anyone who can
-reach it can read and change everything. See [Security](api.md#security).
+The API holds a request that carries an API token to the token's scopes,
+but by default a request without one may do anything. Unless the proxy
+authenticates requests itself, anyone who can reach it can read and change
+everything, so set `anonymous_access = "token-required"` (or
+`"read-only"`) under `[api]` in `kiki.toml`. See
+[Security](api.md#security).
 
 ## Monitoring
 
 The server answers `GET /v1/health`, and serves Prometheus metrics at
-`/metrics`. Under systemd, it also pings the service watchdog while it can
+`/metrics`. A token with only the `metrics` scope
+(`kiki token create prometheus --scopes metrics`) can scrape them and do
+nothing else; Prometheus sends it with `authorization: { credentials: … }`
+in its scrape config. Under systemd, it also pings the service watchdog while it can
 still fetch feeds, so a server that hangs is restarted.

@@ -2,12 +2,13 @@ use super::api::{fetch_entries, fetch_tag, fetch_tags, EntryPage};
 use super::entries::render_entries;
 use super::layout::{render_page, server_unavailable};
 use super::listing::{render_pagination, Listing, PageParams};
+use super::login::Api;
 use super::plugins::is_same_origin;
 use super::API_BASE;
 use crate::db::tags::{TagKind, SYSTEM_TAG_PREFIX};
 use crate::routes::v1::tags::list_tags::{ListTagsResponse, TagResponse};
 use axum::{
-    extract::{Path as UrlPath, Query, State},
+    extract::{Path as UrlPath, Query},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -15,10 +16,7 @@ use quick_xml::escape::escape;
 
 /// Render the list of tags: the total number of tags, and one page of them,
 /// each linked to its page.
-pub(super) async fn tags_page(
-    State(api): State<reqwest::Client>,
-    Query(params): Query<PageParams>,
-) -> Response {
+pub(super) async fn tags_page(api: Api, Query(params): Query<PageParams>) -> Response {
     let page = params.page();
     match fetch_tags(&api, page).await {
         Ok(tags) => render_page(StatusCode::OK, "Tags - Kiki", &render_tag_list(&tags, page)),
@@ -30,7 +28,7 @@ pub(super) async fn tags_page(
 /// newest first. Read entries are left out unless the `show_read` query
 /// parameter is true, or the tag is `system:read`.
 pub(super) async fn tag_page(
-    State(api): State<reqwest::Client>,
+    api: Api,
     UrlPath(id): UrlPath<i64>,
     Query(params): Query<PageParams>,
 ) -> Response {
@@ -73,7 +71,7 @@ pub(super) async fn tag_page(
 /// `403 Forbidden` to requests from other sites, going by `headers`; see
 /// [`is_same_origin`].
 pub(super) async fn delete_tag(
-    State(api): State<reqwest::Client>,
+    api: Api,
     UrlPath(id): UrlPath<i64>,
     headers: HeaderMap,
 ) -> Response {

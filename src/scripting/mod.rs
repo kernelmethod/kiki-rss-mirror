@@ -62,10 +62,10 @@
 //!
 //! Inside the VM: a restricted standard library. Only `string`, `table`, `math`, `os` (with
 //! dangerous functions removed), `tostring`, `tonumber`, `type`, `pairs`, `ipairs`, `select`,
-//! and `unpack` are available, plus the `kiki` table exposing `on`, `log`, and `regex`. Filesystem
+//! and `unpack` are available, plus the `kiki` table exposing `on`, `log`, `regex`, and `html`. Filesystem
 //! access, process execution, and module loading are blocked. Scripts run under a
-//! per-invocation time budget and a VM-wide memory limit (see the `lua` sub-module for the
-//! concrete values).
+//! per-invocation time budget, set per plugin (see [`TimeBudget`]), and a VM-wide memory
+//! limit (see the `lua` sub-module for the concrete values).
 //!
 //! Around the VM: by default `kiki serve` does not host the VM at all. It runs in a separate,
 //! more tightly sandboxed process that holds no database handle, no filesystem access, and no
@@ -80,6 +80,7 @@ pub mod lua;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// A plugin's source code together with its configuration.
 ///
@@ -103,6 +104,64 @@ pub struct ScriptSource {
     pub config: String,
     /// The plugin's other source files, which its code can `require`.
     pub modules: Vec<ScriptModule>,
+    /// How long each call of one of the plugin's handlers may run.
+    pub time_budget: TimeBudget,
+}
+
+/// How long each call of a plugin's handlers may run before it is stopped.
+///
+/// The budget covers one call of a handler, whether registered with `kiki.on` or passed to
+/// `kiki.entries.scan`, not the plugin's handlers taken together. A plugin's manifest sets
+/// it with `time_budget_ms`; see [`crate::plugins::PluginManifest::time_budget_ms`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TimeBudget {
+    /// Each call may run for this many milliseconds.
+    Millis(u64),
+    /// Calls run until they finish.
+    ///
+    /// The script host is still declared dead if it does not answer within
+    /// [`crate::process::script_host::IPC_TIMEOUT`], which disables scripting until the
+    /// server restarts, so this is only for plugins trusted to finish.
+    Unlimited,
+}
+
+impl TimeBudget {
+    /// The budget of a plugin whose manifest does not set one:
+    /// [`lua::SCRIPT_TIMEOUT_MS`] milliseconds.
+    pub const DEFAULT: Self = Self::Millis(lua::SCRIPT_TIMEOUT_MS);
+
+    /// How long each call may run, or `None` if there is no limit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::scripting::TimeBudget;
+    /// use std::time::Duration;
+    ///
+    /// assert_eq!(TimeBudget::Millis(250).limit(), Some(Duration::from_millis(250)));
+    /// assert_eq!(TimeBudget::Unlimited.limit(), None);
+    /// ```
+    pub fn limit(self) -> Option<Duration> {
+        match self {
+            Self::Millis(ms) => Some(Duration::from_millis(ms)),
+            Self::Unlimited => None,
+        }
+    }
+}
+
+impl Default for TimeBudget {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl std::fmt::Display for TimeBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Millis(ms) => write!(f, "{ms}ms"),
+            Self::Unlimited => f.write_str("unlimited"),
+        }
+    }
 }
 
 /// A source file of a plugin other than its entrypoint.
@@ -119,16 +178,18 @@ impl ScriptSource {
     /// The config a script has when none has been set: an empty JSON object.
     pub const EMPTY_CONFIG: &'static str = "{}";
 
-    /// A single-file script named `script`, with an empty config.
+    /// A single-file script named `script`, with an empty config and the default
+    /// [`TimeBudget`].
     ///
     /// # Examples
     ///
     /// ```
-    /// use kiki_rss::scripting::ScriptSource;
+    /// use kiki_rss::scripting::{ScriptSource, TimeBudget};
     ///
     /// let source = ScriptSource::new("local config = ...");
     /// assert_eq!(source.config, "{}");
     /// assert!(source.modules.is_empty());
+    /// assert_eq!(source.time_budget, TimeBudget::DEFAULT);
     /// ```
     pub fn new(text: impl Into<String>) -> Self {
         Self {
@@ -136,6 +197,7 @@ impl ScriptSource {
             text: text.into(),
             config: Self::EMPTY_CONFIG.to_string(),
             modules: Vec::new(),
+            time_budget: TimeBudget::DEFAULT,
         }
     }
 }

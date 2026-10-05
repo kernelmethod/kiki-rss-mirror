@@ -1,4 +1,8 @@
-use utoipa::OpenApi;
+use crate::auth::policy::{requirement, Requirement};
+use crate::auth::Scope;
+use axum::http::Method;
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme};
+use utoipa::{Modify, OpenApi};
 
 /// OpenAPI documentation for the kiki-rss API.
 #[derive(OpenApi)]
@@ -6,6 +10,7 @@ use utoipa::OpenApi;
     paths(
         crate::routes::v1::root::root,
         crate::routes::v1::health::health,
+        crate::routes::v1::access::access,
         crate::routes::v1::feeds::add_feed::add_feed,
         crate::routes::v1::feeds::list_feeds::list_feeds,
         crate::routes::v1::feeds::get_feed::get_feed,
@@ -51,11 +56,23 @@ use utoipa::OpenApi;
         crate::routes::v1::settings::feed_fetch::put_feed_fetch_settings,
         crate::routes::v1::entries::cleanup::cleanup,
         crate::routes::v1::shutdown::shutdown,
+        crate::routes::v1::assets::get_asset,
+        crate::routes::v1::assets::get_asset_by_url,
+        crate::routes::v1::assets::delete_asset,
+        crate::routes::v1::entries::entry_assets::list_entry_assets,
+        crate::routes::v1::settings::assets::get_asset_cache_settings,
+        crate::routes::v1::settings::assets::put_asset_cache_settings,
+        crate::routes::v1::tokens::list_tokens,
+        crate::routes::v1::tokens::create_token,
+        crate::routes::v1::tokens::revoke_token,
+        crate::routes::v1::tokens::current_token,
     ),
     components(
         schemas(
             crate::routes::v1::root::RootResponse,
             crate::routes::v1::health::HealthResponse,
+            crate::routes::v1::access::AccessResponse,
+            crate::config::AnonymousAccess,
             crate::server::ComponentState,
             crate::routes::v1::feeds::add_feed::AddFeedRequest,
             crate::routes::v1::feeds::add_feed::AddFeedResponse,
@@ -114,6 +131,16 @@ use utoipa::OpenApi;
             crate::routes::v1::settings::feed_fetch::FeedFetchSettingsResponse,
             crate::routes::v1::settings::feed_fetch::FeedFetchSettingsRequest,
             crate::routes::v1::entries::cleanup::CleanupResponse,
+            crate::auth::Scopes,
+            crate::routes::v1::entries::entry_assets::EntryAsset,
+            crate::routes::v1::entries::entry_assets::ListEntryAssetsResponse,
+            crate::routes::v1::settings::assets::AssetCacheSettingsResponse,
+            crate::routes::v1::settings::assets::AssetCacheSettingsRequest,
+            crate::db::tokens::Token,
+            crate::routes::v1::tokens::ListTokensResponse,
+            crate::routes::v1::tokens::CreateTokenRequest,
+            crate::routes::v1::tokens::CreateTokenResponse,
+            crate::routes::v1::tokens::CurrentTokenResponse,
         )
     ),
     tags(
@@ -123,7 +150,10 @@ use utoipa::OpenApi;
         (name = "tags", description = "Organize feeds and entries with tags"),
         (name = "plugins", description = "Inspect installed plugins and configure them"),
         (name = "settings", description = "Global configuration settings"),
+        (name = "assets", description = "Images and enclosures cached from entries"),
+        (name = "tokens", description = "Manage the API tokens that grant access to the API"),
     ),
+    modifiers(&TokenSecurity),
     info(
         title = "kiki-rss",
         description = "A self-hosted RSS/Atom feed aggregator API",
@@ -131,3 +161,56 @@ use utoipa::OpenApi;
     )
 )]
 pub struct ApiDoc;
+
+/// Documents the API token each operation requires, from
+/// [`crate::auth::policy`]: as a bearer security requirement naming the
+/// scope, and in the operation's description.
+struct TokenSecurity;
+
+impl Modify for TokenSecurity {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "token",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .description(Some(
+                        "An API token, created with `kiki token create`. A request with a token \
+                         may do only what the token's scopes allow. What a request without one \
+                         may do is set by the `api.anonymous_access` setting, which \
+                         `GET /v1/access` reports: by default, anything.",
+                    ))
+                    .build(),
+            ),
+        );
+
+        for (path, item) in openapi.paths.paths.iter_mut() {
+            for (method, op) in [
+                (Method::GET, &mut item.get),
+                (Method::PUT, &mut item.put),
+                (Method::POST, &mut item.post),
+                (Method::DELETE, &mut item.delete),
+                (Method::PATCH, &mut item.patch),
+            ] {
+                let Some(op) = op else { continue };
+                let (scopes, note) =
+                    match requirement(&method, path).unwrap_or(Requirement::Scope(Scope::Admin)) {
+                        Requirement::Any => continue,
+                        Requirement::Scope(scope) => (
+                            vec![scope.name()],
+                            format!(
+                                "A request with an API token needs the `{scope}` scope; one \
+                                 without needs `api.anonymous_access` to grant it."
+                            ),
+                        ),
+                    };
+                op.security = Some(vec![SecurityRequirement::new("token", scopes)]);
+                op.description = Some(match op.description.take() {
+                    Some(d) if !d.is_empty() => format!("{d}\n\n{note}"),
+                    _ => note,
+                });
+            }
+        }
+    }
+}

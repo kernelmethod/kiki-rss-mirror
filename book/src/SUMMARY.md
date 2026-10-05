@@ -10,10 +10,12 @@
 - [Configuration](configuration.md)
     - [Proxies](proxy.md)
 - [The web UI](web-ui.md)
+- [API tokens](tokens.md)
 - [Running as a service](deployment.md)
 - [Plugins](plugins/index.md)
     - [Filtering entries](plugins/filter.md)
     - [Tagging entries automatically](plugins/auto-tag.md)
+    - [Sanitizing entries' HTML](plugins/sanitize.md)
     - [Stripping tracking parameters](plugins/strip-tracking.md)
 
 # For client and plugin authors

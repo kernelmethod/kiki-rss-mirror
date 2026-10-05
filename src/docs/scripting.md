@@ -48,6 +48,7 @@ flags = "i"
 | `entrypoint`  | No       | The file that runs when the plugin loads, relative to the plugin directory. Defaults to `main.lua`. |
 | `description`, `authors`, `license`, `homepage` | No | Informational; shown by the API. |
 | `enabled`     | No       | Set to `false` to keep a plugin installed without running it. Defaults to `true`. |
+| `time_budget_ms` | No    | How long each call of one of the plugin's handlers may run, in milliseconds, or `"unlimited"`; see [Resource limits](#resource-limits). Defaults to `100`. |
 | `config`      | No       | A table holding the plugin's default config; see [Plugin config](#plugin-config). |
 | `settings`    | No       | An array describing the keys of `config`: their types, labels and descriptions; see [Describing settings](#describing-settings). |
 
@@ -89,6 +90,8 @@ that, kiki exposes a single additional global — the `kiki` table:
   level. `level` must be one of `"debug"`, `"info"`, `"warn"`, or `"error"`.
 - `kiki.regex(pattern [, flags])` — compile a regular expression. See
   [Regular expressions](#regular-expressions) below.
+- `kiki.html` — rewrite HTML, such as an entry's content, with a real HTML
+  parser. See [Rewriting HTML](#rewriting-html) below.
 - `kiki.store` — the plugin's own key-value store, kept in the database. See
   [Storing data](#storing-data).
 - `kiki.entries` — tag the entries already stored, and scan through them.
@@ -304,8 +307,10 @@ a new version, unless its files have been edited. It also installs
 `plugins/strip-tracking`, which uses `entry.ingest` to remove tracking
 parameters such as `utm_source` from entries' URLs and the links in their
 content, and tracking pixels from their content, and can keep images from
-being downloaded for chosen feeds with `cache_assets`, and `plugins/auto-tag`, which tags entries that match regular
-expressions or come from given feeds.
+being downloaded for chosen feeds with `cache_assets`; `plugins/sanitize`,
+which uses [`kiki.html`](#rewriting-html) to remove scripts, styles and
+unsafe links from entries' content; and `plugins/auto-tag`, which tags
+entries that match regular expressions or come from given feeds.
 
 ## Events
 
@@ -573,16 +578,122 @@ for matching it literally. `kiki.regex.new(pattern [, flags])` is the same as
 Compiling the same pattern with the same flags again returns the regex that is
 already compiled, so building a regex inside a handler is cheap, if less tidy.
 
+## Rewriting HTML
+
+An entry's `content` is HTML, which Lua's string patterns cannot parse
+reliably: a pattern looking for `<img src="...">` misses images written
+`<IMG SRC=...>`, and finds them inside comments and attribute values.
+`kiki.html.rewrite(html, handlers)` parses `html` with
+[`lol_html`](https://github.com/cloudflare/lol-html), the streaming HTML
+rewriter Kiki uses itself, calls `handlers` for the parts of it they ask
+for, and returns the rewritten HTML:
+
+```lua
+kiki.on("entry.ingest", function(entry)
+    if entry.content ~= nil then
+        entry.content = kiki.html.rewrite(entry.content, {
+            elements = {
+                -- Remove every <script>, with its content.
+                { "script", function(el) el:remove() end },
+                -- Open links to other sites in a new tab.
+                { "a[href^='http']", function(el)
+                    el:set_attribute("target", "_blank")
+                    el:set_attribute("rel", "noopener")
+                end },
+            },
+            comments = function(comment) comment:remove() end,
+        })
+    end
+    return entry
+end)
+```
+
+`handlers` is a table with any of:
+
+| Key        | Meaning |
+|------------|---------|
+| `elements` | A list of `{ selector, handler }` pairs. `handler` is called with each element matching the CSS `selector`, such as `"img"`, `"a[href]"`, `"div.ad > p"` or `"*"`. An element matching several selectors goes to each of their handlers, in the order they are listed. |
+| `comments` | A function called with each comment. |
+| `text`     | A function called with each chunk of text. |
+
+The selectors `lol_html` supports are listed in
+[its documentation](https://docs.rs/lol_html/latest/lol_html/struct.Selector.html):
+type, class, id and attribute selectors, `*`, and the descendant and child
+combinators, among others. An invalid selector raises an error.
+
+A handler is passed an object for its element, comment or text chunk, which
+it changes by calling its methods. Its return value is ignored. Changes are
+applied once the handler returns, and the object can't be used after that:
+keeping it and calling it later raises an error. An error raised in a
+handler stops the rewrite and is raised by `kiki.html.rewrite`.
+
+The methods that insert content take it as text, which is escaped, unless
+their last argument is `"html"`: `el:append("<b>")` inserts the text `<b>`,
+while `el:append("<b>bold</b>", "html")` inserts a bold element.
+
+An element has these fields and methods:
+
+| Field or method | Meaning |
+|-----------------|---------|
+| `el.tag_name` | The element's name, in lowercase, such as `"img"`. |
+| `el.namespace` | `"html"`, or `"svg"` or `"mathml"` for elements inside `<svg>` or `<math>`. |
+| `el.is_self_closing` | Whether the tag was written self-closing, as in `<br/>`. |
+| `el.can_have_content` | Whether the element can have content: `false` for void elements such as `<img>`. |
+| `el.removed` | Whether the element has been removed or replaced. |
+| `el:get_attribute(name)` | The value of the attribute `name`, or `nil`. |
+| `el:has_attribute(name)` | Whether the element has the attribute. |
+| `el:attributes()` | A list of the element's attributes, each a table with its `name` (in lowercase) and `value`. |
+| `el:set_attribute(name, value)` | Set an attribute, adding it if the element doesn't have it. |
+| `el:remove_attribute(name)` | Remove an attribute. |
+| `el:set_tag_name(name)` | Rename the element. |
+| `el:before(content [, "html"])`, `el:after(...)` | Insert content before or after the element. |
+| `el:prepend(content [, "html"])`, `el:append(...)` | Insert content at the start or end of the element's content. |
+| `el:set_inner_content(content [, "html"])` | Replace the element's content. |
+| `el:replace(content [, "html"])` | Replace the element, and its content. |
+| `el:remove()` | Remove the element and its content. |
+| `el:remove_and_keep_content()` | Remove the element's tags, keeping its content. |
+
+Attribute names are matched ignoring case. Attribute values are decoded:
+`get_attribute` returns `/a?x=1&y=2` for `href="/a?x=1&amp;y=2"`, as a
+browser reads it, and `set_attribute` escapes the value it is given, so
+setting a value a handler has read writes it back unchanged.
+
+A comment has a `text` field and a `set_text(text)` method (the text may
+not contain `-->`), and a chunk of text has a `text` field, holding the text
+as it is written in the HTML, character references and all, and a
+`last_in_text_node` field, which is `true` for the last chunk of a run of
+text: a long run of text may come in several chunks. Both have a `removed`
+field and the methods `before`, `after`, `replace` and `remove`, which work
+as they do for elements.
+
+`kiki.html.escape(s)` escapes `&`, `<`, `>`, `"` and `'` in `s`, for
+putting text into HTML; `kiki.html.unescape(s)` decodes the character
+references in `s`.
+
+`lol_html` rewrites HTML as a stream, without building a document tree. It
+doesn't add missing end tags or remove stray ones, and selectors can't look
+at what comes after an element, so `:has()` and the sibling combinators
+aren't supported. Attribute selectors match values as they are written in
+the HTML, before character references are decoded, so a handler that must
+not miss an element should check the decoded value with `get_attribute`.
+
 ## Resource limits
 
 Every handler call runs under two hard limits:
 
-- **Time**: 100 ms per invocation. Enforced by a Lua debug hook that fires
-  every 1000 VM instructions. Scripts stuck in long-running C-level calls
+- **Time**: 100 ms per invocation, unless the plugin's manifest sets
+  `time_budget_ms` to another number of milliseconds or to `"unlimited"`.
+  Enforced by a Lua debug hook that fires every 1000 VM instructions. Scripts stuck in long-running C-level calls
   (e.g. pathological `string.gsub` patterns) can exceed this slightly before
   control returns to the VM. Time spent waiting on the server in calls to
   `kiki.store`, `kiki.entries` and `kiki.feeds` is not counted, up to one
   second per invocation; past that, waiting counts like anything else.
+
+  An unlimited handler still has a backstop: plugins run one handler at a
+  time in a separate process, and if that process doesn't answer the server
+  for 10 seconds, the server stops it, and with it every plugin, until Kiki
+  restarts. Keep `"unlimited"` for plugins you trust to finish, such as the
+  bundled `sanitize`, which every new entry passes through.
 - **Memory**: 16 MiB across the entire VM. Allocations that would exceed this
   cap fail the handler.
 - **Regexes**: compiled regexes live outside the VM, so the memory cap does not
@@ -590,6 +701,11 @@ Every handler call runs under two hard limits:
   matching cache of the same size), and at most 128 distinct regexes may be
   alive at once; exceeding either raises an error. Regexes a script no longer refers to are freed by Lua's garbage
   collector.
+- **HTML rewriting**: `kiki.html.rewrite` works outside the VM too. Its
+  buffers may take up 4 MiB, the HTML it returns may be at most 8 MiB long,
+  and it takes at most 256 element handlers; exceeding any of these raises an
+  error. Its handlers run within the time budget of the handler that called
+  it.
 
 When a handler errors, times out, or exceeds the memory cap:
 

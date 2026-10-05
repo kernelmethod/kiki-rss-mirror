@@ -1449,7 +1449,7 @@ async fn pages_link_to_the_site_sections() -> Result<()> {
     for path in ["/", "/entries/1", "/feeds", "/tags", "/plugins"] {
         let (_, body) = get_page(tc.client()?, path).await?;
         assert!(
-            body.contains(r#"<nav class="site-nav"><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a href="/plugins">Plugins</a>"#),
+            body.contains(r#"<nav class="site-nav"><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a class="admin-only" href="/plugins">Plugins</a>"#),
             "{path}: {body}"
         );
     }

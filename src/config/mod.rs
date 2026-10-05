@@ -26,6 +26,9 @@
 //!
 //! [web_ui]
 //! allowed_hosts = ["kiki.lan", "*.home.example"]
+//!
+//! [api]
+//! anonymous_access = "read-only"
 //! ```
 //!
 //! The proxy can also be set with environment variables, which take
@@ -98,6 +101,8 @@ pub struct Settings {
     pub proxy: ProxySettings,
     #[serde(default)]
     pub web_ui: WebUiSettings,
+    #[serde(default)]
+    pub api: ApiSettings,
 }
 
 /// Settings governing how and how often feeds are fetched.
@@ -223,6 +228,86 @@ pub struct WebUiSettings {
     /// ```
     #[serde(default)]
     pub allowed_hosts: Vec<HostPattern>,
+
+    /// Whether the web UI requires logging in with an API token, created
+    /// with `kiki token create`, as `kiki web --require-login` does. Each
+    /// person can then do only what their token's scopes allow.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::Overrides;
+    ///
+    /// let o = Overrides::parse("[web_ui]\nrequire_login = true\n").unwrap();
+    /// assert!(o.resolve().unwrap().web_ui.require_login);
+    /// ```
+    #[serde(default)]
+    pub require_login: bool,
+}
+
+/// Settings for the API.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiSettings {
+    /// What a request that presents no API token may do. Requests that do
+    /// present one are held to its scopes either way. A change takes
+    /// effect with the next request.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::{AnonymousAccess, Overrides};
+    ///
+    /// let o = Overrides::parse("[api]\nanonymous_access = \"read-only\"\n").unwrap();
+    /// assert_eq!(o.resolve().unwrap().api.anonymous_access, AnonymousAccess::ReadOnly);
+    /// ```
+    #[serde(default)]
+    pub anonymous_access: AnonymousAccess,
+}
+
+/// What a request without an API token may do; see
+/// [`ApiSettings::anonymous_access`].
+///
+/// Whatever the setting, a request without a token may still reach the
+/// routes that need no scope, such as `/v1/health` and `/v1/access`, the
+/// latter of which reports this setting.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum AnonymousAccess {
+    /// Anything, administration included, as with a token holding every
+    /// scope.
+    #[default]
+    Full,
+    /// Only reading, as with a token holding just the `read` scope.
+    ReadOnly,
+    /// Nothing beyond the routes that need no scope: everything else
+    /// requires a token.
+    TokenRequired,
+}
+
+impl AnonymousAccess {
+    /// The scopes a request without a token holds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::auth::{Scope, Scopes};
+    /// use kiki_rss::config::AnonymousAccess;
+    ///
+    /// assert_eq!(AnonymousAccess::Full.scopes(), Scopes::all());
+    /// assert_eq!(AnonymousAccess::ReadOnly.scopes(), Scopes::of(Scope::Read));
+    /// assert!(AnonymousAccess::TokenRequired.scopes().is_empty());
+    /// ```
+    pub fn scopes(self) -> crate::auth::Scopes {
+        use crate::auth::{Scope, Scopes};
+        match self {
+            AnonymousAccess::Full => Scopes::all(),
+            AnonymousAccess::ReadOnly => Scopes::of(Scope::Read),
+            AnonymousAccess::TokenRequired => Scopes::NONE,
+        }
+    }
 }
 
 /// Environment variable overriding [`ProxySettings::url`].
@@ -327,6 +412,7 @@ impl Default for Settings {
             retention: RetentionSettings::default(),
             proxy: ProxySettings::default(),
             web_ui: WebUiSettings::default(),
+            api: ApiSettings::default(),
         }
     }
 }
@@ -696,6 +782,35 @@ mod tests {
             "[web_ui]\nallowed_hosts = [\"\"]\n",
             "[web_ui]\nallowed_hosts = \"kiki.lan\"\n",
             "[web_ui]\nallowed_host = [\"kiki.lan\"]\n",
+        ] {
+            let o = Overrides::parse(text).unwrap();
+            assert!(
+                matches!(o.resolve(), Err(ConfigError::Invalid(_))),
+                "{text:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_access_is_read_from_the_file() {
+        assert_eq!(
+            Settings::default().api.anonymous_access,
+            AnonymousAccess::Full
+        );
+        for (value, expected) in [
+            ("full", AnonymousAccess::Full),
+            ("read-only", AnonymousAccess::ReadOnly),
+            ("token-required", AnonymousAccess::TokenRequired),
+        ] {
+            let mut o = Overrides::default();
+            o.set("api", "anonymous_access", value).unwrap();
+            let reparsed = Overrides::parse(&o.to_toml_string().unwrap()).unwrap();
+            assert_eq!(reparsed.resolve().unwrap().api.anonymous_access, expected);
+        }
+        for text in [
+            "[api]\nanonymous_access = \"none\"\n",
+            "[api]\nanonymous_access = true\n",
+            "[api]\nanonymous = \"full\"\n",
         ] {
             let o = Overrides::parse(text).unwrap();
             assert!(

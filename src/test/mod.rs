@@ -527,6 +527,14 @@ impl TestConfig {
         bail!("HTTP server has not been started on {:?}", p);
     }
 
+    /// Create an API token named `name` with `scopes` (as `kiki token
+    /// create --scopes` takes them), and return the token.
+    pub fn create_token(&self, name: &str, scopes: &str) -> Result<String> {
+        let conn = self.database_conn()?;
+        let (_, token) = crate::db::tokens::create(&conn, name, scopes.parse()?, None)?;
+        Ok(token)
+    }
+
     /// Return the path to a file in the `test/` data directory.
     pub fn test_data_path(filename: &str) -> PathBuf {
         let mut p = std::env::current_dir().unwrap();
@@ -707,6 +715,7 @@ impl TestConfig {
             license: None,
             homepage: None,
             enabled: true,
+            time_budget_ms: None,
             config,
             settings: vec![],
         };

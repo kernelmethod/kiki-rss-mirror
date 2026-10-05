@@ -55,3 +55,12 @@ Read by `kiki web` as it starts, so restart it after a change.
 | Key | Default | Description |
 | --- | ------- | ----------- |
 | `allowed_hosts` | `[]` | Hosts the web UI answers to besides `localhost`, `127.0.0.1` and `::1`: exact names or addresses, `*.example.com` for every subdomain of `example.com`, or `*` for any host. See [The web UI](web-ui.md). |
+| `require_login` | `false` | Whether the web UI asks for an [API token](tokens.md) before showing anything, as `kiki web --require-login` does. See [Logging in](web-ui.md#logging-in). |
+
+## `[api]`
+
+Changes apply to the next request, with no restart.
+
+| Key | Default | Description |
+| --- | ------- | ----------- |
+| `anonymous_access` | `"full"` | What a request without an [API token](tokens.md) may do: `"full"` (anything, administration included), `"read-only"` (as with a token holding only the `read` scope), or `"token-required"` (nothing but `GET /v1/health`, `GET /v1/`, `GET /v1/access`, `GET /v1/tokens/current` and `/docs`). Requests with a token are held to its scopes either way. `GET /v1/access` reports the setting to anyone. See [Anonymous access](tokens.md#anonymous-access). |

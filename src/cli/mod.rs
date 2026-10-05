@@ -4,6 +4,7 @@ pub mod opml;
 pub mod paths;
 pub mod plugin;
 pub mod serve;
+pub mod token;
 
 #[cfg(feature = "api-docs")]
 pub mod docs;

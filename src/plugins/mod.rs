@@ -75,9 +75,11 @@ mod auto_tag_tests;
 #[cfg(test)]
 mod filter_tests;
 #[cfg(test)]
+mod sanitize_tests;
+#[cfg(test)]
 mod strip_tracking_tests;
 
-use crate::scripting::{ScriptModule, ScriptSource};
+use crate::scripting::{ScriptModule, ScriptSource, TimeBudget};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -222,6 +224,23 @@ pub struct PluginManifest {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
+    /// How long, in milliseconds, each call of one of the plugin's handlers
+    /// may run before it is stopped: a positive integer, or `"unlimited"`
+    /// for no limit. Defaults to [`TimeBudget::DEFAULT`], 100 ms.
+    ///
+    /// Time a handler spends waiting on the server, in calls to
+    /// `kiki.store`, `kiki.entries` and `kiki.feeds`, does not count, up to
+    /// a second per call of the handler. An unlimited handler is still
+    /// stopped, together with every other plugin, if it keeps the script
+    /// host from answering for 10 seconds; see [`TimeBudget::Unlimited`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time_budget_ms"
+    )]
+    #[schema(value_type = Option<Object>)]
+    pub time_budget_ms: Option<TimeBudget>,
+
     /// The plugin's default config, the manifest's `[config]` table, handed
     /// to its entrypoint as its argument. The plugin's config overrides, kept
     /// in the database, replace these key by key.
@@ -242,6 +261,49 @@ pub struct PluginManifest {
 
 fn default_enabled() -> bool {
     true
+}
+
+/// Reads and writes a manifest's `time_budget_ms`: a positive number of
+/// milliseconds, or `"unlimited"`.
+mod time_budget_ms {
+    use crate::scripting::TimeBudget;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    const UNLIMITED: &str = "unlimited";
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Millis(u64),
+        Keyword(String),
+    }
+
+    pub fn serialize<S: Serializer>(
+        budget: &Option<TimeBudget>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match budget {
+            Some(TimeBudget::Millis(ms)) => Repr::Millis(*ms).serialize(serializer),
+            Some(TimeBudget::Unlimited) => UNLIMITED.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<TimeBudget>, D::Error> {
+        let invalid = || {
+            serde::de::Error::custom(format!(
+                "time_budget_ms must be a positive integer or \"{UNLIMITED}\""
+            ))
+        };
+        match Repr::deserialize(deserializer).map_err(|_| invalid())? {
+            Repr::Millis(0) => Err(invalid()),
+            Repr::Millis(ms) => Ok(Some(TimeBudget::Millis(ms))),
+            Repr::Keyword(k) if k == UNLIMITED => Ok(Some(TimeBudget::Unlimited)),
+            Repr::Keyword(_) => Err(invalid()),
+        }
+    }
 }
 
 /// Reads a manifest's `[config]` table, converting it to JSON.
@@ -316,6 +378,12 @@ impl PluginManifest {
         self.entrypoint
             .as_deref()
             .unwrap_or_else(|| self.engine.default_entrypoint())
+    }
+
+    /// The plugin's time budget: the one its manifest sets, or
+    /// [`TimeBudget::DEFAULT`].
+    pub fn time_budget(&self) -> TimeBudget {
+        self.time_budget_ms.unwrap_or_default()
     }
 
     /// Parses and validates a manifest.
@@ -529,6 +597,7 @@ impl Plugin {
             text,
             config: serde_json::Value::Object(self.config.clone()).to_string(),
             modules,
+            time_budget: self.manifest.time_budget(),
         })
     }
 }
@@ -913,6 +982,7 @@ mod tests {
             license: None,
             homepage: None,
             enabled: true,
+            time_budget_ms: None,
             config: Default::default(),
             settings: vec![],
         }
@@ -1061,6 +1131,55 @@ mod tests {
 
         let plugin = Plugin::load(&td.path().join("a")).unwrap();
         assert_eq!(plugin.manifest, m);
+    }
+
+    #[test]
+    fn manifest_time_budget_is_milliseconds_or_unlimited() {
+        let parse = |budget: &str| {
+            PluginManifest::parse(&format!(
+                "name = 'a'\nversion = '1.0.0'\nengine = 'lua'\n{budget}"
+            ))
+        };
+        assert_eq!(parse("").unwrap().time_budget(), TimeBudget::DEFAULT);
+        assert_eq!(
+            parse("time_budget_ms = 250").unwrap().time_budget(),
+            TimeBudget::Millis(250)
+        );
+        assert_eq!(
+            parse("time_budget_ms = 'unlimited'").unwrap().time_budget(),
+            TimeBudget::Unlimited
+        );
+        for invalid in [
+            "time_budget_ms = 0",
+            "time_budget_ms = -5",
+            "time_budget_ms = 1.5",
+            "time_budget_ms = 'forever'",
+        ] {
+            assert!(
+                matches!(parse(invalid), Err(PluginError::InvalidManifest(_))),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn time_budget_reaches_the_script_source() {
+        let td = TempDir::new().unwrap();
+        for (name, budget) in [
+            ("default", None),
+            ("slow", Some(TimeBudget::Millis(500))),
+            ("trusted", Some(TimeBudget::Unlimited)),
+        ] {
+            let mut m = manifest(name);
+            m.time_budget_ms = budget;
+            install(td.path(), &m, "").unwrap();
+            let plugin = Plugin::load(&td.path().join(name)).unwrap();
+            assert_eq!(plugin.manifest.time_budget_ms, budget);
+            assert_eq!(
+                plugin.load_source().unwrap().time_budget,
+                budget.unwrap_or_default()
+            );
+        }
     }
 
     #[test]

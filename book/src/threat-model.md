@@ -16,8 +16,10 @@ processes from doing anything your user account can do; see
 - **Your data**: the feeds, entries, tags and plugin state in `kiki.db`,
   your settings in `kiki.toml`, and the cached assets, all in the
   [data directory](files.md).
-- **Secrets**: the credentials of feeds that need a login, and a proxy's
-  password, if it has one.
+- **Secrets**: the credentials of feeds that need a login, a proxy's
+  password, if it has one, and [API tokens](tokens.md). Kiki stores only a
+  hash of each token; the web UI holds the tokens of the people logged in
+  to it in memory, for as long as their sessions last.
 - **The rest of your account**: your other files, the other processes you
   run, and the machines on your network.
 - **Kiki itself**: a hostile feed or plugin shouldn't be able to stop Kiki
@@ -27,16 +29,18 @@ processes from doing anything your user account can do; see
 
 | Trusted | Partly trusted | Untrusted |
 | --- | --- | --- |
-| You, and anyone else who can reach the API socket | Plugins | Feed servers, and every byte they send: feeds, web pages, images, SVG, redirects, headers |
+| You, and anyone else who can reach the API socket, within what [anonymous access](tokens.md#anonymous-access) or their token allows | Plugins | Feed servers, and every byte they send: feeds, web pages, images, SVG, redirects, headers |
 | The kiki executable, and the kernel | | DNS answers |
 | | | The network between Kiki and a feed server |
 | | | Websites open in your browser while `kiki web` runs |
 
-**The API has no authentication.** Anyone who can connect to the socket can
-read and change everything. Kiki leaves access control to the filesystem:
-the socket is only reachable by those who can reach its path, and a
-directory Kiki creates for it is readable by your user alone. See
-[Security](api.md#security) and
+**By default, the API trusts anyone who can reach it.** A request that
+carries an [API token](tokens.md) may do only what the token's scopes
+allow, but a request without one may do anything, unless
+[`anonymous_access`](tokens.md#anonymous-access) under `[api]` limits it to
+reading (`"read-only"`) or to nothing (`"token-required"`). Who can reach
+the socket at all is left to the filesystem: only those who can reach its
+path, and a directory Kiki creates for it is readable by your user alone. See [Security](api.md#security) and
 [Exposing Kiki over the network](deployment.md#exposing-kiki-over-the-network).
 
 **Plugins** are installed by you, so Kiki doesn't treat them as attackers.
@@ -265,12 +269,16 @@ Kiki's TLS, HTTP, decompression or parsing code.
   runs too long.
 
 Content that is merely unpleasant, rather than an exploit, reaches you
-through clients. Kiki stores entries' HTML as the feed wrote it. The web UI
-sanitizes it before display, but **other API clients must sanitize entry
-content themselves** before showing it in a browser. The
-[`strip-tracking`](plugins/strip-tracking.md) plugin removes tracking pixels
-and tracking parameters from entries' content, but it isn't a sanitizer: it
-leaves scripts, event handlers and the like where they are.
+through clients. The [`sanitize`](plugins/sanitize.md) plugin, installed by
+default, removes scripts, styles, embedded content, event handlers and
+unsafe links from new entries' HTML before Kiki stores it, and the web UI
+sanitizes it again before display. Without that plugin, or for entries
+stored before it was installed, Kiki stores entries' HTML as the feed wrote
+it, so **other API clients should sanitize entry content themselves**
+before showing it in a browser, rather than rely on the plugin's config.
+The [`strip-tracking`](plugins/strip-tracking.md) plugin removes tracking
+pixels and tracking parameters from entries' content, but it isn't a
+sanitizer: it leaves scripts, event handlers and the like where they are.
 
 ### A hostile name server
 
@@ -308,7 +316,10 @@ no files and no sockets. What it can do is what the plugin API allows:
   code that breaks out of the Lua VM can reach every plugin's state.
 
 Each handler has a time and a memory budget (see
-[Resource limits](writing-plugins.md#resource-limits)). A script host that
+[Resource limits](writing-plugins.md#resource-limits)). A plugin's manifest
+may lift its time budget, as the bundled `sanitize` plugin does so that no
+entry is stored unsanitized; the server still stops a script host that
+doesn't answer for 10 seconds. A script host that
 crashes or stops answering is not replaced; plugins stay disabled until
 Kiki is restarted, rather than handing a fresh Lua VM to whatever broke the
 last one. Entries keep flowing in either way.
@@ -319,21 +330,30 @@ won't start.
 
 ### The web UI
 
-The web UI has no login. It listens on `127.0.0.1` by default, and answers
-only requests whose `Host` header names an allowed host, so that a website
-can't reach it by pointing its own domain at your machine (DNS rebinding).
-Requests that change anything must come from the web UI's own pages,
-judging by the browser's `Sec-Fetch-Site` or `Origin` headers.
+By default the web UI has no login, and may do whatever the API allows
+requests without a token. With [`--require-login`](web-ui.md#logging-in),
+it asks for an API token first and acts with that token's scopes. Its
+session cookie is `HttpOnly` and `SameSite=Strict`, and the login form
+sends the token over whatever connection the browser has, so beyond your
+own machine, serve it over HTTPS. It listens on `127.0.0.1` by default,
+and answers only requests whose `Host` header names an allowed host, so
+that a website can't reach it by pointing its own domain at your machine
+(DNS rebinding). Requests that change anything must come from the web UI's
+own pages, judging by the browser's `Sec-Fetch-Site` or `Origin` headers.
 
-A web UI taken over by a request can reach the API, and through it
-everything in Kiki, but no files and no other network service.
+A web UI taken over by a request can reach the API, but no files and no
+other network service. Through the API, it can do what anonymous access
+allows, and what the tokens of the sessions it holds allow.
 
 ## Limits
 
 Kiki doesn't defend against:
 
-- **Anyone who can reach the API**, by design. Put a reverse proxy with
-  authentication in front of it before exposing it beyond your user.
+- **Anyone who can reach the API without a token**, unless you set
+  `anonymous_access`. Before exposing the API beyond your user, set it to
+  `"token-required"` or put a reverse proxy with authentication in front.
+- **Anyone holding a token**, within its scopes. A token is a bearer
+  credential: whoever has it can use it until it expires or is revoked.
 - **Other processes running as your user.** They can read the data
   directory directly; the sandbox limits what Kiki can do, not what others
   can do to Kiki.

@@ -124,6 +124,16 @@ impl PluginArgs {
                             "The server failed to load the plugins with it, and keeps running \
                              them with the config they had: {e}"
                         ),
+                        Err(e)
+                            if e.downcast_ref::<reqwest::Error>().and_then(|e| e.status())
+                                == Some(reqwest::StatusCode::UNAUTHORIZED) =>
+                        {
+                            eprintln!(
+                                "The server did not reload its plugins with it, since \
+                                 api.anonymous_access requires an API token to change plugins; \
+                                 it takes effect when the server restarts."
+                            );
+                        }
                         Err(e) => {
                             tracing::debug!("could not reach the server: {e:#}");
                             eprintln!("It takes effect when the server starts.");

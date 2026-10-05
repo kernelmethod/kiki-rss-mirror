@@ -1,6 +1,6 @@
 [package]
 name = "kiki-rss"
-version = "0.32.0"
+version = "0.33.0"
 edition = "2021"
 description = "An RSS feed aggregator"
 license = "MIT"
@@ -68,6 +68,8 @@ arc-swap = "1"
 notify = "8"
 sha2 = "0.10"
 base64 = "0.22"
+getrandom = "0.3"
+subtle = "2"
 
 [build-dependencies]
 tar = { version = "0.4", default-features = false, optional = true }

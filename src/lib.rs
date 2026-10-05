@@ -12,6 +12,7 @@
 // `clippy.toml`).
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+pub mod auth;
 pub mod config;
 pub mod db;
 pub mod docs;
