@@ -151,7 +151,7 @@ impl PluginArgs {
 fn list(home: &Path, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
     let discovery = discover(home)?;
 
-    let rows: Vec<[String; 6]> = discovery
+    let rows: Vec<[String; 7]> = discovery
         .plugins
         .iter()
         .map(|p| {
@@ -169,6 +169,7 @@ fn list(home: &Path, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
                 m.engine.name().to_string(),
                 p.source.name().to_string(),
                 status.to_string(),
+                permissions(&m.permissions),
                 m.description.clone().unwrap_or_default(),
             ]
         })
@@ -183,10 +184,11 @@ fn list(home: &Path, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
             "ENGINE",
             "SOURCE",
             "STATUS",
+            "PERMISSIONS",
             "DESCRIPTION",
         ]
         .map(String::from);
-        let mut widths = [0; 6];
+        let mut widths = [0; 7];
         for row in std::iter::once(&header).chain(&rows) {
             for (width, cell) in widths.iter_mut().zip(row) {
                 *width = (*width).max(cell.chars().count());
@@ -205,6 +207,19 @@ fn list(home: &Path, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
         writeln!(err, "warning: skipped {:?}: {}", e.dir, e.error)?;
     }
     Ok(())
+}
+
+/// The permissions a plugin asks for, as `kiki plugin ls` shows them: their
+/// names, separated by commas, or `-` for none.
+fn permissions(permissions: &[plugins::Permission]) -> String {
+    if permissions.is_empty() {
+        return "-".to_string();
+    }
+    permissions
+        .iter()
+        .map(|p| p.name())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 impl GetArgs {
@@ -469,12 +484,13 @@ mod tests {
                 "ENGINE",
                 "SOURCE",
                 "STATUS",
+                "PERMISSIONS",
                 "DESCRIPTION"
             ]
         );
         assert_eq!(
             lines.next().unwrap(),
-            ["hello", "1.0.0", "lua", "user", "enabled", "Says", "hello"]
+            ["hello", "1.0.0", "lua", "user", "enabled", "-", "Says", "hello"]
         );
         assert!(lines.next().is_none());
         assert!(String::from_utf8(err).unwrap().contains("broken"));

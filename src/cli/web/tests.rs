@@ -1691,6 +1691,30 @@ async fn the_plugins_page_lists_every_plugin() -> Result<()> {
     Ok(())
 }
 
+/// The plugins page shows the permissions a plugin asks for.
+#[tokio::test]
+async fn the_plugins_page_shows_permissions() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let manifest = crate::plugins::PluginManifest {
+        permissions: vec![crate::plugins::Permission::EntriesDelete],
+        ..crate::plugins::PluginManifest::parse(
+            "name = 'pruner'\nversion = '1.0.0'\nengine = 'lua'\n",
+        )?
+    };
+    crate::plugins::install(&tc.user_plugins_dir(), &manifest, "")?;
+    tc.install_lua_plugin("passthrough", "", serde_json::json!({}))?;
+    let tc = tc.init_server()?;
+
+    let (status, body) = get_page(tc.client()?, "/plugins").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.matches("permissions: entries.delete").count(),
+        1,
+        "{body}"
+    );
+    Ok(())
+}
+
 /// The settings page links to the plugins page, which links back to it.
 #[tokio::test]
 async fn the_settings_page_links_to_the_plugins_page() -> Result<()> {

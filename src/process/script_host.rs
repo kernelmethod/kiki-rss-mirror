@@ -54,7 +54,7 @@ use std::io::{self, BufReader};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::process::Child;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -175,7 +175,7 @@ pub struct ScriptHost {
     /// The [`EventSet::to_bits`] of the events the child's plugins have
     /// handlers for, as of its last response: every event until it has
     /// answered once, and none once the host is retired.
-    subscribed: AtomicU8,
+    subscribed: AtomicU16,
 }
 
 impl ScriptHost {
@@ -208,7 +208,7 @@ impl ScriptHost {
         Ok(ScriptHost {
             state: Mutex::new(Some(Live { channel, child })),
             services: RwLock::new(None),
-            subscribed: AtomicU8::new(EventSet::ALL.to_bits()),
+            subscribed: AtomicU16::new(EventSet::ALL.to_bits()),
         })
     }
 

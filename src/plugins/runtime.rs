@@ -18,7 +18,7 @@
 //! a plugin that needs to apply itself to the entries already stored starts a
 //! scan of them (see [`crate::plugins::services`]).
 
-use super::services::ServerServices;
+use super::services::{LoadedPlugins, ServerServices};
 use super::{discover, Discovery, PluginError};
 use crate::db::plugins::PluginConfigError;
 use crate::metrics::Metrics;
@@ -108,11 +108,10 @@ impl PluginRuntime {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Self, ReloadError> {
         let discovery = ArcSwap::from_pointee(Discovery::default());
-        let services = Arc::new(ServerServices::new(
-            db.clone(),
-            script_runner.clone(),
-            cancel,
-        ));
+        let services = Arc::new(
+            ServerServices::new(db.clone(), script_runner.clone(), cancel)
+                .with_metrics(metrics.clone()),
+        );
         #[cfg(unix)]
         if let Some(host) = &script_host {
             host.set_services(services.clone());
@@ -179,8 +178,9 @@ impl PluginRuntime {
         if changed {
             // Set before the plugins load, since the calls they make while
             // loading are only answered for plugins that are loaded.
-            let names = sources.iter().map(|s| s.name.clone()).collect();
-            let previous = self.services.set_loaded(names);
+            let previous = self
+                .services
+                .set_loaded(loaded_plugins(&discovery, &sources));
             if let Err(e) = self.load(&discovery) {
                 // The plugins that were running keep running, and keep
                 // being reported, so that what the API reports as running
@@ -194,6 +194,11 @@ impl PluginRuntime {
                 return Err(e);
             }
             *last_sources = Some(sources);
+        } else {
+            // The code and config are as they were, but a manifest's
+            // permissions may have changed.
+            self.services
+                .set_loaded(loaded_plugins(&discovery, &sources));
         }
         self.discovery.store(discovery);
         Ok(ReloadOutcome { loaded, changed })
@@ -231,6 +236,23 @@ impl PluginRuntime {
         }
         result
     }
+}
+
+/// The plugins `sources` were loaded from, with the permissions their
+/// manifests in `discovery` ask for.
+fn loaded_plugins(discovery: &Discovery, sources: &[ScriptSource]) -> LoadedPlugins {
+    sources
+        .iter()
+        .map(|source| {
+            let permissions = discovery
+                .plugins
+                .iter()
+                .find(|p| p.manifest.name == source.name)
+                .map(|p| p.manifest.permissions.clone())
+                .unwrap_or_default();
+            (source.name.clone(), permissions)
+        })
+        .collect()
 }
 
 /// Starts watching the plugins directory of `runtime`, reloading its

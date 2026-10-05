@@ -76,7 +76,6 @@ pub fn requirement(method: &Method, path: &str) -> Option<Requirement> {
             scope(Read)
         }
         ("DELETE", "/v1/entries/id/{id}") => scope(Feeds),
-        ("POST", "/v1/entries/cleanup") => scope(Feeds),
         ("PUT", "/v1/entries/id/{id}/tags") => scope(Tags),
         ("PUT" | "DELETE", "/v1/entries/id/{id}/system-tags/{name}") => scope(State),
 

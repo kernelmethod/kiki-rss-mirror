@@ -193,39 +193,6 @@ async fn updates_are_saved_to_the_config_file() -> Result<()> {
 }
 
 #[tokio::test]
-async fn retention_can_be_set_and_cleared() -> Result<()> {
-    let tc = TestBuilder::all().build()?;
-    let client = tc.client()?;
-
-    let resp = client
-        .put("http://localhost/v1/settings/retention")
-        .json(&serde_json::json!({"max_age_days": 30}))
-        .send()
-        .await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = get_json(&client, "/v1/settings/retention").await?;
-    assert_eq!(body["max_age_days"], 30);
-
-    let resp = client
-        .put("http://localhost/v1/settings/retention")
-        .json(&serde_json::json!({"max_age_days": null}))
-        .send()
-        .await?;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = get_json(&client, "/v1/settings/retention").await?;
-    assert!(body["max_age_days"].is_null());
-
-    let resp = client
-        .put("http://localhost/v1/settings/retention")
-        .json(&serde_json::json!({"max_age_days": 0}))
-        .send()
-        .await?;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn edits_to_the_config_file_reach_the_running_server() -> Result<()> {
     let tc = TestBuilder::all().build()?;
     let client = tc.client()?;
@@ -256,7 +223,7 @@ async fn an_invalid_file_on_disk_is_a_conflict() -> Result<()> {
     let client = tc.client()?;
     get_json(&client, "/v1/settings/asset-cache").await?;
 
-    for bad in ["[retention]\nmax_age_days = 0\n", "[retention\n"] {
+    for bad in ["[asset_cache]\nmax_bytes = -1\n", "[asset_cache\n"] {
         std::fs::write(config_path(&tc), bad)?;
         let resp = client
             .put("http://localhost/v1/settings/asset-cache")

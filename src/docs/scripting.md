@@ -61,6 +61,7 @@ flags = "i"
 | `description`, `authors`, `license`, `homepage` | No | Informational; shown by the API. |
 | `enabled`     | No       | Set to `false` to keep a plugin installed without running it. Defaults to `true`. |
 | `time_budget_ms` | No    | How long each call of one of the plugin's handlers may run, in milliseconds, or `"unlimited"`; see [Resource limits](#resource-limits). Defaults to `100`. |
+| `permissions` | No       | What the plugin may do beyond what every plugin can, such as `["entries.delete"]`; see [Permissions](#permissions). Defaults to none. |
 | `config`      | No       | A table holding the plugin's default config; see [Plugin config](#plugin-config). |
 | `settings`    | No       | An array describing the keys of `config`: their types, labels and descriptions; see [Describing settings](#describing-settings). |
 
@@ -109,9 +110,12 @@ that, kiki exposes a single additional global — the `kiki` table:
   parser. See [Rewriting HTML](#rewriting-html) below.
 - `kiki.store` — the plugin's own key-value store, kept in the database. See
   [Storing data](#storing-data).
-- `kiki.entries` — tag the entries already stored, and scan through them.
-  See [Stored entries](#stored-entries).
+- `kiki.entries` — tag the entries already stored, scan through them, and
+  delete them. See [Stored entries](#stored-entries) and
+  [Deleting entries](#deleting-entries).
 - `kiki.feeds` — look up the feeds entries come from. See [Feeds](#feeds).
+- `kiki.every(secs, handler)` — call `handler` every `secs` seconds. See
+  [Timers](#timers).
 
 The sandbox removes `dofile`, `loadfile`, `debug`, `io`, `package`, and the
 destructive `os.*` calls (`execute`, `exit`, `getenv`, `remove`, `rename`,
@@ -324,8 +328,11 @@ parameters such as `utm_source` from entries' URLs and the links in their
 content, and tracking pixels from their content, and can keep images from
 being downloaded for chosen feeds with `cache_assets`; `plugins/sanitize`,
 which uses [`kiki.html`](#rewriting-html) to remove scripts, styles and
-unsafe links from entries' content; and `plugins/auto-tag`, which tags
-entries that match regular expressions or come from given feeds.
+unsafe links from entries' content; `plugins/auto-tag`, which tags
+entries that match regular expressions or come from given feeds; and
+`plugins/retention`, which uses [timers](#timers) and
+[`kiki.entries.delete_where`](#deleting-entries) to delete entries some days
+after their feed stops listing them.
 
 ## Events
 
@@ -534,6 +541,77 @@ kiki.on("plugin.load", function()
 end)
 ```
 
+## Deleting entries
+
+`kiki.entries.delete_where(filter)` deletes stored entries, and returns how
+many it deleted. Deleting cannot be undone, so it needs the
+`entries.delete` [permission](#permissions).
+
+It only ever deletes entries their feed has stopped listing: an entry still
+in its feed would be fetched again on the feed's next refresh, and stored as
+a new, unread entry. Kiki notes when a refresh finds that a feed no longer
+lists an entry; `filter` says which of those entries to delete:
+
+| Filter             | Meaning |
+|--------------------|---------|
+| `dropped_before`   | Required. Delete entries their feed stopped listing before this Unix timestamp. |
+| `feed_id`          | Only delete the entries of this feed. |
+| `published_before` | Only delete entries published before this Unix timestamp. Entries with no publication date are kept. |
+| `include_saved`    | Also delete entries tagged `system:saved`, which are kept unless this is `true`. |
+
+An unknown filter raises an error, as does a missing `dropped_before`. Kiki
+deletes the entries a few hundred at a time, so that a large deletion does
+not hold up feed refreshes for long, but the call returns only once they are
+all deleted; a plugin that may delete many entries at once may need a longer
+[time budget](#resource-limits). This deletes entries that left their feed
+more than 30 days ago, and is most of the bundled `retention` plugin:
+
+```lua
+local DAY = 24 * 60 * 60
+
+local function clean_up()
+    kiki.entries.delete_where({ dropped_before = os.time() - 30 * DAY })
+end
+
+kiki.on("plugin.load", clean_up)
+kiki.every(60 * 60, clean_up)
+```
+
+## Timers
+
+`kiki.every(secs, handler)` calls `handler`, with no arguments, every `secs`
+seconds, the first time `secs` seconds after `kiki.every` is called. Kiki
+checks for timers that are due once a minute, so `secs` must be at least
+`60`, and at most a year, and a timer may run up to a minute late; one that
+runs late does not make the next one late too. Each call has the plugin's
+usual [time budget](#resource-limits), and an error in one is logged, and
+does not stop the timer.
+
+A timer can be started from the top-level chunk or from a handler. Timers
+are not kept across reloads: when plugins reload, every timer stops, and the
+top-level chunk starts its timers again. Since a timer's first call is a
+whole interval away, a plugin that wants to do its work as soon as it loads
+should do it from a `plugin.load` handler as well, as above.
+
+## Permissions
+
+Some calls do what cannot be undone, so a plugin may only make them if its
+manifest asks to, in its `permissions` array:
+
+```toml
+permissions = ["entries.delete"]
+```
+
+| Permission       | Allows |
+|------------------|--------|
+| `entries.delete` | Deleting stored entries, with [`kiki.entries.delete_where`](#deleting-entries). |
+
+A call a plugin has not asked for permission to make raises an error. A
+manifest naming a permission Kiki does not know is invalid. The permissions
+each plugin asks for are shown by `kiki plugin ls`, the web UI and
+`GET /v1/plugins`, so that you can see what a plugin may do before you
+install it.
+
 ## Feeds
 
 An entry names its feed only by `feed_id`. `kiki.feeds.get(id)` looks the
@@ -572,7 +650,8 @@ may be given to a feed added later (listen for `feed.removed` to forget it).
 ## Calls to the server
 
 Calls to `kiki.store`, `kiki.entries` and `kiki.feeds` go to the server,
-which answers them from the database. Time a handler spends waiting on them
+which answers them from the database, and checks that the plugin has the
+[permission](#permissions) a call needs. Time a handler spends waiting on them
 does not count against its [time budget](#resource-limits), up to a second
 per handler call.
 

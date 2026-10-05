@@ -219,10 +219,6 @@ mod imp {
                     FETCH_DURATION_BUCKETS,
                 )?
                 .set_buckets_for_metric(
-                    Matcher::Full("kiki_retention_cleanup_duration_seconds".to_string()),
-                    FETCH_DURATION_BUCKETS,
-                )?
-                .set_buckets_for_metric(
                     Matcher::Full("kiki_db_pool_acquire_duration_seconds".to_string()),
                     HTTP_DURATION_BUCKETS,
                 )?
@@ -467,18 +463,11 @@ mod imp {
                 SharedString::const_str("Total bytes of database pages written to the WAL."),
             );
 
-            r.describe_histogram(
-                KeyName::from_const_str("kiki_retention_cleanup_duration_seconds"),
-                None,
-                SharedString::const_str(
-                    "Duration of retention cleanup operations, labeled by scope.",
-                ),
-            );
             r.describe_counter(
                 KeyName::from_const_str("kiki_entries_deleted_total"),
                 None,
                 SharedString::const_str(
-                    "Total entries deleted by retention cleanup, labeled by scope.",
+                    "Total entries deleted by plugins with kiki.entries.delete_where, labeled by plugin.",
                 ),
             );
 
@@ -928,25 +917,12 @@ mod imp {
             }
         }
 
-        // ----- Retention -----
+        // ----- Deleted entries -----
 
-        pub fn record_retention_cleanup(
-            &self,
-            scope: &'static str,
-            duration_seconds: f64,
-            deleted: u64,
-        ) {
-            let key = Key::from_parts(
-                "kiki_retention_cleanup_duration_seconds",
-                vec![Label::new("scope", scope)],
-            );
-            self.recorder
-                .register_histogram(&key, &METADATA)
-                .record(duration_seconds);
-
+        pub fn record_entries_deleted(&self, plugin: &str, deleted: u64) {
             let key = Key::from_parts(
                 "kiki_entries_deleted_total",
-                vec![Label::new("scope", scope)],
+                vec![Label::new("plugin", plugin.to_string())],
             );
             self.recorder
                 .register_counter(&key, &METADATA)
@@ -1168,16 +1144,10 @@ mod stub {
         ) {
         }
 
-        // ----- Retention -----
+        // ----- Deleted entries -----
 
         #[inline]
-        pub fn record_retention_cleanup(
-            &self,
-            _scope: &'static str,
-            _duration_seconds: f64,
-            _deleted: u64,
-        ) {
-        }
+        pub fn record_entries_deleted(&self, _plugin: &str, _deleted: u64) {}
 
         // ----- Domain totals -----
 

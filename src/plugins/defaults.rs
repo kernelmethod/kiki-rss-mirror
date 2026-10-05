@@ -20,7 +20,8 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 /// A zstd-compressed tarball of the plugins installed by default: currently
-/// `adaptive-fetch`, `auto-tag`, `filter`, `privacy` and `sanitize`.
+/// `adaptive-fetch`, `auto-tag`, `filter`, `privacy`, `retention` and
+/// `sanitize`.
 ///
 /// Each plugin's directory is stored under its own name at the root of the
 /// archive, and holds only regular files.
@@ -280,6 +281,7 @@ fn replace_plugin(plugins_dir: &Path, name: &str, files: &[&BundledFile]) -> Res
 ///         ("auto-tag".to_string(), SyncOutcome::Installed),
 ///         ("filter".to_string(), SyncOutcome::Installed),
 ///         ("privacy".to_string(), SyncOutcome::Installed),
+///         ("retention".to_string(), SyncOutcome::Installed),
 ///         ("sanitize".to_string(), SyncOutcome::Installed),
 ///     ]
 /// );
@@ -370,6 +372,8 @@ mod tests {
                 Path::new("filter/manifest.toml"),
                 Path::new("privacy/main.lua"),
                 Path::new("privacy/manifest.toml"),
+                Path::new("retention/main.lua"),
+                Path::new("retention/manifest.toml"),
                 Path::new("sanitize/main.lua"),
                 Path::new("sanitize/manifest.toml"),
             ]
@@ -386,6 +390,8 @@ mod tests {
                 "filter",
                 "privacy",
                 "privacy",
+                "retention",
+                "retention",
                 "sanitize",
                 "sanitize"
             ]
@@ -408,6 +414,10 @@ mod tests {
         );
         assert_eq!(
             files[8].contents,
+            include_bytes!("../../plugins/retention/main.lua")
+        );
+        assert_eq!(
+            files[10].contents,
             include_bytes!("../../plugins/sanitize/main.lua")
         );
     }
@@ -423,6 +433,7 @@ mod tests {
                 "auto-tag",
                 "filter",
                 "privacy",
+                "retention",
                 "sanitize"
             ]
         );
@@ -462,6 +473,7 @@ mod tests {
                 "auto-tag",
                 "filter",
                 "privacy",
+                "retention",
                 "sanitize"
             ]
         );
@@ -515,6 +527,7 @@ mod tests {
                 "auto-tag",
                 "filter",
                 "privacy",
+                "retention",
                 "sanitize"
             ]
         );

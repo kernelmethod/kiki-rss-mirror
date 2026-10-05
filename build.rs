@@ -27,6 +27,7 @@ mod default_plugins {
         "auto-tag",
         "filter",
         "privacy",
+        "retention",
         "sanitize",
     ];
 

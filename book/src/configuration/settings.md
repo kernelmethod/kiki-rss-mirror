@@ -9,8 +9,8 @@ left alone:
 [feed_fetch]
 default_fetch_interval_seconds = 3600   # fetch new feeds hourly
 
-[retention]
-max_age_days = 30                       # forget entries 30 days after they leave their feed
+[asset_cache]
+enabled = false                         # don't download entries' images
 ```
 
 A running server applies changes to the file as it notices them. If an edit
@@ -18,15 +18,15 @@ leaves the file invalid, the server logs the problem and keeps its current
 settings. Unknown keys are rejected, so a typo is reported rather than
 silently ignored.
 
-The `feed_fetch`, `asset_cache` and `retention` sections can also be changed
-over the API, at `/v1/settings/feed-fetch`, `/v1/settings/asset-cache` and
-`/v1/settings/retention`. A `PUT` changes only the fields it is given:
+The `feed_fetch` and `asset_cache` sections can also be changed over the
+API, at `/v1/settings/feed-fetch` and `/v1/settings/asset-cache`. A `PUT`
+changes only the fields it is given:
 
 ```bash
 curl --unix-socket "$sock" --request PUT \
     --header 'Content-Type: application/json' \
-    --data '{"max_age_days": 30}' \
-    http://localhost/v1/settings/retention
+    --data '{"enabled": false}' \
+    http://localhost/v1/settings/asset-cache
 ```
 
 The API rewrites `kiki.toml` on every change, dropping its comments and
@@ -60,11 +60,10 @@ The on-disk cache of entries' images and enclosures.
 
 ## `[retention]`
 
-When old entries are deleted.
-
-| Key | Default | Description |
-| --- | ------- | ----------- |
-| `max_age_days` | unset (keep forever) | Delete entries once their feed has stopped listing them for more than this many days. Entries still in their feed, and entries tagged `system:saved`, are never deleted. Between 1 and 36500 (100 years). |
+Retired. Deleting old entries is now up to the
+[`retention`](../plugins/retention.md) plugin. A `max_age_days` left in
+`kiki.toml` from an earlier release is moved into that plugin's config when
+the server starts, and removed from the file.
 
 ## `[proxy]`
 

@@ -15,7 +15,7 @@ any client of the API can send one to limit itself to the token's scopes.
 | `read` | Reading feeds, entries, tags and cached assets, searching, and exporting OPML. |
 | `state` | Marking entries read, saved or hidden. |
 | `tags` | Creating, renaming and deleting tags, and tagging entries and feeds. Includes `state`. |
-| `feeds` | Adding, changing, refreshing and deleting feeds, importing OPML, deleting entries, and running cleanup. |
+| `feeds` | Adding, changing, refreshing and deleting feeds, importing OPML, and deleting entries. |
 | `metrics` | Scraping the Prometheus metrics at `/metrics`. |
 | `admin` | Everything: settings, plugins and their config, managing tokens, deleting cached assets and shutting the server down, as well as every other scope. |
 

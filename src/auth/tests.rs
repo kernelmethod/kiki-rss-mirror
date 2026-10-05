@@ -198,7 +198,7 @@ async fn scopes_decide_what_a_token_may_do() -> Result<()> {
         )
         .await?;
         assert_eq!(s, StatusCode::FORBIDDEN);
-        for path in ["/v1/settings/retention", "/v1/plugins", "/v1/tokens"] {
+        for path in ["/v1/settings/asset-cache", "/v1/plugins", "/v1/tokens"] {
             let s = status(client.get(format!("{url}{path}")).bearer_auth(token)).await?;
             assert_eq!(s, StatusCode::FORBIDDEN, "{path}");
         }
@@ -227,7 +227,7 @@ async fn admin_tokens_may_do_anything() -> Result<()> {
 
     for path in [
         "/v1/feeds",
-        "/v1/settings/retention",
+        "/v1/settings/asset-cache",
         "/v1/plugins",
         "/v1/tokens",
         "/metrics",
@@ -347,7 +347,7 @@ async fn read_only_anonymous_access_allows_only_reading() -> Result<()> {
         client.put(format!("{url}/v1/entries/id/1/system-tags/system:read")),
         client.delete(format!("{url}/v1/feeds/id/1")),
         client.get(format!("{url}/v1/tokens")),
-        client.get(format!("{url}/v1/settings/retention")),
+        client.get(format!("{url}/v1/settings/asset-cache")),
         client.post(format!("{url}/v1/shutdown")),
     ] {
         let resp = req.send().await?;
