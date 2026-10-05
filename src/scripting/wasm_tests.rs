@@ -603,3 +603,10 @@ fn compile_errors_name_the_plugin() {
         .unwrap();
     assert!(err.to_string().contains("'broken'"), "{err}");
 }
+
+/// Plugins are compiled to native code with Cranelift, not interpreted.
+#[test]
+fn plugins_are_compiled_to_native_code() {
+    let engine = engine().unwrap();
+    assert!(!engine.is_pulley());
+}

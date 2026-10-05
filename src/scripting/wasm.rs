@@ -151,6 +151,9 @@ fn engine() -> Result<&'static Engine, WasmError> {
     ENGINE
         .get_or_init(|| {
             let mut config = Config::new();
+            // Compile to native code with Cranelift, for the host: the JIT, not Wasmtime's
+            // Pulley interpreter, and not whatever `Auto` may come to pick.
+            config.strategy(wasmtime::Strategy::Cranelift);
             config.wasm_component_model(true);
             config.epoch_interruption(true);
             config.max_wasm_stack(MAX_WASM_STACK);
