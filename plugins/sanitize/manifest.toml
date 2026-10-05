@@ -5,6 +5,11 @@ description = "Sanitize the HTML content of new entries: keep only the elements 
 license = "MIT"
 homepage = "https://github.com/kernelmethod/kiki-rss"
 
+# Every new entry passes through this plugin, and rewriting a long entry's
+# HTML can take longer than the 100 ms other plugins get, so its handlers
+# are not timed out: an entry it gave up on would be stored unsanitized.
+time_budget_ms = "unlimited"
+
 # Rewrites each new entry's content, keeping the elements in `elements` and
 # the attributes in `attributes`, unwrapping other elements (keeping their
 # content), and removing the elements in `drop` with their content. Scripts,

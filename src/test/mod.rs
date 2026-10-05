@@ -715,6 +715,7 @@ impl TestConfig {
             license: None,
             homepage: None,
             enabled: true,
+            time_budget_ms: None,
             config,
             settings: vec![],
         };

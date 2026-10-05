@@ -75,13 +75,15 @@ pub const HOST_FD_ENV: &str = "KIKI_SCRIPT_HOST_FD";
 /// How long the server waits for a response before declaring the host
 /// dead.
 ///
-/// Generous next to the child's own per-handler budget
+/// Generous next to the child's own default per-handler budget
 /// ([`SCRIPT_TIMEOUT_MS`]) so that a slow chain of handlers, or a reload
 /// compiling many scripts, is never mistaken for a hung child — but
 /// short enough that a genuinely wedged host cannot pin a feed worker
-/// indefinitely.
+/// indefinitely. It is also the only limit on the handlers of a plugin
+/// whose budget is [`TimeBudget::Unlimited`].
 ///
 /// [`SCRIPT_TIMEOUT_MS`]: crate::scripting::lua::SCRIPT_TIMEOUT_MS
+/// [`TimeBudget::Unlimited`]: crate::scripting::TimeBudget::Unlimited
 pub const IPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Why a request to the script host could not be served.

@@ -4,7 +4,7 @@
 
 use crate::plugins::PluginManifest;
 use crate::scripting::lua::{LuaScriptRunner, ScriptError};
-use crate::scripting::{FeedEntry, ScriptRunner, ScriptSource};
+use crate::scripting::{FeedEntry, ScriptRunner, ScriptSource, TimeBudget};
 use serde_json::{json, Value};
 
 const MANIFEST: &str = include_str!("../../plugins/sanitize/manifest.toml");
@@ -13,6 +13,7 @@ const MAIN: &str = include_str!("../../plugins/sanitize/main.lua");
 /// The plugin's source, with `config` applied over its defaults.
 fn source(config: Value) -> ScriptSource {
     let manifest = PluginManifest::parse(MANIFEST).unwrap();
+    let time_budget = manifest.time_budget();
     let mut merged = manifest.config;
     if let Value::Object(overrides) = config {
         merged.extend(overrides);
@@ -20,6 +21,7 @@ fn source(config: Value) -> ScriptSource {
     let mut source = ScriptSource::new(MAIN);
     source.name = "sanitize".to_string();
     source.config = Value::Object(merged).to_string();
+    source.time_budget = time_budget;
     source
 }
 
@@ -57,6 +59,13 @@ fn sanitize(runner: &LuaScriptRunner, content: &str) -> String {
         .unwrap()
         .content
         .unwrap()
+}
+
+/// Every new entry passes through the plugin, so it is never cut short.
+#[test]
+fn has_an_unlimited_time_budget() {
+    let manifest = PluginManifest::parse(MANIFEST).unwrap();
+    assert_eq!(manifest.time_budget(), TimeBudget::Unlimited);
 }
 
 #[test]

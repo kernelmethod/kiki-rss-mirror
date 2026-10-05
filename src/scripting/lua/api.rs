@@ -8,7 +8,7 @@
 //! whether the VM runs in the server or in the sandboxed script host.
 
 use super::config::{from_lua_value, to_lua_value};
-use crate::scripting::{ScanOptions, ScriptServices, ServiceCall, ServiceReply};
+use crate::scripting::{ScanOptions, ScriptServices, ServiceCall, ServiceReply, TimeBudget};
 use mlua::prelude::*;
 use mlua::RegistryKey;
 use std::collections::HashMap;
@@ -22,6 +22,9 @@ pub(super) struct ScanCallbacks {
     pub handler: RegistryKey,
     /// Called once the scan has gone through every entry, if the plugin gave one.
     pub on_done: Option<RegistryKey>,
+    /// The time budget of the plugin that started the scan, for each call of `handler` and
+    /// `on_done`.
+    pub budget: TimeBudget,
 }
 
 /// The scans plugins have started, keyed by scan id.
@@ -125,15 +128,21 @@ fn unexpected(name: &str, reply: ServiceReply) -> LuaError {
     LuaError::RuntimeError(format!("kiki.{name}: unexpected reply {reply:?}"))
 }
 
-/// Builds the `kiki` table for the plugin named `plugin`.
-pub(super) fn plugin_kiki_table(lua: &Lua, plugin: &str, ctx: &ApiContext) -> LuaResult<LuaTable> {
+/// Builds the `kiki` table for the plugin named `plugin`, whose handlers have time budget
+/// `budget`.
+pub(super) fn plugin_kiki_table(
+    lua: &Lua,
+    plugin: &str,
+    budget: TimeBudget,
+    ctx: &ApiContext,
+) -> LuaResult<LuaTable> {
     let kiki = lua.create_table()?;
     let meta = lua.create_table()?;
     meta.set("__index", lua.globals().get::<LuaTable>("kiki")?)?;
     kiki.set_metatable(Some(meta));
 
     kiki.raw_set("store", store_table(lua, plugin, ctx)?)?;
-    kiki.raw_set("entries", entries_table(lua, plugin, ctx)?)?;
+    kiki.raw_set("entries", entries_table(lua, plugin, budget, ctx)?)?;
     kiki.raw_set("feeds", feeds_table(lua, plugin, ctx)?)?;
     Ok(kiki)
 }
@@ -204,7 +213,12 @@ fn store_table(lua: &Lua, plugin: &str, ctx: &ApiContext) -> LuaResult<LuaTable>
     Ok(store)
 }
 
-fn entries_table(lua: &Lua, plugin: &str, ctx: &ApiContext) -> LuaResult<LuaTable> {
+fn entries_table(
+    lua: &Lua,
+    plugin: &str,
+    budget: TimeBudget,
+    ctx: &ApiContext,
+) -> LuaResult<LuaTable> {
     let entries = lua.create_table()?;
 
     for (name, present) in [("tag", true), ("untag", false)] {
@@ -247,6 +261,7 @@ fn entries_table(lua: &Lua, plugin: &str, ctx: &ApiContext) -> LuaResult<LuaTabl
             let callbacks = ScanCallbacks {
                 handler: lua.create_registry_value(handler)?,
                 on_done: on_done.map(|f| lua.create_registry_value(f)).transpose()?,
+                budget,
             };
             c.scans
                 .lock()
