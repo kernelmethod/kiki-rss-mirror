@@ -18,6 +18,7 @@ preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/kernelmethod/kiki-rss"
 edit-url-template = "https://github.com/kernelmethod/kiki-rss/edit/main/book/{path}"
 additional-js = ["theme/home-link.js"]
+additional-css = ["theme/diagram.css"]
 
 [output.html.search]
 limit-results = 20
