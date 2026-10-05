@@ -8,6 +8,11 @@
 //!
 //! [#58]: https://github.com/kernelmethod/kiki-rss/pull/58
 //!
+//! WebAssembly plugins run there too, compiled to native code with
+//! Cranelift. That makes the child the one Kiki process allowed memory that
+//! is first writable and then executable (see [`crate::sandbox`]), and the
+//! compiler one more body of code that handles what plugins supply.
+//!
 //! This module moves the VM into a child process that holds nothing: no
 //! database, no filesystem (Landlock with an empty ruleset), and no way
 //! to open a socket (seccomp). Its entire view of the world is one
@@ -45,11 +50,13 @@
 use crate::process::ipc::{
     decode, encode, read_frame, write_frame, FromHost, HostRequest, HostResponse, MAX_FRAME_BYTES,
 };
+use crate::scripting::composite::CompositeRunner;
 use crate::scripting::{
     Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary, ScheduleDecision,
     ScriptRunner, ScriptServices, ScriptSource, ServiceCall, ServiceReply,
 };
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::io::{self, BufReader};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
@@ -82,9 +89,21 @@ pub const HOST_FD_ENV: &str = "KIKI_SCRIPT_HOST_FD";
 /// indefinitely. It is also the only limit on the handlers of a plugin
 /// whose budget is [`TimeBudget::Unlimited`].
 ///
+/// Requests that make the child load WebAssembly plugins are allowed
+/// longer; see [`ScriptHost::request`].
+///
 /// [`SCRIPT_TIMEOUT_MS`]: crate::scripting::lua::SCRIPT_TIMEOUT_MS
 /// [`TimeBudget::Unlimited`]: crate::scripting::TimeBudget::Unlimited
 pub const IPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How much longer than [`IPC_TIMEOUT`] the server waits for the child to
+/// compile a WebAssembly component, per MiB of component (or part of one).
+///
+/// Cranelift compiles about a MiB a second; this leaves room for a slow or
+/// busy machine. Compiling can't be interrupted, but takes time in
+/// proportion to the component's size, which is capped (see
+/// [`crate::plugins::MAX_WASM_COMPONENT_BYTES`]).
+pub const COMPILE_TIME_PER_MIB: Duration = Duration::from_secs(10);
 
 /// Why a request to the script host could not be served.
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +169,8 @@ impl Channel {
 struct Live {
     channel: Channel,
     child: Child,
+    /// The read and write timeout the socket has now.
+    timeout: Duration,
 }
 
 /// A handle to the script host child process.
@@ -163,10 +184,11 @@ struct Live {
 /// [`Self::request`] blocks the calling thread. Dispatch already happens
 /// from synchronous code interleaved with SQLite writes, so this is not
 /// a new kind of stall — but the worst case is bounded differently:
-/// a wedged child costs one caller up to [`IPC_TIMEOUT`], *once*. That
-/// caller retires the host while still holding the mutex, so everyone
-/// queued behind it finds a dead host and returns immediately rather
-/// than each waiting out its own timeout.
+/// a wedged child costs one caller up to [`IPC_TIMEOUT`] (or the longer
+/// wait [`Self::request`] allows a request that loads WebAssembly plugins),
+/// *once*. That caller retires the host while still holding the mutex, so
+/// everyone queued behind it finds a dead host and returns immediately
+/// rather than each waiting out its own timeout.
 pub struct ScriptHost {
     state: Mutex<Option<Live>>,
     /// Answers the calls plugins make while a request is served. Calls
@@ -176,6 +198,9 @@ pub struct ScriptHost {
     /// handlers for, as of its last response: every event until it has
     /// answered once, and none once the host is retired.
     subscribed: AtomicU16,
+    /// The hashes of the WebAssembly components the child has compiled and
+    /// kept, which sources can name without sending them again.
+    components: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl ScriptHost {
@@ -206,9 +231,14 @@ impl ScriptHost {
 
         info!(pid = child.id(), "script host: spawned");
         Ok(ScriptHost {
-            state: Mutex::new(Some(Live { channel, child })),
+            state: Mutex::new(Some(Live {
+                channel,
+                child,
+                timeout: IPC_TIMEOUT,
+            })),
             services: RwLock::new(None),
             subscribed: AtomicU16::new(EventSet::ALL.to_bits()),
+            components: Mutex::new(HashSet::new()),
         })
     }
 
@@ -220,14 +250,29 @@ impl ScriptHost {
 
     /// Send `request` and wait for the matching response.
     ///
-    /// Any channel-level failure retires the host: the child is killed
-    /// and every subsequent call returns [`HostError::Dead`].
+    /// The server waits up to [`IPC_TIMEOUT`] for each frame from the
+    /// child, and longer for the work of loading WebAssembly plugins, which
+    /// is bounded but can take longer than that (see [`Self::timeout`]).
+    /// Any channel-level failure, a timeout among them, retires the host:
+    /// the child is killed and every subsequent call returns
+    /// [`HostError::Dead`].
     pub fn request(&self, request: &HostRequest) -> Result<HostResponse, HostError> {
+        let timeout = self.timeout(request);
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let live = match guard.as_mut() {
             Some(live) => live,
             None => return Err(HostError::Dead),
         };
+        if live.timeout != timeout {
+            // Nothing has gone out yet, so the channel is still in step if
+            // this fails.
+            let socket = live.channel.reader.get_ref();
+            socket
+                .set_read_timeout(Some(timeout))
+                .and_then(|()| socket.set_write_timeout(Some(timeout)))
+                .map_err(|e| HostError::Failed(format!("setting the timeout: {e}")))?;
+            live.timeout = timeout;
+        }
 
         let services = self
             .services
@@ -264,14 +309,73 @@ impl ScriptHost {
         }
     }
 
+    /// How long to wait for each frame of the answer to `request`:
+    ///
+    /// * compiling a WebAssembly component gets [`COMPILE_TIME_PER_MIB`] more
+    ///   per MiB of it;
+    /// * a reload gets [`WASM_LOAD_BUDGET`] more per WebAssembly plugin,
+    ///   each of which may take that long to load;
+    /// * while WebAssembly plugins are loaded, anything else gets one
+    ///   [`WASM_LOAD_BUDGET`] more, since the child restarts a plugin that
+    ///   trapped when it is next needed, one per request at most.
+    ///
+    /// [`WASM_LOAD_BUDGET`]: crate::scripting::WASM_LOAD_BUDGET
+    fn timeout(&self, request: &HostRequest) -> Duration {
+        let wasm_loaded = !self
+            .components
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        request_timeout(request, wasm_loaded)
+    }
+
     /// Rebuild the child's VM from `sources`, replacing whatever it was
     /// running. If `sources` fail to compile, the child keeps running the
     /// VM it had.
     ///
+    /// Each WebAssembly component the child has not compiled yet is sent
+    /// first, in a message of its own; the sources then name it by hash.
+    ///
     /// Returns the number of scripts the child compiled.
-    pub fn reload(&self, sources: Vec<ScriptSource>) -> Result<usize, HostError> {
+    pub fn reload(&self, mut sources: Vec<ScriptSource>) -> Result<usize, HostError> {
+        let mut used = HashSet::new();
+        for source in &mut sources {
+            let Some(component) = source.component.as_mut() else {
+                continue;
+            };
+            used.insert(component.hash);
+            let known = self
+                .components
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&component.hash);
+            if !known {
+                let put = HostRequest::PutComponent {
+                    plugin: source.name.clone(),
+                    component: component.clone(),
+                };
+                match self.request(&put)? {
+                    HostResponse::Ack => {}
+                    other => {
+                        return Err(HostError::Protocol(format!("expected Ack, got {other:?}")))
+                    }
+                }
+                self.components
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(component.hash);
+            }
+            component.bytes = Vec::new();
+        }
         match self.request(&HostRequest::Reload { sources })? {
-            HostResponse::Reloaded { loaded } => Ok(loaded),
+            HostResponse::Reloaded { loaded } => {
+                // The child forgets the components no plugin uses any more.
+                self.components
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|hash| used.contains(hash));
+                Ok(loaded)
+            }
             other => Err(HostError::Protocol(format!(
                 "expected Reloaded, got {other:?}"
             ))),
@@ -303,6 +407,25 @@ impl Drop for ScriptHost {
             drop(live.channel);
             crate::process::reap(live.child);
         }
+    }
+}
+
+/// How long to wait for each frame of the answer to `request`, given
+/// whether WebAssembly plugins are loaded; see [`ScriptHost::timeout`].
+fn request_timeout(request: &HostRequest, wasm_loaded: bool) -> Duration {
+    use crate::scripting::WASM_LOAD_BUDGET;
+    const MIB: usize = 1024 * 1024;
+    match request {
+        HostRequest::PutComponent { component, .. } => {
+            let mib = component.bytes.len().div_ceil(MIB).max(1) as u32;
+            IPC_TIMEOUT + COMPILE_TIME_PER_MIB * mib
+        }
+        HostRequest::Reload { sources } => {
+            let wasm = sources.iter().filter(|s| s.component.is_some()).count() as u32;
+            IPC_TIMEOUT + WASM_LOAD_BUDGET * wasm
+        }
+        _ if wasm_loaded => IPC_TIMEOUT + WASM_LOAD_BUDGET,
+        _ => IPC_TIMEOUT,
     }
 }
 
@@ -520,7 +643,7 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
 
     if no_sandbox {
         warn!(
-            "script host: sandbox disabled via --no-sandbox; the Lua VM runs with full \
+            "script host: sandbox disabled via --no-sandbox; plugins run with full \
              filesystem and syscall access"
         );
     } else {
@@ -535,7 +658,7 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
         channel: channel.clone(),
     });
 
-    let mut runner: Option<crate::scripting::lua::LuaScriptRunner> = None;
+    let mut runner: Option<CompositeRunner> = None;
 
     loop {
         let frame = match read_frame(&mut channel.lock().unwrap_or_else(|e| e.into_inner()).reader)
@@ -611,19 +734,23 @@ impl ScriptServices for IpcServices {
 
 /// Handle a single request against the child's current VM.
 fn serve(
-    runner: &mut Option<crate::scripting::lua::LuaScriptRunner>,
+    runner: &mut Option<CompositeRunner>,
     services: &Arc<dyn ScriptServices>,
     request: HostRequest,
 ) -> HostResponse {
     match request {
         HostRequest::Reload { sources } => {
             let count = sources.len();
-            match crate::scripting::lua::LuaScriptRunner::from_sources_with(
-                &sources,
-                Some(services.clone()),
-            ) {
+            match CompositeRunner::from_sources_with(&sources, Some(services.clone())) {
                 Ok(new_runner) => {
                     *runner = Some(new_runner);
+                    #[cfg(feature = "wasm-plugins")]
+                    crate::scripting::wasm::retain_components(
+                        &sources
+                            .iter()
+                            .filter_map(|s| s.component.as_ref().map(|c| c.hash))
+                            .collect(),
+                    );
                     HostResponse::Reloaded { loaded: count }
                 }
                 Err(e) => {
@@ -682,9 +809,30 @@ fn serve(
             HostResponse::Ack
         }
 
+        HostRequest::PutComponent { plugin, component } => put_component(&plugin, &component),
+
         HostRequest::CallResult { .. } => HostResponse::Failed {
             message: "a call result arrived with no call outstanding".to_string(),
         },
+    }
+}
+
+/// Compile `component` and keep it for the next reload.
+#[cfg(feature = "wasm-plugins")]
+fn put_component(plugin: &str, component: &crate::scripting::WasmComponent) -> HostResponse {
+    match crate::scripting::wasm::put_component(plugin, component) {
+        Ok(()) => HostResponse::Ack,
+        Err(e) => HostResponse::Failed {
+            message: format!("{e}"),
+        },
+    }
+}
+
+/// See the variant of this function built with the `wasm-plugins` feature.
+#[cfg(not(feature = "wasm-plugins"))]
+fn put_component(_: &str, _: &crate::scripting::WasmComponent) -> HostResponse {
+    HostResponse::Failed {
+        message: "this build of Kiki cannot run WebAssembly plugins".to_string(),
     }
 }
 
@@ -719,6 +867,43 @@ mod tests {
         })
         .unwrap()
         .len()
+    }
+
+    /// Loading WebAssembly plugins is given time in proportion to the work.
+    #[test]
+    fn timeouts_grow_with_the_work_of_loading_plugins() {
+        use crate::scripting::{ScriptSource, WasmComponent, WASM_LOAD_BUDGET};
+        let put = |len: usize| HostRequest::PutComponent {
+            plugin: "p".to_string(),
+            component: WasmComponent::new(vec![0; len]),
+        };
+        assert_eq!(
+            request_timeout(&put(10), false),
+            IPC_TIMEOUT + COMPILE_TIME_PER_MIB
+        );
+        assert_eq!(
+            request_timeout(&put(7 * 1024 * 1024), false),
+            IPC_TIMEOUT + COMPILE_TIME_PER_MIB * 7
+        );
+
+        let reload = HostRequest::Reload {
+            sources: vec![
+                ScriptSource::wasm(vec![]),
+                ScriptSource::new(""),
+                ScriptSource::wasm(vec![]),
+            ],
+        };
+        assert_eq!(
+            request_timeout(&reload, false),
+            IPC_TIMEOUT + WASM_LOAD_BUDGET * 2
+        );
+
+        let event = HostRequest::TransformEntry { entry: entry(1, 1) };
+        assert_eq!(request_timeout(&event, false), IPC_TIMEOUT);
+        assert_eq!(
+            request_timeout(&event, true),
+            IPC_TIMEOUT + WASM_LOAD_BUDGET
+        );
     }
 
     #[test]

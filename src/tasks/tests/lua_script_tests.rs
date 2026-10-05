@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use super::super::scripting::load_lua_sources;
+use super::super::scripting::load_plugin_sources;
 use super::super::*;
 use crate::scripting::ScriptRunner;
 use crate::test::TestBuilder;
@@ -53,7 +53,7 @@ async fn integration_filter_script_drops_all_entries() -> Result<()> {
     .await?;
 
     let runner = {
-        let sources = load_lua_sources(&crate::plugins::discover(&tc.plugins_dir())?);
+        let sources = load_plugin_sources(&crate::plugins::discover(&tc.plugins_dir())?);
         crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     refresh_feed(
@@ -91,7 +91,7 @@ async fn integration_modify_script_changes_titles() -> Result<()> {
     .await?;
 
     let runner = {
-        let sources = load_lua_sources(&crate::plugins::discover(&tc.plugins_dir())?);
+        let sources = load_plugin_sources(&crate::plugins::discover(&tc.plugins_dir())?);
         crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     refresh_feed(
@@ -142,7 +142,7 @@ async fn integration_content_script_preserves_rss_description() -> Result<()> {
     )?;
 
     let runner = {
-        let sources = load_lua_sources(&crate::plugins::discover(&tc.plugins_dir())?);
+        let sources = load_plugin_sources(&crate::plugins::discover(&tc.plugins_dir())?);
         crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     refresh_feed(
@@ -187,7 +187,7 @@ async fn integration_tagging_script_adds_tags() -> Result<()> {
     .await?;
 
     let runner = {
-        let sources = load_lua_sources(&crate::plugins::discover(&tc.plugins_dir())?);
+        let sources = load_plugin_sources(&crate::plugins::discover(&tc.plugins_dir())?);
         crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     refresh_feed(
@@ -257,7 +257,7 @@ async fn integration_filter_script_prevents_tagging_script() -> Result<()> {
     let pool = make_pool(&tc.database_path())?;
 
     let runner = {
-        let sources = load_lua_sources(&crate::plugins::discover(&tc.plugins_dir())?);
+        let sources = load_plugin_sources(&crate::plugins::discover(&tc.plugins_dir())?);
         crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     refresh_feed(
@@ -322,7 +322,7 @@ async fn integration_configured_regex_filter_hides_entries() -> Result<()> {
     .await?;
 
     let runner = {
-        let sources = load_lua_sources(&crate::plugins::discover(&tc.plugins_dir())?);
+        let sources = load_plugin_sources(&crate::plugins::discover(&tc.plugins_dir())?);
         crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     let metrics = super::test_metrics();
@@ -392,7 +392,7 @@ async fn integration_scripts_can_skip_asset_caching() -> Result<()> {
     .await?;
 
     let runner = {
-        let sources = load_lua_sources(&crate::plugins::discover(&tc.plugins_dir())?);
+        let sources = load_plugin_sources(&crate::plugins::discover(&tc.plugins_dir())?);
         crate::scripting::lua::LuaScriptRunner::from_sources(&sources)?
     };
     let (tx, rx) = async_channel::unbounded();

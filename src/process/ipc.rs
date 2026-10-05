@@ -33,7 +33,7 @@
 
 use crate::scripting::{
     Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary, ScheduleDecision,
-    ScriptSource, ServiceCall, ServiceReply,
+    ScriptSource, ServiceCall, ServiceReply, WasmComponent,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, IoSlice, Read, Write};
@@ -54,6 +54,8 @@ pub enum HostRequest {
     /// `sources`, each script with its config.
     ///
     /// Sent when the server starts, and whenever plugins are reloaded.
+    /// The WebAssembly components among `sources` carry only their hash:
+    /// each was sent beforehand with [`HostRequest::PutComponent`].
     Reload { sources: Vec<ScriptSource> },
 
     /// Run `entry` through the `entry.ingest` handler chain.
@@ -85,6 +87,19 @@ pub enum HostRequest {
     /// Run `schedule` through the `fetch.schedule` handler chain. Answered
     /// with [`HostResponse::Schedule`].
     Schedule { schedule: FetchSchedule },
+
+    /// Compile `component`, the code of the WebAssembly plugin named
+    /// `plugin`, and keep it, so that a later [`HostRequest::Reload`] can
+    /// name it by hash alone. Answered
+    /// with [`HostResponse::Ack`], or [`HostResponse::Failed`] if it does
+    /// not compile.
+    ///
+    /// Each component gets a message of its own, so that a few large ones
+    /// don't make a `Reload` too large for a frame.
+    PutComponent {
+        plugin: String,
+        component: WasmComponent,
+    },
 }
 
 /// A message from the script host back to the server.

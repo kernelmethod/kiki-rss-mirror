@@ -45,8 +45,8 @@ path, and a directory Kiki creates for it is readable by your user alone. See [S
 
 **Plugins** are installed by you, so Kiki doesn't treat them as attackers.
 They still run in a process of their own with nothing to reach but the
-server, because a plugin is Lua that runs over text a feed wrote, inside a
-Lua VM written in C. A buggy plugin, or a feed that subverts one, shouldn't
+server, because a plugin is code that runs over text a feed wrote, inside a
+Lua VM written in C or as WebAssembly compiled to native code. A buggy plugin, or a feed that subverts one, shouldn't
 put the database within reach.
 
 ## Processes
@@ -107,7 +107,7 @@ with a sandbox fitted to its own job:
   <text class="title" x="36" y="394">script host</text>
   <text x="36" y="414">files: none</text>
   <text x="36" y="430">sockets: none</text>
-  <text x="36" y="446">runs plugins' Lua</text>
+  <text x="36" y="446">runs plugins</text>
   <!-- Feed fetcher -->
   <rect class="group" x="235" y="335" width="550" height="280" rx="10"/>
   <text class="note" x="249" y="353">feed fetcher</text>
@@ -226,7 +226,12 @@ every process it starts:
   use for. Only the supervisor may `execve`, and then only the kiki
   executable.
 - **`PR_SET_MDWE`** refuses memory that is both writable and executable,
-  so injected code can't be written into memory and then run.
+  so injected code can't be written into memory and then run. Every
+  process gets it but the script host, which compiles WebAssembly plugins
+  to native code, and so must write code and then run it. (A build
+  without the `wasm-plugins` feature refuses it in the script host too.)
+  For the same reason, the systemd units Kiki ships don't set
+  `MemoryDenyWriteExecute=`, which every process would inherit.
 
 Each of these depends on the kernel:
 
@@ -315,13 +320,24 @@ no files and no sockets. What it can do is what the plugin API allows:
 - read the URL and title of any feed;
 - read and write plugin state. The server keeps each plugin's state
   apart, but it takes the script host's word for which plugin is asking, so
-  code that breaks out of the Lua VM can reach every plugin's state.
+  code that breaks out of the Lua VM, or out of a WebAssembly plugin's
+  sandbox, can reach every plugin's state.
 
 Plugins that ask for different permissions run in separate Lua VMs, so a
 plugin without `entries.delete` can't change the code of one that has it,
-such as by replacing `string.format`. All the VMs share the script host
-process, though, so code that breaks out of a VM can make any call, with any
-plugin's permissions.
+such as by replacing `string.format`. Each WebAssembly plugin runs in an
+instance of its own, sharing no memory with any other plugin. All of them
+share the script host process, though, so code that breaks out of a VM or
+an instance can make any call, with any plugin's permissions.
+
+The script host compiles WebAssembly plugins to native code with Wasmtime's
+Cranelift compiler, so it may write code to memory and then run it, which no
+other Kiki process may. A bug in Cranelift, or in Wasmtime's sandboxing, that
+lets a plugin run code of its own lands in the script host, with no files,
+no sockets, and only the plugin API to reach the server through: the same
+place a Lua VM escape lands. What the host loses is a defence against
+memory-corruption exploits, which can no longer be stopped from writing new
+code and running it.
 
 Each handler has a time and a memory budget (see
 [Resource limits](writing-plugins.md#resource-limits)). A plugin's manifest
@@ -330,7 +346,9 @@ entry is stored unsanitized; the server still stops a script host that
 doesn't answer for 10 seconds. A script host that
 crashes or stops answering is not replaced; plugins stay disabled until
 Kiki is restarted, rather than handing a fresh Lua VM to whatever broke the
-last one. Entries keep flowing in either way.
+last one. Entries keep flowing in either way. A WebAssembly plugin that
+traps, such as by running out of time or memory, is started afresh in the
+script host, and disabled until plugins reload if it keeps trapping.
 
 `kiki serve --no-script-isolation` runs plugins inside the server instead,
 with the server's access to the database. Avoid it unless the script host

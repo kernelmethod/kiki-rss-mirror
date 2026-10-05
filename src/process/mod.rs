@@ -36,7 +36,8 @@
 //! network connections at all. Within it, the worker downloads, the parser
 //! parses, and the resolver looks hostnames up, each in a process of its
 //! own. The server keeps the database, scheduling, and script dispatch.
-//! The script host ([`script_host`]) runs user-supplied Lua.
+//! The script host ([`script_host`]) runs plugins: user-supplied Lua, and
+//! WebAssembly compiled to native code.
 //!
 //! # Spawning order
 //!

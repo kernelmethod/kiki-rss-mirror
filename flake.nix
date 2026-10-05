@@ -26,6 +26,12 @@
               # Bundled plugins, packed into a .tar.zst by build.rs and pulled
               # into tests via include_str! (e.g. plugins/filter/main.lua)
               pluginsFilter = path: _type: builtins.match ".*/plugins(/.*)?" path != null;
+              # The WebAssembly plugin interface, read by wasmtime's bindgen!
+              # (src/scripting/wasm.rs), and the plugin its tests run
+              # (tests/wasm-fixture/fixture.wasm, via include_bytes!)
+              witFilter = path: _type: builtins.match ".*/wit(/.*)?" path != null;
+              wasmFixtureFilter = path: _type:
+                builtins.match ".*/tests/wasm-fixture(/fixture\\.wasm)?" path != null;
               # The guide in book/ is built separately (see `book` below);
               # leaving it out means editing it doesn't rebuild the crate.
               notBook = path: path != toString ./book
@@ -33,6 +39,7 @@
               customOrCargo = path: type: (notBook path) && (
                 (sqlFilter path type) || (xmlFilter path type) || (docsFilter path type)
                 || (webUiFilter path type) || (pluginsFilter path type)
+                || (witFilter path type) || (wasmFixtureFilter path type)
                 || (craneLib.filterCargoSources path type));
             in
               pkgs.lib.cleanSourceWith {

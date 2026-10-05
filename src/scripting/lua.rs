@@ -34,13 +34,16 @@
 //! and have limits of their own; see the `regex_api` and `html_api` modules.
 
 mod api;
+
+pub use api::MAX_TIMER_INTERVAL;
 mod config;
 mod html_api;
 mod regex_api;
 
 use super::{
-    parse_script_config, Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary,
-    ScheduleDecision, ScriptRunner, ScriptServices, ScriptSource, TimeBudget,
+    parse_script_config, restore_read_only, Event, EventPayload, EventSet, FeedEntry,
+    FetchSchedule, ScanSummary, ScheduleDecision, ScriptRunner, ScriptServices, ScriptSource,
+    TimeBudget,
 };
 use crate::plugins::Permission;
 use api::{ApiContext, Budget};
@@ -256,17 +259,6 @@ fn wait_from_lua(value: &LuaValue) -> Result<Option<u64>, String> {
     }
 }
 
-/// Copies the fields scripts may not change from `original` onto `modified`, the entry a
-/// handler returned.
-fn restore_read_only(modified: &mut FeedEntry, original: &FeedEntry) {
-    modified.id = original.id;
-    modified.feed_id = original.feed_id;
-    modified.syndication_format = original.syndication_format.clone();
-    modified.guid = original.guid.clone();
-    modified.authors = original.authors.clone();
-    modified.categories = original.categories.clone();
-}
-
 /// A handler registered with `kiki.on`, with the name and time budget of the plugin that
 /// registered it.
 struct Handler {
@@ -420,6 +412,14 @@ impl LuaScriptRunner {
             }
         }
         out
+    }
+
+    /// Whether a plugin in this runner started the scan `scan_id`, which has not finished.
+    pub fn has_scan(&self, scan_id: u64) -> bool {
+        self.scans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&scan_id)
     }
 
     /// The events at least one handler is registered for.

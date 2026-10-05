@@ -171,7 +171,7 @@ impl PluginRuntime {
             .read_blocking(|conn| crate::db::plugins::all_config_overrides(conn))??;
         discovery.apply_config_overrides(overrides);
 
-        let sources = super::load_sources(&discovery, super::PluginEngine::Lua);
+        let sources = super::load_sources(&discovery);
         let loaded = sources.len();
         let changed = last_sources.as_ref() != Some(&sources);
         let discovery = Arc::new(discovery);

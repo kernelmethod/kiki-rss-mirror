@@ -64,7 +64,10 @@ SystemCallFilter=@system-service @sandbox
 SystemCallFilter=~@privileged @resources @mount @swap @reboot @module @debug @cpu-emulation @obsolete @raw-io @keyring
 
 # Memory & execution
-MemoryDenyWriteExecute=yes
+# No MemoryDenyWriteExecute=: the script host compiles WebAssembly plugins
+# to native code, and the setting would be inherited by it and cannot be
+# lifted. Every other kiki process refuses writable and executable memory
+# itself, with PR_SET_MDWE (Linux 6.3+).
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

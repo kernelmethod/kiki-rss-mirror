@@ -1,0 +1,181 @@
+// The interface between Kiki and plugins written as WebAssembly components.
+//
+// A plugin whose manifest says `engine = "wasm"` is a component targeting the
+// `plugin` world below. It is the WebAssembly counterpart of the Lua API
+// described in the guide's "Writing plugins" chapter: the same events, the
+// same calls to the server, with the same limits and permissions.
+//
+// The host keeps a copy of this file; see src/scripting/wasm.rs.
+
+package kiki:plugin@0.1.0;
+
+interface types {
+    /// The levels `log` writes at.
+    enum level { debug, info, warn, error }
+
+    /// The events a plugin can handle. `init` returns the ones it does, and
+    /// only those are delivered to it.
+    enum event-kind {
+        entry-parsed,
+        entry-ingest,
+        fetch-success,
+        fetch-error,
+        feed-added,
+        feed-removed,
+        plugin-load,
+        fetch-schedule,
+    }
+
+    /// A feed entry. `id`, `feed-id`, `syndication-format`, `guid`, `authors`
+    /// and `categories` are read-only: changes a handler makes to them are
+    /// discarded.
+    record entry {
+        /// The stored entry's id; `none` for an entry being ingested.
+        id: option<s64>,
+        feed-id: s64,
+        /// `"rss"` or `"atom"`.
+        syndication-format: string,
+        guid: string,
+        /// Unix timestamp.
+        published-at: option<s64>,
+        title: string,
+        url: option<string>,
+        /// HTML.
+        content: option<string>,
+        authors: list<string>,
+        categories: list<string>,
+        tags: list<string>,
+        cache-assets: bool,
+    }
+
+    /// `fetch.success`: a feed was fetched.
+    record fetch-success {
+        feed-id: s64,
+        status: u16,
+        url: string,
+        content-length: option<u64>,
+    }
+
+    /// `fetch.error`: a feed could not be fetched.
+    record fetch-error {
+        feed-id: s64,
+        /// `"http"`, `"timeout"`, `"network"`, `"too_many_redirects"`,
+        /// `"body_too_large"`, `"parse"` or `"fetcher"`.
+        kind: string,
+        status: option<u16>,
+        message: string,
+        retry-after: option<s64>,
+    }
+
+    /// A feed, as `feed.added` and `feed.removed` describe it.
+    record feed-event {
+        id: s64,
+        url: string,
+        title: string,
+    }
+
+    /// A feed, as `get-feed` returns it.
+    record feed {
+        id: s64,
+        /// The URL it is fetched from, if any.
+        url: option<string>,
+        title: string,
+    }
+
+    enum content-change { changed, unchanged, unknown }
+
+    /// `fetch.schedule`: the wait before a feed's next fetch.
+    record fetch-schedule {
+        feed-id: s64,
+        status: u16,
+        change: content-change,
+        hint-secs: u64,
+        interval-secs: u64,
+        min-cadence-secs: u64,
+        wait-secs: u64,
+    }
+
+    /// Which stored entries a scan visits.
+    record scan-options {
+        feed-id: option<s64>,
+        since: option<s64>,
+        include-hidden: bool,
+    }
+
+    /// What a finished scan did.
+    record scan-summary {
+        scanned: u64,
+        updated: u64,
+    }
+
+    /// Which stored entries `delete-entries` deletes.
+    record delete-filter {
+        dropped-before: s64,
+        feed-id: option<s64>,
+        published-before: option<s64>,
+        /// Defaults to `["system:saved"]`; an empty list keeps nothing.
+        keep-tagged: option<list<string>>,
+    }
+}
+
+/// What the server does for plugins: the counterparts of `kiki.log`,
+/// `kiki.store`, `kiki.entries`, `kiki.feeds` and `kiki.every`.
+interface host {
+    use types.{level, feed, scan-options, delete-filter};
+
+    /// Write `message` to the server log.
+    log: func(level: level, message: string);
+
+    /// The value stored under `key`, as JSON text, or `none`.
+    store-get: func(key: string) -> result<option<string>, string>;
+    /// Store `value`, JSON text, under `key`, or remove the key if `none`.
+    store-set: func(key: string, value: option<string>) -> result<_, string>;
+
+    /// Add the tag `name` to the stored entry `id`; whether it was added.
+    tag-entry: func(id: s64, name: string) -> result<bool, string>;
+    /// Remove the tag `name` from the stored entry `id`; whether it had it.
+    untag-entry: func(id: s64, name: string) -> result<bool, string>;
+    /// Start a scan of the stored entries; returns its id. Its entries go
+    /// to `on-scan-entry`, and `on-scan-done` follows once it has gone
+    /// through them all. Not allowed from `init`.
+    start-scan: func(options: scan-options) -> result<u64, string>;
+    /// Delete stored entries their feed no longer lists; returns how many.
+    /// Needs the `entries.delete` permission.
+    delete-entries: func(filter: delete-filter) -> result<u64, string>;
+
+    /// The feed `id`, or `none`.
+    get-feed: func(id: s64) -> result<option<feed>, string>;
+
+    /// Call `on-timer` with the returned id every `secs` seconds (60 to a
+    /// year), starting `secs` seconds from now.
+    every: func(secs: u64) -> result<u32, string>;
+}
+
+world plugin {
+    use types.{
+        event-kind, entry, fetch-success, fetch-error, feed-event,
+        fetch-schedule, scan-summary,
+    };
+    import host;
+
+    /// Called when plugins load, with the plugin's config as a JSON
+    /// object. Returns the events the plugin handles, or an error, which
+    /// fails the load.
+    export init: func(config: string) -> result<list<event-kind>, string>;
+
+    export on-entry-parsed: func(entry: entry);
+    /// Return the entry, possibly changed, to keep it, or `none` to drop it.
+    export on-entry-ingest: func(entry: entry) -> option<entry>;
+    export on-fetch-success: func(event: fetch-success);
+    export on-fetch-error: func(event: fetch-error);
+    export on-feed-added: func(feed: feed-event);
+    export on-feed-removed: func(feed: feed-event);
+    export on-plugin-load: func();
+    /// Return a longer wait in seconds, or `none` to leave it.
+    export on-fetch-schedule: func(schedule: fetch-schedule) -> option<u64>;
+    export on-timer: func(id: u32);
+    /// Like `on-entry-ingest`, for an entry a scan visits: only system
+    /// tags added to `tags` are kept, and `none` leaves the entry alone.
+    export on-scan-entry: func(scan: u64, entry: entry) -> option<entry>;
+    export on-scan-done: func(scan: u64, summary: scan-summary);
+}

@@ -1525,6 +1525,52 @@ mod script_isolation {
         kiki.shutdown();
     }
 
+    /// End to end, with WebAssembly: a component plugin, compiled to native
+    /// code in the sandboxed script host, transforms a real entry together
+    /// with a Lua plugin, each in its turn. This is the test that fails if
+    /// the host refuses the writable and executable memory Cranelift needs,
+    /// or if a component does not make it across the IPC channel.
+    #[cfg(feature = "wasm-plugins")]
+    #[test]
+    fn an_isolated_wasm_plugin_transforms_an_ingested_entry() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn_with(&[], |home| {
+            let user = home.join("plugins").join("user");
+            let wasm = user.join("10-wasm");
+            std::fs::create_dir_all(&wasm).expect("create plugin directory");
+            std::fs::write(
+                wasm.join("plugin.wasm"),
+                include_bytes!("wasm-fixture/fixture.wasm"),
+            )
+            .expect("write plugin.wasm");
+            std::fs::write(
+                wasm.join("manifest.toml"),
+                "name = \"wasm\"\nversion = \"1.0.0\"\nengine = \"wasm\"\n\
+                 [config]\nsuffix = \" [wasm]\"\n",
+            )
+            .expect("write manifest.toml");
+            let lua = user.join("20-lua");
+            std::fs::create_dir_all(&lua).expect("create plugin directory");
+            std::fs::write(lua.join("main.lua"), TITLE_STAMPING_SCRIPT).expect("write main.lua");
+            std::fs::write(
+                lua.join("manifest.toml"),
+                "name = \"lua\"\nversion = \"1.0.0\"\nengine = \"lua\"\n",
+            )
+            .expect("write manifest.toml");
+        });
+        kiki.wait_for_plugins_loaded(2, Duration::from_secs(20));
+        assert_eq!(kiki.script_host_pids().len(), 1);
+
+        let feed_id = create_local_feed(&mut kiki, addr);
+        let title = refresh_and_read_title(&mut kiki, feed_id);
+        assert!(
+            title.starts_with("[scripted] ") && title.ends_with(" [wasm]"),
+            "entry title was not transformed by both plugins in turn: {title:?}"
+        );
+        kiki.assert_still_running();
+        kiki.shutdown();
+    }
+
     /// The server skips sending the script host events nothing handles,
     /// going by the handlers the host reports with each response. A handler
     /// registered after loading, here by a `plugin.load` handler, must

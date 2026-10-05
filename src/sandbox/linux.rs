@@ -193,10 +193,16 @@ pub fn restrict_syscalls(config: &SandboxConfig) -> Result<()> {
 /// From then on the kernel fails, with `EACCES`, any `mmap` asking for
 /// `PROT_WRITE | PROT_EXEC`, and any `mmap` or `mprotect` that would make
 /// a mapping executable that was not already — so injected code can no
-/// longer be written into memory and then run. No Kiki process needs that:
-/// Lua 5.4 is an interpreter, with no JIT. This is what systemd's
+/// longer be written into memory and then run. This is what systemd's
 /// `MemoryDenyWriteExecute=` installs where the kernel has it, here
 /// applied however Kiki is started.
+///
+/// Every process gets it but the script host, when Kiki is built with the
+/// `wasm-plugins` feature: it compiles WebAssembly plugins to native code
+/// with Cranelift, which writes the code and then makes it executable (see
+/// [`crate::scripting::wasm`]). The server starts the script host before
+/// it refuses such memory itself, so the host does not inherit it. Lua 5.4
+/// is an interpreter, with no JIT, and no other process needs it.
 ///
 /// The setting cannot be undone, and is inherited by forked children and
 /// kept across `execve` (so the feed fetcher's worker, parser and resolver
@@ -206,6 +212,25 @@ pub fn restrict_syscalls(config: &SandboxConfig) -> Result<()> {
 /// An older kernel that lacks it is logged and otherwise ignored.
 fn apply_mdwe(config: &SandboxConfig) -> Result<()> {
     let profile = config.profile_name();
+    if !refuses_write_exec(&config.profile) {
+        if write_exec_refused() {
+            // Inherited, as from systemd's MemoryDenyWriteExecute=, and
+            // impossible to undo.
+            tracing::warn!(
+                profile,
+                "mdwe: writable and executable memory is refused, so WebAssembly \
+                 plugins cannot be compiled; if Kiki runs under systemd, remove \
+                 MemoryDenyWriteExecute= from its unit"
+            );
+        } else {
+            tracing::info!(
+                profile,
+                "mdwe: writable and executable memory allowed, to compile \
+                 WebAssembly plugins"
+            );
+        }
+        return Ok(());
+    }
     match refuse_write_exec().context("prctl(PR_SET_MDWE)")? {
         Mdwe::Refused => {
             tracing::info!(profile, "mdwe: writable and executable memory refused");
@@ -237,6 +262,22 @@ enum Mdwe {
     AlreadyRefused,
     /// The kernel predates `PR_SET_MDWE`.
     Unsupported,
+}
+
+/// Whether processes with `profile` refuse writable and executable memory:
+/// all but the script host, when it runs WebAssembly plugins.
+fn refuses_write_exec(profile: &SandboxProfile) -> bool {
+    !(cfg!(feature = "wasm-plugins") && matches!(profile, SandboxProfile::ScriptHost))
+}
+
+/// Whether this process already refuses writable and executable memory
+/// with `PR_SET_MDWE`.
+fn write_exec_refused() -> bool {
+    let flags = libc::PR_MDWE_REFUSE_EXEC_GAIN as libc::c_ulong;
+    // SAFETY: `PR_GET_MDWE` takes no pointers and only reads the calling
+    // process's flags; the unused arguments must be zero.
+    let current = unsafe { libc::prctl(libc::PR_GET_MDWE, 0, 0, 0, 0) };
+    current >= 0 && current as libc::c_ulong & flags == flags
 }
 
 /// The bare `prctl` calls behind [`apply_mdwe`], which neither logs nor
@@ -964,6 +1005,30 @@ fn detect_arch() -> Option<seccompiler::TargetArch> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Only the script host may have writable and executable memory, and
+    /// only when it runs WebAssembly plugins.
+    #[test]
+    fn only_the_script_host_may_write_and_execute_memory() {
+        let all = [
+            SandboxConfig::server(PathBuf::new(), PathBuf::new(), PathBuf::new(), false),
+            SandboxConfig::script_host(false),
+            SandboxConfig::feed_fetcher(false),
+            SandboxConfig::feed_worker(false),
+            SandboxConfig::feed_parser(false),
+            SandboxConfig::feed_resolver(false),
+            SandboxConfig::web_ui(false),
+        ];
+        for config in &all {
+            let script_host = matches!(config.profile, SandboxProfile::ScriptHost);
+            assert_eq!(
+                refuses_write_exec(&config.profile),
+                !(script_host && cfg!(feature = "wasm-plugins")),
+                "{}",
+                config.profile_name()
+            );
+        }
+    }
 
     /// Once [`refuse_write_exec`] has run, memory can neither be mapped writable
     /// and executable nor made executable afterwards, but read-write and
