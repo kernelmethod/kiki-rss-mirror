@@ -26,8 +26,8 @@ mod default_plugins {
         "adaptive-fetch",
         "auto-tag",
         "filter",
+        "privacy",
         "sanitize",
-        "strip-tracking",
     ];
 
     /// How deep inside a plugin directory files are bundled. Matches the depth

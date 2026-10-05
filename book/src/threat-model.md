@@ -276,7 +276,7 @@ sanitizes it again before display. Without that plugin, or for entries
 stored before it was installed, Kiki stores entries' HTML as the feed wrote
 it, so **other API clients should sanitize entry content themselves**
 before showing it in a browser, rather than rely on the plugin's config.
-The [`strip-tracking`](plugins/strip-tracking.md) plugin removes tracking
+The [`privacy`](plugins/privacy.md) plugin removes tracking
 pixels and tracking parameters from entries' content, but it isn't a
 sanitizer: it leaves scripts, event handlers and the like where they are.
 

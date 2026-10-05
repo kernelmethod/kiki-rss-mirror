@@ -421,16 +421,16 @@ fn invalid_configs_fail_to_load() {
     }
 }
 
-/// `strip-tracking` runs after `sanitize`, in directory order, and still
-/// finds the parameters and pixels it removes.
+/// `privacy` runs before `sanitize`, in directory order, and `sanitize`
+/// still cleans up what it leaves behind.
 #[test]
-fn strip_tracking_still_works_on_sanitized_content() {
+fn sanitize_still_works_on_privacy_cleaned_content() {
     let manifest =
-        PluginManifest::parse(include_str!("../../plugins/strip-tracking/manifest.toml")).unwrap();
-    let mut strip = ScriptSource::new(include_str!("../../plugins/strip-tracking/main.lua"));
-    strip.name = "strip-tracking".to_string();
+        PluginManifest::parse(include_str!("../../plugins/privacy/manifest.toml")).unwrap();
+    let mut strip = ScriptSource::new(include_str!("../../plugins/privacy/main.lua"));
+    strip.name = "privacy".to_string();
     strip.config = Value::Object(manifest.config).to_string();
-    let runner = LuaScriptRunner::from_sources(&[source(json!({})), strip]).unwrap();
+    let runner = LuaScriptRunner::from_sources(&[strip, source(json!({}))]).unwrap();
 
     assert_eq!(
         sanitize(

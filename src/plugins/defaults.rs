@@ -20,7 +20,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 /// A zstd-compressed tarball of the plugins installed by default: currently
-/// `adaptive-fetch`, `auto-tag`, `filter`, `sanitize` and `strip-tracking`.
+/// `adaptive-fetch`, `auto-tag`, `filter`, `privacy` and `sanitize`.
 ///
 /// Each plugin's directory is stored under its own name at the root of the
 /// archive, and holds only regular files.
@@ -279,8 +279,8 @@ fn replace_plugin(plugins_dir: &Path, name: &str, files: &[&BundledFile]) -> Res
 ///         ("adaptive-fetch".to_string(), SyncOutcome::Installed),
 ///         ("auto-tag".to_string(), SyncOutcome::Installed),
 ///         ("filter".to_string(), SyncOutcome::Installed),
+///         ("privacy".to_string(), SyncOutcome::Installed),
 ///         ("sanitize".to_string(), SyncOutcome::Installed),
-///         ("strip-tracking".to_string(), SyncOutcome::Installed),
 ///     ]
 /// );
 /// // Syncing again finds them up to date.
@@ -368,10 +368,10 @@ mod tests {
                 Path::new("auto-tag/manifest.toml"),
                 Path::new("filter/main.lua"),
                 Path::new("filter/manifest.toml"),
+                Path::new("privacy/main.lua"),
+                Path::new("privacy/manifest.toml"),
                 Path::new("sanitize/main.lua"),
                 Path::new("sanitize/manifest.toml"),
-                Path::new("strip-tracking/main.lua"),
-                Path::new("strip-tracking/manifest.toml"),
             ]
         );
         let plugins: Vec<_> = files.iter().map(|f| f.plugin.as_str()).collect();
@@ -384,10 +384,10 @@ mod tests {
                 "auto-tag",
                 "filter",
                 "filter",
+                "privacy",
+                "privacy",
                 "sanitize",
-                "sanitize",
-                "strip-tracking",
-                "strip-tracking"
+                "sanitize"
             ]
         );
         assert_eq!(
@@ -404,11 +404,11 @@ mod tests {
         );
         assert_eq!(
             files[6].contents,
-            include_bytes!("../../plugins/sanitize/main.lua")
+            include_bytes!("../../plugins/privacy/main.lua")
         );
         assert_eq!(
             files[8].contents,
-            include_bytes!("../../plugins/strip-tracking/main.lua")
+            include_bytes!("../../plugins/sanitize/main.lua")
         );
     }
 
@@ -422,8 +422,8 @@ mod tests {
                 "adaptive-fetch",
                 "auto-tag",
                 "filter",
-                "sanitize",
-                "strip-tracking"
+                "privacy",
+                "sanitize"
             ]
         );
         outcomes[2].1
@@ -461,8 +461,8 @@ mod tests {
                 "adaptive-fetch",
                 "auto-tag",
                 "filter",
-                "sanitize",
-                "strip-tracking"
+                "privacy",
+                "sanitize"
             ]
         );
 
@@ -514,8 +514,8 @@ mod tests {
                 "adaptive-fetch",
                 "auto-tag",
                 "filter",
-                "sanitize",
-                "strip-tracking"
+                "privacy",
+                "sanitize"
             ]
         );
     }

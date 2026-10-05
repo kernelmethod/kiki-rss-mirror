@@ -138,8 +138,8 @@ downloaded. It never removes tags. See
 
 ### Stripping tracking parameters
 
-Kiki also ships a `strip-tracking` plugin, in
-[`plugins/strip-tracking`](plugins/strip-tracking), installed by default like
+Kiki also ships a `privacy` plugin, in
+[`plugins/privacy`](plugins/privacy), installed by default like
 `filter`. It removes tracking parameters, such as `utm_source`, `fbclid` and
 `gclid`, from the query strings (and query-like fragments, such as
 `#xtor=RSS-1`) of new entries' URLs, and of the links in their content. It
@@ -150,11 +150,11 @@ are downloaded, not the ones already stored. To strip other parameters or
 trackers, or to leave entries' content alone:
 
 ```bash
-kiki plugin config get strip-tracking --defaults > strip-tracking.toml
-# edit strip-tracking.toml: add names to `params` ("prefix_*" matches a prefix)
+kiki plugin config get privacy --defaults > privacy.toml
+# edit privacy.toml: add names to `params` ("prefix_*" matches a prefix)
 # or image sources to `trackers` ("*.example.com", "example.com/pixel"),
 # or set `content = false` or `pixels = false`
-kiki plugin config set strip-tracking strip-tracking.toml
+kiki plugin config set privacy privacy.toml
 ```
 
 To keep Kiki from downloading any images or enclosures for some feeds, so
@@ -162,10 +162,10 @@ that the sites serving them never hear from it, list the feeds, by id or by
 URL, in `skip_assets`:
 
 ```bash
-echo 'skip_assets = [3, "https://example.com/feed.xml"]' | kiki plugin config set strip-tracking
+echo 'skip_assets = [3, "https://example.com/feed.xml"]' | kiki plugin config set privacy
 ```
 
-See [`plugins/strip-tracking/main.lua`](plugins/strip-tracking/main.lua) for the details.
+See [`plugins/privacy/main.lua`](plugins/privacy/main.lua) for the details.
 
 ### Sanitizing entries' HTML
 
