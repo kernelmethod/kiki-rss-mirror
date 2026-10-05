@@ -88,14 +88,18 @@ pub enum HostRequest {
     /// with [`HostResponse::Schedule`].
     Schedule { schedule: FetchSchedule },
 
-    /// Compile `component`, a WebAssembly plugin, and keep it, so that a
-    /// later [`HostRequest::Reload`] can name it by hash alone. Answered
+    /// Compile `component`, the code of the WebAssembly plugin named
+    /// `plugin`, and keep it, so that a later [`HostRequest::Reload`] can
+    /// name it by hash alone. Answered
     /// with [`HostResponse::Ack`], or [`HostResponse::Failed`] if it does
     /// not compile.
     ///
     /// Each component gets a message of its own, so that a few large ones
     /// don't make a `Reload` too large for a frame.
-    PutComponent { component: WasmComponent },
+    PutComponent {
+        plugin: String,
+        component: WasmComponent,
+    },
 }
 
 /// A message from the script host back to the server.

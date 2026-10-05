@@ -169,7 +169,8 @@ built for `wasm32-wasip2` still loads, but calling any of them, as `std::fs`,
 A WebAssembly plugin's handlers run under the same [time budget](writing-plugins.md#resource-limits)
 as a Lua plugin's: 100 ms per call, unless its manifest sets
 `time_budget_ms`, with time spent waiting on the server not counted, up to a
-second per call. `init` may run for up to 5 seconds. Each plugin may use up to
+second per call. Loading a plugin, which runs its `init`, may take up to 5
+seconds. Each plugin may use up to
 16 MiB of memory and 512 KiB of stack.
 
 Kiki compiles each plugin to native code when it loads, once for each
@@ -181,8 +182,11 @@ called into WASI that Kiki doesn't provide, it fails as a Lua handler that
 raises an error does: the entry passes through it unmodified, the wait
 before a feed's next fetch is left as it was, or the failure is logged. A
 trap can leave the plugin's memory in any state, so the plugin is then
-started afresh: Kiki loads it again and calls `init`, which starts its
-timers again, while the scans it had started end. A plugin that traps more
+started afresh the next time it is needed: Kiki loads it again and calls
+`init`, which starts its timers again, while the scans it had started end.
+Timers that were due when the plugin trapped aren't called. Kiki restarts at
+most one plugin per event, so a plugin may miss an event or two if several
+trap at once. A plugin that traps more
 than five times in ten minutes is disabled until plugins next reload.
 
 ## Security

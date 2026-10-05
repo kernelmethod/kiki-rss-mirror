@@ -289,7 +289,7 @@ fn only_components_put_are_kept() {
 #[test]
 fn components_are_found_by_hash_once_compiled() {
     let component = WasmComponent::new(FIXTURE.to_vec());
-    put_component(&component).unwrap();
+    put_component("a", &component).unwrap();
     let mut source = source("a", json!({ "suffix": "!" }));
     source.component.as_mut().unwrap().bytes.clear();
     let (runner, _) = runner(&[source.clone()]);
@@ -495,14 +495,14 @@ fn scans() {
 
 #[test]
 fn timers() {
-    let (runner, recorder) = runner(&[source("a", json!({ "every": 60 }))]);
+    let (runner, recorder) = runner(&[source("a", json!({ "every": [60] }))]);
     assert!(runner.handles(Event::Timer));
     runner.run_timers(Instant::now());
     assert!(recorder.seen("timer").is_none());
     runner.run_timers(Instant::now() + Duration::from_secs(61));
     assert_eq!(recorder.seen("timer").unwrap(), "0");
 
-    let err = WasmScriptRunner::from_sources_with(&[source("a", json!({ "every": 1 }))], None)
+    let err = WasmScriptRunner::from_sources_with(&[source("a", json!({ "every": [1] }))], None)
         .err()
         .unwrap();
     assert!(err.to_string().contains("between 60"), "{err}");
@@ -551,4 +551,55 @@ fn mixed_engines_run_in_plugin_order() {
         .dispatch_transform_entry(entry("t"))
         .unwrap()
         .is_none());
+}
+
+/// When a timer handler traps, the timers still due were the old instance's: they are not
+/// called on the restarted one, whose own timers start afresh.
+#[test]
+fn timers_of_a_trapped_instance_are_dropped() {
+    let (runner, recorder) = runner(&[source("a", json!({ "every": [60, 60], "trap_timer": 0 }))]);
+    let later = Instant::now() + Duration::from_secs(61);
+    runner.run_timers(later);
+    // Timer 0 trapped, and timer 1 was not called.
+    assert!(recorder.seen("timer").is_none());
+    // The plugin is restarted on the next tick, with timers not yet due.
+    assert!(runner.handles(Event::Timer));
+    runner.run_timers(later);
+    assert!(recorder.seen("timer").is_none());
+    assert!(runner.handles(Event::Timer));
+}
+
+/// A plugin that trapped is restarted when it is next needed, and a dispatch restarts at
+/// most one plugin, so that it takes at most one load budget longer.
+#[test]
+fn restarts_wait_for_the_next_dispatch_one_at_a_time() {
+    let (runner, _) = runner(&[
+        source("a", json!({ "trap_title": "boom", "suffix": "a" })),
+        source("b", json!({ "trap_title": "boom", "suffix": "b" })),
+    ]);
+    let out = runner
+        .dispatch_transform_entry(entry("boom"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.title, "boom");
+    // Both trapped; this dispatch restarts a, and passes the entry through b.
+    let out = runner
+        .dispatch_transform_entry(entry("t"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.title, "ta");
+    let out = runner
+        .dispatch_transform_entry(entry("t"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.title, "tab");
+}
+
+/// Compile errors in the script host name the plugin.
+#[test]
+fn compile_errors_name_the_plugin() {
+    let err = put_component("broken", &WasmComponent::new(b"not wasm".to_vec()))
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("'broken'"), "{err}");
 }

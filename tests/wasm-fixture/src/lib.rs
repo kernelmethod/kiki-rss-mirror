@@ -28,8 +28,10 @@ struct Config {
     change_guid: bool,
     /// Return this wait from `fetch.schedule`.
     wait_secs: Option<u64>,
-    /// Start a timer of this many seconds when made.
-    every: Option<u64>,
+    /// Start a timer of each of these many seconds when made.
+    every: Vec<u64>,
+    /// Panic when the timer with this id is due.
+    trap_timer: Option<u32>,
     /// Fail to load with this message.
     init_error: Option<String>,
     /// Start a scan from `plugin.load`.
@@ -75,8 +77,8 @@ impl Plugin for Fixture {
         if let Some(message) = &config.init_error {
             return Err(message.clone());
         }
-        if let Some(secs) = config.every {
-            host::every(secs)?;
+        for secs in &config.every {
+            host::every(*secs)?;
         }
         if config.scan {
             // Scans cannot start while loading; record the refusal.
@@ -205,6 +207,9 @@ impl Plugin for Fixture {
     }
 
     fn on_timer(&mut self, id: u32) {
+        if Some(id) == self.config.trap_timer {
+            panic!("trap requested");
+        }
         seen("timer", id.to_string());
     }
 

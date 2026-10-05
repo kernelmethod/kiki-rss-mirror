@@ -79,7 +79,21 @@ A `Reload` frame is capped at 8 MiB, so components travel separately.
 BLAKE3 hash. `Reload` then names each component by hash only. The server
 remembers which hashes the child has, so a reload that changes only config
 sends and compiles nothing. A successful reload evicts unused components on
-both sides.
+both sides. `PutComponent` also carries the plugin's name, for its compile
+errors.
+
+The server waits `IPC_TIMEOUT` (10 s) for each frame from the script host,
+and kills it for good when the wait runs out: the server can't start a new
+one once its own sandbox denies `execve`. Loading WebAssembly plugins is
+bounded but can take longer than that, so the wait grows with the work
+(`request_timeout` in `src/process/script_host.rs`):
+
+- `PutComponent`: 10 s more per MiB of component, since compiling can't be
+  interrupted but takes time in proportion to size;
+- `Reload`: one `WASM_LOAD_BUDGET` (5 s) more per WebAssembly plugin, which
+  instantiating and `init` share;
+- anything else, while WebAssembly plugins are loaded: one
+  `WASM_LOAD_BUDGET` more, for restarting a plugin that trapped.
 
 ### Limits and failures
 
@@ -87,14 +101,17 @@ These match the Lua engine where they can:
 
 - Time: the plugin's `TimeBudget`, enforced with epoch interruption (a
   thread ticks every 5 ms). Time spent waiting on host calls is given back,
-  up to 1 s per call. `init` gets 5 s.
+  up to 1 s per call. Instantiating a plugin and its `init` share 5 s.
 - Resources: 16 MiB of linear memory and 512 KiB of stack per plugin, plus
   limits on tables and instances.
 - Isolation: each plugin has its own `Store`, so plugins share no memory.
 - Failures: a trap passes the entry through unmodified, keeps the fetch
   schedule's wait, or is logged, as for Lua.
 - After a trap, the plugin is instantiated afresh and `init` runs again,
-  which restarts its timers and ends its scans. More than 5 traps in 10
+  which restarts its timers and ends its scans; timers of the old instance
+  that were still due are dropped. The restart waits for the next dispatch
+  the plugin is part of, and a dispatch restarts at most one plugin, so a
+  request takes at most one load budget longer. More than 5 traps in 10
   minutes disables the plugin until the next reload.
 
 A per-plugin `memory_limit_mib` was considered and left out: 16 MiB has been

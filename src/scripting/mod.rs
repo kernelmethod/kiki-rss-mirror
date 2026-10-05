@@ -231,6 +231,11 @@ impl std::fmt::Display for TimeBudget {
     }
 }
 
+/// How long loading one WebAssembly plugin may take in the script host: instantiating it
+/// and calling its `init`, together. The server allows a reload this much longer per
+/// WebAssembly plugin; see [`crate::process::script_host::ScriptHost`].
+pub const WASM_LOAD_BUDGET: Duration = Duration::from_secs(5);
+
 /// A source file of a plugin other than its entrypoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptModule {

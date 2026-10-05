@@ -40,7 +40,8 @@
 //! * The plugin's [`TimeBudget`], enforced with Wasmtime's epoch interruption: a thread
 //!   advances the engine's epoch every [`EPOCH_TICK`], and at each tick a running plugin
 //!   checks its deadline. As for Lua, time spent waiting on the server is given back, up to
-//!   [`MAX_CALL_ALLOWANCE`] per call. `init` runs under [`LOAD_BUDGET`].
+//!   [`MAX_CALL_ALLOWANCE`] per call. Instantiating a plugin and calling its `init` run
+//!   under [`LOAD_BUDGET`], together.
 //! * [`WASM_MEMORY_LIMIT_BYTES`] of linear memory per plugin, and limits on tables and
 //!   instances, enforced with [`StoreLimits`].
 //! * [`MAX_WASM_STACK`] bytes of stack.
@@ -48,9 +49,12 @@
 //! A call that traps — runs out of time or memory, or hits `unreachable`, as a Rust panic
 //! does — fails as a Lua handler's error does: the entry passes through unmodified, the
 //! wait is kept, or the failure is logged. Since a trap can leave the plugin's memory in
-//! any state, the plugin is then started afresh: instantiated again, and its `init`
-//! called again, which starts its timers again. Its scans end. A plugin that traps more
-//! than [`MAX_TRAPS`] times in [`TRAP_WINDOW`] is disabled until plugins next reload.
+//! any state, the plugin is then started afresh: instantiated again, and its `init` called
+//! again, which starts its timers again. Its scans end. The restart waits for the next
+//! event the plugin handles, and each dispatch restarts at most one plugin, so the time a
+//! request to the script host can take grows by at most one [`LOAD_BUDGET`]; see
+//! [`crate::process::script_host::ScriptHost`]. A plugin that traps more than
+//! [`MAX_TRAPS`] times in [`TRAP_WINDOW`] is disabled until plugins next reload.
 
 use super::lua::MAX_TIMER_INTERVAL;
 use super::{
@@ -89,8 +93,9 @@ pub const MAX_WASM_STACK: usize = 512 * 1024;
 /// time budget.
 pub const EPOCH_TICK: Duration = Duration::from_millis(5);
 
-/// The time budget of a plugin's `init`, which runs when plugins load.
-pub const LOAD_BUDGET: Duration = Duration::from_secs(5);
+/// The time budget of loading a plugin: instantiating it and calling its `init`, together.
+/// See [`super::WASM_LOAD_BUDGET`].
+pub const LOAD_BUDGET: Duration = super::WASM_LOAD_BUDGET;
 
 /// How much of the time a call spends waiting on the server does not count against its
 /// time budget, as for Lua.
@@ -223,7 +228,8 @@ fn compile(plugin: &str, component: &WasmComponent) -> Result<Component, WasmErr
     compile_bytes(plugin, &component.bytes)
 }
 
-/// Compile `component` and keep it, so that sources can refer to it by hash alone.
+/// Compile `component`, the code of the plugin named `plugin`, and keep it, so that
+/// sources can refer to it by hash alone.
 ///
 /// The script host calls this for each component the server sends it, before the sources
 /// that use it; see [`crate::process::script_host::ScriptHost::reload`].
@@ -231,8 +237,8 @@ fn compile(plugin: &str, component: &WasmComponent) -> Result<Component, WasmErr
 /// # Errors
 ///
 /// Returns [`WasmError::Compile`] if the component cannot be compiled.
-pub fn put_component(component: &WasmComponent) -> Result<(), WasmError> {
-    let compiled = compile_bytes("(uploaded)", &component.bytes)?;
+pub fn put_component(plugin: &str, component: &WasmComponent) -> Result<(), WasmError> {
+    let compiled = compile_bytes(plugin, &component.bytes)?;
     cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -494,8 +500,11 @@ struct WasmPlugin {
     component: Component,
     /// The events the plugin's `init` said it handles.
     events: EventSet,
-    /// `None` once the plugin has been disabled for trapping too often.
+    /// `None` after a trap, until the plugin is restarted, and for good once it has been
+    /// disabled for trapping too often.
     live: Option<Live>,
+    /// Whether the plugin trapped, and is to be started afresh when it is next needed.
+    restart_pending: bool,
     /// When the plugin last trapped, oldest first, within [`TRAP_WINDOW`].
     traps: VecDeque<Instant>,
 }
@@ -536,7 +545,8 @@ fn instantiate(
         }
     });
 
-    // Instantiating runs the component's start functions, which get the load budget too.
+    // Instantiating runs the component's start functions. They and `init` share one load
+    // budget, so that loading a plugin takes at most that long, however the time splits.
     store.data_mut().budget.start(Some(LOAD_BUDGET));
     let bindings = Bindings::instantiate(&mut store, component, linker).map_err(|e| {
         WasmError::Instantiate {
@@ -544,13 +554,12 @@ fn instantiate(
             message: format!("{e:?}"),
         }
     })?;
-    store.data_mut().budget.stop();
     let mut live = Live { store, bindings };
     let init_err = |message: String| WasmError::Init {
         plugin: name.to_string(),
         message,
     };
-    let kinds = call(&mut live, Some(LOAD_BUDGET), |b, s| b.call_init(s, config))
+    let kinds = continue_call(&mut live, LOAD_BUDGET, |b, s| b.call_init(s, config))
         .map_err(init_err)?
         .map_err(init_err)?;
     live.store.data_mut().loading = false;
@@ -572,6 +581,23 @@ fn call<R>(
     f: impl FnOnce(&Bindings, &mut Store<State>) -> wasmtime::Result<R>,
 ) -> Result<R, String> {
     live.store.data_mut().budget.start(limit);
+    finish_call(live, limit, f)
+}
+
+/// As [`call`], under the budget of `limit` that is already running.
+fn continue_call<R>(
+    live: &mut Live,
+    limit: Duration,
+    f: impl FnOnce(&Bindings, &mut Store<State>) -> wasmtime::Result<R>,
+) -> Result<R, String> {
+    finish_call(live, Some(limit), f)
+}
+
+fn finish_call<R>(
+    live: &mut Live,
+    limit: Option<Duration>,
+    f: impl FnOnce(&Bindings, &mut Store<State>) -> wasmtime::Result<R>,
+) -> Result<R, String> {
     live.store.set_epoch_deadline(1);
     let result = f(&live.bindings, &mut live.store);
     let expired = live.store.data().budget.expired();
@@ -651,31 +677,44 @@ fn schedule_to_wit(schedule: &FetchSchedule) -> wit::FetchSchedule {
     }
 }
 
+/// What one dispatch shares between the plugins it calls.
+struct Dispatch<'a> {
+    linker: &'a Linker<State>,
+    services: &'a Option<Arc<dyn ScriptServices>>,
+    /// Whether a plugin has been restarted during this dispatch: each restarts at most one.
+    restarted: bool,
+}
+
 impl WasmPlugin {
-    /// Call into the plugin with `f`, under its time budget, if it is running.
+    /// Call into the plugin with `f`, under its time budget, restarting it first if it
+    /// trapped earlier and this dispatch has not restarted a plugin yet.
     ///
-    /// On failure, logs `what` failed, and starts the plugin afresh, or disables it if it
-    /// has failed too often. Returns `None` if the call failed or the plugin is disabled.
+    /// On failure, logs `what` failed, and marks the plugin to be started afresh, or
+    /// disables it if it has failed too often. Returns `None` if the call failed or the
+    /// plugin is not running.
     fn call<R>(
         &mut self,
-        linker: &Linker<State>,
-        services: &Option<Arc<dyn ScriptServices>>,
+        dispatch: &mut Dispatch<'_>,
         what: &str,
         f: impl FnOnce(&Bindings, &mut Store<State>) -> wasmtime::Result<R>,
     ) -> Option<R> {
+        if !self.ensure_live(dispatch) {
+            return None;
+        }
         let live = self.live.as_mut()?;
         match call(live, self.budget.limit(), f) {
             Ok(result) => Some(result),
             Err(e) => {
                 warn!(plugin = %self.name, error = %e, "{what} failed");
-                self.restart(linker, services);
+                self.trapped();
                 None
             }
         }
     }
 
-    /// Start the plugin afresh after a trap, unless it has trapped too often.
-    fn restart(&mut self, linker: &Linker<State>, services: &Option<Arc<dyn ScriptServices>>) {
+    /// Note a trap: the instance is dropped, and the plugin is to be started afresh,
+    /// unless it has trapped too often.
+    fn trapped(&mut self) {
         self.live = None;
         let now = Instant::now();
         self.traps.push_back(now);
@@ -686,37 +725,56 @@ impl WasmPlugin {
         {
             self.traps.pop_front();
         }
-        if self.traps.len() > MAX_TRAPS {
+        self.restart_pending = self.traps.len() <= MAX_TRAPS;
+        if !self.restart_pending {
             error!(
                 plugin = %self.name,
                 "plugin failed {} times in {} minutes; disabling it until plugins reload",
                 self.traps.len(),
                 TRAP_WINDOW.as_secs() / 60
             );
-            return;
         }
+    }
+
+    /// Make sure the plugin is running, restarting it if it trapped and `dispatch` has not
+    /// restarted a plugin yet. Returns whether it is running.
+    fn ensure_live(&mut self, dispatch: &mut Dispatch<'_>) -> bool {
+        if self.live.is_some() {
+            return true;
+        }
+        if !self.restart_pending || dispatch.restarted {
+            return false;
+        }
+        dispatch.restarted = true;
+        self.restart_pending = false;
         match instantiate(
-            linker,
+            dispatch.linker,
             &self.component,
             &self.name,
             &self.config,
-            services.clone(),
+            dispatch.services.clone(),
         ) {
             Ok((live, events)) => {
                 debug!(plugin = %self.name, "plugin restarted");
                 self.live = Some(live);
                 self.events = events;
+                true
             }
-            Err(e) => error!(
-                plugin = %self.name,
-                error = %e,
-                "plugin could not be restarted; disabling it until plugins reload"
-            ),
+            Err(e) => {
+                error!(
+                    plugin = %self.name,
+                    error = %e,
+                    "plugin could not be restarted; disabling it until plugins reload"
+                );
+                false
+            }
         }
     }
 
+    /// Whether the plugin handles `event`: it is running, or will be restarted to handle
+    /// it.
     fn handles(&self, event: Event) -> bool {
-        self.live.is_some() && self.events.contains(event)
+        (self.live.is_some() || self.restart_pending) && self.events.contains(event)
     }
 
     fn has_scan(&self, scan_id: u64) -> bool {
@@ -794,6 +852,7 @@ impl WasmScriptRunner {
                 component,
                 events,
                 live: Some(live),
+                restart_pending: false,
                 traps: VecDeque::new(),
             });
         }
@@ -808,16 +867,31 @@ impl WasmScriptRunner {
         self.plugins.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn dispatch(&self) -> Dispatch<'_> {
+        Dispatch {
+            linker: &self.linker,
+            services: &self.services,
+            restarted: false,
+        }
+    }
+
     /// The events at least one plugin handles, and [`Event::Timer`] if a plugin has
     /// started a timer.
     pub fn subscriptions(&self) -> EventSet {
         let mut set = EventSet::default();
         for plugin in self.plugins().iter() {
-            let Some(live) = &plugin.live else { continue };
-            set = set.union(plugin.events);
-            if !live.store.data().timers.is_empty() {
-                set.insert(Event::Timer);
+            match &plugin.live {
+                Some(live) => {
+                    if !live.store.data().timers.is_empty() {
+                        set.insert(Event::Timer);
+                    }
+                }
+                // A plugin that is to be restarted may start timers again, so the timer
+                // tick, like its events, restarts it.
+                None if plugin.restart_pending => set.insert(Event::Timer),
+                None => continue,
             }
+            set = set.union(plugin.events);
         }
         set
     }
@@ -830,8 +904,11 @@ impl WasmScriptRunner {
     /// Calls `on-timer` for each timer due by `now`, and schedules its next call, as the
     /// Lua engine does.
     fn run_timers(&self, now: Instant) {
+        let mut dispatch = self.dispatch();
         let mut plugins = self.plugins();
         for plugin in plugins.iter_mut() {
+            // A restarted plugin starts its timers afresh, so none is due yet.
+            plugin.ensure_live(&mut dispatch);
             let due: Vec<u32> = match plugin.live.as_mut() {
                 None => continue,
                 Some(live) => live
@@ -850,7 +927,12 @@ impl WasmScriptRunner {
                     .collect(),
             };
             for id in due {
-                plugin.call(&self.linker, &self.services, "timer handler", |b, s| {
+                // A timer handler that traps ends the instance, and with it the timers
+                // still due: the ids belong to the old instance.
+                if plugin.live.is_none() {
+                    break;
+                }
+                plugin.call(&mut dispatch, "timer handler", |b, s| {
                     b.call_on_timer(s, id)
                 });
             }
@@ -865,17 +947,15 @@ impl ScriptRunner for WasmScriptRunner {
 
     fn dispatch_transform_entry(&self, entry: FeedEntry) -> anyhow::Result<Option<FeedEntry>> {
         let mut current = entry;
+        let mut dispatch = self.dispatch();
         for plugin in self.plugins().iter_mut() {
             if !plugin.handles(Event::EntryIngest) {
                 continue;
             }
             let input = entry_to_wit(current.clone());
-            let returned = plugin.call(
-                &self.linker,
-                &self.services,
-                "entry.ingest handler",
-                |b, s| b.call_on_entry_ingest(s, &input),
-            );
+            let returned = plugin.call(&mut dispatch, "entry.ingest handler", |b, s| {
+                b.call_on_entry_ingest(s, &input)
+            });
             match returned {
                 // A failed handler passes the entry through unmodified.
                 None => {}
@@ -891,17 +971,15 @@ impl ScriptRunner for WasmScriptRunner {
         mut schedule: FetchSchedule,
     ) -> anyhow::Result<Option<ScheduleDecision>> {
         let mut decision = None;
+        let mut dispatch = self.dispatch();
         for plugin in self.plugins().iter_mut() {
             if !plugin.handles(Event::FetchSchedule) {
                 continue;
             }
             let input = schedule_to_wit(&schedule);
-            let returned = plugin.call(
-                &self.linker,
-                &self.services,
-                "fetch.schedule handler",
-                |b, s| b.call_on_fetch_schedule(s, input),
-            );
+            let returned = plugin.call(&mut dispatch, "fetch.schedule handler", |b, s| {
+                b.call_on_fetch_schedule(s, input)
+            });
             if let Some(Some(wait_secs)) = returned {
                 schedule.wait_secs = wait_secs;
                 decision = Some(ScheduleDecision {
@@ -919,17 +997,16 @@ impl ScriptRunner for WasmScriptRunner {
             return;
         }
         let what = format!("{} handler", event.name());
+        let mut dispatch = self.dispatch();
         for plugin in self.plugins().iter_mut() {
             if !plugin.handles(event) {
                 continue;
             }
-            let (linker, services) = (&self.linker, &self.services);
+            let d = &mut dispatch;
             match (&payload, event) {
                 (EventPayload::Entry(entry), Event::EntryParsed) => {
                     let entry = entry_to_wit(entry.clone());
-                    plugin.call(linker, services, &what, |b, s| {
-                        b.call_on_entry_parsed(s, &entry)
-                    });
+                    plugin.call(d, &what, |b, s| b.call_on_entry_parsed(s, &entry));
                 }
                 (
                     EventPayload::FetchSuccess {
@@ -946,9 +1023,7 @@ impl ScriptRunner for WasmScriptRunner {
                         url: url.clone(),
                         content_length: *content_length,
                     };
-                    plugin.call(linker, services, &what, |b, s| {
-                        b.call_on_fetch_success(s, &event)
-                    });
+                    plugin.call(d, &what, |b, s| b.call_on_fetch_success(s, &event));
                 }
                 (
                     EventPayload::FetchError {
@@ -967,9 +1042,7 @@ impl ScriptRunner for WasmScriptRunner {
                         message: message.clone(),
                         retry_after: *retry_after,
                     };
-                    plugin.call(linker, services, &what, |b, s| {
-                        b.call_on_fetch_error(s, &event)
-                    });
+                    plugin.call(d, &what, |b, s| b.call_on_fetch_error(s, &event));
                 }
                 (EventPayload::Feed { id, url, title }, Event::FeedAdded | Event::FeedRemoved) => {
                     let feed = wit::FeedEvent {
@@ -977,7 +1050,7 @@ impl ScriptRunner for WasmScriptRunner {
                         url: url.clone(),
                         title: title.clone(),
                     };
-                    plugin.call(linker, services, &what, |b, s| {
+                    plugin.call(d, &what, |b, s| {
                         if event == Event::FeedAdded {
                             b.call_on_feed_added(s, &feed)
                         } else {
@@ -986,7 +1059,7 @@ impl ScriptRunner for WasmScriptRunner {
                     });
                 }
                 (EventPayload::PluginLoad, Event::PluginLoad) => {
-                    plugin.call(linker, services, &what, |b, s| b.call_on_plugin_load(s));
+                    plugin.call(d, &what, |b, s| b.call_on_plugin_load(s));
                 }
                 _ => warn!(
                     event = event.name(),
@@ -1005,6 +1078,7 @@ impl ScriptRunner for WasmScriptRunner {
         let Some(plugin) = plugins.iter_mut().find(|p| p.has_scan(scan_id)) else {
             return Ok(None);
         };
+        let mut dispatch = self.dispatch();
         let start = Instant::now();
         let mut results = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -1017,7 +1091,7 @@ impl ScriptRunner for WasmScriptRunner {
                 return Ok(None);
             }
             let input = entry_to_wit(entry.clone());
-            let returned = plugin.call(&self.linker, &self.services, "scan handler", |b, s| {
+            let returned = plugin.call(&mut dispatch, "scan handler", |b, s| {
                 b.call_on_scan_entry(s, scan_id, &input)
             });
             results.push(returned.flatten().map(|e| entry_from_wit(e, &entry)));
@@ -1038,7 +1112,7 @@ impl ScriptRunner for WasmScriptRunner {
                 scanned: summary.scanned,
                 updated: summary.updated,
             };
-            plugin.call(&self.linker, &self.services, "scan on-done", |b, s| {
+            plugin.call(&mut self.dispatch(), "scan on-done", |b, s| {
                 b.call_on_scan_done(s, scan_id, summary)
             });
         }
