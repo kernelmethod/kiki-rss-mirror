@@ -1,22 +1,14 @@
 # Introduction
 
-Kiki is an RSS/Atom feed _engine_. It is not a feed reader by itself, but the
-part of one that runs behind the scenes: it keeps a list of feeds, fetches
-them on a sensible schedule, stores their entries, and serves all of it over
-an HTTP API. A reader's interface, a sync bridge to another reader, or a
-script that consumes feeds can then be built on top of that API.
-
-```text
-  feeds on the web ──▶ kiki serve ──▶ Unix socket ──▶ your reader, scripts,
-                       (fetch, store,                  or `kiki web`
-                        filter, tag)
-```
+Kiki is an RSS and Atom feed aggregator, consisting of a central engine
+and a [minimal web UI](web-ui.md).
 
 Kiki ships with:
 
-- **`kiki serve`**, the server. It fetches feeds, honours their caching
+- **`kiki serve`**, the engine. It fetches feeds, honours their caching
   headers and backs off from misbehaving servers, caches images and
-  enclosures, and runs plugins over new entries.
+  enclosures, and runs plugins over new entries. This functionality is
+  exposed over an HTTP API.
 - **Plugins** written in Lua, four of which are installed by default: one
   [hides entries](plugins/filter.md) matching rules you set, one
   [tags entries](plugins/auto-tag.md) automatically, one
@@ -49,3 +41,5 @@ Some things are deliberately left to the applications built on Kiki:
 - Working on Kiki itself? See [Building and testing](development.md), the
   [Rust API documentation](../docs/kiki_rss/) and the
   [test coverage report](../coverage/).
+- Curious how Kiki compares with other engines? See the [Why
+  Kiki?](why-kiki.md) for more details.

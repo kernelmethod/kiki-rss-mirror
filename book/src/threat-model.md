@@ -15,7 +15,7 @@ processes from doing anything your user account can do; see
 
 - **Your data**: the feeds, entries, tags and plugin state in `kiki.db`,
   your settings in `kiki.toml`, and the cached assets, all in the
-  [data directory](files.md).
+  [data directory](configuration/environment.md).
 - **Secrets**: the credentials of feeds that need a login, a proxy's
   password, if it has one, and [API tokens](tokens.md). Kiki stores only a
   hash of each token; the web UI holds the tokens of the people logged in
@@ -265,7 +265,7 @@ Kiki's TLS, HTTP, decompression or parsing code.
   recorded as having crashed the fetcher; the others carry on.
 - **Exhaustion** is bounded: every fetch has a timeout and a cap on the
   size of the body (see `timeout_seconds` and `max_feed_bytes` under
-  [`[feed_fetch]`](settings.md#feed_fetch)), and the supervisor kills a parse or lookup that
+  [`[feed_fetch]`](configuration/settings.md#feed_fetch)), and the supervisor kills a parse or lookup that
   runs too long.
 
 Content that is merely unpleasant, rather than an exploit, reaches you
@@ -291,7 +291,7 @@ nothing but hostnames: no feed bytes and no credentials.
 A feed's URL, or one it redirects to, may name `localhost` or an address on
 your LAN, and Kiki will fetch it. Kiki doesn't block private addresses,
 because feeds on the local network are a reasonable thing to subscribe to.
-If Kiki must not reach some services, use a [proxy](proxy.md) or a firewall
+If Kiki must not reach some services, use a [proxy](configuration/settings.md#proxy) or a firewall
 to keep it from them.
 
 Credentials for a feed are only sent to that feed's own origin; they are
