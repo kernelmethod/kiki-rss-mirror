@@ -1,9 +1,7 @@
 pub mod v1;
 
-use crate::metrics::Metrics;
 use crate::server::AppState;
 use axum::{http::StatusCode, Router};
-use std::sync::Arc;
 use std::time::Duration;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 #[cfg(feature = "api-docs")]
@@ -37,7 +35,15 @@ async fn api_fallback() -> (StatusCode, &'static str) {
     (StatusCode::NOT_FOUND, "Not Found")
 }
 
-pub fn create_router(metrics: Arc<Metrics>) -> Router<AppState> {
+/// The API's router, serving `state`.
+///
+/// Every route, the fallback included, is wrapped in
+/// [`crate::auth::authorize`], which checks the token a request carries.
+/// The router is returned finished, with the layer added last, so that
+/// routes are only ever added here, inside it. A route added to the
+/// returned router afterwards would not be wrapped: don't. The
+/// `every_route_checks_tokens` test catches one that isn't.
+pub fn create_router(state: AppState) -> Router {
     let router = Router::new().nest("/v1/", v1::create_router());
 
     #[cfg(feature = "api-docs")]
@@ -51,19 +57,21 @@ pub fn create_router(metrics: Arc<Metrics>) -> Router<AppState> {
     let router = router
         .route("/metrics", get(crate::metrics::handle_metrics))
         .layer(middleware::from_fn_with_state(
-            metrics.clone(),
+            state.metrics.clone(),
             crate::metrics::track_http,
         ));
 
-    // When the `metrics` feature is disabled, the `metrics` argument is
-    // unused; silence the warning explicitly.
-    #[cfg(not(feature = "metrics"))]
-    let _ = metrics;
-
-    router.fallback(api_fallback).layer((
-        TraceLayer::new_for_http(),
-        TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(10)),
-    ))
+    router
+        .fallback(api_fallback)
+        .layer((
+            TraceLayer::new_for_http(),
+            TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(10)),
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::authorize,
+        ))
+        .with_state(state)
 }
 
 #[cfg(test)]
@@ -86,6 +94,61 @@ pub mod test {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(resp.text().await?, "Not Found");
 
+        Ok(())
+    }
+
+    /// Every route checks the token a request carries: a bad token is
+    /// refused with `401` by every route in the OpenAPI document, and by
+    /// `/docs`, `/metrics` and the fallback. A route the auth middleware
+    /// does not wrap would answer some other way.
+    #[tokio::test]
+    async fn every_route_checks_tokens() -> Result<()> {
+        use crate::routes::v1::docs::ApiDoc;
+        use reqwest::Method;
+        use utoipa::OpenApi;
+
+        let tc = TestBuilder::all().init_server().build()?;
+        let client = tc.client()?;
+
+        // Path parameters are filled in with a value every route accepts
+        // the shape of, so that requests reach the route rather than
+        // failing to match it.
+        let param = regex::Regex::new(r"\{[^}]+\}")?;
+        let mut requests = vec![(Method::GET, "/v1/no-such-route".to_owned())];
+        #[cfg(feature = "api-docs")]
+        requests.push((Method::GET, "/docs".to_owned()));
+        #[cfg(feature = "metrics")]
+        requests.push((Method::GET, "/metrics".to_owned()));
+        for (path, item) in &ApiDoc::openapi().paths.paths {
+            for (method, op) in [
+                (Method::GET, &item.get),
+                (Method::PUT, &item.put),
+                (Method::POST, &item.post),
+                (Method::DELETE, &item.delete),
+                (Method::PATCH, &item.patch),
+            ] {
+                if op.is_some() {
+                    requests.push((method, param.replace_all(path, "1").into_owned()));
+                }
+            }
+        }
+        assert!(requests.len() > 50, "too few routes: {requests:?}");
+
+        let mut unchecked = Vec::new();
+        for (method, path) in &requests {
+            let resp = client
+                .request(method.clone(), format!("http://localhost{path}"))
+                .bearer_auth("kiki_1_invalid")
+                .send()
+                .await?;
+            if resp.status() != StatusCode::UNAUTHORIZED {
+                unchecked.push(format!("{method} {path}: {}", resp.status()));
+            }
+        }
+        assert!(
+            unchecked.is_empty(),
+            "routes that did not check the token: {unchecked:#?}"
+        );
         Ok(())
     }
 

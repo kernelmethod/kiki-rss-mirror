@@ -1275,14 +1275,7 @@ async fn uds_server(
         config,
         liveness,
     });
-    // Every route checks the request's token, if it has one; see
-    // `crate::auth`.
-    let app = routes::create_router(metrics)
-        .layer(axum::middleware::from_fn_with_state(
-            shared_state.clone(),
-            crate::auth::authorize,
-        ))
-        .with_state(shared_state);
+    let app = routes::create_router(shared_state);
 
     let listener = UnixListener::from_std(listener)
         .with_context(|| format!("Unable to listen on Unix socket at {:?}", socket_path))?;

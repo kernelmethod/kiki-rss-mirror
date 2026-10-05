@@ -3,7 +3,10 @@
 //! Every route the server serves is listed in [`requirement`]. A route
 //! missing from it requires [`Scope::Admin`], so a route added without a
 //! thought for its scope is locked down rather than left open; the tests
-//! check that every documented route is listed.
+//! check that every documented route is listed. Every route is documented
+//! in [`ApiDoc`](crate::routes::v1::docs::ApiDoc), and
+//! `routes::test::every_route_checks_tokens` checks that each one passes
+//! through [`super::authorize`], which applies this table.
 
 use super::Scope;
 use axum::http::Method;
