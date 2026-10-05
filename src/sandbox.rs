@@ -46,8 +46,10 @@
 //! * **`PR_SET_MDWE`** (Linux 6.3+) makes the kernel refuse memory that is
 //!   writable and executable, and refuse making any mapping executable
 //!   that was not already, so injected code cannot be written and then
-//!   run. Every profile gets it; it is the in-process counterpart of
-//!   systemd's `MemoryDenyWriteExecute=`.
+//!   run. It is the in-process counterpart of systemd's
+//!   `MemoryDenyWriteExecute=`. Every profile gets it but the script host
+//!   when Kiki is built with the `wasm-plugins` feature, which compiles
+//!   WebAssembly plugins to native code (see [`crate::scripting::wasm`]).
 //!
 //! All three are installed before the process touches untrusted
 //! input — for the server, just after it binds its listening socket; for
@@ -206,7 +208,7 @@ impl SandboxConfig {
         }
     }
 
-    /// Configuration for the Lua script host process.
+    /// Configuration for the script host process, which runs plugins.
     pub fn script_host(log_only: bool) -> Self {
         SandboxConfig {
             profile: SandboxProfile::ScriptHost,

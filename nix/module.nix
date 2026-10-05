@@ -69,9 +69,10 @@ in
         Restart = "on-failure";
         RestartSec = 5;
 
-        # Kiki refuses writable and executable memory itself on Linux 6.3+;
-        # these also cover older kernels.
-        MemoryDenyWriteExecute = true;
+        # No MemoryDenyWriteExecute: the script host compiles WebAssembly
+        # plugins to native code, and would inherit it. Kiki's other
+        # processes refuse writable and executable memory themselves on
+        # Linux 6.3+.
         LockPersonality = true;
       };
     };

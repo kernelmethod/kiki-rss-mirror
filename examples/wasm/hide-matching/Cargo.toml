@@ -1,0 +1,23 @@
+[package]
+name = "hide-matching"
+version = "1.0.0"
+edition = "2021"
+publish = false
+description = "An example Kiki plugin in Rust: hide entries matching regular expressions"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kiki-plugin = { path = "../../../sdk/rust/kiki-plugin" }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[workspace]

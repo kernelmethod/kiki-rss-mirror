@@ -62,7 +62,7 @@ pub enum LoadPluginsError {
     HostDead(String),
 }
 
-/// Build a [`ScriptRunner`] from the Lua plugins in `discovery` and install it in
+/// Build a [`ScriptRunner`] from the plugins in `discovery` and install it in
 /// `handle`, replacing the runner it held.
 ///
 /// Called when the server starts, and again whenever plugins are reloaded (see
@@ -93,7 +93,7 @@ pub fn load_script_runner(
     host: &crate::process::ScriptHostHandle,
     services: Arc<dyn crate::scripting::ScriptServices>,
 ) -> Result<usize, LoadPluginsError> {
-    let sources = load_lua_sources(discovery);
+    let sources = load_plugin_sources(discovery);
     let count = sources.len();
 
     // A runner with no handlers behaves exactly like no runner at all —
@@ -123,7 +123,7 @@ pub fn load_script_runner(
             Err(e) if host.is_alive() => {
                 // The host answered, it just could not compile what we
                 // sent, and kept running what it had.
-                warn!("script host failed to compile Lua scripts: {}", e);
+                warn!("script host failed to load plugins: {}", e);
                 metrics.record_plugin_load_error();
                 Err(LoadPluginsError::Compile(e.to_string()))
             }
@@ -143,7 +143,8 @@ pub fn load_script_runner(
 
     // No isolated host: compile into a VM in this process.
     let _ = host;
-    match crate::scripting::lua::LuaScriptRunner::from_sources_with(&sources, Some(services)) {
+    match crate::scripting::composite::CompositeRunner::from_sources_with(&sources, Some(services))
+    {
         Ok(runner) => {
             handle.set(if empty {
                 None
@@ -156,7 +157,7 @@ pub fn load_script_runner(
             Ok(count)
         }
         Err(e) => {
-            warn!("failed to compile Lua scripts: {}", e);
+            warn!("failed to load plugins: {}", e);
             metrics.record_plugin_load_error();
             Err(LoadPluginsError::Compile(e.to_string()))
         }
@@ -173,7 +174,7 @@ fn fire_plugin_load(handle: &ScriptRunnerHandle) {
     }
 }
 
-/// Read the source of every enabled Lua plugin in `discovery`.
-pub(super) fn load_lua_sources(discovery: &crate::plugins::Discovery) -> Vec<ScriptSource> {
-    crate::plugins::load_sources(discovery, crate::plugins::PluginEngine::Lua)
+/// Read the source of every enabled plugin in `discovery`, of every engine.
+pub(super) fn load_plugin_sources(discovery: &crate::plugins::Discovery) -> Vec<ScriptSource> {
+    crate::plugins::load_sources(discovery)
 }

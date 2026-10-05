@@ -75,8 +75,17 @@
 //! that makes this substitutable: [`lua::LuaScriptRunner`] runs the VM here,
 //! [`crate::process::script_host::SubprocessScriptRunner`] forwards to the child, and callers
 //! cannot tell the difference.
+//!
+//! # WebAssembly plugins
+//!
+//! Plugins can also be WebAssembly components (see the [`wasm`] sub-module, built with the
+//! `wasm-plugins` feature). [`composite::CompositeRunner`] runs Lua and WebAssembly plugins
+//! together, in plugin order, behind the same trait.
 
+pub mod composite;
 pub mod lua;
+#[cfg(feature = "wasm-plugins")]
+pub mod wasm;
 
 use crate::db::tags::SystemTag;
 use crate::plugins::Permission;
@@ -114,6 +123,56 @@ pub struct ScriptSource {
     /// The server decides what a plugin may do; the runner only keeps plugins that ask for
     /// different permissions apart, so that none can tamper with code running with more.
     pub permissions: Vec<Permission>,
+    /// The plugin's WebAssembly component, for a plugin whose engine is `wasm`; `None` for
+    /// a Lua plugin, whose code is in [`Self::text`] and [`Self::modules`].
+    pub component: Option<WasmComponent>,
+}
+
+/// The code of a WebAssembly plugin: a component, or a core module that the runner turns
+/// into one.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WasmComponent {
+    /// The BLAKE3 hash of [`Self::bytes`], which identifies the component even once its
+    /// bytes have been left out.
+    pub hash: [u8; 32],
+    /// The component's bytes. The server leaves them out of the sources it sends the
+    /// script host once the host has compiled the component, which it then finds by
+    /// [`Self::hash`].
+    #[serde(with = "serde_bytes")]
+    pub bytes: Vec<u8>,
+}
+
+impl WasmComponent {
+    /// The component `bytes`, with their hash.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::scripting::WasmComponent;
+    ///
+    /// let component = WasmComponent::new(b"\0asm".to_vec());
+    /// assert_eq!(component.hash, *blake3::hash(b"\0asm").as_bytes());
+    /// ```
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            hash: *blake3::hash(&bytes).as_bytes(),
+            bytes,
+        }
+    }
+
+    /// The component's hash, in hexadecimal, for log messages.
+    pub fn hash_hex(&self) -> String {
+        self.hash.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+impl std::fmt::Debug for WasmComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WasmComponent")
+            .field("hash", &self.hash_hex())
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// How long each call of a plugin's handlers may run before it is stopped.
@@ -208,8 +267,39 @@ impl ScriptSource {
             modules: Vec::new(),
             time_budget: TimeBudget::DEFAULT,
             permissions: Vec::new(),
+            component: None,
         }
     }
+
+    /// A WebAssembly plugin named `plugin` whose code is `bytes`, with an empty config and
+    /// the default [`TimeBudget`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::scripting::ScriptSource;
+    ///
+    /// let source = ScriptSource::wasm(b"\0asm".to_vec());
+    /// assert!(source.text.is_empty());
+    /// assert_eq!(source.component.unwrap().bytes, b"\0asm");
+    /// ```
+    pub fn wasm(bytes: Vec<u8>) -> Self {
+        Self {
+            component: Some(WasmComponent::new(bytes)),
+            ..Self::new("")
+        }
+    }
+}
+
+/// Copies the fields scripts may not change from `original` onto `modified`, the entry a
+/// handler returned.
+pub(crate) fn restore_read_only(modified: &mut FeedEntry, original: &FeedEntry) {
+    modified.id = original.id;
+    modified.feed_id = original.feed_id;
+    modified.syndication_format = original.syndication_format.clone();
+    modified.guid = original.guid.clone();
+    modified.authors = original.authors.clone();
+    modified.categories = original.categories.clone();
 }
 
 /// Error returned when a script's config is not a JSON object.
@@ -407,6 +497,24 @@ impl EventSet {
     /// The set an integer from [`Self::to_bits`] stands for.
     pub fn from_bits(bits: u16) -> Self {
         EventSet(bits)
+    }
+
+    /// The events in either set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::scripting::{Event, EventSet};
+    ///
+    /// let mut a = EventSet::default();
+    /// a.insert(Event::EntryIngest);
+    /// let mut b = EventSet::default();
+    /// b.insert(Event::Timer);
+    /// let both = a.union(b);
+    /// assert!(both.contains(Event::EntryIngest) && both.contains(Event::Timer));
+    /// ```
+    pub fn union(self, other: EventSet) -> EventSet {
+        EventSet(self.0 | other.0)
     }
 }
 

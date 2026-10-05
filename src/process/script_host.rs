@@ -8,6 +8,11 @@
 //!
 //! [#58]: https://github.com/kernelmethod/kiki-rss/pull/58
 //!
+//! WebAssembly plugins run there too, compiled to native code with
+//! Cranelift. That makes the child the one Kiki process allowed memory that
+//! is first writable and then executable (see [`crate::sandbox`]), and the
+//! compiler one more body of code that handles what plugins supply.
+//!
 //! This module moves the VM into a child process that holds nothing: no
 //! database, no filesystem (Landlock with an empty ruleset), and no way
 //! to open a socket (seccomp). Its entire view of the world is one
@@ -45,11 +50,13 @@
 use crate::process::ipc::{
     decode, encode, read_frame, write_frame, FromHost, HostRequest, HostResponse, MAX_FRAME_BYTES,
 };
+use crate::scripting::composite::CompositeRunner;
 use crate::scripting::{
     Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary, ScheduleDecision,
     ScriptRunner, ScriptServices, ScriptSource, ServiceCall, ServiceReply,
 };
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::io::{self, BufReader};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
@@ -176,6 +183,9 @@ pub struct ScriptHost {
     /// handlers for, as of its last response: every event until it has
     /// answered once, and none once the host is retired.
     subscribed: AtomicU16,
+    /// The hashes of the WebAssembly components the child has compiled and
+    /// kept, which sources can name without sending them again.
+    components: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl ScriptHost {
@@ -209,6 +219,7 @@ impl ScriptHost {
             state: Mutex::new(Some(Live { channel, child })),
             services: RwLock::new(None),
             subscribed: AtomicU16::new(EventSet::ALL.to_bits()),
+            components: Mutex::new(HashSet::new()),
         })
     }
 
@@ -268,10 +279,48 @@ impl ScriptHost {
     /// running. If `sources` fail to compile, the child keeps running the
     /// VM it had.
     ///
+    /// Each WebAssembly component the child has not compiled yet is sent
+    /// first, in a message of its own; the sources then name it by hash.
+    ///
     /// Returns the number of scripts the child compiled.
-    pub fn reload(&self, sources: Vec<ScriptSource>) -> Result<usize, HostError> {
+    pub fn reload(&self, mut sources: Vec<ScriptSource>) -> Result<usize, HostError> {
+        let mut used = HashSet::new();
+        for source in &mut sources {
+            let Some(component) = source.component.as_mut() else {
+                continue;
+            };
+            used.insert(component.hash);
+            let known = self
+                .components
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&component.hash);
+            if !known {
+                let put = HostRequest::PutComponent {
+                    component: component.clone(),
+                };
+                match self.request(&put)? {
+                    HostResponse::Ack => {}
+                    other => {
+                        return Err(HostError::Protocol(format!("expected Ack, got {other:?}")))
+                    }
+                }
+                self.components
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(component.hash);
+            }
+            component.bytes = Vec::new();
+        }
         match self.request(&HostRequest::Reload { sources })? {
-            HostResponse::Reloaded { loaded } => Ok(loaded),
+            HostResponse::Reloaded { loaded } => {
+                // The child forgets the components no plugin uses any more.
+                self.components
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|hash| used.contains(hash));
+                Ok(loaded)
+            }
             other => Err(HostError::Protocol(format!(
                 "expected Reloaded, got {other:?}"
             ))),
@@ -520,7 +569,7 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
 
     if no_sandbox {
         warn!(
-            "script host: sandbox disabled via --no-sandbox; the Lua VM runs with full \
+            "script host: sandbox disabled via --no-sandbox; plugins run with full \
              filesystem and syscall access"
         );
     } else {
@@ -535,7 +584,7 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
         channel: channel.clone(),
     });
 
-    let mut runner: Option<crate::scripting::lua::LuaScriptRunner> = None;
+    let mut runner: Option<CompositeRunner> = None;
 
     loop {
         let frame = match read_frame(&mut channel.lock().unwrap_or_else(|e| e.into_inner()).reader)
@@ -611,19 +660,23 @@ impl ScriptServices for IpcServices {
 
 /// Handle a single request against the child's current VM.
 fn serve(
-    runner: &mut Option<crate::scripting::lua::LuaScriptRunner>,
+    runner: &mut Option<CompositeRunner>,
     services: &Arc<dyn ScriptServices>,
     request: HostRequest,
 ) -> HostResponse {
     match request {
         HostRequest::Reload { sources } => {
             let count = sources.len();
-            match crate::scripting::lua::LuaScriptRunner::from_sources_with(
-                &sources,
-                Some(services.clone()),
-            ) {
+            match CompositeRunner::from_sources_with(&sources, Some(services.clone())) {
                 Ok(new_runner) => {
                     *runner = Some(new_runner);
+                    #[cfg(feature = "wasm-plugins")]
+                    crate::scripting::wasm::retain_components(
+                        &sources
+                            .iter()
+                            .filter_map(|s| s.component.as_ref().map(|c| c.hash))
+                            .collect(),
+                    );
                     HostResponse::Reloaded { loaded: count }
                 }
                 Err(e) => {
@@ -682,9 +735,30 @@ fn serve(
             HostResponse::Ack
         }
 
+        HostRequest::PutComponent { component } => put_component(&component),
+
         HostRequest::CallResult { .. } => HostResponse::Failed {
             message: "a call result arrived with no call outstanding".to_string(),
         },
+    }
+}
+
+/// Compile `component` and keep it for the next reload.
+#[cfg(feature = "wasm-plugins")]
+fn put_component(component: &crate::scripting::WasmComponent) -> HostResponse {
+    match crate::scripting::wasm::put_component(component) {
+        Ok(()) => HostResponse::Ack,
+        Err(e) => HostResponse::Failed {
+            message: format!("{e}"),
+        },
+    }
+}
+
+/// See the variant of this function built with the `wasm-plugins` feature.
+#[cfg(not(feature = "wasm-plugins"))]
+fn put_component(_: &crate::scripting::WasmComponent) -> HostResponse {
+    HostResponse::Failed {
+        message: "this build of Kiki cannot run WebAssembly plugins".to_string(),
     }
 }
 

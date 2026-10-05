@@ -4,6 +4,12 @@ Kiki has a Lua scripting engine that plugins use to hook into server events —
 transforming incoming entries, reacting to feed lifecycle changes, or logging
 when something interesting happens.
 
+Plugins can also be WebAssembly components, written in Rust or another
+language that compiles to WebAssembly. They take the same events, make the
+same calls to the server and are installed, configured and limited the same
+way; what differs is described in the chapter *Writing WebAssembly plugins*.
+This chapter describes plugins in general, and the Lua API.
+
 ## Plugins
 
 Plugins live in the `plugins/` directory in Kiki's home (next to `kiki.db`;
@@ -56,8 +62,8 @@ flags = "i"
 |---------------|----------|---------|
 | `name`        | Yes      | The plugin's name: lowercase letters, digits, `-` and `_`, starting with a letter or digit, at most 64 characters. Must be unique among installed plugins. |
 | `version`     | Yes      | The plugin's version, as `MAJOR.MINOR.PATCH` with an optional pre-release or build suffix ([Semantic Versioning](https://semver.org)). |
-| `engine`      | Yes      | The engine the plugin's code is written for. Currently only `"lua"`. |
-| `entrypoint`  | No       | The file that runs when the plugin loads, relative to the plugin directory. Defaults to `main.lua`. |
+| `engine`      | Yes      | The engine the plugin's code is written for: `"lua"`, or `"wasm"` for a WebAssembly plugin. |
+| `entrypoint`  | No       | The file that runs when the plugin loads, relative to the plugin directory. Defaults to `main.lua`, or `plugin.wasm` for a WebAssembly plugin. |
 | `description`, `authors`, `license`, `homepage` | No | Informational; shown by the API. |
 | `enabled`     | No       | Set to `false` to keep a plugin installed without running it. Defaults to `true`. |
 | `time_budget_ms` | No    | How long each call of one of the plugin's handlers may run, in milliseconds, or `"unlimited"`; see [Resource limits](#resource-limits). Defaults to `100`. |

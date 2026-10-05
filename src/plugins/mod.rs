@@ -93,7 +93,7 @@ mod retention_tests;
 #[cfg(test)]
 mod sanitize_tests;
 
-use crate::scripting::{ScriptModule, ScriptSource, TimeBudget};
+use crate::scripting::{ScriptModule, ScriptSource, TimeBudget, WasmComponent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -128,6 +128,15 @@ pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 /// Every plugin's source is shipped to the script host in one message, so
 /// this also keeps the message well inside the host's frame limit.
 pub const MAX_PLUGIN_SOURCE_BYTES: u64 = 1024 * 1024;
+
+/// Largest WebAssembly plugin, in bytes.
+///
+/// Each component is shipped to the script host in a message of its own, so
+/// this keeps it inside the host's frame limit.
+pub const MAX_WASM_COMPONENT_BYTES: u64 = 7 * 1024 * 1024;
+
+const _: () =
+    assert!(MAX_WASM_COMPONENT_BYTES + 64 * 1024 <= crate::process::ipc::MAX_FRAME_BYTES as u64);
 
 /// How deep inside a plugin directory source files are looked for.
 const MAX_SOURCE_DEPTH: usize = 8;
@@ -168,6 +177,9 @@ pub fn plugins_dir(home: &Path) -> PathBuf {
 pub enum PluginEngine {
     /// Lua 5.4. See the scripting guide for the API available to Lua code.
     Lua,
+    /// A WebAssembly component targeting the `plugin` world in `wit/kiki-plugin.wit`, or a
+    /// core module carrying that world's type information, which Kiki turns into one.
+    Wasm,
 }
 
 impl PluginEngine {
@@ -175,6 +187,7 @@ impl PluginEngine {
     pub fn name(self) -> &'static str {
         match self {
             Self::Lua => "lua",
+            Self::Wasm => "wasm",
         }
     }
 
@@ -182,6 +195,7 @@ impl PluginEngine {
     pub fn source_extension(self) -> &'static str {
         match self {
             Self::Lua => "lua",
+            Self::Wasm => "wasm",
         }
     }
 
@@ -189,6 +203,7 @@ impl PluginEngine {
     pub fn default_entrypoint(self) -> &'static str {
         match self {
             Self::Lua => "main.lua",
+            Self::Wasm => "plugin.wasm",
         }
     }
 
@@ -196,6 +211,7 @@ impl PluginEngine {
     pub fn is_supported(self) -> bool {
         match self {
             Self::Lua => true,
+            Self::Wasm => cfg!(feature = "wasm-plugins"),
         }
     }
 }
@@ -330,7 +346,8 @@ pub struct PluginManifest {
     pub engine: PluginEngine,
 
     /// Path of the file whose code runs when the plugin is loaded, relative
-    /// to the plugin directory. Defaults to `main.lua` for Lua plugins.
+    /// to the plugin directory. Defaults to `main.lua` for Lua plugins, and
+    /// `plugin.wasm` for WebAssembly plugins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
 
@@ -716,6 +733,9 @@ impl Plugin {
     /// Returns an error if a source file cannot be read or is not UTF-8, or
     /// if the sources are larger than [`MAX_PLUGIN_SOURCE_BYTES`] in total.
     pub fn load_source(&self) -> Result<ScriptSource, PluginError> {
+        if self.manifest.engine == PluginEngine::Wasm {
+            return self.load_wasm_source();
+        }
         let extension = self.manifest.engine.source_extension();
         let mut files = Vec::new();
         collect_source_files(&self.dir, &self.dir, extension, 0, &mut files)?;
@@ -748,6 +768,39 @@ impl Plugin {
             modules,
             time_budget: self.manifest.time_budget(),
             permissions: self.manifest.permissions.clone(),
+            component: None,
+        })
+    }
+
+    /// Reads a WebAssembly plugin's entrypoint, its one file of code.
+    fn load_wasm_source(&self) -> Result<ScriptSource, PluginError> {
+        let path = self.dir.join(self.manifest.entrypoint());
+        let io_err = |source| PluginError::Io {
+            path: path.clone(),
+            source,
+        };
+        let len = std::fs::metadata(&path).map_err(io_err)?.len();
+        if len > MAX_WASM_COMPONENT_BYTES {
+            return Err(PluginError::TooLarge {
+                path,
+                limit: MAX_WASM_COMPONENT_BYTES,
+            });
+        }
+        let bytes = std::fs::read(&path).map_err(io_err)?;
+        if bytes.len() as u64 > MAX_WASM_COMPONENT_BYTES {
+            return Err(PluginError::TooLarge {
+                path,
+                limit: MAX_WASM_COMPONENT_BYTES,
+            });
+        }
+        Ok(ScriptSource {
+            name: self.manifest.name.clone(),
+            text: String::new(),
+            config: serde_json::Value::Object(self.config.clone()).to_string(),
+            modules: Vec::new(),
+            time_budget: self.manifest.time_budget(),
+            permissions: self.manifest.permissions.clone(),
+            component: Some(WasmComponent::new(bytes)),
         })
     }
 }
@@ -1081,9 +1134,12 @@ fn list_dirs(dir: &Path) -> Result<Vec<PathBuf>, PluginError> {
     Ok(dirs)
 }
 
-/// Reads the source of every enabled plugin in `discovery` whose engine is
-/// `engine`, logging each plugin that cannot be loaded.
-pub fn load_sources(discovery: &Discovery, engine: PluginEngine) -> Vec<ScriptSource> {
+/// Reads the source of every enabled plugin in `discovery`, in the order the
+/// plugins load in, logging each plugin that cannot be loaded.
+///
+/// Plugins written for an engine this build of Kiki cannot run are skipped
+/// with a warning.
+pub fn load_sources(discovery: &Discovery) -> Vec<ScriptSource> {
     let mut sources = Vec::new();
     for plugin in &discovery.plugins {
         let name = &plugin.manifest.name;
@@ -1091,7 +1147,12 @@ pub fn load_sources(discovery: &Discovery, engine: PluginEngine) -> Vec<ScriptSo
             tracing::debug!(plugin = %name, "skipping disabled plugin");
             continue;
         }
-        if plugin.manifest.engine != engine {
+        if !plugin.manifest.engine.is_supported() {
+            tracing::warn!(
+                plugin = %name,
+                engine = plugin.manifest.engine.name(),
+                "skipping plugin: this build of Kiki cannot run its engine"
+            );
             continue;
         }
         match plugin.load_source() {
@@ -1641,7 +1702,7 @@ mod tests {
         off.enabled = false;
         install(td.path(), &off, "-- off").unwrap();
 
-        let sources = load_sources(&discover(tmp.path()).unwrap(), PluginEngine::Lua);
+        let sources = load_sources(&discover(tmp.path()).unwrap());
         let names: Vec<_> = sources.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["on"]);
     }
