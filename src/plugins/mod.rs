@@ -87,9 +87,9 @@ mod auto_tag_tests;
 #[cfg(test)]
 mod filter_tests;
 #[cfg(test)]
-mod sanitize_tests;
+mod privacy_tests;
 #[cfg(test)]
-mod strip_tracking_tests;
+mod sanitize_tests;
 
 use crate::scripting::{ScriptModule, ScriptSource, TimeBudget};
 use serde::{Deserialize, Serialize};

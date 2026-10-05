@@ -59,7 +59,7 @@ kiki plugin config set sanitize sanitize.toml
 ## Plugin order
 
 Plugins run in the order of their directory names, so `sanitize` runs after
-`filter` and `auto-tag`, and before `strip-tracking`. Plugins whose
+`filter`, `auto-tag` and `privacy`. Plugins whose
 directory names sort after `sanitize` see the sanitized content, and can
 add markup back; a plugin of your own that should run on unsanitized
 content needs a name that sorts before it.

@@ -83,7 +83,7 @@ To use Tor, set `url = "socks5h://127.0.0.1:9050"`. With `socks5://`, Kiki
 looks host names up itself, and those DNS queries go out directly, telling
 whoever can see them which sites Kiki fetches from. To keep Kiki from
 downloading images and enclosures at all for some feeds, see `skip_assets`
-in the [strip-tracking plugin](../plugins/strip-tracking.md).
+in the [privacy plugin](../plugins/privacy.md).
 
 ## `[web_ui]`
 

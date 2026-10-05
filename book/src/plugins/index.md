@@ -16,11 +16,11 @@ with Kiki, and in `plugins/user/` if you installed it.
 | [`filter`](filter.md) | Hides entries matching rules you set. |
 | [`auto-tag`](auto-tag.md) | Tags entries matching rules you set. |
 | [`sanitize`](sanitize.md) | Removes scripts, styles, embedded content and unsafe links from entries' HTML. |
-| [`strip-tracking`](strip-tracking.md) | Removes tracking parameters from links, and tracking pixels from content. |
+| [`privacy`](privacy.md) | Removes tracking parameters from links, and tracking pixels from content. |
 | [`adaptive-fetch`](adaptive-fetch.md) | Fetches feeds less often while they keep turning out unchanged. |
 
 `filter` and `auto-tag` do nothing until you give them rules.
-`sanitize`, `strip-tracking` and `adaptive-fetch` work out of the box.
+`sanitize`, `privacy` and `adaptive-fetch` work out of the box.
 
 Pass `kiki init --no-default-plugins` to skip them. `kiki init --check`,
 which the packaged services run before every start, installs default plugins

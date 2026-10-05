@@ -13,7 +13,7 @@ Kiki ships with:
   [hides entries](plugins/filter.md) matching rules you set, one
   [tags entries](plugins/auto-tag.md) automatically, one
   [sanitizes entries' HTML](plugins/sanitize.md), and one
-  [strips tracking parameters](plugins/strip-tracking.md) and pixels.
+  [strips tracking parameters](plugins/privacy.md) and pixels.
 - **`kiki web`**, a small [web UI](web-ui.md) for reading feeds in a browser.
 - **OPML import and export**, for moving feeds in from, or out to, another
   aggregator.

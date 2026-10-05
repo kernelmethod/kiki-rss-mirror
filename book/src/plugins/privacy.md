@@ -1,6 +1,6 @@
 # Stripping tracking parameters
 
-The `strip-tracking` plugin cleans up new entries as they arrive:
+The `privacy` plugin cleans up new entries as they arrive:
 
 - It removes tracking parameters, such as `utm_source`, `fbclid` and
   `gclid`, from the query strings of entries' URLs and of the links in their
@@ -19,11 +19,11 @@ To strip other parameters or trackers, or to leave entries' content alone,
 start from its defaults:
 
 ```bash
-kiki plugin config get strip-tracking --defaults > strip-tracking.toml
-# edit strip-tracking.toml: add names to `params` ("prefix_*" matches a prefix)
+kiki plugin config get privacy --defaults > privacy.toml
+# edit privacy.toml: add names to `params` ("prefix_*" matches a prefix)
 # or image sources to `trackers` ("*.example.com", "example.com/pixel"),
 # or set `content = false` or `pixels = false`
-kiki plugin config set strip-tracking strip-tracking.toml
+kiki plugin config set privacy privacy.toml
 ```
 
 ## Not downloading assets at all
@@ -33,8 +33,8 @@ that the sites serving them never hear from it, list the feeds, by id or by
 URL, in `skip_assets`:
 
 ```bash
-echo 'skip_assets = [3, "https://example.com/feed.xml"]' | kiki plugin config set strip-tracking
+echo 'skip_assets = [3, "https://example.com/feed.xml"]' | kiki plugin config set privacy
 ```
 
-See [`plugins/strip-tracking/main.lua`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/strip-tracking/main.lua)
+See [`plugins/privacy/main.lua`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/privacy/main.lua)
 for the details.

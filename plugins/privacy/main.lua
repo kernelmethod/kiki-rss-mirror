@@ -45,7 +45,7 @@
 local config = ...
 
 local function fail(message)
-    error("strip-tracking: " .. message, 0)
+    error("privacy: " .. message, 0)
 end
 
 -- The names in `params`, lowercased: exact names as a set, and the
