@@ -293,7 +293,8 @@ pub(super) fn render_plugins(resp: &ListPluginsResponse) -> String {
 
     html.push_str(
         "<p class=\"meta\">Plugins are reloaded whenever the plugins directory or a \
-         plugin's config changes.</p>\n",
+         plugin's config changes.</p>\n\
+         <p><a href=\"/settings\">&larr; Back to settings</a></p>\n",
     );
     html
 }
