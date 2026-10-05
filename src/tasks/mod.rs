@@ -1,4 +1,3 @@
-mod adaptive;
 pub mod assets;
 mod backoff;
 mod cache;

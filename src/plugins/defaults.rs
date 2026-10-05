@@ -19,7 +19,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 /// A zstd-compressed tarball of the plugins installed by default: currently
-/// `auto-tag`, `filter`, `sanitize` and `strip-tracking`.
+/// `adaptive-fetch`, `auto-tag`, `filter`, `sanitize` and `strip-tracking`.
 ///
 /// Each plugin's directory is stored under its own name at the root of the
 /// archive, and holds only regular files.
@@ -273,6 +273,7 @@ fn replace_plugin(plugins_dir: &Path, name: &str, files: &[&BundledFile]) -> Res
 /// assert_eq!(
 ///     outcomes,
 ///     [
+///         ("adaptive-fetch".to_string(), SyncOutcome::Installed),
 ///         ("auto-tag".to_string(), SyncOutcome::Installed),
 ///         ("filter".to_string(), SyncOutcome::Installed),
 ///         ("sanitize".to_string(), SyncOutcome::Installed),
@@ -358,6 +359,8 @@ mod tests {
         assert_eq!(
             paths,
             [
+                Path::new("adaptive-fetch/main.lua"),
+                Path::new("adaptive-fetch/manifest.toml"),
                 Path::new("auto-tag/main.lua"),
                 Path::new("auto-tag/manifest.toml"),
                 Path::new("filter/main.lua"),
@@ -372,6 +375,8 @@ mod tests {
         assert_eq!(
             plugins,
             [
+                "adaptive-fetch",
+                "adaptive-fetch",
                 "auto-tag",
                 "auto-tag",
                 "filter",
@@ -384,18 +389,22 @@ mod tests {
         );
         assert_eq!(
             files[0].contents,
-            include_bytes!("../../plugins/auto-tag/main.lua")
+            include_bytes!("../../plugins/adaptive-fetch/main.lua")
         );
         assert_eq!(
             files[2].contents,
-            include_bytes!("../../plugins/filter/main.lua")
+            include_bytes!("../../plugins/auto-tag/main.lua")
         );
         assert_eq!(
             files[4].contents,
-            include_bytes!("../../plugins/sanitize/main.lua")
+            include_bytes!("../../plugins/filter/main.lua")
         );
         assert_eq!(
             files[6].contents,
+            include_bytes!("../../plugins/sanitize/main.lua")
+        );
+        assert_eq!(
+            files[8].contents,
             include_bytes!("../../plugins/strip-tracking/main.lua")
         );
     }
@@ -404,8 +413,17 @@ mod tests {
     fn sync_filter(dir: &Path) -> SyncOutcome {
         let outcomes = sync_default_plugins(dir).unwrap();
         let names: Vec<_> = outcomes.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names, ["auto-tag", "filter", "sanitize", "strip-tracking"]);
-        outcomes[1].1
+        assert_eq!(
+            names,
+            [
+                "adaptive-fetch",
+                "auto-tag",
+                "filter",
+                "sanitize",
+                "strip-tracking"
+            ]
+        );
+        outcomes[2].1
     }
 
     /// Makes the recorded version of `filter` look older than the bundled
@@ -436,7 +454,13 @@ mod tests {
             .collect();
         assert_eq!(
             installed,
-            ["auto-tag", "filter", "sanitize", "strip-tracking"]
+            [
+                "adaptive-fetch",
+                "auto-tag",
+                "filter",
+                "sanitize",
+                "strip-tracking"
+            ]
         );
 
         let discovery = discover(&plugins_dir).unwrap();
@@ -483,6 +507,7 @@ mod tests {
             entries,
             [
                 RECORD_FILE_NAME,
+                "adaptive-fetch",
                 "auto-tag",
                 "filter",
                 "sanitize",

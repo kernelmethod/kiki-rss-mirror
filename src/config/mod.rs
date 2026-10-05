@@ -128,13 +128,6 @@ pub struct FeedFetchSettings {
     /// applied to permanent errors, in seconds.
     pub max_backoff_seconds: u64,
 
-    /// Whether to back off from feeds whose freshness hint is shorter than
-    /// their fetch interval but which keep turning out to be unchanged.
-    /// Each unchanged fetch doubles the wait, and each changed one halves
-    /// it, always between `min_polling_cadence_seconds` and the feed's own
-    /// interval. Feeds can override this individually.
-    pub adaptive_fetch: bool,
-
     /// How often, in seconds, to bypass conditional-request headers and
     /// force a full `GET` on a feed. Catches servers that keep serving the
     /// same `ETag`/`Last-Modified` while the body has changed.
@@ -401,7 +394,6 @@ impl Default for Settings {
                 min_polling_cadence_seconds: 60,
                 default_fetch_interval_seconds: DEFAULT_FETCH_INTERVAL_SECONDS,
                 max_backoff_seconds: 24 * 60 * 60,
-                adaptive_fetch: true,
                 force_refresh_after_seconds: 7 * 24 * 60 * 60,
                 max_feed_bytes: DEFAULT_MAX_FEED_BYTES,
             },
@@ -561,12 +553,49 @@ impl Overrides {
     /// wrong type, or a value that fails [`Settings::validate`].
     pub fn resolve(&self) -> Result<Settings, ConfigError> {
         let mut merged = toml::Table::try_from(Settings::default())?;
-        merge(&mut merged, &self.0);
+        merge(&mut merged, &self.without_retired_keys());
         let settings: Settings = toml::Value::Table(merged)
             .try_into()
             .map_err(|e: toml::de::Error| ConfigError::Invalid(e.message().to_string()))?;
         settings.validate()?;
         Ok(settings)
+    }
+}
+
+/// Settings Kiki no longer has, as `(section, key)`, with what replaced
+/// each. A config file that still sets one is accepted, and the key
+/// ignored with a warning, rather than refused.
+const RETIRED_KEYS: &[(&str, &str, &str)] = &[(
+    "feed_fetch",
+    "adaptive_fetch",
+    "adaptive fetching is now the adaptive-fetch plugin; set its \
+     `feeds` or `exclude`, or disable it in its manifest",
+)];
+
+impl Overrides {
+    /// The overrides without any of the [`RETIRED_KEYS`], warning about
+    /// each one that was set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::{Overrides, Settings};
+    ///
+    /// let o = Overrides::parse("[feed_fetch]\nadaptive_fetch = false\n").unwrap();
+    /// assert_eq!(o.resolve().unwrap(), Settings::default());
+    /// ```
+    fn without_retired_keys(&self) -> toml::Table {
+        let mut table = self.0.clone();
+        for (section, key, replacement) in RETIRED_KEYS {
+            let removed = table
+                .get_mut(*section)
+                .and_then(toml::Value::as_table_mut)
+                .and_then(|t| t.remove(*key));
+            if removed.is_some() {
+                tracing::warn!("ignoring the retired setting {section}.{key}: {replacement}");
+            }
+        }
+        table
     }
 }
 

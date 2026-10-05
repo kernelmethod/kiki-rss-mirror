@@ -13,7 +13,6 @@ const MIN_FETCH_INTERVAL: u64 = 10_800;
 fn success_with_hint(hint: Option<u64>) -> FetchOutcome {
     FetchOutcome::Success {
         server_hint_secs: hint,
-        adaptive_level: 0,
     }
 }
 
@@ -374,7 +373,6 @@ fn plan(outcome: FetchOutcome) -> super::super::backoff::Schedule {
 fn test_plan_zero_hint_explains_min_cadence() {
     let schedule = plan(FetchOutcome::NotModified {
         server_hint_secs: Some(0),
-        adaptive_level: 0,
     })
     .with_hint_source(Some("Cache-Control \"public, max-age=0\"".to_string()));
     assert_eq!(schedule.next_fetch_at, PLAN_NOW + 60);
@@ -520,4 +518,77 @@ fn test_format_duration() {
     assert_eq!(format_duration(7_500), "2h 5m");
     assert_eq!(format_duration(108_000), "1d 6h");
     assert_eq!(format_duration(86_430), "1d");
+}
+
+/// A plugin has room to lengthen only a wait taken from a hint shorter
+/// than the feed's interval: from that wait up to the interval.
+#[test]
+fn test_plugin_room() {
+    let short = plan(FetchOutcome::NotModified {
+        server_hint_secs: Some(0),
+    });
+    assert_eq!(
+        short.plugin_room(MAX_BACKOFF),
+        Some((60, MIN_FETCH_INTERVAL))
+    );
+    // Never past the backoff cap.
+    assert_eq!(short.plugin_room(600), Some((60, 600)));
+
+    for hint in [None, Some(MIN_FETCH_INTERVAL), Some(2 * MIN_FETCH_INTERVAL)] {
+        assert_eq!(plan(success_with_hint(hint)).plugin_room(MAX_BACKOFF), None);
+    }
+    let failed = plan(FetchOutcome::TransientErr {
+        retry_after_ts: None,
+        consecutive_failures: 1,
+        stale_if_error_secs: None,
+    });
+    assert_eq!(failed.plugin_room(MAX_BACKOFF), None);
+}
+
+/// A plugin's wait is held to the room it has, and the explanation names
+/// the plugin.
+#[test]
+fn test_stretched_by_plugin() {
+    let short = || {
+        plan(FetchOutcome::NotModified {
+            server_hint_secs: Some(0),
+        })
+    };
+
+    let schedule = short().stretched_by_plugin("adaptive-fetch".into(), 480, MAX_BACKOFF);
+    assert_eq!(schedule.next_fetch_at, PLAN_NOW + 480);
+    assert_eq!(
+        schedule.reason,
+        ScheduleReason::Plugin {
+            plugin: "adaptive-fetch".into(),
+            hint_secs: 0,
+            secs: 480
+        }
+    );
+    assert_eq!(schedule.clamp, None);
+    assert_eq!(schedule.reason.metric_source(), "plugin");
+    assert!(schedule
+        .to_string()
+        .contains("freshness hint of 0s, stretched to 8m by the adaptive-fetch plugin"));
+
+    // Past the interval: the interval.
+    let schedule = short().stretched_by_plugin("p".into(), 1_000_000, MAX_BACKOFF);
+    assert_eq!(schedule.next_fetch_at, PLAN_NOW + MIN_FETCH_INTERVAL as i64);
+
+    // Shorter than planned: as planned.
+    for secs in [0, 30, 60] {
+        assert_eq!(
+            short().stretched_by_plugin("p".into(), secs, MAX_BACKOFF),
+            short()
+        );
+    }
+
+    // No room: as planned.
+    let interval = plan(success_with_hint(None));
+    assert_eq!(
+        interval
+            .clone()
+            .stretched_by_plugin("p".into(), 1_000_000, MAX_BACKOFF),
+        interval
+    );
 }

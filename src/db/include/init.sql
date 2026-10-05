@@ -158,16 +158,6 @@ CREATE TABLE feeds (
     -- retry time is folded into `next_fetch_at`.
     retry_after_at          INTEGER,
 
-    -- Adaptive fetching (see src/tasks/adaptive.rs). `adaptive_fetch` is
-    -- the feed's override of `feed_fetch.adaptive_fetch`: NULL follows the
-    -- server setting, 0 turns it off for this feed, and 1 turns it on.
-    -- `adaptive_fetch_level` rises by one each time a fetch finds the feed
-    -- unchanged and falls by one each time it has changed; a freshness
-    -- hint shorter than the feed's interval is stretched by
-    -- 2^adaptive_fetch_level, up to that interval.
-    adaptive_fetch          INTEGER,
-    adaptive_fetch_level    INTEGER NOT NULL DEFAULT 0,
-
     -- Per-feed authentication. `auth_type` is one of:
     --   * NULL or 'none' — no authentication (default)
     --   * 'basic'        — HTTP Basic auth (auth_username + auth_password)

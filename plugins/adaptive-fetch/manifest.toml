@@ -1,0 +1,32 @@
+name = "adaptive-fetch"
+version = "1.0.0"
+engine = "lua"
+description = "Fetch feeds less often while they keep turning out unchanged, when their server asks for them more often than their interval"
+license = "MIT"
+homepage = "https://github.com/kernelmethod/kiki-rss"
+
+# Some servers ask for their feed to be fetched far more often than it
+# changes (`Cache-Control: max-age=0` is common). This plugin backs off
+# from such a feed while it keeps turning out unchanged, and comes back
+# while it changes, never fetching it less often than its own interval.
+# See main.lua for how.
+#
+# `feeds` and `exclude` name feeds by id, or by the URL they are fetched
+# from. With both empty, every feed is backed off from.
+[config]
+feeds = []
+exclude = []
+
+[[settings]]
+name = "feeds"
+type = "list"
+items = { type = "feed" }
+label = "Only these feeds"
+description = "Back off only from these feeds, each given by its id or the URL it is fetched from. Empty means every feed."
+
+[[settings]]
+name = "exclude"
+type = "list"
+items = { type = "feed" }
+label = "Never these feeds"
+description = "Always fetch these feeds as often as their server asks, each given by its id or the URL it is fetched from."

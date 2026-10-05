@@ -46,8 +46,8 @@ use crate::process::ipc::{
     decode, encode, read_frame, write_frame, FromHost, HostRequest, HostResponse, MAX_FRAME_BYTES,
 };
 use crate::scripting::{
-    Event, EventPayload, EventSet, FeedEntry, ScanSummary, ScriptRunner, ScriptServices,
-    ScriptSource, ServiceCall, ServiceReply,
+    Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary, ScheduleDecision,
+    ScriptRunner, ScriptServices, ScriptSource, ServiceCall, ServiceReply,
 };
 use anyhow::{Context, Result};
 use std::io::{self, BufReader};
@@ -392,6 +392,19 @@ impl ScriptRunner for SubprocessScriptRunner {
         }
     }
 
+    fn dispatch_schedule(&self, schedule: FetchSchedule) -> Result<Option<ScheduleDecision>> {
+        if !self.handles(Event::FetchSchedule) {
+            return Ok(None);
+        }
+        match self.host.request(&HostRequest::Schedule { schedule })? {
+            HostResponse::Schedule { decision } => Ok(decision),
+            HostResponse::Failed { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "expected a Schedule response, got {other:?}"
+            )),
+        }
+    }
+
     fn dispatch_observe(&self, event: Event, payload: EventPayload) {
         if !self.handles(event) {
             return;
@@ -629,6 +642,16 @@ fn serve(
             None => HostResponse::Entry { entry: Some(entry) },
             Some(r) => match r.dispatch_transform_entry(entry) {
                 Ok(entry) => HostResponse::Entry { entry },
+                Err(e) => HostResponse::Failed {
+                    message: format!("{e}"),
+                },
+            },
+        },
+
+        HostRequest::Schedule { schedule } => match runner.as_ref() {
+            None => HostResponse::Schedule { decision: None },
+            Some(r) => match r.dispatch_schedule(schedule) {
+                Ok(decision) => HostResponse::Schedule { decision },
                 Err(e) => HostResponse::Failed {
                     message: format!("{e}"),
                 },

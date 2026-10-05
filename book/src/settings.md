@@ -17,7 +17,6 @@ every feed, with no restart.
 | `min_polling_cadence_seconds` | `60` | The shortest time between two fetches of the same feed, in seconds, whatever the feed's server asks for. Stops a misbehaving server from making Kiki poll it constantly. |
 | `default_fetch_interval_seconds` | `86400` (1 day) | The fetch interval given to newly added feeds: the longest Kiki waits between fetches, and the wait used when the server gives no hint of its own. Feeds already added keep their own interval, which can be changed per feed. |
 | `max_backoff_seconds` | `86400` (1 day) | The longest Kiki backs off from a feed after errors, in seconds, and the wait after a permanent error. |
-| `adaptive_fetch` | `true` | Back off from feeds whose server asks to be fetched more often than their interval, but which keep turning out to be unchanged. Each unchanged fetch doubles the wait and each changed one halves it, staying between `min_polling_cadence_seconds` and the feed's own interval. Feeds can override this. |
 | `force_refresh_after_seconds` | `604800` (1 week) | How often to fetch a feed in full, ignoring `ETag` and `Last-Modified`, in seconds. Catches servers that keep sending the same headers after the feed has changed. |
 | `max_feed_bytes` | `33554432` (32 MiB) | The largest feed Kiki reads, in bytes. Bigger responses are abandoned and recorded as an error. |
 

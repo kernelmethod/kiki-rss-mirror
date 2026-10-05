@@ -32,8 +32,8 @@ mod html_api;
 mod regex_api;
 
 use super::{
-    parse_script_config, Event, EventPayload, EventSet, FeedEntry, ScanSummary, ScriptRunner,
-    ScriptServices, ScriptSource, TimeBudget,
+    parse_script_config, Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary,
+    ScheduleDecision, ScriptRunner, ScriptServices, ScriptSource, TimeBudget,
 };
 use api::{ApiContext, Budget};
 use mlua::prelude::*;
@@ -215,6 +215,39 @@ fn payload_to_lua(lua: &Lua, payload: EventPayload) -> LuaResult<LuaValue> {
     }
 }
 
+/// Convert a [`FetchSchedule`] into the table passed to a `fetch.schedule` handler.
+fn schedule_to_lua(lua: &Lua, schedule: &FetchSchedule) -> LuaResult<LuaValue> {
+    let t = lua.create_table()?;
+    t.set("feed_id", schedule.feed_id)?;
+    t.set("status", schedule.status)?;
+    t.set("change", schedule.change.name())?;
+    t.set("hint_secs", schedule.hint_secs)?;
+    t.set("interval_secs", schedule.interval_secs)?;
+    t.set("min_cadence_secs", schedule.min_cadence_secs)?;
+    t.set("wait_secs", schedule.wait_secs)?;
+    Ok(LuaValue::Table(t))
+}
+
+/// The wait, in whole seconds, that a `fetch.schedule` handler returned, or `None` if it
+/// returned `nil`.
+///
+/// # Errors
+///
+/// Returns a description of the value if it is not `nil` or a number of seconds that is
+/// not negative. Fractions are rounded down, and waits too long to count saturate.
+fn wait_from_lua(value: &LuaValue) -> Result<Option<u64>, String> {
+    match *value {
+        LuaValue::Nil => Ok(None),
+        LuaValue::Integer(secs) => u64::try_from(secs)
+            .map(Some)
+            .map_err(|_| format!("a negative wait ({secs})")),
+        // `as` rounds toward zero and saturates at u64::MAX.
+        LuaValue::Number(secs) if secs >= 0.0 => Ok(Some(secs as u64)),
+        LuaValue::Number(secs) => Err(format!("an invalid wait ({secs})")),
+        ref other => Err(format!("a {}", other.type_name())),
+    }
+}
+
 /// Copies the fields scripts may not change from `original` onto `modified`, the entry a
 /// handler returned.
 fn restore_read_only(modified: &mut FeedEntry, original: &FeedEntry) {
@@ -226,10 +259,18 @@ fn restore_read_only(modified: &mut FeedEntry, original: &FeedEntry) {
     modified.categories = original.categories.clone();
 }
 
-/// A handler registered with `kiki.on`, and the time budget of the plugin that registered
-/// it.
+/// A handler registered with `kiki.on`, with the name and time budget of the plugin that
+/// registered it.
 struct Handler {
     key: RegistryKey,
+    plugin: Arc<str>,
+    budget: TimeBudget,
+}
+
+/// A registered handler, resolved to a function that can be called.
+struct LiveHandler {
+    function: LuaFunction,
+    plugin: Arc<str>,
     budget: TimeBudget,
 }
 
@@ -382,7 +423,7 @@ impl LuaScriptRunner {
     /// The handlers mutex is acquired only for the short snapshot; we then drop it so that
     /// subsequent handler execution (which can call `kiki.on` recursively, in theory) does
     /// not deadlock.
-    fn resolve_handlers(&self, lua: &Lua, event: Event) -> Vec<(LuaFunction, TimeBudget)> {
+    fn resolve_handlers(&self, lua: &Lua, event: Event) -> Vec<LiveHandler> {
         let guard = self
             .handlers
             .lock()
@@ -394,7 +435,11 @@ impl LuaScriptRunner {
         let mut out = Vec::with_capacity(registered.len());
         for handler in registered {
             match lua.registry_value::<LuaFunction>(&handler.key) {
-                Ok(f) => out.push((f, handler.budget)),
+                Ok(function) => out.push(LiveHandler {
+                    function,
+                    plugin: handler.plugin.clone(),
+                    budget: handler.budget,
+                }),
                 Err(e) => warn!(error = %e, "failed to resolve handler from Lua registry"),
             }
         }
@@ -462,7 +507,10 @@ fn plugin_env(
     meta.set("__index", lua.globals())?;
     env.set_metatable(Some(meta));
     let kiki = api::plugin_kiki_table(lua, &source.name, source.time_budget, ctx)?;
-    kiki.raw_set("on", on_function(lua, handlers, source.time_budget)?)?;
+    kiki.raw_set(
+        "on",
+        on_function(lua, handlers, &source.name, source.time_budget)?,
+    )?;
     env.raw_set("kiki", kiki)?;
 
     let plugin = source.name.clone();
@@ -512,10 +560,16 @@ fn plugin_env(
     Ok(env)
 }
 
-/// Build a plugin's `kiki.on(event, handler)`, which registers `handler` for `event` with
-/// the plugin's time budget.
-fn on_function(lua: &Lua, handlers: &Handlers, budget: TimeBudget) -> LuaResult<LuaFunction> {
+/// Build the `kiki.on(event, handler)` of the plugin named `plugin`, which registers
+/// `handler` for `event` with the plugin's time budget.
+fn on_function(
+    lua: &Lua,
+    handlers: &Handlers,
+    plugin: &str,
+    budget: TimeBudget,
+) -> LuaResult<LuaFunction> {
     let handlers = Arc::clone(handlers);
+    let plugin: Arc<str> = Arc::from(plugin);
     lua.create_function(move |lua, (event_name, handler): (String, LuaFunction)| {
         let event = Event::from_name(&event_name)
             .ok_or_else(|| LuaError::RuntimeError(format!("unknown event: {}", event_name)))?;
@@ -525,7 +579,11 @@ fn on_function(lua: &Lua, handlers: &Handlers, budget: TimeBudget) -> LuaResult<
             .map_err(|_| LuaError::RuntimeError("scripting state poisoned".to_string()))?
             .entry(event)
             .or_default()
-            .push(Handler { key, budget });
+            .push(Handler {
+                key,
+                plugin: plugin.clone(),
+                budget,
+            });
         Ok(())
     })
 }
@@ -583,7 +641,7 @@ impl ScriptRunner for LuaScriptRunner {
         let original = entry.clone();
 
         let mut current = entry;
-        for (handler, limit) in &handlers {
+        for handler in &handlers {
             let lua_entry = match current.clone().into_lua(&lua) {
                 Ok(v) => v,
                 Err(e) => {
@@ -592,7 +650,13 @@ impl ScriptRunner for LuaScriptRunner {
                 }
             };
 
-            match call_with_timeout::<LuaValue>(&lua, &self.budget, *limit, handler, lua_entry) {
+            match call_with_timeout::<LuaValue>(
+                &lua,
+                &self.budget,
+                handler.budget,
+                &handler.function,
+                lua_entry,
+            ) {
                 Ok(LuaValue::Nil) => return Ok(None),
                 Ok(LuaValue::Table(t)) => match FeedEntry::from_lua(LuaValue::Table(t), &lua) {
                     Ok(mut modified) => {
@@ -624,6 +688,49 @@ impl ScriptRunner for LuaScriptRunner {
         Ok(Some(current))
     }
 
+    fn dispatch_schedule(
+        &self,
+        mut schedule: FetchSchedule,
+    ) -> anyhow::Result<Option<ScheduleDecision>> {
+        let lua = self
+            .lua
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut decision = None;
+        for handler in self.resolve_handlers(&lua, Event::FetchSchedule) {
+            let payload = schedule_to_lua(&lua, &schedule)?;
+            let returned = call_with_timeout::<LuaValue>(
+                &lua,
+                &self.budget,
+                handler.budget,
+                &handler.function,
+                payload,
+            );
+            let wait = returned.map_err(|e| e.to_string()).and_then(|v| {
+                wait_from_lua(&v)
+                    .map_err(|e| format!("returned {e} instead of a number of seconds or nil"))
+            });
+            match wait {
+                Ok(None) => {}
+                Ok(Some(wait_secs)) => {
+                    schedule.wait_secs = wait_secs;
+                    decision = Some(ScheduleDecision {
+                        wait_secs,
+                        plugin: handler.plugin.to_string(),
+                    });
+                }
+                Err(e) => warn!(
+                    plugin = %handler.plugin,
+                    feed_id = schedule.feed_id,
+                    error = %e,
+                    "fetch.schedule handler failed; keeping the wait"
+                ),
+            }
+        }
+        Ok(decision)
+    }
+
     fn dispatch_observe(&self, event: Event, payload: EventPayload) {
         let lua = self
             .lua
@@ -635,7 +742,7 @@ impl ScriptRunner for LuaScriptRunner {
             return;
         }
 
-        for (handler, limit) in &handlers {
+        for handler in &handlers {
             let lua_payload = match payload_to_lua(&lua, payload.clone()) {
                 Ok(v) => v,
                 Err(e) => {
@@ -648,9 +755,13 @@ impl ScriptRunner for LuaScriptRunner {
                 }
             };
 
-            if let Err(e) =
-                call_with_timeout::<LuaValue>(&lua, &self.budget, *limit, handler, lua_payload)
-            {
+            if let Err(e) = call_with_timeout::<LuaValue>(
+                &lua,
+                &self.budget,
+                handler.budget,
+                &handler.function,
+                lua_payload,
+            ) {
                 warn!(
                     event = event.name(),
                     error = %e,
@@ -1128,6 +1239,125 @@ mod tests {
         .unwrap();
         let result = runner.dispatch_transform_entry(entry).unwrap().unwrap();
         assert_eq!(result.tags, vec!["keep"]);
+    }
+
+    fn schedule() -> FetchSchedule {
+        FetchSchedule {
+            feed_id: 7,
+            status: 304,
+            change: crate::scripting::ContentChange::Unchanged,
+            hint_secs: 0,
+            interval_secs: 3600,
+            min_cadence_secs: 60,
+            wait_secs: 60,
+        }
+    }
+
+    /// Plugins named `name`, with `text` as their entrypoint.
+    fn named(name: &str, text: &str) -> ScriptSource {
+        let mut source = ScriptSource::new(text);
+        source.name = name.to_string();
+        source
+    }
+
+    #[test]
+    fn schedule_handlers_see_the_fetch() {
+        let runner = LuaScriptRunner::from_sources(&[named(
+            "p",
+            r#"
+            kiki.on("fetch.schedule", function(f)
+                assert(f.feed_id == 7 and f.status == 304 and f.change == "unchanged")
+                assert(f.hint_secs == 0 and f.interval_secs == 3600)
+                assert(f.min_cadence_secs == 60 and f.wait_secs == 60)
+                return f.wait_secs * 3
+            end)
+        "#,
+        )])
+        .unwrap();
+        assert!(runner.handles(Event::FetchSchedule));
+        assert_eq!(
+            runner.dispatch_schedule(schedule()).unwrap(),
+            Some(ScheduleDecision {
+                wait_secs: 180,
+                plugin: "p".into()
+            })
+        );
+    }
+
+    #[test]
+    fn schedule_handlers_chain_and_nil_keeps_the_wait() {
+        let runner = LuaScriptRunner::from_sources(&[
+            named(
+                "double",
+                "kiki.on('fetch.schedule', function(f) return f.wait_secs * 2 end)",
+            ),
+            named(
+                "keep",
+                "kiki.on('fetch.schedule', function(f) return nil end)",
+            ),
+            named(
+                "add",
+                "kiki.on('fetch.schedule', function(f) return f.wait_secs + 0.9 end)",
+            ),
+        ])
+        .unwrap();
+        // 60 doubled, kept, then 120.9 rounded down; the last to change it
+        // chose it.
+        assert_eq!(
+            runner.dispatch_schedule(schedule()).unwrap(),
+            Some(ScheduleDecision {
+                wait_secs: 120,
+                plugin: "add".into()
+            })
+        );
+    }
+
+    #[test]
+    fn schedule_handlers_that_fail_or_return_nonsense_keep_the_wait() {
+        for body in [
+            "error('boom')",
+            "return -5",
+            "return 0/0",
+            "return 'soon'",
+            "return {}",
+        ] {
+            let runner = LuaScriptRunner::from_sources(&[named(
+                "bad",
+                &format!("kiki.on('fetch.schedule', function(f) {body} end)"),
+            )])
+            .unwrap();
+            assert_eq!(
+                runner.dispatch_schedule(schedule()).unwrap(),
+                None,
+                "{body}"
+            );
+        }
+        // A failing handler does not stop the next one.
+        let runner = LuaScriptRunner::from_sources(&[
+            named(
+                "bad",
+                "kiki.on('fetch.schedule', function() error('boom') end)",
+            ),
+            named(
+                "good",
+                "kiki.on('fetch.schedule', function() return 600 end)",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            runner.dispatch_schedule(schedule()).unwrap(),
+            Some(ScheduleDecision {
+                wait_secs: 600,
+                plugin: "good".into()
+            })
+        );
+    }
+
+    #[test]
+    fn no_schedule_handlers_means_no_decision() {
+        let runner = LuaScriptRunner::new(&[]).unwrap();
+        assert!(!runner.handles(Event::FetchSchedule));
+        assert_eq!(runner.dispatch_schedule(schedule()).unwrap(), None);
     }
 
     #[test]
