@@ -2,7 +2,8 @@
 //! `kiki.feeds`.
 //!
 //! Each plugin sees its own `kiki` table, which holds these functions bound to the plugin's
-//! name and falls back to the shared `kiki` table (`kiki.on`, `kiki.log`, `kiki.regex`)
+//! name and falls back to the shared `kiki` table (`kiki.on`, `kiki.log`, `kiki.regex`,
+//! `kiki.html`)
 //! for everything else. Every call goes through [`ScriptServices`], so it works the same
 //! whether the VM runs in the server or in the sandboxed script host.
 

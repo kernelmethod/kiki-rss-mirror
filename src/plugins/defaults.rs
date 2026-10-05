@@ -19,7 +19,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 /// A zstd-compressed tarball of the plugins installed by default: currently
-/// `auto-tag`, `filter` and `strip-tracking`.
+/// `auto-tag`, `filter`, `sanitize` and `strip-tracking`.
 ///
 /// Each plugin's directory is stored under its own name at the root of the
 /// archive, and holds only regular files.
@@ -275,6 +275,7 @@ fn replace_plugin(plugins_dir: &Path, name: &str, files: &[&BundledFile]) -> Res
 ///     [
 ///         ("auto-tag".to_string(), SyncOutcome::Installed),
 ///         ("filter".to_string(), SyncOutcome::Installed),
+///         ("sanitize".to_string(), SyncOutcome::Installed),
 ///         ("strip-tracking".to_string(), SyncOutcome::Installed),
 ///     ]
 /// );
@@ -361,6 +362,8 @@ mod tests {
                 Path::new("auto-tag/manifest.toml"),
                 Path::new("filter/main.lua"),
                 Path::new("filter/manifest.toml"),
+                Path::new("sanitize/main.lua"),
+                Path::new("sanitize/manifest.toml"),
                 Path::new("strip-tracking/main.lua"),
                 Path::new("strip-tracking/manifest.toml"),
             ]
@@ -373,6 +376,8 @@ mod tests {
                 "auto-tag",
                 "filter",
                 "filter",
+                "sanitize",
+                "sanitize",
                 "strip-tracking",
                 "strip-tracking"
             ]
@@ -387,6 +392,10 @@ mod tests {
         );
         assert_eq!(
             files[4].contents,
+            include_bytes!("../../plugins/sanitize/main.lua")
+        );
+        assert_eq!(
+            files[6].contents,
             include_bytes!("../../plugins/strip-tracking/main.lua")
         );
     }
@@ -395,7 +404,7 @@ mod tests {
     fn sync_filter(dir: &Path) -> SyncOutcome {
         let outcomes = sync_default_plugins(dir).unwrap();
         let names: Vec<_> = outcomes.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names, ["auto-tag", "filter", "strip-tracking"]);
+        assert_eq!(names, ["auto-tag", "filter", "sanitize", "strip-tracking"]);
         outcomes[1].1
     }
 
@@ -425,7 +434,10 @@ mod tests {
             .inspect(|(_, outcome)| assert_eq!(*outcome, SyncOutcome::Installed))
             .map(|(name, _)| name.as_str())
             .collect();
-        assert_eq!(installed, ["auto-tag", "filter", "strip-tracking"]);
+        assert_eq!(
+            installed,
+            ["auto-tag", "filter", "sanitize", "strip-tracking"]
+        );
 
         let discovery = discover(&plugins_dir).unwrap();
         assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
@@ -469,7 +481,13 @@ mod tests {
         entries.sort();
         assert_eq!(
             entries,
-            [RECORD_FILE_NAME, "auto-tag", "filter", "strip-tracking"]
+            [
+                RECORD_FILE_NAME,
+                "auto-tag",
+                "filter",
+                "sanitize",
+                "strip-tracking"
+            ]
         );
     }
 

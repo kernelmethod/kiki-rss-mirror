@@ -75,6 +75,8 @@ mod auto_tag_tests;
 #[cfg(test)]
 mod filter_tests;
 #[cfg(test)]
+mod sanitize_tests;
+#[cfg(test)]
 mod strip_tracking_tests;
 
 use crate::scripting::{ScriptModule, ScriptSource};

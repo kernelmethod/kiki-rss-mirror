@@ -1,0 +1,78 @@
+name = "sanitize"
+version = "1.0.0"
+engine = "lua"
+description = "Sanitize the HTML content of new entries: keep only the elements and attributes allowed, and drop scripts, styles, embedded content, event handlers and links to unsafe URLs"
+license = "MIT"
+homepage = "https://github.com/kernelmethod/kiki-rss"
+
+# Rewrites each new entry's content, keeping the elements in `elements` and
+# the attributes in `attributes`, unwrapping other elements (keeping their
+# content), and removing the elements in `drop` with their content. Scripts,
+# styles, frames, embedded objects, SVG and MathML are always removed, and
+# so are comments and event handler attributes. URL attributes, such as
+# href and src, must be relative or use one of the `url_schemes`. See
+# main.lua for the details.
+#
+# To change what it keeps, start from its defaults, for example with
+# `kiki plugin config get sanitize --defaults`, edit them and pass them to
+# `kiki plugin config set sanitize`.
+[config]
+elements = [
+    # Text
+    "a", "abbr", "b", "bdi", "bdo", "br", "cite", "code", "data", "del",
+    "dfn", "em", "i", "ins", "kbd", "mark", "q", "rp", "rt", "ruby", "s",
+    "samp", "small", "span", "strong", "sub", "sup", "time", "u", "var",
+    "wbr",
+    # Blocks
+    "address", "article", "aside", "blockquote", "details", "div",
+    "figcaption", "figure", "footer", "h1", "h2", "h3", "h4", "h5", "h6",
+    "header", "hr", "p", "pre", "section", "summary",
+    # Lists
+    "dd", "dl", "dt", "li", "ol", "ul",
+    # Tables
+    "caption", "col", "colgroup", "table", "tbody", "td", "tfoot", "th",
+    "thead", "tr",
+    # Images
+    "img",
+]
+drop = ["audio", "button", "canvas", "input", "select", "video"]
+attributes = [
+    "title", "lang", "dir",
+    "a:href",
+    "img:src", "img:alt", "img:width", "img:height",
+    "blockquote:cite", "q:cite", "del:cite", "ins:cite",
+    "del:datetime", "ins:datetime", "time:datetime", "data:value",
+    "ol:start", "ol:reversed", "ol:type", "li:value",
+    "td:colspan", "td:rowspan", "th:colspan", "th:rowspan", "th:scope",
+    "col:span", "colgroup:span",
+    "details:open",
+]
+url_schemes = ["http", "https", "mailto"]
+
+[[settings]]
+name = "elements"
+type = "list"
+items = { type = "string" }
+label = "Elements to keep"
+description = "Any other element is unwrapped: its tags are removed and its content kept. Scripts, styles, frames, embedded objects, SVG and MathML are always removed, with their content."
+
+[[settings]]
+name = "drop"
+type = "list"
+items = { type = "string" }
+label = "Elements to remove"
+description = "Elements removed together with their content, rather than unwrapped."
+
+[[settings]]
+name = "attributes"
+type = "list"
+items = { type = "string" }
+label = "Attributes to keep"
+description = "A bare name, such as title, keeps the attribute on every element; element:name, such as a:href, keeps it on that element only. Event handlers, such as onclick, are always removed."
+
+[[settings]]
+name = "url_schemes"
+type = "list"
+items = { type = "string" }
+label = "URL schemes"
+description = "The schemes that links, images and other URL attributes may use. Relative URLs are always allowed; an attribute with any other scheme is removed, and so is an image left without a source."
