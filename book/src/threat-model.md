@@ -317,6 +317,12 @@ no files and no sockets. What it can do is what the plugin API allows:
   apart, but it takes the script host's word for which plugin is asking, so
   code that breaks out of the Lua VM can reach every plugin's state.
 
+Plugins that ask for different permissions run in separate Lua VMs, so a
+plugin without `entries.delete` can't change the code of one that has it,
+such as by replacing `string.format`. All the VMs share the script host
+process, though, so code that breaks out of a VM can make any call, with any
+plugin's permissions.
+
 Each handler has a time and a memory budget (see
 [Resource limits](writing-plugins.md#resource-limits)). A plugin's manifest
 may lift its time budget, as the bundled `sanitize` plugin does so that no
