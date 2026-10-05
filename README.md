@@ -84,12 +84,13 @@ a feed's "include" rules. Hidden entries are left out of the web UI, and of
 `GET /v1/entries` and `GET /v1/feeds/id/{id}/entries` unless those are passed
 `include_hidden=true`. It is bundled into the `kiki` binary (the
 `default-plugins` Cargo feature, on by default) and `kiki init` installs it into
-the plugins directory, with no rules; pass `kiki init --no-default-plugins` to
+the plugins directory's `system/` directory (your own plugins go in `user/`),
+with no rules; pass `kiki init --no-default-plugins` to
 skip it. `kiki init --check` installs default plugins into a Kiki home set up
 before they were bundled, and updates the ones an earlier release installed,
 unless they've been edited since (their config overrides are kept in the
 database, so setting config doesn't count). A default plugin you delete isn't
-reinstalled; `plugins/.default-plugins.toml` records which were installed.
+reinstalled; `plugins/system/.default-plugins.toml` records which were installed.
 Then give it some rules:
 
 ```bash

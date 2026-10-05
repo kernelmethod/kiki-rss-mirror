@@ -409,7 +409,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let dir = plugins::plugins_dir(home.path()).join("hello");
+        let dir = plugins::PluginSource::User
+            .dir(&plugins::plugins_dir(home.path()))
+            .join("hello");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(plugins::MANIFEST_FILE_NAME),
@@ -446,7 +448,12 @@ mod tests {
     #[test]
     fn test_list() {
         let home = home();
-        std::fs::create_dir(plugins::plugins_dir(home.path()).join("broken")).unwrap();
+        std::fs::create_dir(
+            plugins::PluginSource::User
+                .dir(&plugins::plugins_dir(home.path()))
+                .join("broken"),
+        )
+        .unwrap();
 
         let (mut out, mut err) = (Vec::new(), Vec::new());
         list(home.path(), &mut out, &mut err).unwrap();

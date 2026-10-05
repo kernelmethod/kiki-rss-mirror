@@ -2,9 +2,10 @@
 //!
 //! The build script packs each default plugin's directory from `plugins/` in
 //! Kiki's source into a zstd-compressed tarball, [`DEFAULT_PLUGINS_TAR_ZST`],
-//! embedded in the binary. [`sync_default_plugins`] unpacks it into a plugins
-//! directory, where the plugins are discovered like any other plugin, so they
-//! can be configured, disabled in their manifest, edited or deleted.
+//! embedded in the binary. [`sync_default_plugins`] unpacks it into the
+//! system plugins directory (see [`crate::plugins::PluginSource::System`]),
+//! where the plugins are discovered like any other plugin, so they can be
+//! configured, disabled in their manifest, edited or deleted.
 //!
 //! `kiki init --check` syncs them on every run, so a new release of Kiki
 //! brings new default plugins, and updates to the ones already installed,
@@ -93,11 +94,11 @@ fn bundled_files() -> Result<Vec<BundledFile>> {
     Ok(files)
 }
 
-/// Name of the file, inside the plugins directory, that records the default
-/// plugins [`sync_default_plugins`] has installed and the files each was
-/// installed with. Its name starts with a dot, so [`crate::plugins::discover`]
-/// ignores it, though it reads it to tell which plugins are system plugins.
-pub const RECORD_FILE_NAME: &str = super::DEFAULT_PLUGINS_RECORD_FILE_NAME;
+/// Name of the file, inside the system plugins directory, that records the
+/// default plugins [`sync_default_plugins`] has installed and the files each
+/// was installed with. Its name starts with a dot, so
+/// [`crate::plugins::discover`] ignores it.
+pub const RECORD_FILE_NAME: &str = ".default-plugins.toml";
 
 /// How deep inside a plugin directory files are compared. Matches the depth
 /// the build script bundles files from.
@@ -244,7 +245,9 @@ fn replace_plugin(plugins_dir: &Path, name: &str, files: &[&BundledFile]) -> Res
 
 /// Installs every plugin in [`DEFAULT_PLUGINS_TAR_ZST`] into `plugins_dir`,
 /// creating it if needed, and updates the ones installed by an earlier
-/// version of Kiki.
+/// version of Kiki. `plugins_dir` is normally the system plugins directory,
+/// [`crate::plugins::PluginSource::System`]'s directory inside the plugins
+/// directory.
 ///
 /// Which plugins were installed, and with which files, is kept in
 /// [`RECORD_FILE_NAME`] in `plugins_dir`. For each bundled plugin:
@@ -349,7 +352,7 @@ pub fn sync_default_plugins(plugins_dir: &Path) -> Result<Vec<(String, SyncOutco
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::plugins::discover;
+    use crate::plugins::{discover, PluginSource};
     use tempfile::TempDir;
 
     #[test]
@@ -446,7 +449,7 @@ mod tests {
     fn installed_plugins_are_discovered() {
         let td = TempDir::new().unwrap();
         let plugins_dir = td.path().join("plugins");
-        let outcomes = sync_default_plugins(&plugins_dir).unwrap();
+        let outcomes = sync_default_plugins(&PluginSource::System.dir(&plugins_dir)).unwrap();
         let installed: Vec<_> = outcomes
             .iter()
             .inspect(|(_, outcome)| assert_eq!(*outcome, SyncOutcome::Installed))
@@ -467,7 +470,7 @@ mod tests {
         assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
         for plugin in &discovery.plugins {
             assert_eq!(plugin.manifest.name, plugin.dir_name());
-            assert_eq!(plugin.source, crate::plugins::PluginSource::System);
+            assert_eq!(plugin.source, PluginSource::System);
         }
         let names: Vec<_> = discovery
             .plugins

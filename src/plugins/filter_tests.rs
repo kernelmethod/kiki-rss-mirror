@@ -304,7 +304,7 @@ async fn stored_entries_are_filtered_when_the_rules_change() -> Result<()> {
             })
             .collect::<Result<_>>()?
     };
-    let dir = tc.plugins_dir().join("filter");
+    let dir = tc.user_plugins_dir().join("filter");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("manifest.toml"), MANIFEST)?;
     std::fs::write(dir.join("main.lua"), MAIN)?;
@@ -396,7 +396,7 @@ async fn dropped_tag_rules_do_not_rescan() -> Result<()> {
         crate::db::plugins::store_set(&conn, "filter", "rules", Some(&recorded))?;
         id
     };
-    let dir = tc.plugins_dir().join("filter");
+    let dir = tc.user_plugins_dir().join("filter");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("manifest.toml"), MANIFEST)?;
     std::fs::write(dir.join("main.lua"), MAIN)?;

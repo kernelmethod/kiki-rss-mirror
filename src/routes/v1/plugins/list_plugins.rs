@@ -139,7 +139,7 @@ mod test {
             r#"kiki.on("entry.ingest", function(entry) return entry end)"#,
             serde_json::json!({"x": 1}),
         )?;
-        std::fs::create_dir_all(tc.plugins_dir().join("broken"))?;
+        std::fs::create_dir_all(tc.user_plugins_dir().join("broken"))?;
         let tc = tc.init_server()?;
         let client = tc.client()?;
 

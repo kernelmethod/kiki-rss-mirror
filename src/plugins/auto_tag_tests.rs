@@ -293,7 +293,7 @@ async fn stored_entries_are_tagged_when_the_rules_change() -> Result<()> {
         }
         ids
     };
-    let dir = tc.plugins_dir().join("auto-tag");
+    let dir = tc.user_plugins_dir().join("auto-tag");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("manifest.toml"), MANIFEST)?;
     std::fs::write(dir.join("main.lua"), MAIN)?;

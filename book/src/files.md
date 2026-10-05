@@ -13,7 +13,7 @@ Inside the data directory:
 | ------------ | --------------------------------------------------------------------- |
 | `kiki.db`    | The SQLite database: feeds, entries, tags and plugin state.            |
 | `kiki.toml`  | [Settings](configuration.md) that differ from the defaults.            |
-| `plugins/`   | Installed [plugins](plugins/index.md), one directory each.            |
+| `plugins/`   | Installed [plugins](plugins/index.md), one directory each: in `system/` if bundled with Kiki, in `user/` if you installed them. |
 | `assets/`    | Cached images and enclosures; see `asset_cache` in [Settings](settings.md). |
 
 ## Moving things around
