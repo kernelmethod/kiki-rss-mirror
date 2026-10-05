@@ -310,8 +310,9 @@ pub(super) fn render_plugin(plugin: &PluginResponse) -> String {
     )
 }
 
-/// Render a plugin's description, and a line with its engine, whether it
-/// runs, its authors, license and homepage.
+/// Render a plugin's description, and a line with its engine, whether it is
+/// a system or user plugin, whether it runs, its authors, license and
+/// homepage.
 pub(super) fn render_plugin_details(plugin: &PluginResponse) -> String {
     let mut html = String::new();
     if let Some(description) = plugin
@@ -325,7 +326,10 @@ pub(super) fn render_plugin_details(plugin: &PluginResponse) -> String {
         ));
     }
 
-    let mut parts = vec![plugin.engine.name().to_owned()];
+    let mut parts = vec![
+        plugin.engine.name().to_owned(),
+        format!("{} plugin", plugin.source.name()),
+    ];
     parts.push(
         if !plugin.engine_supported {
             "engine not supported by this build"

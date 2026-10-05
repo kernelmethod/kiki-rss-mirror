@@ -96,8 +96,8 @@ fn bundled_files() -> Result<Vec<BundledFile>> {
 /// Name of the file, inside the plugins directory, that records the default
 /// plugins [`sync_default_plugins`] has installed and the files each was
 /// installed with. Its name starts with a dot, so [`crate::plugins::discover`]
-/// ignores it.
-pub const RECORD_FILE_NAME: &str = ".default-plugins.toml";
+/// ignores it, though it reads it to tell which plugins are system plugins.
+pub const RECORD_FILE_NAME: &str = super::DEFAULT_PLUGINS_RECORD_FILE_NAME;
 
 /// How deep inside a plugin directory files are compared. Matches the depth
 /// the build script bundles files from.
@@ -467,6 +467,7 @@ mod tests {
         assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
         for plugin in &discovery.plugins {
             assert_eq!(plugin.manifest.name, plugin.dir_name());
+            assert_eq!(plugin.source, crate::plugins::PluginSource::System);
         }
         let names: Vec<_> = discovery
             .plugins

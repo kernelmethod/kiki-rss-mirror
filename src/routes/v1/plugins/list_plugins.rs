@@ -1,4 +1,4 @@
-use crate::plugins::{DiscoveryError, Plugin, PluginEngine};
+use crate::plugins::{DiscoveryError, Plugin, PluginEngine, PluginSource};
 use crate::server::AppState;
 use axum::{
     extract::State,
@@ -23,6 +23,10 @@ pub struct PluginResponse {
     pub entrypoint: String,
     /// The name of the plugin's directory inside the plugins directory.
     pub directory: String,
+    /// Whether the plugin is a system plugin, bundled with Kiki and
+    /// installed by `kiki init`, or a user plugin, installed by hand.
+    #[serde(default)]
+    pub source: PluginSource,
     pub description: Option<String>,
     pub authors: Vec<String>,
     pub license: Option<String>,
@@ -45,6 +49,7 @@ impl From<&Plugin> for PluginResponse {
             enabled: m.enabled,
             entrypoint: m.entrypoint().to_string(),
             directory: plugin.dir_name(),
+            source: plugin.source,
             description: m.description.clone(),
             authors: m.authors.clone(),
             license: m.license.clone(),
@@ -148,6 +153,7 @@ mod test {
         assert_eq!(plugin.version, "1.0.0");
         assert_eq!(plugin.engine, PluginEngine::Lua);
         assert_eq!(plugin.entrypoint, "main.lua");
+        assert_eq!(plugin.source, PluginSource::User);
         assert_eq!(plugin.directory, "passthrough");
         assert!(plugin.enabled);
         assert_eq!(

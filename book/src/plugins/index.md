@@ -26,6 +26,14 @@ installed, unless you've edited their files. A default plugin you delete
 isn't reinstalled; `plugins/.default-plugins.toml` records which were
 installed.
 
+The default plugins are *system* plugins, and any plugin you install
+yourself is a *user* plugin. Both kinds load, run and take config the same
+way; the only difference is that Kiki looks after system plugins, while user
+plugins are yours to install, update and remove. A plugin is a system plugin
+if its directory is listed in `.default-plugins.toml`, and stays one if you
+edit it. `kiki plugin ls`, the web UI and the API (the `source` field of a
+plugin, `"system"` or `"user"`) all show which kind each plugin is.
+
 ## Managing plugins
 
 To see the installed plugins, and to read or change a plugin's config as

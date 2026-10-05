@@ -62,7 +62,8 @@
 //!
 //! With the `default-plugins` feature, Kiki also bundles plugins from its
 //! source tree into its binary, and `kiki init` installs them; see
-//! [`defaults`].
+//! [`defaults`]. Those are *system* plugins, and every other plugin is a
+//! *user* plugin; see [`PluginSource`].
 
 #[cfg(feature = "default-plugins")]
 pub mod defaults;
@@ -93,6 +94,13 @@ pub const PLUGINS_DIR_NAME: &str = "plugins";
 
 /// Name of the manifest file at the root of every plugin directory.
 pub const MANIFEST_FILE_NAME: &str = "manifest.toml";
+
+/// Name of the file, inside the plugins directory, in which `kiki init`
+/// records the default plugins it has installed (see [`defaults`]). Its
+/// name starts with a dot, so [`discover`] doesn't take it for a plugin.
+///
+/// The plugins it lists are [`PluginSource::System`] plugins.
+pub const DEFAULT_PLUGINS_RECORD_FILE_NAME: &str = ".default-plugins.toml";
 
 /// Largest manifest file that will be read.
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -176,6 +184,37 @@ impl PluginEngine {
     pub fn is_supported(self) -> bool {
         match self {
             Self::Lua => true,
+        }
+    }
+}
+
+/// Where an installed plugin came from.
+///
+/// Both kinds are discovered, configured and run the same way; the
+/// difference is who looks after them. Kiki installs and updates system
+/// plugins itself, while user plugins are installed, updated and removed
+/// by whoever runs Kiki.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginSource {
+    /// Bundled with Kiki and installed by `kiki init`: a plugin listed in
+    /// [`DEFAULT_PLUGINS_RECORD_FILE_NAME`]. It stays a system plugin if
+    /// its files are edited, though `kiki init` then stops updating it.
+    System,
+    /// Installed by hand, by copying its directory into the plugins
+    /// directory.
+    #[default]
+    User,
+}
+
+impl PluginSource {
+    /// The source's name, as the API and CLI show it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
         }
     }
 }
@@ -513,6 +552,9 @@ pub struct Plugin {
     pub dir: PathBuf,
     /// The plugin's manifest.
     pub manifest: PluginManifest,
+    /// Whether the plugin was installed by Kiki or by hand. Set by
+    /// [`discover`]; a plugin loaded on its own is a user plugin.
+    pub source: PluginSource,
     /// The plugin's config: the manifest's default config, with the
     /// plugin's overrides applied over it by
     /// [`Discovery::apply_config_overrides`]. Until then, just the defaults.
@@ -546,6 +588,7 @@ impl Plugin {
             dir: dir.to_path_buf(),
             config: manifest.config.clone(),
             manifest,
+            source: PluginSource::User,
         })
     }
 
@@ -828,6 +871,11 @@ impl Discovery {
 /// A directory that cannot be loaded, or whose plugin has the same name as
 /// one found before it, is reported in [`Discovery::errors`] and skipped.
 ///
+/// Plugins in the directories listed in [`DEFAULT_PLUGINS_RECORD_FILE_NAME`]
+/// are [`PluginSource::System`] plugins, and the rest are
+/// [`PluginSource::User`] plugins. A record that cannot be read is logged,
+/// and makes every plugin a user plugin.
+///
 /// A missing `plugins_dir` holds no plugins.
 ///
 /// # Errors
@@ -877,10 +925,15 @@ pub fn discover(plugins_dir: &Path) -> Result<Discovery, PluginError> {
     }
     dirs.sort();
 
+    let system = system_plugin_dirs(plugins_dir);
     let mut discovery = Discovery::default();
     let mut names = HashSet::new();
     for dir in dirs {
-        match Plugin::load(&dir) {
+        let source = match dir.file_name().and_then(|n| n.to_str()) {
+            Some(name) if system.contains(name) => PluginSource::System,
+            _ => PluginSource::User,
+        };
+        match Plugin::load(&dir).map(|plugin| Plugin { source, ..plugin }) {
             Ok(plugin) if !names.insert(plugin.manifest.name.clone()) => {
                 let other = discovery
                     .plugins
@@ -901,6 +954,32 @@ pub fn discover(plugins_dir: &Path) -> Result<Discovery, PluginError> {
         }
     }
     Ok(discovery)
+}
+
+/// Returns the names of the plugin directories listed in
+/// [`DEFAULT_PLUGINS_RECORD_FILE_NAME`] in `plugins_dir`: the top-level keys
+/// of its table. None are listed if there is no record, or if it cannot be
+/// read, which is logged.
+fn system_plugin_dirs(plugins_dir: &Path) -> HashSet<String> {
+    let path = plugins_dir.join(DEFAULT_PLUGINS_RECORD_FILE_NAME);
+    let text = match read_small_file(&path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return HashSet::new(),
+        Err(e) => {
+            tracing::warn!("unable to tell system plugins from user plugins: {e}");
+            return HashSet::new();
+        }
+    };
+    match toml::from_str::<toml::Table>(&text) {
+        Ok(table) => table.into_iter().map(|(name, _)| name).collect(),
+        Err(e) => {
+            tracing::warn!(
+                "unable to tell system plugins from user plugins: invalid {}: {e}",
+                path.display()
+            );
+            HashSet::new()
+        }
+    }
 }
 
 /// Reads the source of every enabled plugin in `discovery` whose engine is
@@ -1339,6 +1418,49 @@ mod tests {
         let sources = load_sources(&discover(td.path()).unwrap(), PluginEngine::Lua);
         let names: Vec<_> = sources.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["on"]);
+    }
+
+    #[test]
+    fn recorded_default_plugins_are_system_plugins() {
+        let td = TempDir::new().unwrap();
+        for name in ["bundled", "mine"] {
+            install(td.path(), &manifest(name), "").unwrap();
+        }
+        let sources = |dir: &Path| -> Vec<(String, PluginSource)> {
+            discover(dir)
+                .unwrap()
+                .plugins
+                .into_iter()
+                .map(|p| (p.manifest.name, p.source))
+                .collect()
+        };
+
+        // With no record, every plugin is a user plugin.
+        assert_eq!(
+            sources(td.path()),
+            [
+                ("bundled".to_string(), PluginSource::User),
+                ("mine".to_string(), PluginSource::User),
+            ]
+        );
+
+        // Plugins the record lists are system plugins, and the record
+        // itself isn't taken for a plugin.
+        let record = td.path().join(DEFAULT_PLUGINS_RECORD_FILE_NAME);
+        write(&record, "[bundled]\n\"main.lua\" = \"abc\"\n\n[deleted]\n");
+        assert_eq!(
+            sources(td.path()),
+            [
+                ("bundled".to_string(), PluginSource::System),
+                ("mine".to_string(), PluginSource::User),
+            ]
+        );
+
+        // A record that can't be read makes them all user plugins.
+        write(&record, "not toml");
+        assert!(sources(td.path())
+            .iter()
+            .all(|(_, source)| *source == PluginSource::User));
     }
 
     #[test]
