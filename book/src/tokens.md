@@ -5,8 +5,8 @@ they need: a phone app that may read and mark entries read, a script that
 refreshes feeds, a Prometheus server that scrapes metrics. Each token has a
 set of **scopes**, and the API refuses anything outside them.
 
-Tokens are needed to use the API over TCP, which `kiki serve --api-listen`
-turns on, and to log in to the web UI when it requires a login.
+Tokens are how people log in to the web UI when it requires a login, and
+any client of the API can send one to limit itself to the token's scopes.
 
 ## Scopes
 
@@ -29,7 +29,8 @@ to, say, refreshing feeds. Three presets cover the usual combinations:
 | `manager` | `read`, `tags`, `feeds` |
 
 The [API reference](../api/) lists the scope each endpoint needs.
-`GET /v1/health`, `GET /v1/` and `/docs` need no token at all.
+`GET /v1/health`, `GET /v1/`, `/docs` and `GET /v1/tokens/current` need
+no particular scope.
 
 ## Creating, listing and revoking tokens
 
@@ -59,10 +60,11 @@ Tokens look like `kiki_12_…`: the token's id, then 43 random characters.
 Send the token in an `Authorization` header:
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/v1/feeds
+curl --unix-socket "$XDG_RUNTIME_DIR/kiki/kiki.sock" \
+  -H "Authorization: Bearer $TOKEN" http://localhost/v1/feeds
 ```
 
-A request with a missing, malformed, expired or revoked token gets
+A request with a malformed, expired or revoked token gets
 `401 Unauthorized`. One whose token lacks the scope it needs gets
 `403 Forbidden`, naming the scope.
 
@@ -70,36 +72,20 @@ A request with a missing, malformed, expired or revoked token gets
 scopes, and works with any valid token, so a client can check a token
 before using it.
 
-## Serving the API over TCP
-
-`kiki serve --api-listen ADDR` serves the API over TCP as well as on the
-Unix socket. Every request on it needs a token, except for the public
-routes above:
-
-```bash
-kiki serve --api-listen 127.0.0.1:8081
-```
-
-`kiki web` takes the same option.
-
-The listener speaks plain HTTP, so anyone who can watch the network
-between a client and Kiki can read the tokens it sends. Keep it on
-loopback, or on a private network such as a WireGuard or Tailscale
-interface, and to reach it from elsewhere put a reverse proxy that
-terminates TLS in front of it; see
-[Exposing Kiki over the network](deployment.md#exposing-kiki-over-the-network).
-
 ## Tokens on the Unix socket
 
-On the Unix socket a token is optional. Anyone who can open the socket can
-already read and write Kiki's database, so a request without a token may do
-anything, just as before tokens existed. A request that does carry a token
-is held to that token's scopes; this is how the web UI acts for someone who
-logged in with a token.
+The API is served on Kiki's Unix socket, and a token there is optional.
+Anyone who can open the socket can already read and write Kiki's database,
+so a request without a token may do anything, just as before tokens
+existed. A request that does carry a token is held to that token's scopes;
+this is how the web UI acts for someone who logged in with a token.
 
-This is also why a reverse proxy should forward to the TCP listener rather
-than to the socket: requests it forwards to the socket without a token would
-be allowed everything.
+So tokens limit what a client may do only if it sends one. A reverse proxy
+that forwards requests to the socket passes on whatever `Authorization`
+header the client sent, and a request without one is allowed everything.
+Unless the proxy authenticates requests itself, don't expose the API
+through it; see
+[Exposing Kiki over the network](deployment.md#exposing-kiki-over-the-network).
 
 ## Logging in to the web UI
 

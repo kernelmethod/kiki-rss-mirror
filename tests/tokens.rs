@@ -1,12 +1,12 @@
-//! Integration tests for API tokens: `kiki token`, and `kiki serve
-//! --api-listen` serving the API over TCP from inside its sandbox.
+//! Integration tests for API tokens: `kiki token`, and the server checking
+//! them from inside its sandbox.
 //!
-//! These spawn the real binary, so that the TCP listener is exercised
-//! under the same Landlock and seccomp filters it runs under in
+//! These spawn the real binary, so that tokens are created and checked
+//! under the same Landlock and seccomp filters the server runs under in
 //! production.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -62,28 +62,21 @@ fn create_token(home: &Path, name: &str, scopes: &str) -> String {
         .to_owned()
 }
 
-/// A loopback address with a port nothing is listening on.
-fn free_addr() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("find a free port")
-}
-
 /// Send a bodiless request and return its status code.
-fn status(addr: SocketAddr, method: &str, path: &str, token: Option<&str>) -> u16 {
-    request(addr, method, path, token, "").0
+fn status(socket: &Path, method: &str, path: &str, token: Option<&str>) -> u16 {
+    request(socket, method, path, token, "").0
 }
 
 /// Send a request with the JSON `body`, and return its status code and
 /// body.
 fn request(
-    addr: SocketAddr,
+    socket: &Path,
     method: &str,
     path: &str,
     token: Option<&str>,
     body: &str,
 ) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).expect("connect to the API");
+    let mut stream = UnixStream::connect(socket).expect("connect to the API");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("set timeout");
@@ -111,10 +104,12 @@ fn request(
     (code, body)
 }
 
-fn spawn_serve(home: &Path, addr: SocketAddr) -> Server {
+/// Spawn `kiki serve` in `home`, and wait for it to listen on its socket,
+/// `home/kiki.sock`.
+fn spawn_serve(home: &Path, socket: &Path) -> Server {
     let mut server = Server(
         Command::new(KIKI_BIN)
-            .args(["serve", "--api-listen", &addr.to_string()])
+            .arg("serve")
             .env("KIKI_HOME", home)
             .env_remove("KIKI_SOCKET")
             .env("RUST_LOG", "warn")
@@ -133,30 +128,32 @@ fn spawn_serve(home: &Path, addr: SocketAddr) -> Server {
             }
             panic!("kiki exited before listening ({status:?}): {stderr}");
         }
-        if TcpStream::connect(addr).is_ok() {
+        if UnixStream::connect(socket).is_ok() {
             return server;
         }
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("kiki never started listening on {addr}");
+    panic!("kiki never started listening on {}", socket.display());
 }
 
-/// The sandboxed server serves the API over TCP, and holds every request to
-/// its token.
+/// The sandboxed server holds every request that carries a token to it.
 #[test]
-fn api_listen_serves_with_tokens() {
+fn server_checks_tokens() {
     let (_td, home) = init_home();
     let reader = create_token(&home, "reader", "reader");
     let admin = create_token(&home, "admin", "admin");
-    let addr = free_addr();
-    let _server = spawn_serve(&home, addr);
+    let socket = home.join("kiki.sock");
+    let _server = spawn_serve(&home, &socket);
+    let socket = socket.as_path();
 
-    assert_eq!(status(addr, "GET", "/v1/health", None), 200);
-    assert_eq!(status(addr, "GET", "/v1/feeds", None), 401);
-    assert_eq!(status(addr, "GET", "/v1/feeds", Some("kiki_1_wrong")), 401);
-    assert_eq!(status(addr, "GET", "/v1/feeds", Some(&reader)), 200);
-    assert_eq!(status(addr, "GET", "/v1/tokens", Some(&reader)), 403);
-    assert_eq!(status(addr, "GET", "/v1/tokens", Some(&admin)), 200);
+    assert_eq!(status(socket, "GET", "/v1/tokens", None), 200);
+    assert_eq!(
+        status(socket, "GET", "/v1/feeds", Some("kiki_1_wrong")),
+        401
+    );
+    assert_eq!(status(socket, "GET", "/v1/feeds", Some(&reader)), 200);
+    assert_eq!(status(socket, "GET", "/v1/tokens", Some(&reader)), 403);
+    assert_eq!(status(socket, "GET", "/v1/tokens", Some(&admin)), 200);
 
     // A token revoked while the server runs is refused at once.
     let out = kiki_token(&home, &["revoke", "reader"]);
@@ -165,20 +162,20 @@ fn api_listen_serves_with_tokens() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(status(addr, "GET", "/v1/feeds", Some(&reader)), 401);
+    assert_eq!(status(socket, "GET", "/v1/feeds", Some(&reader)), 401);
 
     // Tokens can be created through the API too, from inside the sandbox.
     let (code, body) = request(
-        addr,
+        socket,
         "POST",
         "/v1/tokens",
         Some(&admin),
-        r#"{"name": "made-over-tcp", "scopes": ["read"]}"#,
+        r#"{"name": "made-over-the-api", "scopes": ["read"]}"#,
     );
     assert_eq!(code, 201, "{body}");
     assert!(body.contains("\"token\":\"kiki_"), "{body}");
 
-    assert_eq!(status(addr, "POST", "/v1/shutdown", Some(&admin)), 200);
+    assert_eq!(status(socket, "POST", "/v1/shutdown", Some(&admin)), 200);
 }
 
 /// `kiki token ls` lists what `create` made, and never the tokens

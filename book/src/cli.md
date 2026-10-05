@@ -6,7 +6,7 @@ Every command prints its full set of options with `--help`, e.g.
 | Command | What it does |
 | ------- | ------------ |
 | `kiki init` | Sets up the data directory: database, config and [default plugins](plugins/index.md). `--check` only does what's missing, and syncs the default plugins; `--force` starts over, deleting the database; `--no-default-plugins` skips the plugins. |
-| `kiki serve` | Starts the server. `--uds PATH` picks the socket; `--api-listen ADDR` also serves the API over TCP, [with tokens](tokens.md#serving-the-api-over-tcp); see [Sandboxing](deployment.md#sandboxing) for `--no-sandbox` and `--seccomp-log-only`. |
+| `kiki serve` | Starts the server. `--uds PATH` picks the socket; see [Sandboxing](deployment.md#sandboxing) for `--no-sandbox` and `--seccomp-log-only`. |
 | `kiki web` | Starts the server along with [the web UI](web-ui.md). `--listen ADDR` (default `127.0.0.1:8080`), `--allowed-host HOST`, `--require-login`, and `kiki serve`'s options. |
 | `kiki migrate` | Migrates the database to the current schema; see [Upgrading](deployment.md#upgrading). `--dry-run`, `--no-backup`. |
 | `kiki opml import FILE` | Imports feeds from OPML; `-` reads from stdin. |

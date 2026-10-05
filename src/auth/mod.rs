@@ -1,16 +1,14 @@
 //! API tokens, and checking that a request may do what it asks.
 //!
-//! The API is served on a Unix socket, and optionally on a TCP listener
-//! (`kiki serve --listen`). A request presents a token with an
-//! `Authorization: Bearer <token>` header, and the token's [`Scopes`]
-//! decide which routes it may use; see [`policy::requirement`].
+//! The API is served on a Unix socket. A request may present a token with
+//! an `Authorization: Bearer <token>` header, and the token's [`Scopes`]
+//! then decide which routes it may use; see [`policy::requirement`].
 //!
-//! On the Unix socket a token is optional. Whoever can open the socket
-//! already has the run of the data directory, so a request without one is
-//! allowed everything, as it always has been. A request that does carry a
-//! token is held to that token's scopes, which is how the web UI acts for
-//! someone who logged in with a token. On the TCP listener every request
-//! needs a token, except to the few [`Requirement::Public`] routes.
+//! A token is optional. Whoever can open the socket already has the run of
+//! the data directory, so a request without one is allowed everything, as
+//! it always has been. A request that does carry a token is held to that
+//! token's scopes, which is how the web UI acts for someone who logged in
+//! with a token.
 
 pub mod policy;
 mod scope;
@@ -28,28 +26,14 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use std::convert::Infallible;
-
-/// Which listener a request arrived on. Set as a request extension by the
-/// server; a request without one is treated as [`Transport::Network`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transport {
-    /// The Unix socket, where requests need no token.
-    Socket,
-    /// The TCP listener, where requests need a token.
-    Network,
-}
 
 /// Who a request is from, as decided by [`authorize`], which adds it to
 /// every request it lets through. Handlers that need finer checks than
 /// their route's [`Requirement`] can extract it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
-    /// A client on the Unix socket that presented no token, which may do
-    /// anything.
+    /// A client that presented no token, which may do anything.
     Socket,
-    /// A client that presented no token for a public route.
-    Anonymous,
     /// A client that presented a valid token.
     Token(Token),
 }
@@ -59,7 +43,6 @@ impl Principal {
     pub fn scopes(&self) -> Scopes {
         match self {
             Principal::Socket => Scopes::all(),
-            Principal::Anonymous => Scopes::NONE,
             Principal::Token(token) => token.scopes,
         }
     }
@@ -68,27 +51,19 @@ impl Principal {
     pub fn allows(&self, scope: Scope) -> bool {
         self.scopes().contains(scope)
     }
-
-    fn satisfies(&self, requirement: Requirement) -> bool {
-        match requirement {
-            Requirement::Public => true,
-            Requirement::Authenticated => !matches!(self, Principal::Anonymous),
-            Requirement::Scope(scope) => self.allows(scope),
-        }
-    }
 }
 
-/// A principal holding no scopes, for a request [`authorize`] never saw,
-/// so that a handler checking scopes refuses it.
+/// The principal [`authorize`] found for the request. A request it never
+/// saw is refused, rather than taken to be allowed anything.
 impl<S: Send + Sync> FromRequestParts<S> for Principal {
-    type Rejection = Infallible;
+    type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
-        Ok(parts
+        parts
             .extensions
             .get::<Principal>()
             .cloned()
-            .unwrap_or(Principal::Anonymous))
+            .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"))
     }
 }
 
@@ -101,7 +76,7 @@ pub fn forbidden(scope: Scope) -> Response {
         .into_response()
 }
 
-/// The response to a request with a missing, invalid or expired token.
+/// The response to a request with an invalid or expired token.
 fn unauthorized(message: &'static str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -132,19 +107,13 @@ fn bearer_token(req: &Request) -> Result<Option<&str>, ()> {
 /// asks for, and adds its [`Principal`] to it.
 ///
 /// It must wrap each route, as [`axum::Router::layer`] does, so that it
-/// sees the route's [`MatchedPath`]. A request matching no route needs only
-/// to be [`Requirement::Authenticated`], so that the API's 404s are not
-/// shown to clients without a token.
+/// sees the route's [`MatchedPath`]. A request matching no route needs no
+/// scope, and gets the API's 404.
 pub async fn authorize(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
-    let transport = req
-        .extensions()
-        .get::<Transport>()
-        .copied()
-        .unwrap_or(Transport::Network);
     let requirement = match req.extensions().get::<MatchedPath>() {
         Some(path) => policy::requirement(req.method(), path.as_str())
             .unwrap_or(Requirement::Scope(Scope::Admin)),
-        None => Requirement::Authenticated,
+        None => Requirement::Any,
     };
 
     let principal = match bearer_token(&req) {
@@ -185,18 +154,13 @@ pub async fn authorize(State(state): State<AppState>, mut req: Request, next: Ne
                 }
             }
         }
-        Ok(None) => match transport {
-            Transport::Socket => Principal::Socket,
-            Transport::Network => Principal::Anonymous,
-        },
+        Ok(None) => Principal::Socket,
     };
 
-    if !principal.satisfies(requirement) {
-        return match (requirement, &principal) {
-            (_, Principal::Anonymous) => unauthorized("A token is required"),
-            (Requirement::Scope(scope), _) => forbidden(scope),
-            _ => unauthorized("A token is required"),
-        };
+    if let Requirement::Scope(scope) = requirement {
+        if !principal.allows(scope) {
+            return forbidden(scope);
+        }
     }
 
     req.extensions_mut().insert(principal);

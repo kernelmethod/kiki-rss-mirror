@@ -8,14 +8,13 @@
 use super::Scope;
 use axum::http::Method;
 
-/// What a request must carry to reach a route.
+/// What a request's token must grant to reach a route. A request without
+/// a token may reach any route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requirement {
-    /// Nothing: anyone who can reach the server may use the route.
-    Public,
-    /// Any valid token, whatever its scopes.
-    Authenticated,
-    /// A token granting the scope.
+    /// Nothing in particular: any valid token will do.
+    Any,
+    /// The scope.
     Scope(Scope),
 }
 
@@ -23,7 +22,7 @@ pub enum Requirement {
 /// such as `/v1/feeds/id/{id}`) must carry, or `None` if the route is not
 /// listed, in which case [`Scope::Admin`] is required.
 pub fn requirement(method: &Method, path: &str) -> Option<Requirement> {
-    use Requirement::{Authenticated, Public};
+    use Requirement::Any;
     use Scope::{Admin, Feeds, Metrics, Read, State, Tags};
     let scope = Requirement::Scope;
 
@@ -31,12 +30,12 @@ pub fn requirement(method: &Method, path: &str) -> Option<Requirement> {
     let m = method.as_str();
     Some(match (m, path) {
         // Meta
-        (_, "/v1/" | "/v1/health" | "/docs") if get => Public,
+        (_, "/v1/" | "/v1/health" | "/docs") if get => Any,
         ("POST", "/v1/shutdown") => scope(Admin),
         (_, "/metrics") if get => scope(Metrics),
 
         // Tokens
-        (_, "/v1/tokens/current") if get => Authenticated,
+        (_, "/v1/tokens/current") if get => Any,
         (_, "/v1/tokens") if get => scope(Admin),
         ("POST", "/v1/tokens") => scope(Admin),
         ("DELETE", "/v1/tokens/id/{id}") => scope(Admin),

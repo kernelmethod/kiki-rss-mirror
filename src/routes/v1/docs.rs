@@ -162,9 +162,9 @@ impl Modify for TokenSecurity {
                 HttpBuilder::new()
                     .scheme(HttpAuthScheme::Bearer)
                     .description(Some(
-                        "An API token, created with `kiki token create`. Required on the TCP \
-                         listener; optional over the Unix socket, where a request without one \
-                         may do anything.",
+                        "An API token, created with `kiki token create`. Optional: a request \
+                         without one may do anything, while one with a token may do only what \
+                         the token's scopes allow.",
                     ))
                     .build(),
             ),
@@ -179,16 +179,14 @@ impl Modify for TokenSecurity {
                 (Method::PATCH, &mut item.patch),
             ] {
                 let Some(op) = op else { continue };
-                let (scopes, note) = match requirement(&method, path)
-                    .unwrap_or(Requirement::Scope(Scope::Admin))
-                {
-                    Requirement::Public => continue,
-                    Requirement::Authenticated => (vec![], "Requires any API token.".to_owned()),
-                    Requirement::Scope(scope) => (
-                        vec![scope.name()],
-                        format!("Requires an API token with the `{scope}` scope."),
-                    ),
-                };
+                let (scopes, note) =
+                    match requirement(&method, path).unwrap_or(Requirement::Scope(Scope::Admin)) {
+                        Requirement::Any => continue,
+                        Requirement::Scope(scope) => (
+                            vec![scope.name()],
+                            format!("A request with an API token needs the `{scope}` scope."),
+                        ),
+                    };
                 op.security = Some(vec![SecurityRequirement::new("token", scopes)]);
                 op.description = Some(match op.description.take() {
                     Some(d) if !d.is_empty() => format!("{d}\n\n{note}"),
