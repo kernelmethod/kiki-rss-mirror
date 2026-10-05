@@ -11,11 +11,13 @@
 use super::Scope;
 use axum::http::Method;
 
-/// What a request's token must grant to reach a route. A request without
-/// a token may reach any route.
+/// What a request must be allowed to reach a route: by its token's scopes,
+/// or, for a request without a token, by the
+/// [`AnonymousAccess`](crate::config::AnonymousAccess) setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requirement {
-    /// Nothing in particular: any valid token will do.
+    /// Nothing in particular: any valid token will do, as will no token,
+    /// whatever the anonymous access setting.
     Any,
     /// The scope.
     Scope(Scope),
@@ -33,7 +35,7 @@ pub fn requirement(method: &Method, path: &str) -> Option<Requirement> {
     let m = method.as_str();
     Some(match (m, path) {
         // Meta
-        (_, "/v1/" | "/v1/health" | "/docs") if get => Any,
+        (_, "/v1/" | "/v1/health" | "/v1/access" | "/docs") if get => Any,
         ("POST", "/v1/shutdown") => scope(Admin),
         (_, "/metrics") if get => scope(Metrics),
 

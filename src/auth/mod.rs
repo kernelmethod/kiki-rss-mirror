@@ -4,11 +4,14 @@
 //! an `Authorization: Bearer <token>` header, and the token's [`Scopes`]
 //! then decide which routes it may use; see [`policy::requirement`].
 //!
-//! A token is optional. Whoever can open the socket already has the run of
-//! the data directory, so a request without one is allowed everything, as
-//! it always has been. A request that does carry a token is held to that
-//! token's scopes, which is how the web UI acts for someone who logged in
-//! with a token.
+//! A request that carries a token is held to that token's scopes, which is
+//! how the web UI acts for someone who logged in with a token. What a
+//! request without one may do is set by
+//! [`ApiSettings::anonymous_access`](crate::config::ApiSettings::anonymous_access):
+//! by default, everything, since whoever can open the socket already has
+//! the run of the data directory; or only reading; or nothing beyond the
+//! routes that need no scope. `GET /v1/access` reports the setting to
+//! anyone.
 
 pub mod policy;
 mod scope;
@@ -32,8 +35,10 @@ use axum::{
 /// their route's [`Requirement`] can extract it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
-    /// A client that presented no token, which may do anything.
-    Socket,
+    /// A client that presented no token, which may do what the
+    /// [`AnonymousAccess`](crate::config::AnonymousAccess) setting in
+    /// effect for the request allowed: these scopes.
+    Anonymous(Scopes),
     /// A client that presented a valid token.
     Token(Token),
 }
@@ -42,7 +47,7 @@ impl Principal {
     /// The scopes the principal holds.
     pub fn scopes(&self) -> Scopes {
         match self {
-            Principal::Socket => Scopes::all(),
+            Principal::Anonymous(scopes) => *scopes,
             Principal::Token(token) => token.scopes,
         }
     }
@@ -76,15 +81,24 @@ pub fn forbidden(scope: Scope) -> Response {
         .into_response()
 }
 
-/// The response to a request with an invalid or expired token.
-fn unauthorized(message: &'static str) -> Response {
+/// The response to a request without a token that needs a scope anonymous
+/// requests are not given.
+fn token_required(scope: Scope) -> Response {
+    unauthorized(format!(
+        "This request needs an API token with the {scope} scope"
+    ))
+}
+
+/// The response to a request with an invalid or expired token, or none
+/// where one is needed.
+fn unauthorized(message: impl Into<String>) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(
             header::WWW_AUTHENTICATE,
             HeaderValue::from_static("Bearer realm=\"kiki\""),
         )],
-        message,
+        message.into(),
     )
         .into_response()
 }
@@ -154,12 +168,16 @@ pub async fn authorize(State(state): State<AppState>, mut req: Request, next: Ne
                 }
             }
         }
-        Ok(None) => Principal::Socket,
+        Ok(None) => Principal::Anonymous(state.config.current().api.anonymous_access.scopes()),
     };
 
     if let Requirement::Scope(scope) = requirement {
         if !principal.allows(scope) {
-            return forbidden(scope);
+            // Without a token, the answer is to present one.
+            return match principal {
+                Principal::Anonymous(_) => token_required(scope),
+                Principal::Token(_) => forbidden(scope),
+            };
         }
     }
 

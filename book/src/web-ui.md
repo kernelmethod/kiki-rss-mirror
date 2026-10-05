@@ -17,8 +17,12 @@ over the server's socket and renders what it gets back.
 
 ## Logging in
 
-By default the web UI has no login: anyone who can reach it can read and
-change everything in Kiki. To require a login, start it with
+By default the web UI has no login: anyone who can reach it can do what
+the API allows requests without a token, which unless
+[`anonymous_access`](tokens.md#anonymous-access) says otherwise is to read
+and change everything in Kiki. With `anonymous_access = "read-only"`, the
+web UI only shows entries, and with `"token-required"` it always requires
+logging in. To require a login, start it with
 `--require-login`, or set it in `kiki.toml`:
 
 ```toml

@@ -10,6 +10,7 @@ use utoipa::{Modify, OpenApi};
     paths(
         crate::routes::v1::root::root,
         crate::routes::v1::health::health,
+        crate::routes::v1::access::access,
         crate::routes::v1::feeds::add_feed::add_feed,
         crate::routes::v1::feeds::list_feeds::list_feeds,
         crate::routes::v1::feeds::get_feed::get_feed,
@@ -70,6 +71,8 @@ use utoipa::{Modify, OpenApi};
         schemas(
             crate::routes::v1::root::RootResponse,
             crate::routes::v1::health::HealthResponse,
+            crate::routes::v1::access::AccessResponse,
+            crate::config::AnonymousAccess,
             crate::server::ComponentState,
             crate::routes::v1::feeds::add_feed::AddFeedRequest,
             crate::routes::v1::feeds::add_feed::AddFeedResponse,
@@ -173,9 +176,10 @@ impl Modify for TokenSecurity {
                 HttpBuilder::new()
                     .scheme(HttpAuthScheme::Bearer)
                     .description(Some(
-                        "An API token, created with `kiki token create`. Optional: a request \
-                         without one may do anything, while one with a token may do only what \
-                         the token's scopes allow.",
+                        "An API token, created with `kiki token create`. A request with a token \
+                         may do only what the token's scopes allow. What a request without one \
+                         may do is set by the `api.anonymous_access` setting, which \
+                         `GET /v1/access` reports: by default, anything.",
                     ))
                     .build(),
             ),
@@ -195,7 +199,10 @@ impl Modify for TokenSecurity {
                         Requirement::Any => continue,
                         Requirement::Scope(scope) => (
                             vec![scope.name()],
-                            format!("A request with an API token needs the `{scope}` scope."),
+                            format!(
+                                "A request with an API token needs the `{scope}` scope; one \
+                                 without needs `api.anonymous_access` to grant it."
+                            ),
                         ),
                     };
                 op.security = Some(vec![SecurityRequirement::new("token", scopes)]);

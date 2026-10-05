@@ -18,7 +18,7 @@ mod tests;
 
 use crate::cli::paths::{self, Env};
 use crate::cli::serve::ServeArgs;
-use crate::config::{self, ConfigStore, HostPattern};
+use crate::config::{self, AnonymousAccess, ConfigStore, HostPattern};
 use crate::sandbox::{self, SandboxConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
@@ -114,20 +114,32 @@ impl WebArgs {
             .with_context(|| format!("unable to bind the web UI to {}", self.listen))?;
         listener.set_nonblocking(true)?;
         tracing::info!("web UI listening on http://{}", listener.local_addr()?);
-        let settings = configured_web_ui()?;
-        let allowed_hosts = self.allowed_hosts(&settings.allowed_hosts);
-        let gate = if self.require_login || settings.require_login {
+        let settings = configured_settings()?;
+        let allowed_hosts = self.allowed_hosts(&settings.web_ui.allowed_hosts);
+        let anonymous = settings.api.anonymous_access;
+        let gate = if self.require_login || settings.web_ui.require_login {
             tracing::info!("the web UI requires logging in with an API token");
+            Gate::login_required(api)
+        } else if anonymous == AnonymousAccess::TokenRequired {
+            // Without a token, the web UI could show nothing at all.
+            tracing::info!(
+                "the web UI requires logging in with an API token, since api.anonymous_access \
+                 is \"token-required\""
+            );
             Gate::login_required(api)
         } else {
             if !self.listen.ip().is_loopback() {
+                let what = match anonymous {
+                    AnonymousAccess::ReadOnly => "read everything",
+                    _ => "do anything",
+                };
                 tracing::warn!(
                     "the web UI listens on {} and does not require logging in, so anyone who \
-                     can reach it can do anything; see --require-login",
+                     can reach it can {what}; see --require-login",
                     self.listen
                 );
             }
-            Gate::open(api)
+            Gate::anonymous(api, anonymous.scopes())
         };
 
         let server = self.spawn_server(&socket_path)?;
@@ -243,20 +255,20 @@ impl WebArgs {
     }
 }
 
-/// The config file's `web_ui` settings, read from `kiki.toml` in the data
-/// directory, where the `kiki serve` child reads its own settings. Read
-/// once, before the sandbox hides the file.
+/// The settings in `kiki.toml` in the data directory, where the `kiki
+/// serve` child reads its own settings. Read once, before the sandbox
+/// hides the file, for the `web_ui` settings and `api.anonymous_access`.
 ///
 /// # Errors
 ///
 /// Returns an error if the data directory cannot be found, or if the
 /// config file cannot be read or holds an invalid setting.
-fn configured_web_ui() -> Result<config::WebUiSettings> {
+fn configured_settings() -> Result<config::Settings> {
     let data_dir = paths::resolve_data_dir(&Env::from_process())?;
     let path = data_dir.path.join(config::CONFIG_FILE_NAME);
     let store =
         ConfigStore::open(&path).with_context(|| format!("failed to load config file {path:?}"))?;
-    Ok(store.current().web_ui.clone())
+    Ok(store.current().as_ref().clone())
 }
 
 /// Serve the web UI on `listener` alongside the Kiki `server`, until one of

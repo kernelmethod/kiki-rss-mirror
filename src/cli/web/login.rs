@@ -10,8 +10,9 @@
 //! can neither read it nor have the browser send it to the web UI.
 //! Sessions do not survive a restart of the web UI.
 //!
-//! Without login, the web UI acts with the full access its Unix socket
-//! gives it, as it always has.
+//! Without login, the web UI sends no token, so it may do what the API
+//! allows requests without one (`api.anonymous_access`): by default,
+//! anything, as it always has.
 
 use super::layout::render_form_page;
 use super::plugins::is_same_origin;
@@ -56,7 +57,8 @@ pub(super) struct Api {
 }
 
 impl Api {
-    /// A client acting with the full access of the Unix socket.
+    /// A client that sends no token, so acts with what the API allows
+    /// anonymous requests.
     pub(super) fn unauthenticated(client: reqwest::Client) -> Self {
         Api {
             client,
@@ -208,14 +210,25 @@ pub(super) struct Gate {
     /// The sessions of those logged in, or `None` if login is not
     /// required.
     sessions: Option<Sessions>,
+    /// What the API allows requests without a token, when login is not
+    /// required, so that pages can hide the controls that would fail.
+    anonymous: Scopes,
 }
 
 impl Gate {
     /// Let everyone use the web UI with the full access of `api`.
+    #[cfg(test)]
     pub(super) fn open(api: reqwest::Client) -> Self {
+        Gate::anonymous(api, Scopes::all())
+    }
+
+    /// Let everyone use the web UI without logging in, through `api`,
+    /// which allows requests without a token `scopes`.
+    pub(super) fn anonymous(api: reqwest::Client, scopes: Scopes) -> Self {
         Gate {
             api,
             sessions: None,
+            anonymous: scopes,
         }
     }
 
@@ -225,6 +238,7 @@ impl Gate {
         Gate {
             api,
             sessions: Some(Sessions::default()),
+            anonymous: Scopes::NONE,
         }
     }
 }
@@ -270,7 +284,11 @@ pub(super) async fn gate(State(gate): State<Arc<Gate>>, mut req: Request, next: 
     let Some(sessions) = &gate.sessions else {
         req.extensions_mut()
             .insert(Api::unauthenticated(gate.api.clone()));
-        return next.run(req).await;
+        let viewer = Viewer {
+            scopes: gate.anonymous,
+            token_name: None,
+        };
+        return VIEWER.scope(viewer, next.run(req)).await;
     };
     if matches!(req.uri().path(), "/login" | "/logout") {
         return next.run(req).await;
