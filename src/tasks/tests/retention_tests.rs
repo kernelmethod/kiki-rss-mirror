@@ -287,7 +287,7 @@ async fn deleting_keeps_saved_entries_unless_asked() -> Result<()> {
     assert_eq!(f.guids(), ["current", "saved"]);
 
     let filter = DeleteFilter {
-        include_saved: true,
+        keep_tagged: vec![],
         ..filter
     };
     assert_eq!(delete(&f, filter), 1);

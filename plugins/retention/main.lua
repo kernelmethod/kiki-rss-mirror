@@ -37,7 +37,7 @@ end
 local function clean_up()
     local deleted = kiki.entries.delete_where({
         dropped_before = os.time() - days * DAY,
-        include_saved = not keep_saved,
+        keep_tagged = keep_saved and { "system:saved" } or {},
     })
     if deleted > 0 then
         kiki.log("info", string.format("retention: deleted %d entries", deleted))

@@ -94,7 +94,7 @@ fn entries_dropped_long_enough_ago_are_deleted_on_load_and_then_hourly() {
             dropped_before: deletes[0].dropped_before,
             feed_id: None,
             published_before: None,
-            include_saved: false,
+            keep_tagged: vec!["system:saved".into()],
         }
     );
 }
@@ -108,7 +108,7 @@ fn saved_entries_can_be_deleted_too() {
     )
     .unwrap();
     runner.dispatch_observe(Event::PluginLoad, EventPayload::PluginLoad);
-    assert!(services.deletes.lock().unwrap()[0].include_saved);
+    assert!(services.deletes.lock().unwrap()[0].keep_tagged.is_empty());
 }
 
 #[test]

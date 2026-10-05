@@ -557,9 +557,13 @@ lists an entry; `filter` says which of those entries to delete:
 | `dropped_before`   | Required. Delete entries their feed stopped listing before this Unix timestamp. |
 | `feed_id`          | Only delete the entries of this feed. |
 | `published_before` | Only delete entries published before this Unix timestamp. Entries with no publication date are kept. |
-| `include_saved`    | Also delete entries tagged `system:saved`, which are kept unless this is `true`. |
+| `keep_tagged`      | Keep entries tagged with any of these tags: a tag name, or a list of them. Defaults to `"system:saved"`; `{}` deletes entries however they are tagged. |
 
-An unknown filter raises an error, as does a missing `dropped_before`. Kiki
+An unknown filter raises an error, as does a missing `dropped_before` or a
+`system:` name in `keep_tagged` that is not a system tag. To keep saved
+entries and entries with the user tag `keep` too, pass
+`keep_tagged = { "system:saved", "keep" }`: setting `keep_tagged` replaces
+the default, rather than adding to it. Kiki
 deletes the entries a few hundred at a time, so that a large deletion does
 not hold up feed refreshes for long, but the call returns only once they are
 all deleted; a plugin that may delete many entries at once may need a longer

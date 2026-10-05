@@ -233,7 +233,8 @@ pub(crate) fn delete_entries(db: &Db, filter: &DeleteFilter) -> Result<u64, Stri
 /// Deletes up to [`DELETE_BATCH`] of the entries `filter` describes, oldest
 /// dropped first, and returns how many it deleted.
 fn delete_batch(conn: &Connection, filter: &DeleteFilter) -> rusqlite::Result<u64> {
-    let saved = SystemTag::Saved.id(conn)?;
+    let keep_tagged = serde_json::to_string(&filter.keep_tagged)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
     let deleted = conn
         .prepare_cached(
             "DELETE FROM entries WHERE id IN (
@@ -241,9 +242,11 @@ fn delete_batch(conn: &Connection, filter: &DeleteFilter) -> rusqlite::Result<u6
                 WHERE dropped_at IS NOT NULL AND dropped_at < :dropped_before
                   AND (:feed_id IS NULL OR feed_id = :feed_id)
                   AND (:published_before IS NULL OR published_at < :published_before)
-                  AND (:include_saved OR NOT EXISTS (
-                      SELECT 1 FROM entry_tags et WHERE et.entry_id = e.id AND et.tag_id = :saved
-                  ))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM entry_tags et JOIN tags t ON t.id = et.tag_id
+                      WHERE et.entry_id = e.id
+                        AND t.name IN (SELECT value FROM json_each(:keep_tagged))
+                  )
                 ORDER BY dropped_at
                 LIMIT :limit
             )",
@@ -252,8 +255,7 @@ fn delete_batch(conn: &Connection, filter: &DeleteFilter) -> rusqlite::Result<u6
             ":dropped_before": filter.dropped_before,
             ":feed_id": filter.feed_id,
             ":published_before": filter.published_before,
-            ":include_saved": filter.include_saved,
-            ":saved": saved,
+            ":keep_tagged": keep_tagged,
             ":limit": DELETE_BATCH as i64,
         })?;
     Ok(deleted as u64)
@@ -1121,7 +1123,7 @@ mod tests {
         let filter = DeleteFilter {
             dropped_before: i64::MAX,
             published_before: Some(i64::MAX),
-            include_saved: true,
+            keep_tagged: vec![],
             ..Default::default()
         };
         assert_eq!(delete_batch(&conn, &filter).unwrap(), 1);
@@ -1148,6 +1150,38 @@ mod tests {
     }
 
     #[test]
+    fn entries_with_any_kept_tag_are_kept() {
+        let pool = pool();
+        let conn = pool.connect();
+        let feed = insert_feed(&conn);
+        let saved = insert_entry(&conn, feed, "rss", "saved");
+        let pinned = insert_entry(&conn, feed, "rss", "pinned");
+        let other = insert_entry(&conn, feed, "rss", "other");
+        for id in [saved, pinned, other] {
+            drop_entry(&conn, id, 10);
+        }
+        assert!(set_entry_tag(&conn, saved, "system:saved", true).unwrap());
+        assert!(set_entry_tag(&conn, pinned, "pinned", true).unwrap());
+        assert!(set_entry_tag(&conn, other, "other", true).unwrap());
+
+        let filter = DeleteFilter {
+            dropped_before: week_ago(),
+            keep_tagged: vec!["pinned".into(), "system:saved".into(), "missing".into()],
+            ..Default::default()
+        };
+        assert_eq!(delete_batch(&conn, &filter).unwrap(), 1);
+        assert_eq!(entry_ids(&conn), [saved, pinned]);
+
+        // Naming only "pinned" replaces the default, so saved entries go too.
+        let filter = DeleteFilter {
+            keep_tagged: vec!["pinned".into()],
+            ..filter
+        };
+        assert_eq!(delete_batch(&conn, &filter).unwrap(), 1);
+        assert_eq!(entry_ids(&conn), [pinned]);
+    }
+
+    #[test]
     fn plugins_delete_entries_through_delete_where() {
         let pool = pool();
         let conn = pool.connect();
@@ -1168,6 +1202,20 @@ mod tests {
                 kiki.store.set("missing", not ok and tostring(err):find("dropped_before") ~= nil)
                 ok, err = pcall(kiki.entries.delete_where, { dropped_before = 1, nope = 2 })
                 kiki.store.set("unknown", not ok and tostring(err):find("unknown filter") ~= nil)
+                ok, err = pcall(kiki.entries.delete_where,
+                    { dropped_before = 1, keep_tagged = { "system:nope" } })
+                kiki.store.set("system", not ok and tostring(err):find("not a system tag") ~= nil)
+                local bad = 0
+                for _, tags in ipairs({ { tag = "x" }, { 1 }, true }) do
+                    ok, err = pcall(kiki.entries.delete_where,
+                        { dropped_before = 1, keep_tagged = tags })
+                    if not ok and tostring(err):find("list of them") then
+                        bad = bad + 1
+                    end
+                end
+                kiki.store.set("bad", bad)
+                kiki.store.set("one", kiki.entries.delete_where(
+                    { dropped_before = 1, keep_tagged = "pinned" }))
             end)
             "#,
         );
@@ -1177,6 +1225,9 @@ mod tests {
             ("deleted", serde_json::json!(1)),
             ("missing", serde_json::json!(true)),
             ("unknown", serde_json::json!(true)),
+            ("system", serde_json::json!(true)),
+            ("bad", serde_json::json!(3)),
+            ("one", serde_json::json!(0)),
         ] {
             assert_eq!(store_get(&conn, "p", key).unwrap(), Some(value), "{key}");
         }

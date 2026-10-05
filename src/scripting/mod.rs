@@ -78,6 +78,7 @@
 
 pub mod lua;
 
+use crate::db::tags::SystemTag;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
@@ -531,7 +532,7 @@ pub struct ScanOptions {
 /// Only entries their feed has stopped listing are ever deleted: an entry still in its
 /// feed would be fetched again on the feed's next refresh, and stored as a new, unread
 /// entry.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteFilter {
     /// Delete entries their feed stopped listing before this Unix timestamp.
     pub dropped_before: i64,
@@ -540,8 +541,20 @@ pub struct DeleteFilter {
     /// Only delete entries published before this Unix timestamp. Entries with no
     /// publication date are kept.
     pub published_before: Option<i64>,
-    /// Also delete entries tagged `system:saved`, which are kept by default.
-    pub include_saved: bool,
+    /// Keep entries tagged with any of these tags, by name. Defaults to
+    /// `system:saved`; empty deletes entries however they are tagged.
+    pub keep_tagged: Vec<String>,
+}
+
+impl Default for DeleteFilter {
+    fn default() -> Self {
+        Self {
+            dropped_before: 0,
+            feed_id: None,
+            published_before: None,
+            keep_tagged: vec![SystemTag::Saved.name().to_string()],
+        }
+    }
 }
 
 /// How a scan went, handed to its `on_done` callback when it finishes.
