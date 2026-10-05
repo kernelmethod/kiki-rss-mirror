@@ -3,9 +3,15 @@
 //! # Architecture
 //!
 //! A single [`LuaScriptRunner`] is built at server startup and shared across every worker
-//! that needs to dispatch events. Internally the runner owns one Lua VM guarded by a
-//! [`std::sync::Mutex`], plus a registry mapping each [`Event`] to the list of handlers
-//! registered for it.
+//! that needs to dispatch events. Internally the runner owns one Lua VM for each set of
+//! [`Permission`]s its plugins ask for, all guarded by one [`std::sync::Mutex`], plus a
+//! registry mapping each [`Event`] to the list of handlers registered for it.
+//!
+//! Plugins that ask for the same permissions share a VM, and with it the standard library
+//! tables (`string`, `table`, ...). Plugins that ask for different permissions get VMs of
+//! their own, so a plugin cannot reach code that runs with permissions it lacks, such as by
+//! replacing `string.format` under it. Each handler is passed a payload built in its own
+//! VM, and handlers run in the order they were registered, whichever VMs they are in.
 //!
 //! Handlers are registered at script load time via the `kiki.on(event, handler)` function
 //! exposed in Lua. Scripts must not return anything from their top-level chunk — a return
@@ -19,7 +25,8 @@
 //!   its manifest says otherwise, [`SCRIPT_TIMEOUT_MS`]), enforced via [`Lua::set_hook`]
 //!   firing every [`HOOK_EVERY_N`] bytecode instructions.
 //! * A per-VM memory cap (see [`SCRIPT_MEMORY_LIMIT_BYTES`]), applied once at construction
-//!   via [`Lua::set_memory_limit`].
+//!   via [`Lua::set_memory_limit`]. A plugin that uses up its VM's memory fails only the
+//!   plugins that share its permissions.
 //!
 //! Timeouts surface as execution errors; for `entry.ingest` handlers the entry passes
 //! through unmodified, for observe handlers the failure is dropped. Regexes compiled through
@@ -35,6 +42,7 @@ use super::{
     parse_script_config, Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary,
     ScheduleDecision, ScriptRunner, ScriptServices, ScriptSource, TimeBudget,
 };
+use crate::plugins::Permission;
 use api::{ApiContext, Budget};
 use mlua::prelude::*;
 use mlua::HookTriggers;
@@ -60,7 +68,7 @@ pub const SCAN_SLICE: Duration = Duration::from_millis(50);
 /// Frequency (in Lua VM instructions) at which the timeout hook fires.
 const HOOK_EVERY_N: u32 = 1000;
 
-/// Memory cap for the scripting VM.
+/// Memory cap for each scripting VM.
 pub const SCRIPT_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Errors that can occur during script loading or execution.
@@ -262,13 +270,17 @@ fn restore_read_only(modified: &mut FeedEntry, original: &FeedEntry) {
 /// A handler registered with `kiki.on`, with the name and time budget of the plugin that
 /// registered it.
 struct Handler {
+    /// The index of the VM the handler lives in.
+    vm: usize,
     key: RegistryKey,
     plugin: Arc<str>,
     budget: TimeBudget,
 }
 
 /// A registered handler, resolved to a function that can be called.
-struct LiveHandler {
+struct LiveHandler<'a> {
+    /// The VM the handler lives in.
+    lua: &'a Lua,
     function: LuaFunction,
     plugin: Arc<str>,
     budget: TimeBudget,
@@ -281,10 +293,12 @@ type Handlers = Arc<Mutex<HashMap<Event, Vec<Handler>>>>;
 ///
 /// See the module-level docs for the architecture, sandboxing, and script contract.
 pub struct LuaScriptRunner {
-    // Wrapping `Lua` in a `Mutex` gives us atomicity across the
+    // One VM per permission set, indexed by the `vm` of the handlers, timers and scans
+    // that live in it. Wrapping them in a `Mutex` gives us atomicity across the
     // `set_hook → call → remove_hook` sequence — mlua's internal locking only protects
-    // individual calls, not sequences.
-    lua: Mutex<Lua>,
+    // individual calls, not sequences — and runs one handler at a time, so that one
+    // `budget` serves them all.
+    vms: Mutex<Vec<Lua>>,
     // Populated by the plugins' `kiki.on` closures.
     handlers: Handlers,
     // The handlers of the scans plugins have started with `kiki.entries.scan`.
@@ -311,9 +325,10 @@ impl LuaScriptRunner {
 
     /// Build a runner from scripts and their configs.
     ///
-    /// The VM is sandboxed and memory-capped before any script is loaded. Each script's
-    /// top-level chunk is called with its config, converted to a Lua table, as its only
-    /// argument, and registers handlers via `kiki.on`.
+    /// Each script is loaded into the VM of the scripts that ask for the same permissions,
+    /// which is sandboxed and memory-capped before any script is loaded into it. Each
+    /// script's top-level chunk is called with its config, converted to a Lua table, as its
+    /// only argument, and registers handlers via `kiki.on`.
     ///
     /// # Errors
     ///
@@ -336,85 +351,39 @@ impl LuaScriptRunner {
         script_sources: &[ScriptSource],
         services: Option<Arc<dyn ScriptServices>>,
     ) -> Result<Self, ScriptError> {
-        let lua = Lua::new_with(
-            LuaStdLib::STRING | LuaStdLib::TABLE | LuaStdLib::MATH | LuaStdLib::OS,
-            LuaOptions::default(),
-        )
-        .map_err(ScriptError::ScriptLoadError)?;
-
-        lua.set_memory_limit(SCRIPT_MEMORY_LIMIT_BYTES)
-            .map_err(ScriptError::ScriptLoadError)?;
-
-        // Remove dangerous OS functions, leaving only os.time, os.clock, os.date, os.difftime.
-        {
-            let os: LuaTable = lua
-                .globals()
-                .get("os")
-                .map_err(ScriptError::ScriptLoadError)?;
-            for func in &["execute", "exit", "getenv", "remove", "rename", "tmpname"] {
-                os.set(*func, LuaValue::Nil)
-                    .map_err(ScriptError::ScriptLoadError)?;
-            }
-        }
-
-        // Remove other dangerous globals.
-        for global in &["require", "dofile", "loadfile", "debug", "io", "package"] {
-            lua.globals()
-                .set(*global, LuaValue::Nil)
-                .map_err(ScriptError::ScriptLoadError)?;
-        }
-
         let handlers: Handlers = Arc::new(Mutex::new(HashMap::new()));
-
-        let kiki = lua.create_table().map_err(ScriptError::ScriptLoadError)?;
-
-        {
-            let log_fn = lua
-                .create_function(|_, (level, message): (String, String)| {
-                    match level.as_str() {
-                        "debug" => tracing::debug!(target: "kiki::lua", "{}", message),
-                        "info" => tracing::info!(target: "kiki::lua", "{}", message),
-                        "warn" => tracing::warn!(target: "kiki::lua", "{}", message),
-                        "error" => tracing::error!(target: "kiki::lua", "{}", message),
-                        other => {
-                            return Err(LuaError::RuntimeError(format!(
-                                "kiki.log: unknown level '{}'; expected debug|info|warn|error",
-                                other
-                            )));
-                        }
-                    }
-                    Ok(())
-                })
-                .map_err(ScriptError::ScriptLoadError)?;
-            kiki.set("log", log_fn)
-                .map_err(ScriptError::ScriptLoadError)?;
-        }
-
-        regex_api::install(&lua, &kiki).map_err(ScriptError::ScriptLoadError)?;
-        html_api::install(&lua, &kiki).map_err(ScriptError::ScriptLoadError)?;
-
-        lua.globals()
-            .set("kiki", kiki)
-            .map_err(ScriptError::ScriptLoadError)?;
 
         // Load each plugin, passing it its config. Chunks register handlers via
         // `kiki.on(...)` side effects and must not return a value — any return (including a
         // function) is treated as an error to catch accidentally-copied legacy scripts at
         // load time rather than silently.
-        let ctx = ApiContext {
+        let mut ctx = ApiContext {
             services,
             scans: Arc::new(Mutex::new(HashMap::new())),
             timers: Arc::new(Mutex::new(Vec::new())),
             budget: Arc::new(Budget::default()),
             loading: Arc::new(AtomicBool::new(true)),
+            vm: 0,
         };
+        let mut permission_sets: Vec<Vec<Permission>> = Vec::new();
+        let mut vms = Vec::new();
         for source in script_sources {
-            load_plugin(&lua, source, &ctx, &handlers)?;
+            let permissions = permission_set(&source.permissions);
+            ctx.vm = match permission_sets.iter().position(|set| *set == permissions) {
+                Some(vm) => vm,
+                None => {
+                    permission_sets.push(permissions);
+                    vms.push(new_vm()?);
+                    vms.len() - 1
+                }
+            };
+            let lua = vm(&vms, ctx.vm).map_err(ScriptError::ScriptLoadError)?;
+            load_plugin(lua, source, &ctx, &handlers)?;
         }
         ctx.loading.store(false, Ordering::SeqCst);
 
         Ok(Self {
-            lua: Mutex::new(lua),
+            vms: Mutex::new(vms),
             handlers,
             scans: ctx.scans,
             timers: ctx.timers,
@@ -427,7 +396,7 @@ impl LuaScriptRunner {
     /// The handlers mutex is acquired only for the short snapshot; we then drop it so that
     /// subsequent handler execution (which can call `kiki.on` recursively, in theory) does
     /// not deadlock.
-    fn resolve_handlers(&self, lua: &Lua, event: Event) -> Vec<LiveHandler> {
+    fn resolve_handlers<'a>(&self, vms: &'a [Lua], event: Event) -> Vec<LiveHandler<'a>> {
         let guard = self
             .handlers
             .lock()
@@ -438,8 +407,11 @@ impl LuaScriptRunner {
         };
         let mut out = Vec::with_capacity(registered.len());
         for handler in registered {
-            match lua.registry_value::<LuaFunction>(&handler.key) {
-                Ok(function) => out.push(LiveHandler {
+            let resolved = vm(vms, handler.vm)
+                .and_then(|lua| Ok((lua, lua.registry_value::<LuaFunction>(&handler.key)?)));
+            match resolved {
+                Ok((lua, function)) => out.push(LiveHandler {
+                    lua,
                     function,
                     plugin: handler.plugin.clone(),
                     budget: handler.budget,
@@ -480,8 +452,8 @@ impl LuaScriptRunner {
     /// A timer's next call is due one interval after the one just made was, so a timer
     /// that runs late on one tick is not late on every tick after it; one that fell more
     /// than an interval behind is due one interval from `now`.
-    fn run_timers(&self, lua: &Lua, now: Instant) {
-        let due: Vec<(LuaFunction, Arc<str>, TimeBudget)> = {
+    fn run_timers(&self, vms: &[Lua], now: Instant) {
+        let due: Vec<(&Lua, LuaFunction, Arc<str>, TimeBudget)> = {
             let mut timers = self.timers.lock().unwrap_or_else(|e| e.into_inner());
             let mut due = Vec::new();
             for timer in timers.iter_mut().filter(|t| t.next <= now) {
@@ -489,15 +461,19 @@ impl LuaScriptRunner {
                 if timer.next <= now {
                     timer.next = now + timer.every;
                 }
-                match lua.registry_value::<LuaFunction>(&timer.handler) {
-                    Ok(function) => due.push((function, timer.plugin.clone(), timer.budget)),
+                let resolved = vm(vms, timer.vm)
+                    .and_then(|lua| Ok((lua, lua.registry_value::<LuaFunction>(&timer.handler)?)));
+                match resolved {
+                    Ok((lua, function)) => {
+                        due.push((lua, function, timer.plugin.clone(), timer.budget))
+                    }
                     Err(e) => warn!(error = %e, "failed to resolve timer from Lua registry"),
                 }
             }
             due
         };
         // The timers lock is released, so handlers may start timers of their own.
-        for (function, plugin, budget) in due {
+        for (lua, function, plugin, budget) in due {
             if let Err(e) =
                 call_with_timeout::<LuaValue>(lua, &self.budget, budget, &function, LuaValue::Nil)
             {
@@ -505,6 +481,87 @@ impl LuaScriptRunner {
             }
         }
     }
+}
+
+/// The VM at `index` in `vms`: one a handler, timer or scan was registered in, which is
+/// always there.
+fn vm(vms: &[Lua], index: usize) -> LuaResult<&Lua> {
+    vms.get(index)
+        .ok_or_else(|| LuaError::RuntimeError(format!("no scripting VM {index}")))
+}
+
+/// The canonical form of a plugin's `permissions`: sorted, without duplicates, so that
+/// plugins asking for the same permissions in another order share a VM.
+fn permission_set(permissions: &[Permission]) -> Vec<Permission> {
+    let mut set = permissions.to_vec();
+    set.sort_by_key(|p| p.name());
+    set.dedup();
+    set
+}
+
+/// Build a sandboxed, memory-capped VM with the shared `kiki` table, ready for plugins to
+/// be loaded into.
+fn new_vm() -> Result<Lua, ScriptError> {
+    let lua = Lua::new_with(
+        LuaStdLib::STRING | LuaStdLib::TABLE | LuaStdLib::MATH | LuaStdLib::OS,
+        LuaOptions::default(),
+    )
+    .map_err(ScriptError::ScriptLoadError)?;
+
+    lua.set_memory_limit(SCRIPT_MEMORY_LIMIT_BYTES)
+        .map_err(ScriptError::ScriptLoadError)?;
+
+    // Remove dangerous OS functions, leaving only os.time, os.clock, os.date, os.difftime.
+    {
+        let os: LuaTable = lua
+            .globals()
+            .get("os")
+            .map_err(ScriptError::ScriptLoadError)?;
+        for func in &["execute", "exit", "getenv", "remove", "rename", "tmpname"] {
+            os.set(*func, LuaValue::Nil)
+                .map_err(ScriptError::ScriptLoadError)?;
+        }
+    }
+
+    // Remove other dangerous globals.
+    for global in &["require", "dofile", "loadfile", "debug", "io", "package"] {
+        lua.globals()
+            .set(*global, LuaValue::Nil)
+            .map_err(ScriptError::ScriptLoadError)?;
+    }
+
+    let kiki = lua.create_table().map_err(ScriptError::ScriptLoadError)?;
+
+    {
+        let log_fn = lua
+            .create_function(|_, (level, message): (String, String)| {
+                match level.as_str() {
+                    "debug" => tracing::debug!(target: "kiki::lua", "{}", message),
+                    "info" => tracing::info!(target: "kiki::lua", "{}", message),
+                    "warn" => tracing::warn!(target: "kiki::lua", "{}", message),
+                    "error" => tracing::error!(target: "kiki::lua", "{}", message),
+                    other => {
+                        return Err(LuaError::RuntimeError(format!(
+                            "kiki.log: unknown level '{}'; expected debug|info|warn|error",
+                            other
+                        )));
+                    }
+                }
+                Ok(())
+            })
+            .map_err(ScriptError::ScriptLoadError)?;
+        kiki.set("log", log_fn)
+            .map_err(ScriptError::ScriptLoadError)?;
+    }
+
+    regex_api::install(&lua, &kiki).map_err(ScriptError::ScriptLoadError)?;
+    html_api::install(&lua, &kiki).map_err(ScriptError::ScriptLoadError)?;
+
+    lua.globals()
+        .set("kiki", kiki)
+        .map_err(ScriptError::ScriptLoadError)?;
+
+    Ok(lua)
 }
 
 /// Run a plugin's entrypoint, passing it its config.
@@ -554,7 +611,7 @@ fn plugin_env(
     let kiki = api::plugin_kiki_table(lua, &source.name, source.time_budget, ctx)?;
     kiki.raw_set(
         "on",
-        on_function(lua, handlers, &source.name, source.time_budget)?,
+        on_function(lua, handlers, &source.name, source.time_budget, ctx.vm)?,
     )?;
     env.raw_set("kiki", kiki)?;
 
@@ -605,13 +662,14 @@ fn plugin_env(
     Ok(env)
 }
 
-/// Build the `kiki.on(event, handler)` of the plugin named `plugin`, which registers
-/// `handler` for `event` with the plugin's time budget.
+/// Build the `kiki.on(event, handler)` of the plugin named `plugin`, loaded into the VM
+/// `vm`, which registers `handler` for `event` with the plugin's time budget.
 fn on_function(
     lua: &Lua,
     handlers: &Handlers,
     plugin: &str,
     budget: TimeBudget,
+    vm: usize,
 ) -> LuaResult<LuaFunction> {
     let handlers = Arc::clone(handlers);
     let plugin: Arc<str> = Arc::from(plugin);
@@ -625,6 +683,7 @@ fn on_function(
             .entry(event)
             .or_default()
             .push(Handler {
+                vm,
                 key,
                 plugin: plugin.clone(),
                 budget,
@@ -672,12 +731,12 @@ impl ScriptRunner for LuaScriptRunner {
     }
 
     fn dispatch_transform_entry(&self, entry: FeedEntry) -> anyhow::Result<Option<FeedEntry>> {
-        let lua = self
-            .lua
+        let vms = self
+            .vms
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let handlers = self.resolve_handlers(&lua, Event::EntryIngest);
+        let handlers = self.resolve_handlers(&vms, Event::EntryIngest);
         if handlers.is_empty() {
             return Ok(Some(entry));
         }
@@ -687,7 +746,8 @@ impl ScriptRunner for LuaScriptRunner {
 
         let mut current = entry;
         for handler in &handlers {
-            let lua_entry = match current.clone().into_lua(&lua) {
+            let lua = handler.lua;
+            let lua_entry = match current.clone().into_lua(lua) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(error = %e, "failed to convert FeedEntry to Lua table; skipping handler");
@@ -696,14 +756,14 @@ impl ScriptRunner for LuaScriptRunner {
             };
 
             match call_with_timeout::<LuaValue>(
-                &lua,
+                lua,
                 &self.budget,
                 handler.budget,
                 &handler.function,
                 lua_entry,
             ) {
                 Ok(LuaValue::Nil) => return Ok(None),
-                Ok(LuaValue::Table(t)) => match FeedEntry::from_lua(LuaValue::Table(t), &lua) {
+                Ok(LuaValue::Table(t)) => match FeedEntry::from_lua(LuaValue::Table(t), lua) {
                     Ok(mut modified) => {
                         restore_read_only(&mut modified, &original);
                         current = modified;
@@ -737,16 +797,17 @@ impl ScriptRunner for LuaScriptRunner {
         &self,
         mut schedule: FetchSchedule,
     ) -> anyhow::Result<Option<ScheduleDecision>> {
-        let lua = self
-            .lua
+        let vms = self
+            .vms
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut decision = None;
-        for handler in self.resolve_handlers(&lua, Event::FetchSchedule) {
-            let payload = schedule_to_lua(&lua, &schedule)?;
+        for handler in self.resolve_handlers(&vms, Event::FetchSchedule) {
+            let lua = handler.lua;
+            let payload = schedule_to_lua(lua, &schedule)?;
             let returned = call_with_timeout::<LuaValue>(
-                &lua,
+                lua,
                 &self.budget,
                 handler.budget,
                 &handler.function,
@@ -777,23 +838,24 @@ impl ScriptRunner for LuaScriptRunner {
     }
 
     fn dispatch_observe(&self, event: Event, payload: EventPayload) {
-        let lua = self
-            .lua
+        let vms = self
+            .vms
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if event == Event::Timer {
-            self.run_timers(&lua, Instant::now());
+            self.run_timers(&vms, Instant::now());
             return;
         }
 
-        let handlers = self.resolve_handlers(&lua, event);
+        let handlers = self.resolve_handlers(&vms, event);
         if handlers.is_empty() {
             return;
         }
 
         for handler in &handlers {
-            let lua_payload = match payload_to_lua(&lua, payload.clone()) {
+            let lua = handler.lua;
+            let lua_payload = match payload_to_lua(lua, payload.clone()) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(
@@ -806,7 +868,7 @@ impl ScriptRunner for LuaScriptRunner {
             };
 
             if let Err(e) = call_with_timeout::<LuaValue>(
-                &lua,
+                lua,
                 &self.budget,
                 handler.budget,
                 &handler.function,
@@ -826,15 +888,22 @@ impl ScriptRunner for LuaScriptRunner {
         scan_id: u64,
         entries: Vec<FeedEntry>,
     ) -> anyhow::Result<Option<Vec<Option<FeedEntry>>>> {
-        let lua = self
-            .lua
+        let vms = self
+            .vms
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let (handler, limit): (LuaFunction, TimeBudget) = {
+        let (lua, handler, limit): (&Lua, LuaFunction, TimeBudget) = {
             let scans = self.scans.lock().unwrap_or_else(|e| e.into_inner());
             match scans.get(&scan_id) {
-                Some(callbacks) => (lua.registry_value(&callbacks.handler)?, callbacks.budget),
+                Some(callbacks) => {
+                    let lua = vm(&vms, callbacks.vm)?;
+                    (
+                        lua,
+                        lua.registry_value(&callbacks.handler)?,
+                        callbacks.budget,
+                    )
+                }
                 None => return Ok(None),
             }
         };
@@ -846,16 +915,16 @@ impl ScriptRunner for LuaScriptRunner {
             if !results.is_empty() && start.elapsed() >= SCAN_SLICE {
                 break;
             }
-            let lua_entry = entry.clone().into_lua(&lua)?;
+            let lua_entry = entry.clone().into_lua(lua)?;
             let result = match call_with_timeout::<LuaValue>(
-                &lua,
+                lua,
                 &self.budget,
                 limit,
                 &handler,
                 lua_entry,
             ) {
                 Ok(LuaValue::Nil) => None,
-                Ok(LuaValue::Table(t)) => match FeedEntry::from_lua(LuaValue::Table(t), &lua) {
+                Ok(LuaValue::Table(t)) => match FeedEntry::from_lua(LuaValue::Table(t), lua) {
                     Ok(mut modified) => {
                         restore_read_only(&mut modified, &entry);
                         Some(modified)
@@ -891,17 +960,20 @@ impl ScriptRunner for LuaScriptRunner {
         let Some(callbacks) = callbacks else {
             return;
         };
-        let lua = self
-            .lua
+        let vms = self
+            .vms
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(lua) = vm(&vms, callbacks.vm) else {
+            return;
+        };
         if let (Some(summary), Some(on_done)) = (summary, &callbacks.on_done) {
             let result = lua.registry_value::<LuaFunction>(on_done).and_then(|f| {
                 let t = lua.create_table()?;
                 t.set("scanned", summary.scanned)?;
                 t.set("updated", summary.updated)?;
                 call_with_timeout::<LuaValue>(
-                    &lua,
+                    lua,
                     &self.budget,
                     callbacks.budget,
                     &f,
@@ -1310,6 +1382,71 @@ mod tests {
         source
     }
 
+    /// `named(name, text)`, asking for `permissions`.
+    fn with_permissions(name: &str, text: &str, permissions: &[Permission]) -> ScriptSource {
+        ScriptSource {
+            permissions: permissions.to_vec(),
+            ..named(name, text)
+        }
+    }
+
+    /// A plugin that replaces `string.upper` reaches the plugins that ask for the same
+    /// permissions, but not those that ask for others, which run in a VM of their own.
+    #[test]
+    fn plugins_with_other_permissions_do_not_share_a_vm() {
+        let tamper = r#"string.upper = function() return "tampered" end"#;
+        let upper = r#"
+            kiki.on("entry.ingest", function(entry)
+                entry.tags[#entry.tags + 1] = string.upper("x")
+                return entry
+            end)
+        "#;
+        let delete = [Permission::EntriesDelete];
+        let runner = LuaScriptRunner::from_sources(&[
+            named("tamper", tamper),
+            with_permissions("privileged", upper, &delete),
+            named("peer", upper),
+            // The same permissions, asked for twice, share the privileged VM.
+            with_permissions("privileged-too", upper, &[delete[0], delete[0]]),
+        ])
+        .unwrap();
+        assert_eq!(runner.vms.lock().unwrap().len(), 2);
+
+        let entry = runner
+            .dispatch_transform_entry(make_entry())
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.tags, ["X", "tampered", "X"]);
+    }
+
+    /// Handlers run in the order they were registered, wherever their VMs are, and each
+    /// sees what the handlers before it returned.
+    #[test]
+    fn handlers_in_other_vms_run_in_registration_order() {
+        let append = |tag: &str| {
+            format!(
+                r#"kiki.on("entry.ingest", function(entry)
+                    entry.title = entry.title .. "{tag}"
+                    return entry
+                end)"#
+            )
+        };
+        let delete = [Permission::EntriesDelete];
+        let runner = LuaScriptRunner::from_sources(&[
+            named("a", &append("a")),
+            with_permissions("b", &append("b"), &delete),
+            named("c", &append("c")),
+            with_permissions("d", &append("d"), &delete),
+        ])
+        .unwrap();
+
+        let entry = runner
+            .dispatch_transform_entry(make_entry())
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.title, "Test Titleabcd");
+    }
+
     #[test]
     fn schedule_handlers_see_the_fetch() {
         let runner = LuaScriptRunner::from_sources(&[named(
@@ -1497,8 +1634,8 @@ mod tests {
     }
 
     fn run_timers_at(runner: &LuaScriptRunner, at: Instant) {
-        let lua = runner.lua.lock().unwrap();
-        runner.run_timers(&lua, at);
+        let vms = runner.vms.lock().unwrap();
+        runner.run_timers(&vms, at);
     }
 
     #[test]
@@ -1705,14 +1842,15 @@ mod tests {
 
     /// Gives `runner`'s plugins a global `sleep_ms(ms)` that blocks for `ms` milliseconds.
     fn install_sleep(runner: &LuaScriptRunner) {
-        let lua = runner.lua.lock().unwrap();
-        let sleep = lua
-            .create_function(|_, ms: u64| {
-                std::thread::sleep(Duration::from_millis(ms));
-                Ok(())
-            })
-            .unwrap();
-        lua.globals().set("sleep_ms", sleep).unwrap();
+        for lua in runner.vms.lock().unwrap().iter() {
+            let sleep = lua
+                .create_function(|_, ms: u64| {
+                    std::thread::sleep(Duration::from_millis(ms));
+                    Ok(())
+                })
+                .unwrap();
+            lua.globals().set("sleep_ms", sleep).unwrap();
+        }
     }
 
     /// A plugin whose handler keeps busy for `ms` milliseconds, then tags the entry with

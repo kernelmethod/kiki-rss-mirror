@@ -124,7 +124,11 @@ processes. `require` loads only the plugin's own modules; see
 [Modules](#modules).
 
 Each plugin runs in an environment of its own: globals a plugin defines are
-not visible to other plugins.
+not visible to other plugins. Plugins that ask for the same
+[permissions](#permissions) share a VM, and with it the standard library
+tables, so one that changes `string` or `table` changes them for the others
+too. Plugins that ask for different permissions run in separate VMs, so a
+plugin can't tamper with code that runs with permissions it lacks.
 
 ## Script structure
 
@@ -834,8 +838,9 @@ Every handler call runs under two hard limits:
   for 10 seconds, the server stops it, and with it every plugin, until Kiki
   restarts. Keep `"unlimited"` for plugins you trust to finish, such as the
   bundled `sanitize`, which every new entry passes through.
-- **Memory**: 16 MiB across the entire VM. Allocations that would exceed this
-  cap fail the handler.
+- **Memory**: 16 MiB for each VM, shared by the plugins that ask for the
+  same [permissions](#permissions). Allocations that would exceed this cap
+  fail the handler.
 - **Regexes**: compiled regexes live outside the VM, so the memory cap does not
   count them. Each is instead limited to 256 KiB of compiled program (plus a
   matching cache of the same size), and at most 128 distinct regexes may be

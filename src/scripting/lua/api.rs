@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 /// The callbacks of a scan a plugin started.
 pub(super) struct ScanCallbacks {
+    /// The index of the VM the callbacks live in.
+    pub vm: usize,
     /// Called with each entry.
     pub handler: RegistryKey,
     /// Called once the scan has gone through every entry, if the plugin gave one.
@@ -35,6 +37,8 @@ pub(super) type Scans = Arc<Mutex<HashMap<u64, ScanCallbacks>>>;
 
 /// A timer a plugin started with `kiki.every(secs, handler)`.
 pub(super) struct Timer {
+    /// The index of the VM the handler lives in.
+    pub vm: usize,
     /// Called each time the timer is due.
     pub handler: RegistryKey,
     /// The name of the plugin that started the timer.
@@ -127,6 +131,9 @@ pub(super) struct ApiContext {
     /// Set while plugins' top-level chunks run, when scans cannot start yet: the runner
     /// they would be dispatched to is not installed until every plugin has loaded.
     pub loading: Arc<AtomicBool>,
+    /// The index of the VM the plugin is loaded into, which the timers and scans it starts
+    /// live in.
+    pub vm: usize,
 }
 
 impl ApiContext {
@@ -186,6 +193,7 @@ fn every_function(
 ) -> LuaResult<LuaFunction> {
     let plugin: Arc<str> = Arc::from(plugin);
     let timers = ctx.timers.clone();
+    let vm = ctx.vm;
     lua.create_function(move |lua, (secs, handler): (LuaValue, LuaFunction)| {
         let err = |m: String| LuaError::RuntimeError(format!("kiki.every: {m}"));
         let secs = match secs {
@@ -207,6 +215,7 @@ fn every_function(
         }
         let every = Duration::from_secs_f64(secs);
         let timer = Timer {
+            vm,
             handler: lua.create_registry_value(handler)?,
             plugin: plugin.clone(),
             budget,
@@ -330,6 +339,7 @@ fn entries_table(
             // The scan cannot reach the handler before it is registered: its batches are
             // dispatched through this runner, which is busy until this handler returns.
             let callbacks = ScanCallbacks {
+                vm: c.vm,
                 handler: lua.create_registry_value(handler)?,
                 on_done: on_done.map(|f| lua.create_registry_value(f)).transpose()?,
                 budget,

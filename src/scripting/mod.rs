@@ -79,6 +79,7 @@
 pub mod lua;
 
 use crate::db::tags::SystemTag;
+use crate::plugins::Permission;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
@@ -88,7 +89,7 @@ use std::time::Duration;
 ///
 /// Each plugin's entrypoint is called with its config as its only argument, so a
 /// plugin reads it with `local config = ...`. That keeps one plugin's config out of reach
-/// of the others that share its VM.
+/// of the others that share its VM: the plugins that ask for the same [`Permission`]s.
 ///
 /// A plugin's other source files travel with it as [`ScriptModule`]s, which its code
 /// loads with `require`.
@@ -108,6 +109,11 @@ pub struct ScriptSource {
     pub modules: Vec<ScriptModule>,
     /// How long each call of one of the plugin's handlers may run.
     pub time_budget: TimeBudget,
+    /// The permissions the plugin's manifest asks for.
+    ///
+    /// The server decides what a plugin may do; the runner only keeps plugins that ask for
+    /// different permissions apart, so that none can tamper with code running with more.
+    pub permissions: Vec<Permission>,
 }
 
 /// How long each call of a plugin's handlers may run before it is stopped.
@@ -192,6 +198,7 @@ impl ScriptSource {
     /// assert_eq!(source.config, "{}");
     /// assert!(source.modules.is_empty());
     /// assert_eq!(source.time_budget, TimeBudget::DEFAULT);
+    /// assert!(source.permissions.is_empty());
     /// ```
     pub fn new(text: impl Into<String>) -> Self {
         Self {
@@ -200,6 +207,7 @@ impl ScriptSource {
             config: Self::EMPTY_CONFIG.to_string(),
             modules: Vec::new(),
             time_budget: TimeBudget::DEFAULT,
+            permissions: Vec::new(),
         }
     }
 }

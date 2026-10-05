@@ -178,9 +178,7 @@ impl PluginRuntime {
         if changed {
             // Set before the plugins load, since the calls they make while
             // loading are only answered for plugins that are loaded.
-            let previous = self
-                .services
-                .set_loaded(loaded_plugins(&discovery, &sources));
+            let previous = self.services.set_loaded(loaded_plugins(&sources));
             if let Err(e) = self.load(&discovery) {
                 // The plugins that were running keep running, and keep
                 // being reported, so that what the API reports as running
@@ -194,11 +192,6 @@ impl PluginRuntime {
                 return Err(e);
             }
             *last_sources = Some(sources);
-        } else {
-            // The code and config are as they were, but a manifest's
-            // permissions may have changed.
-            self.services
-                .set_loaded(loaded_plugins(&discovery, &sources));
         }
         self.discovery.store(discovery);
         Ok(ReloadOutcome { loaded, changed })
@@ -239,19 +232,11 @@ impl PluginRuntime {
 }
 
 /// The plugins `sources` were loaded from, with the permissions their
-/// manifests in `discovery` ask for.
-fn loaded_plugins(discovery: &Discovery, sources: &[ScriptSource]) -> LoadedPlugins {
+/// manifests ask for.
+fn loaded_plugins(sources: &[ScriptSource]) -> LoadedPlugins {
     sources
         .iter()
-        .map(|source| {
-            let permissions = discovery
-                .plugins
-                .iter()
-                .find(|p| p.manifest.name == source.name)
-                .map(|p| p.manifest.permissions.clone())
-                .unwrap_or_default();
-            (source.name.clone(), permissions)
-        })
+        .map(|source| (source.name.clone(), source.permissions.clone()))
         .collect()
 }
 
