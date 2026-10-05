@@ -8,6 +8,7 @@
 //! whether the VM runs in the server or in the sandboxed script host.
 
 use super::config::{from_lua_value, to_lua_value};
+use crate::db::tags::{is_reserved_tag_name, SystemTag};
 use crate::scripting::{
     DeleteFilter, ScanOptions, ScriptServices, ServiceCall, ServiceReply, TimeBudget, TIMER_TICK,
 };
@@ -389,15 +390,11 @@ fn delete_filter(filter: LuaValue) -> LuaResult<DeleteFilter> {
             "dropped_before" => dropped_before = Some(int(&value)?),
             "feed_id" => parsed.feed_id = Some(int(&value)?),
             "published_before" => parsed.published_before = Some(int(&value)?),
-            "include_saved" => {
-                parsed.include_saved = value
-                    .as_boolean()
-                    .ok_or_else(|| err("filter 'include_saved' must be a boolean"))?
-            }
+            "keep_tagged" => parsed.keep_tagged = keep_tagged(value).map_err(|m| err(&m))?,
             other => {
                 return Err(err(&format!(
                     "unknown filter '{other}'; expected dropped_before, feed_id, \
-                     published_before or include_saved"
+                     published_before or keep_tagged"
                 )))
             }
         }
@@ -406,6 +403,36 @@ fn delete_filter(filter: LuaValue) -> LuaResult<DeleteFilter> {
         err("'dropped_before' is required: only entries their feed has stopped listing are deleted")
     })?;
     Ok(parsed)
+}
+
+/// Parses the `keep_tagged` filter of `kiki.entries.delete_where`: a tag name, or a
+/// list of them. Names starting with `system:` must name a system tag.
+fn keep_tagged(value: LuaValue) -> Result<Vec<String>, String> {
+    let bad = || "filter 'keep_tagged' must be a tag name or a list of them".to_string();
+    let name = |value: LuaValue| match value {
+        LuaValue::String(name) => name.to_str().map(|n| n.to_string()).map_err(|_| bad()),
+        _ => Err(bad()),
+    };
+    let names = match value {
+        LuaValue::Table(list) => {
+            let names = list
+                .sequence_values::<LuaValue>()
+                .map(|value| name(value.map_err(|_| bad())?))
+                .collect::<Result<Vec<_>, _>>()?;
+            // Anything besides the list itself, such as `{ tag = "x" }`, is a mistake.
+            if names.len() != list.pairs::<LuaValue, LuaValue>().count() {
+                return Err(bad());
+            }
+            names
+        }
+        value => vec![name(value)?],
+    };
+    for name in &names {
+        if is_reserved_tag_name(name) && !SystemTag::ALL.iter().any(|t| t.name() == name) {
+            return Err(format!("{name:?} in 'keep_tagged' is not a system tag"));
+        }
+    }
+    Ok(names)
 }
 
 /// Parses the arguments of `kiki.entries.scan([options,] handler [, on_done])`.

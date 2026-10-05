@@ -18,7 +18,7 @@ time_budget_ms = "unlimited"
 # Zero, the default, keeps every entry forever. See main.lua for how.
 [config]
 max_age_days = 0
-keep_saved = true
+keep_tags = ["system:saved"]
 
 [[settings]]
 name = "max_age_days"
@@ -29,7 +29,8 @@ min = 0
 max = 36500
 
 [[settings]]
-name = "keep_saved"
-type = "boolean"
-label = "Keep saved entries"
-description = "Never delete entries tagged system:saved, however long ago their feed stopped listing them."
+name = "keep_tags"
+type = "list"
+items = { type = "string" }
+label = "Tags to keep"
+description = "Never delete entries tagged with any of these tags, however long ago their feed stopped listing them. system:saved keeps saved entries."

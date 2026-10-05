@@ -64,6 +64,7 @@ fn the_manifest_asks_for_the_delete_permission() {
     let manifest = PluginManifest::parse(MANIFEST).unwrap();
     assert_eq!(manifest.permissions, [Permission::EntriesDelete]);
     assert_eq!(manifest.config["max_age_days"], 0);
+    crate::plugins::settings::check_config(&manifest.settings, &manifest.config).unwrap();
 }
 
 #[test]
@@ -94,21 +95,35 @@ fn entries_dropped_long_enough_ago_are_deleted_on_load_and_then_hourly() {
             dropped_before: deletes[0].dropped_before,
             feed_id: None,
             published_before: None,
-            include_saved: false,
+            keep_tagged: vec!["system:saved".into()],
         }
     );
 }
 
 #[test]
-fn saved_entries_can_be_deleted_too() {
-    let services = Arc::new(FakeServices::default());
-    let runner = plugin(
-        json!({"max_age_days": 30, "keep_saved": false}),
-        services.clone(),
-    )
-    .unwrap();
-    runner.dispatch_observe(Event::PluginLoad, EventPayload::PluginLoad);
-    assert!(services.deletes.lock().unwrap()[0].include_saved);
+fn entries_with_the_tags_it_is_given_are_kept() {
+    for (keep_tags, keep_tagged) in [
+        (json!([]), vec![]),
+        (
+            json!(["keep", "system:saved"]),
+            vec!["keep", "system:saved"],
+        ),
+        // A config without `keep_tags` keeps saved entries.
+        (Value::Null, vec!["system:saved"]),
+    ] {
+        let services = Arc::new(FakeServices::default());
+        let runner = plugin(
+            json!({"max_age_days": 30, "keep_tags": keep_tags}),
+            services.clone(),
+        )
+        .unwrap();
+        runner.dispatch_observe(Event::PluginLoad, EventPayload::PluginLoad);
+        assert_eq!(
+            services.deletes.lock().unwrap()[0].keep_tagged,
+            keep_tagged,
+            "{keep_tags}"
+        );
+    }
 }
 
 #[test]
@@ -118,7 +133,10 @@ fn bad_configs_fail_to_load() {
         json!({"max_age_days": 1.5}),
         json!({"max_age_days": "30"}),
         json!({"max_age_days": 36501}),
-        json!({"keep_saved": "no"}),
+        json!({"keep_tags": "system:saved"}),
+        json!({"keep_tags": [1]}),
+        json!({"keep_tags": [""]}),
+        json!({"keep_tags": {"tag": "keep"}}),
     ] {
         let result = plugin(overrides.clone(), Arc::new(FakeServices::default()));
         assert!(result.is_err(), "{overrides} should fail to load");
@@ -263,7 +281,7 @@ fn the_retired_setting_moves_to_the_plugin() {
 fn the_plugins_own_setting_is_kept() {
     let (config, db) = config_and_db("[retention]\nmax_age_days = 30\n");
     db.write_blocking(|conn| {
-        let overrides = json!({"max_age_days": 7, "keep_saved": false});
+        let overrides = json!({"max_age_days": 7, "keep_tags": []});
         crate::db::plugins::set_config_overrides(conn, "retention", overrides.as_object().unwrap())
     })
     .unwrap()
