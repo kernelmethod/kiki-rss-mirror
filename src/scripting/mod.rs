@@ -46,15 +46,16 @@
 //!
 //! `entry.ingest` handlers run in registration order; the output of one becomes the input
 //! of the next. A handler may return `nil` to drop the entry; subsequent handlers are not
-//! called. Handlers for observe-only events (everything except `entry.ingest`) are called
-//! for their side effects; their return values are discarded.
+//! called. `fetch.schedule` handlers also run in order, each seeing the wait the one before
+//! it chose (see [`FetchSchedule`]). Handlers for observe-only events (everything else) are
+//! called for their side effects; their return values are discarded.
 //!
 //! # Error handling
 //!
 //! If a handler fails to load, times out, or throws a runtime error, the error is logged as
-//! a warning. For `entry.ingest` the entry passes through the failing handler **unmodified**;
-//! for observe events the failure is simply dropped. A broken script never silently drops
-//! entries.
+//! a warning. For `entry.ingest` the entry passes through the failing handler **unmodified**,
+//! and for `fetch.schedule` the wait is left as it was; for observe events the failure is
+//! simply dropped. A broken script never silently drops entries.
 //!
 //! # Sandboxing
 //!
@@ -302,6 +303,10 @@ pub enum Event {
     /// Fires once plugins have loaded: when the server starts, and whenever plugins are
     /// reloaded because a plugin or its config changed.
     PluginLoad,
+    /// Fires after a fetch that found the feed working (a `200` or `304`) whose freshness
+    /// hint has it fetched again sooner than its interval. Handlers may lengthen the wait
+    /// by returning a number of seconds; see [`FetchSchedule`].
+    FetchSchedule,
 }
 
 impl Event {
@@ -315,6 +320,7 @@ impl Event {
             Self::FeedAdded => "feed.added",
             Self::FeedRemoved => "feed.removed",
             Self::PluginLoad => "plugin.load",
+            Self::FetchSchedule => "fetch.schedule",
         }
     }
 
@@ -328,6 +334,7 @@ impl Event {
             "feed.added" => Some(Self::FeedAdded),
             "feed.removed" => Some(Self::FeedRemoved),
             "plugin.load" => Some(Self::PluginLoad),
+            "fetch.schedule" => Some(Self::FetchSchedule),
             _ => None,
         }
     }
@@ -341,7 +348,8 @@ impl Event {
 /// A set of [`Event`]s, such as those some handler is registered for.
 ///
 /// Packed into one byte, so the script host can report its subscriptions
-/// on every response for next to nothing.
+/// on every response for next to nothing. That holds eight events, which
+/// [`Event`] has; another one needs a wider integer here.
 ///
 /// # Examples
 ///
@@ -411,6 +419,87 @@ pub enum EventPayload {
     Feed { id: i64, url: String, title: String },
     /// Used for [`Event::PluginLoad`]. Handlers are called with no argument.
     PluginLoad,
+}
+
+/// What a fetch revealed about a feed's content, as `fetch.schedule` handlers see it in
+/// [`FetchSchedule::change`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContentChange {
+    /// The content differs from the last fetch.
+    Changed,
+    /// The content is the same as at the last fetch: the server answered `304 Not
+    /// Modified`, or sent the same body again.
+    Unchanged,
+    /// There is nothing to compare against, such as on a feed's first fetch.
+    Unknown,
+}
+
+impl ContentChange {
+    /// Compare a fresh body hash with the one stored from the last `200`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::scripting::ContentChange;
+    ///
+    /// assert_eq!(ContentChange::from_hashes(Some("a"), "a"), ContentChange::Unchanged);
+    /// assert_eq!(ContentChange::from_hashes(Some("a"), "b"), ContentChange::Changed);
+    /// assert_eq!(ContentChange::from_hashes(None, "b"), ContentChange::Unknown);
+    /// ```
+    pub fn from_hashes(stored: Option<&str>, fresh: &str) -> Self {
+        match stored {
+            Some(stored) if stored == fresh => ContentChange::Unchanged,
+            Some(_) => ContentChange::Changed,
+            None => ContentChange::Unknown,
+        }
+    }
+
+    /// The name `fetch.schedule` handlers see: `"changed"`, `"unchanged"` or `"unknown"`.
+    pub fn name(self) -> &'static str {
+        match self {
+            ContentChange::Changed => "changed",
+            ContentChange::Unchanged => "unchanged",
+            ContentChange::Unknown => "unknown",
+        }
+    }
+}
+
+/// The payload of [`Event::FetchSchedule`]: a feed that was just fetched, and the wait
+/// before its next fetch.
+///
+/// The event fires only when the server's freshness hint has the feed fetched again
+/// sooner than its own interval, so that `wait_secs < interval_secs`. Each handler is
+/// called with this as a table, and may return a number of seconds to wait instead, or
+/// `nil` to leave the wait as it is; the next handler sees the new wait in `wait_secs`.
+/// The server then holds the wait between the one it planned and the feed's interval:
+/// plugins can have a feed fetched less often, never more often than its server asks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchSchedule {
+    /// The feed that was fetched.
+    pub feed_id: i64,
+    /// The status the server answered with: `200` or `304`.
+    pub status: u16,
+    /// Whether the feed's content changed since the last fetch.
+    pub change: ContentChange,
+    /// The freshness hint the wait was planned from, in seconds, from the response's
+    /// `Cache-Control` or `Expires` or else the feed's own `<ttl>` or `sy:updatePeriod`.
+    pub hint_secs: u64,
+    /// The feed's fetch interval, in seconds: the longest it is ever left unfetched.
+    pub interval_secs: u64,
+    /// The server's `feed_fetch.min_polling_cadence_seconds`: the shortest wait.
+    pub min_cadence_secs: u64,
+    /// The wait before the next fetch, in seconds.
+    pub wait_secs: u64,
+}
+
+/// The wait `fetch.schedule` handlers chose, from [`ScriptRunner::dispatch_schedule`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleDecision {
+    /// The wait before the feed's next fetch, in seconds, as the last handler to change it
+    /// returned it. The server still holds it within its bounds.
+    pub wait_secs: u64,
+    /// The plugin whose handler chose it.
+    pub plugin: String,
 }
 
 /// Which stored entries a scan visits. See [`ServiceCall::StartScan`].
@@ -505,9 +594,10 @@ pub trait ScriptServices: Send + Sync {
 /// Implementations hold a live scripting VM plus the handlers registered by scripts at load
 /// time, and route [`Event`]s to the appropriate handlers.
 ///
-/// Transform events (currently only [`Event::EntryIngest`]) use
-/// [`Self::dispatch_transform_entry`] and may return `Ok(None)` to filter the entry out.
-/// All other events are observe-only and dispatched via [`Self::dispatch_observe`].
+/// Transform events use methods of their own: [`Event::EntryIngest`] uses
+/// [`Self::dispatch_transform_entry`], which may return `Ok(None)` to filter the entry out,
+/// and [`Event::FetchSchedule`] uses [`Self::dispatch_schedule`]. All other events are
+/// observe-only and dispatched via [`Self::dispatch_observe`].
 pub trait ScriptRunner: Send + Sync {
     /// Whether any handler may be registered for `event`.
     ///
@@ -527,6 +617,20 @@ pub trait ScriptRunner: Send + Sync {
     /// - `Ok(None)` — a handler filtered the entry out; it should not be inserted.
     /// - `Err(_)` — an unrecoverable failure; the caller decides how to proceed.
     fn dispatch_transform_entry(&self, entry: FeedEntry) -> anyhow::Result<Option<FeedEntry>>;
+
+    /// Pass `schedule` through each `fetch.schedule` handler in registration order.
+    ///
+    /// Returns the wait the handlers chose and the plugin that chose it, or `Ok(None)` if
+    /// every handler left the wait as it was (or failed, or none is registered).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the handlers could not be run at all; the caller then keeps the
+    /// wait it planned.
+    fn dispatch_schedule(
+        &self,
+        schedule: FetchSchedule,
+    ) -> anyhow::Result<Option<ScheduleDecision>>;
 
     /// Fire an observe-only event to every handler registered for it.
     ///

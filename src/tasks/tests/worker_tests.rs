@@ -3,7 +3,8 @@
 
 use crate::db::task_queue::{backdate_task, ensure_task, TASK_FTS_OPTIMIZE};
 use crate::scripting::{
-    Event, EventPayload, FeedEntry, ScanSummary, ScriptRunner, ScriptRunnerHandle,
+    Event, EventPayload, FeedEntry, FetchSchedule, ScanSummary, ScheduleDecision, ScriptRunner,
+    ScriptRunnerHandle,
 };
 use crate::tasks::{spawn_workers, TaskManagerCommand};
 use crate::test::TestBuilder;
@@ -19,6 +20,9 @@ struct PanickingRunner;
 impl ScriptRunner for PanickingRunner {
     fn dispatch_transform_entry(&self, _: FeedEntry) -> Result<Option<FeedEntry>> {
         panic!("test panic in entry.ingest");
+    }
+    fn dispatch_schedule(&self, _: FetchSchedule) -> Result<Option<ScheduleDecision>> {
+        panic!("test panic in fetch.schedule");
     }
     fn dispatch_observe(&self, _: Event, _: EventPayload) {
         panic!("test panic in an observe event");

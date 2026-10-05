@@ -23,10 +23,16 @@ pub struct Migration {
 ///    (the first is `0001_...`)
 /// 3. Make the same change to `src/db/include/init.sql`, which always holds
 ///    the complete current schema
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_api_tokens",
-    sql: include_str!("include/migrations/0001_api_tokens.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_api_tokens",
+        sql: include_str!("include/migrations/0001_api_tokens.sql"),
+    },
+    Migration {
+        name: "0002_adaptive_fetch_plugin",
+        sql: include_str!("include/migrations/0002_adaptive_fetch_plugin.sql"),
+    },
+];
 
 /// SQL to create the migrations table. Safe to run on databases that already
 /// have it (uses `IF NOT EXISTS`).
@@ -182,6 +188,67 @@ pub(crate) mod tests {
             crate::db::tokens::authenticate(&conn, &secret, 0)?,
             crate::db::tokens::Authentication::Valid(token)
         );
+        Ok(())
+    }
+
+    /// `0002_adaptive_fetch_plugin` hands each feed's adaptive level to the
+    /// adaptive-fetch plugin's store, and the feeds it was turned off for to
+    /// the plugin's `exclude` setting, then drops the columns.
+    #[test]
+    fn test_0002_adaptive_fetch_plugin() -> Result<()> {
+        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute_batch(
+            "ALTER TABLE feeds ADD COLUMN adaptive_fetch INTEGER;
+             ALTER TABLE feeds ADD COLUMN adaptive_fetch_level INTEGER NOT NULL DEFAULT 0;
+             DELETE FROM migrations WHERE name = '0002_adaptive_fetch_plugin';
+             INSERT INTO feeds (id, title, url, adaptive_fetch, adaptive_fetch_level) VALUES
+                 (1, 'follows the server', 'http://a/', NULL, 3),
+                 (2, 'turned on', 'http://b/', 1, 5),
+                 (3, 'turned off', 'http://c/', 0, 2),
+                 (4, 'never backed off', 'http://d/', NULL, 0),
+                 (5, 'also turned off', 'http://e/', 0, 0);",
+        )?;
+        assert_eq!(run_pending_migrations(&mut conn)?, 1);
+
+        let levels: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT key, value FROM plugin_store
+                 WHERE plugin = 'adaptive-fetch' ORDER BY key",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            levels,
+            [
+                ("level:1".to_string(), "3".to_string()),
+                ("level:2".to_string(), "5".to_string()),
+            ]
+        );
+        let config = crate::db::plugins::get_config_overrides(&conn, "adaptive-fetch")?;
+        assert_eq!(config["exclude"], serde_json::json!([3, 5]));
+
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('feeds')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        assert!(!columns.iter().any(|c| c.starts_with("adaptive")));
+        Ok(())
+    }
+
+    /// Without feeds turned off, `0002_adaptive_fetch_plugin` leaves the
+    /// adaptive-fetch plugin with no config overrides.
+    #[test]
+    fn test_0002_adaptive_fetch_plugin_without_overrides() -> Result<()> {
+        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute_batch(
+            "ALTER TABLE feeds ADD COLUMN adaptive_fetch INTEGER;
+             ALTER TABLE feeds ADD COLUMN adaptive_fetch_level INTEGER NOT NULL DEFAULT 0;
+             DELETE FROM migrations WHERE name = '0002_adaptive_fetch_plugin';
+             INSERT INTO feeds (title, url) VALUES ('feed', 'http://a/');",
+        )?;
+        assert_eq!(run_pending_migrations(&mut conn)?, 1);
+        let rows: i64 = conn.query_row("SELECT count(*) FROM plugins", [], |row| row.get(0))?;
+        assert_eq!(rows, 0);
         Ok(())
     }
 

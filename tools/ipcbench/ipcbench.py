@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Measure what Kiki's inter-process traffic costs during feed ingestion.
 
-Starts a local feed server and a fresh `kiki serve`, then runs refreshes in
-which every item of every feed is new, so each round ingests
-FEEDS * ITEMS entries through the feed fetcher and the script host (with
-the plugins `kiki init` installs). For each round it records the wall time
-to ingest, and the CPU time and context switches of every Kiki process;
-with --strace, it also counts each process's system calls for the first
-round.
+Starts a local feed server and a fresh `kiki serve`, then runs refreshes.
+With the default `--workload new`, every item of every feed is new, so each
+round ingests FEEDS * ITEMS entries through the feed fetcher and the script
+host (with the plugins `kiki init` installs). With `--workload unchanged`,
+no feed ever changes: each round is FEEDS fetches answered `304 Not
+Modified`, with a `max-age=0` freshness hint, which measures what one fetch
+and its scheduling cost apart from storing entries. For each round it
+records the wall time, and the CPU time and context switches of every Kiki
+process; with --strace, it also counts each process's system calls for the
+first round.
 
     ipcbench.py run KIKI [--label NAME]           one binary, JSON lines out
     ipcbench.py compare BEFORE AFTER [--runs N]   interleaved runs, then a table
@@ -47,12 +50,21 @@ SETTLE_STEP = 0.2
 
 class FeedServer:
     """Serves /feed/<n>.xml: `items` items of about `content_bytes` of HTML
-    each, whose guids change every round."""
+    each, whose guids change every round.
 
-    def __init__(self, items, content_bytes):
+    With `unchanged`, the feeds keep the items of round 0 instead, and are
+    served with an `ETag` and `Cache-Control: max-age=0`, so every request
+    after the first is answered `304 Not Modified`. `requests` counts the
+    requests answered, and `not_modified` the 304s among them."""
+
+    def __init__(self, items, content_bytes, unchanged=False):
         self.items = items
         self.content = "<p>" + LOREM * max(1, content_bytes // len(LOREM)) + "</p>"
         self.round = 0
+        self.unchanged = unchanged
+        self.requests = 0
+        self.not_modified = 0
+        self.lock = threading.Lock()
         bench = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -63,8 +75,23 @@ class FeedServer:
                     self.send_response(404)
                     self.end_headers()
                     return
-                body = bench.feed(n)
+                r = 0 if bench.unchanged else bench.round
+                etag = f'"r{r}-f{n}"'
+                fresh = bench.unchanged and self.headers.get("If-None-Match") == etag
+                with bench.lock:
+                    bench.requests += 1
+                    bench.not_modified += fresh
+                if fresh:
+                    self.send_response(304)
+                    self.send_header("ETag", etag)
+                    self.send_header("Cache-Control", "max-age=0")
+                    self.end_headers()
+                    return
+                body = bench.feed(n, r)
                 self.send_response(200)
+                if bench.unchanged:
+                    self.send_header("ETag", etag)
+                    self.send_header("Cache-Control", "max-age=0")
                 self.send_header("Content-Type", "application/rss+xml")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -77,8 +104,7 @@ class FeedServer:
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
-    def feed(self, n):
-        r = self.round
+    def feed(self, n, r):
         items = "".join(
             f"<item><title>Item {r}-{n}-{i}</title><guid>r{r}-f{n}-i{i}</guid>"
             f"<link>http://example.com/{r}/{n}/{i}?utm_source=bench</link>"
@@ -197,8 +223,9 @@ def parse_strace(path):
 # --- A run ----------------------------------------------------------------
 
 
-def run(kiki, label, feeds, items, content_bytes, rounds, trace, serve_args):
-    feeds_srv = FeedServer(items, content_bytes)
+def run(kiki, label, workload, feeds, items, content_bytes, rounds, trace, serve_args):
+    unchanged = workload == "unchanged"
+    feeds_srv = FeedServer(items, content_bytes, unchanged)
     home = tempfile.mkdtemp(prefix="kiki-ipcbench-")
     env = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
     env.update(KIKI_HOME=home, RUST_LOG=os.environ.get("KIKI_LOG", "warn"))
@@ -240,6 +267,19 @@ def run(kiki, label, feeds, items, content_bytes, rounds, trace, serve_args):
                 time.sleep(0.05)
             raise RuntimeError(f"round {r}: only {have} of {want} entries arrived")
 
+        def wait_for_checks(since):
+            """Wait until every feed has been checked at or after `since`."""
+            deadline = time.time() + 600
+            have = 0
+            while time.time() < deadline:
+                (have,) = db.execute(
+                    "SELECT count(*) FROM feeds WHERE last_checked >= ?", (since,)
+                ).fetchone()
+                if have >= feeds:
+                    return
+                time.sleep(0.05)
+            raise RuntimeError(f"only {have} of {feeds} feeds were checked")
+
         # Round 0, queued by creating the feeds, is the warm-up.
         wait_for(0)
         time.sleep(1)
@@ -255,13 +295,22 @@ def run(kiki, label, feeds, items, content_bytes, rounds, trace, serve_args):
                         cmd = ["strace", "-c", "-f", "-o", out, "-p", str(pid)]
                         tracers.append((name, out, subprocess.Popen(cmd, stderr=subprocess.DEVNULL)))
                 time.sleep(1)
+            # `last_checked` is in whole seconds, so a round starts on a new
+            # one to tell its checks from the last round's.
+            time.sleep(1 - time.time() % 1)
             before = sample(proc.pid)
+            requests, not_modified = feeds_srv.requests, feeds_srv.not_modified
             start = time.time()
             api(sock, "POST", "/v1/feeds/refresh")
-            wait_for(r)
+            if unchanged:
+                wait_for_checks(int(start))
+            else:
+                wait_for(r)
             wall = time.time() - start
             after, settled = settle(proc.pid, start)
             result = {
+                "requests": feeds_srv.requests - requests,
+                "not_modified": feeds_srv.not_modified - not_modified,
                 "wall": round(wall, 3),
                 "settle": round(max(wall, settled), 3),
                 "procs": {
@@ -276,7 +325,8 @@ def run(kiki, label, feeds, items, content_bytes, rounds, trace, serve_args):
                     tracer.wait(30)
                     result["syscalls"][name] = parse_strace(out)
             results.append(result)
-        return {"label": label, "feeds": feeds, "items": items, "rounds": results}
+        return {"label": label, "workload": workload, "feeds": feeds, "items": items,
+                "rounds": results}
     finally:
         proc.terminate()
         try:
@@ -300,15 +350,23 @@ def summarize(results, out=sys.stdout):
             # A traced round is slowed by strace, so it is not timed.
             else:
                 rounds.setdefault(label, []).append(r)
-    size = results[0]["feeds"] * results[0]["items"] if results else 0
+    workload = results[0].get("workload", "new") if results else "new"
+    if workload == "unchanged":
+        size = results[0]["feeds"]
+        what = "304 Not Modified fetches"
+    else:
+        size = results[0]["feeds"] * results[0]["items"] if results else 0
+        what = "new entries"
 
     def med(label, f):
         return statistics.median(f(r) for r in rounds[label]) if rounds.get(label) else 0
 
-    print(f"Medians over rounds of {size:,} new entries "
+    print(f"Medians over rounds of {size:,} {what} "
           f"({', '.join(f'{l}: {len(rounds.get(l, []))}' for l in labels)} rounds)\n",
           file=out)
     rows = [
+        ("feed requests", lambda r: r.get("requests", 0), "{:,.0f}"),
+        ("304 responses", lambda r: r.get("not_modified", 0), "{:,.0f}"),
         ("wall time (s)", lambda r: r["wall"], "{:.2f}"),
         ("settle time (s)", lambda r: r.get("settle", 0), "{:.2f}"),
         ("all processes CPU (s)", lambda r: sum(v[0] for v in r["procs"].values()), "{:.2f}"),
@@ -349,8 +407,13 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def sizes(sp):
-        sp.add_argument("--feeds", type=int, default=40)
-        sp.add_argument("--items", type=int, default=250, help="items per feed")
+        sp.add_argument("--workload", choices=["new", "unchanged"], default="new",
+                        help="new: every item is new each round; "
+                             "unchanged: every fetch is a 304 (default: new)")
+        sp.add_argument("--feeds", type=int,
+                        help="feeds to create (default: 40, or 1000 for --workload unchanged)")
+        sp.add_argument("--items", type=int,
+                        help="items per feed (default: 250, or 5 for --workload unchanged)")
         sp.add_argument("--content-bytes", type=int, default=2048,
                         help="approximate size of each item's HTML")
         sp.add_argument("--rounds", type=int, default=3, help="measured refreshes per run")
@@ -380,7 +443,11 @@ def main():
         summarize([json.loads(l) for l in open(args.results) if l.strip()])
         return
 
-    common = (args.feeds, args.items, args.content_bytes, args.rounds)
+    if args.feeds is None:
+        args.feeds = 1000 if args.workload == "unchanged" else 40
+    if args.items is None:
+        args.items = 5 if args.workload == "unchanged" else 250
+    common = (args.workload, args.feeds, args.items, args.content_bytes, args.rounds)
     if args.cmd == "run":
         res = run(args.kiki, args.label, *common, args.strace, args.serve_arg)
         print(json.dumps(res))
@@ -403,8 +470,8 @@ def main():
     if args.strace:
         for kiki, label in zip(bins, labels):
             print(f"strace run: {label}", file=sys.stderr)
-            res = run(kiki, label, args.feeds, args.items, args.content_bytes, 1, True,
-                      args.serve_arg)
+            res = run(kiki, label, args.workload, args.feeds, args.items, args.content_bytes,
+                      1, True, args.serve_arg)
             results.append(res)
             if out:
                 out.write(json.dumps(res) + "\n")

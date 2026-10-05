@@ -1,7 +1,6 @@
 //! Settings endpoint for how feed responses are fetched.
 use super::update_config;
 use crate::config::FeedFetchSettings;
-use crate::routes::v1::feeds::update_feed::unwind_adaptive_fetch;
 use crate::server::AppState;
 use axum::{
     extract::State,
@@ -28,10 +27,6 @@ pub struct FeedFetchSettingsResponse {
     pub force_refresh_after_seconds: u64,
     /// Largest feed response body, in bytes, that will be read into memory.
     pub max_feed_bytes: u64,
-    /// Whether to back off from feeds whose short freshness hint keeps
-    /// turning out to be unchanged, between the minimum polling cadence and
-    /// each feed's own interval. Feeds can override it.
-    pub adaptive_fetch: bool,
 }
 
 impl From<&FeedFetchSettings> for FeedFetchSettingsResponse {
@@ -43,7 +38,6 @@ impl From<&FeedFetchSettings> for FeedFetchSettingsResponse {
             max_backoff_seconds: s.max_backoff_seconds,
             force_refresh_after_seconds: s.force_refresh_after_seconds,
             max_feed_bytes: s.max_feed_bytes,
-            adaptive_fetch: s.adaptive_fetch,
         }
     }
 }
@@ -73,10 +67,6 @@ pub struct FeedFetchSettingsRequest {
     /// greater than zero.
     #[serde(default)]
     pub max_feed_bytes: Option<u64>,
-    /// Whether to back off from feeds whose short freshness hint keeps
-    /// turning out to be unchanged. Feeds with their own setting keep it.
-    #[serde(default)]
-    pub adaptive_fetch: Option<bool>,
 }
 
 /// Get feed fetch settings.
@@ -102,8 +92,6 @@ pub async fn get_feed_fetch_settings(State(state): State<AppState>) -> Response 
 /// scheduled further out than the new cap. Lowering `max_feed_bytes` does
 /// not retroactively affect already-stored entries, and
 /// `default_fetch_interval_seconds` applies only to feeds added afterwards.
-/// Turning `adaptive_fetch` off brings forward any fetch it had put off,
-/// for every feed without its own setting.
 #[utoipa::path(
     put,
     path = "/v1/settings/feed-fetch",
@@ -123,8 +111,6 @@ pub async fn put_feed_fetch_settings(
     Json(payload): Json<FeedFetchSettingsRequest>,
 ) -> Result<Response, Response> {
     let backoff_changed = payload.max_backoff_seconds.is_some();
-    let was_adaptive = state.config.current().feed_fetch.adaptive_fetch;
-    let adaptive_fetch = payload.adaptive_fetch;
     let settings = update_config(&state, move |o| {
         let fields = [
             ("timeout_seconds", payload.timeout_seconds),
@@ -148,9 +134,6 @@ pub async fn put_feed_fetch_settings(
                 o.set(SECTION, key, value)?;
             }
         }
-        if let Some(adaptive_fetch) = adaptive_fetch {
-            o.set(SECTION, "adaptive_fetch", adaptive_fetch)?;
-        }
         Ok(())
     })
     .await?;
@@ -158,40 +141,8 @@ pub async fn put_feed_fetch_settings(
     if backoff_changed {
         cap_scheduled_fetches(&state, settings.feed_fetch.max_backoff_seconds).await;
     }
-    if was_adaptive && !settings.feed_fetch.adaptive_fetch {
-        unwind_server_adaptive_fetch(&state, settings.feed_fetch.min_polling_cadence_seconds).await;
-    }
 
     Ok(Json(FeedFetchSettingsResponse::from(&settings.feed_fetch)).into_response())
-}
-
-/// Undo adaptive fetching for every feed that follows the server setting,
-/// now that it has been turned off; see [`unwind_adaptive_fetch`].
-///
-/// As with [`cap_scheduled_fetches`], a failure is logged rather than
-/// reported: each feed stops adapting from its next fetch regardless.
-async fn unwind_server_adaptive_fetch(state: &AppState, min_cadence: u64) {
-    let min_cadence = i64::try_from(min_cadence).unwrap_or(i64::MAX);
-    let result = state
-        .db
-        .write(move |conn| {
-            unwind_adaptive_fetch(conn, "adaptive_fetch IS NULL", [min_cadence])?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => event!(
-            Level::WARN,
-            "failed to bring forward adaptively delayed fetches: {:#}",
-            e
-        ),
-        Err(e) => event!(
-            Level::WARN,
-            "task error bringing forward adaptively delayed fetches: {:?}",
-            e
-        ),
-    }
 }
 
 /// Bring forward every fetch scheduled more than `max_backoff_seconds`

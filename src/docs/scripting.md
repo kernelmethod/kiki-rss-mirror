@@ -323,10 +323,11 @@ entries that match regular expressions or come from given feeds.
 | `feed.added`     | `{ id, url, title }`                       | Fires after a feed is created via the HTTP API. |
 | `feed.removed`   | `{ id, url, title }`                       | Fires after a feed is deleted via the HTTP API, or merged into another feed because it permanently redirected to that feed's URL (its entries then belong to the other feed). `id`, `url`, `title` reflect the feed's state immediately before deletion. |
 | `plugin.load`    | none                                       | Fires once plugins have loaded: when the server starts, and after every reload. Where to start a [scan](#stored-entries) of stored entries. |
+| `fetch.schedule` | `{ feed_id, status, change, hint_secs, interval_secs, min_cadence_secs, wait_secs }` | **Lengthen the wait** before a feed's next fetch. Return a number of seconds, or `nil` to leave it. See [Scheduling fetches](#scheduling-fetches). |
 
-Only `entry.ingest` is a **transform** event — its handlers can modify or
-filter the payload. All other events are observe-only; their return values are
-discarded.
+`entry.ingest` and `fetch.schedule` are **transform** events: their handlers
+can change what happens. All other events are observe-only; their return
+values are discarded.
 
 ### The entry table
 
@@ -381,6 +382,47 @@ registration order (which matches the order of their plugins' directory
 names). For `entry.ingest`, the output of one
 handler becomes the input to the next — if any handler returns `nil`, the
 entry is dropped immediately and subsequent handlers do not run.
+
+## Scheduling fetches
+
+After a fetch that found a feed working, Kiki plans the next one: as soon as
+the freshness hint from the server's `Cache-Control` or `Expires` (or the
+feed's own `<ttl>` or `sy:updatePeriod`) runs out, but no sooner than
+`min_polling_cadence_seconds` and no later than the feed's own interval.
+When that hint is shorter than the interval, `fetch.schedule` fires, and its
+handlers may have Kiki wait longer. The bundled `adaptive-fetch` plugin
+(`plugins/adaptive-fetch/main.lua`) uses it to back off from feeds that keep
+turning out unchanged.
+
+The payload is a table with:
+
+| Field              | Meaning |
+|--------------------|---------|
+| `feed_id`          | The feed that was fetched. |
+| `status`           | `200`, or `304` for `Not Modified`. |
+| `change`           | `"changed"` if the feed's content differs from the last fetch, `"unchanged"` if not (a `304`, or the same body again), or `"unknown"` if there is nothing to compare against, as on a feed's first fetch. |
+| `hint_secs`        | The freshness hint, in seconds. |
+| `interval_secs`    | The feed's fetch interval, in seconds. |
+| `min_cadence_secs` | The server's `min_polling_cadence_seconds`. |
+| `wait_secs`        | The wait before the next fetch, in seconds. |
+
+A handler returns the number of seconds to wait instead (fractions are
+rounded down), or `nil` to leave the wait as it is. Handlers run in order,
+each seeing the wait the one before chose in `wait_secs`. Kiki then holds
+the wait between the one it planned and the feed's interval: a plugin can
+have a feed fetched less often than its server asks, but never more often,
+and never less often than its interval.
+
+```lua
+-- Fetch no feed more than once every ten minutes.
+kiki.on("fetch.schedule", function(fetch)
+    return math.max(fetch.wait_secs, 600)
+end)
+```
+
+The event fires on every such fetch, so a handler should be quick, and keep
+what it needs from the server, such as values in `kiki.store`, in a table of
+its own rather than asking for them every time.
 
 ## Storing data
 
@@ -711,6 +753,9 @@ When a handler errors, times out, or exceeds the memory cap:
 
 - For `entry.ingest`, the entry passes through that handler **unmodified** —
   a broken script will never silently drop entries.
+- For `fetch.schedule`, the wait is left as it was, and the next handler runs.
+  A handler that returns something other than `nil` or a number of seconds
+  that is not negative counts as failing.
 - For observe events, the failure is logged and dropped.
 
 ## Upgrading from database scripts

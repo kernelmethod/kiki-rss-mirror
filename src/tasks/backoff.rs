@@ -1,4 +1,3 @@
-use crate::tasks::adaptive::stretched_wait;
 use chrono::{DateTime, Datelike, SecondsFormat, Timelike, Utc};
 use reqwest::Url;
 use std::fmt;
@@ -43,18 +42,9 @@ pub(super) fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<i64> 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum FetchOutcome {
     /// Fresh 200 OK or a file:// read.
-    ///
-    /// `adaptive_level` is the feed's adaptive-fetch level after this fetch
-    /// (see [`crate::tasks::adaptive`]); zero leaves the hint as it is.
-    Success {
-        server_hint_secs: Option<u64>,
-        adaptive_level: u32,
-    },
+    Success { server_hint_secs: Option<u64> },
     /// 304 Not Modified.
-    NotModified {
-        server_hint_secs: Option<u64>,
-        adaptive_level: u32,
-    },
+    NotModified { server_hint_secs: Option<u64> },
     /// Transient error — eligible for exponential backoff.
     ///
     /// `stale_if_error_secs` carries the most recent
@@ -81,9 +71,6 @@ pub(super) struct SchedulerConfig {
     /// a full `GET` so the fetcher can detect servers that keep returning
     /// unchanged validators while the body has actually changed.
     pub(super) force_refresh_after: u64,
-    /// Whether adaptive fetching is on for this feed: its own setting, or
-    /// else `feed_fetch.adaptive_fetch`.
-    pub(super) adaptive: bool,
 }
 
 /// Compute when a feed is next eligible to be fetched, and why.
@@ -91,9 +78,9 @@ pub(super) struct SchedulerConfig {
 /// Rules (all results clamped to `[now + min_cadence, now + max_backoff]`):
 /// - `Success` / `NotModified`: use `min(server_hint, min_fetch_interval)`
 ///   when a hint is present; otherwise use `min_fetch_interval`. The per-feed
-///   `min_fetch_interval` is a ceiling, so we never wait longer than it. A
-///   hint shorter than the interval is stretched by the feed's adaptive
-///   level, if it has one (see [`crate::tasks::adaptive`]).
+///   `min_fetch_interval` is a ceiling, so we never wait longer than it.
+///   A wait from a hint shorter than the interval may then be lengthened by
+///   a `fetch.schedule` plugin; see [`Schedule::stretched_by_plugin`].
 /// - `TransientErr` with `Retry-After`: honor the server's deadline.
 /// - `TransientErr` without `Retry-After`: exponential backoff
 ///   `min_cadence * 2^(consecutive_failures - 1)`.
@@ -126,45 +113,24 @@ pub(super) fn plan_next_fetch(
     let max_backoff = max_backoff.max(min_cadence);
 
     let (raw_next_ts, reason): (i64, ScheduleReason) = match outcome {
-        FetchOutcome::Success {
-            server_hint_secs,
-            adaptive_level,
-        }
-        | FetchOutcome::NotModified {
-            server_hint_secs,
-            adaptive_level,
-        } => match stretched_wait(
-            server_hint_secs,
-            adaptive_level,
-            min_cadence,
-            min_fetch_interval,
-        ) {
-            Some(secs) => (
-                now_ts.saturating_add(secs as i64),
-                ScheduleReason::Adaptive {
-                    hint_secs: server_hint_secs.unwrap_or(0),
-                    secs,
-                    level: adaptive_level,
+        FetchOutcome::Success { server_hint_secs }
+        | FetchOutcome::NotModified { server_hint_secs } => {
+            let reason = match server_hint_secs {
+                Some(hint) if hint < min_fetch_interval => ScheduleReason::FreshnessHint {
+                    secs: hint,
+                    interval_secs: min_fetch_interval,
                 },
-            ),
-            None => {
-                let reason = match server_hint_secs {
-                    Some(hint) if hint < min_fetch_interval => ScheduleReason::FreshnessHint {
-                        secs: hint,
-                        interval_secs: min_fetch_interval,
-                    },
-                    hint_secs => ScheduleReason::FeedInterval {
-                        secs: min_fetch_interval,
-                        hint_secs,
-                    },
-                };
-                let interval = match server_hint_secs {
-                    Some(hint) => hint.min(min_fetch_interval),
-                    None => min_fetch_interval,
-                };
-                (now_ts.saturating_add(interval as i64), reason)
-            }
-        },
+                hint_secs => ScheduleReason::FeedInterval {
+                    secs: min_fetch_interval,
+                    hint_secs,
+                },
+            };
+            let interval = match server_hint_secs {
+                Some(hint) => hint.min(min_fetch_interval),
+                None => min_fetch_interval,
+            };
+            (now_ts.saturating_add(interval as i64), reason)
+        }
         FetchOutcome::TransientErr {
             retry_after_ts: Some(ts),
             stale_if_error_secs,
@@ -283,12 +249,12 @@ pub(crate) enum ScheduleReason {
     /// `interval_secs`. The hint came from the HTTP cache headers or the
     /// feed's own `<ttl>` / `sy:updatePeriod`.
     FreshnessHint { secs: u64, interval_secs: u64 },
-    /// A freshness hint of `hint_secs`, stretched to `secs` because the
-    /// feed has kept turning out unchanged; `level` is its adaptive level.
-    Adaptive {
+    /// A freshness hint of `hint_secs`, whose wait the `fetch.schedule`
+    /// handler of `plugin` lengthened to `secs`.
+    Plugin {
+        plugin: String,
         hint_secs: u64,
         secs: u64,
-        level: u32,
     },
     /// The feed's own fetch interval; either there was no freshness hint
     /// or the hint (`hint_secs`) was longer than the interval.
@@ -309,7 +275,7 @@ impl ScheduleReason {
     pub(crate) fn metric_source(&self) -> &'static str {
         match self {
             ScheduleReason::FreshnessHint { .. } => "cache_hint",
-            ScheduleReason::Adaptive { .. } => "adaptive",
+            ScheduleReason::Plugin { .. } => "plugin",
             ScheduleReason::FeedInterval { .. } => "interval",
             ScheduleReason::RetryAfter => "retry_after",
             ScheduleReason::StaleIfError { .. } => "stale_if_error",
@@ -348,6 +314,67 @@ impl Schedule {
         self
     }
 
+    /// The room a `fetch.schedule` plugin has to lengthen this schedule's
+    /// wait: the wait itself, and the longest it may be lengthened to, which
+    /// is the feed's interval (never past `max_backoff`). `None` unless the
+    /// wait came from a freshness hint shorter than the feed's interval, and
+    /// is still shorter than that.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // A 0s hint on a feed with a 1h interval, raised to a 1m cadence.
+    /// let schedule = plan_next_fetch(
+    ///     FetchOutcome::NotModified { server_hint_secs: Some(0) },
+    ///     now_ts, 60, 86_400, 3_600,
+    /// );
+    /// assert_eq!(schedule.plugin_room(86_400), Some((60, 3_600)));
+    /// ```
+    pub(super) fn plugin_room(&self, max_backoff: u64) -> Option<(u64, u64)> {
+        let ScheduleReason::FreshnessHint { interval_secs, .. } = self.reason else {
+            return None;
+        };
+        let wait = self.wait_secs();
+        let ceiling = interval_secs.min(max_backoff);
+        (wait < ceiling).then_some((wait, ceiling))
+    }
+
+    /// This schedule with its wait lengthened to `secs` by `plugin`'s
+    /// `fetch.schedule` handler, within the bounds of
+    /// [`Self::plugin_room`]. Returned as it is when there is no room, or
+    /// `secs` would not lengthen the wait.
+    pub(super) fn stretched_by_plugin(
+        mut self,
+        plugin: String,
+        secs: u64,
+        max_backoff: u64,
+    ) -> Schedule {
+        let Some((wait, ceiling)) = self.plugin_room(max_backoff) else {
+            return self;
+        };
+        let ScheduleReason::FreshnessHint {
+            secs: hint_secs, ..
+        } = self.reason
+        else {
+            return self;
+        };
+        let secs = secs.min(ceiling);
+        if secs <= wait {
+            return self;
+        }
+        self.next_fetch_at = self
+            .now_ts
+            .saturating_add(i64::try_from(secs).unwrap_or(i64::MAX));
+        self.reason = ScheduleReason::Plugin {
+            plugin,
+            hint_secs,
+            secs,
+        };
+        // Lengthened past the floor it may have been raised to.
+        self.clamp = None;
+        self
+    }
+
     /// Seconds from when the schedule was computed until the next fetch.
     pub(crate) fn wait_secs(&self) -> u64 {
         u64::try_from(self.next_fetch_at.saturating_sub(self.now_ts)).unwrap_or(0)
@@ -369,7 +396,7 @@ impl fmt::Display for Schedule {
         let had_hint = matches!(
             self.reason,
             ScheduleReason::FreshnessHint { .. }
-                | ScheduleReason::Adaptive { .. }
+                | ScheduleReason::Plugin { .. }
                 | ScheduleReason::FeedInterval {
                     hint_secs: Some(_),
                     ..
@@ -410,16 +437,16 @@ impl fmt::Display for ScheduleReason {
                 format_duration(secs),
                 format_duration(interval_secs)
             ),
-            ScheduleReason::Adaptive {
+            ScheduleReason::Plugin {
+                ref plugin,
                 hint_secs,
                 secs,
-                level,
             } => write!(
                 f,
-                "freshness hint of {}, stretched to {} as the feed has been changing rarely (adaptive level {})",
+                "freshness hint of {}, stretched to {} by the {} plugin",
                 format_duration(hint_secs),
                 format_duration(secs),
-                level
+                plugin
             ),
             ScheduleReason::FeedInterval {
                 secs,

@@ -61,8 +61,9 @@ remove the file first.
 ## Per-feed settings
 
 Each feed also has settings of its own, changed with a `PUT` to
-`/v1/feeds/id/{id}`: its fetch interval (`min_fetch_interval_seconds`),
-whether it uses adaptive fetching, and credentials for feeds behind HTTP
-authentication. New feeds take their interval and adaptive fetching from
-the global settings above. See the
+`/v1/feeds/id/{id}`: its fetch interval (`min_fetch_interval_seconds`) and
+credentials for feeds behind HTTP authentication. New feeds take their
+interval from the global settings above. Which feeds are backed off from
+while they keep turning out unchanged is up to the
+[`adaptive-fetch`](plugins/adaptive-fetch.md) plugin. See the
 [API reference](../api/) for the fields.

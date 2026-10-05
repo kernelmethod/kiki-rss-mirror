@@ -17,6 +17,7 @@
     - [Tagging entries automatically](plugins/auto-tag.md)
     - [Sanitizing entries' HTML](plugins/sanitize.md)
     - [Stripping tracking parameters](plugins/strip-tracking.md)
+    - [Backing off from feeds that rarely change](plugins/adaptive-fetch.md)
 
 # For client and plugin authors
 

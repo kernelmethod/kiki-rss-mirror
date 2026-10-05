@@ -32,7 +32,8 @@
 //! multiplexed instead; see [`crate::process::feed_fetcher`].
 
 use crate::scripting::{
-    Event, EventPayload, EventSet, FeedEntry, ScanSummary, ScriptSource, ServiceCall, ServiceReply,
+    Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary, ScheduleDecision,
+    ScriptSource, ServiceCall, ServiceReply,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, IoSlice, Read, Write};
@@ -80,6 +81,10 @@ pub enum HostRequest {
     CallResult {
         result: Result<ServiceReply, String>,
     },
+
+    /// Run `schedule` through the `fetch.schedule` handler chain. Answered
+    /// with [`HostResponse::Schedule`].
+    Schedule { schedule: FetchSchedule },
 }
 
 /// A message from the script host back to the server.
@@ -109,6 +114,10 @@ pub enum HostResponse {
     /// entry passes through unmodified, matching the in-process
     /// runner's contract.
     Failed { message: String },
+
+    /// The `fetch.schedule` handler chain ran. `None` means the wait was
+    /// left as it was.
+    Schedule { decision: Option<ScheduleDecision> },
 }
 
 /// A frame from the script host to the server.

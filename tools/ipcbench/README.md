@@ -21,6 +21,15 @@ With `--strace`, it also counts every system call each of the server, the
 script host, the fetcher's supervisor, its worker and its parser makes over
 one round, in runs of its own, since tracing slows the processes it traces.
 
+With `--workload unchanged`, no feed ever changes instead: the feeds are
+served with an `ETag` and `Cache-Control: max-age=0`, so every fetch after
+the first is answered `304 Not Modified` and stores nothing. A round is then
+`--feeds` fetches (1,000 by default), and ends when every feed has been
+checked. This measures what a fetch and its scheduling cost on their own,
+such as the `fetch.schedule` event that the `adaptive-fetch` plugin handles
+on every such fetch. The table's `feed requests` and `304 responses` rows
+confirm what each round fetched.
+
 ## Running
 
 It needs Linux, Python 3.8 or later, and `strace` for `--strace`; nothing
@@ -58,8 +67,9 @@ directory, which is left there so its `kiki.log` can be read afterwards.
 
 | Option         | Default | Meaning                                                    |
 |----------------|---------|------------------------------------------------------------|
-| `--feeds`      | 40      | Feeds to create                                            |
-| `--items`      | 250     | Items per feed                                             |
+| `--workload`   | `new`   | `new`: every item is new each round; `unchanged`: every fetch is a 304 |
+| `--feeds`      | 40      | Feeds to create (1,000 with `--workload unchanged`)        |
+| `--items`      | 250     | Items per feed (5 with `--workload unchanged`)             |
 | `--content-bytes` | 2048 | Approximate size of each item's HTML                      |
 | `--rounds`     | 3       | Refreshes measured per run, after one warm-up refresh      |
 | `--runs`       | 3       | Runs of each binary (`compare` only)                       |

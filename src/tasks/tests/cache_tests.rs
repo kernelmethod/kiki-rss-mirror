@@ -918,11 +918,10 @@ async fn test_304_resets_consecutive_failures_and_reschedules() -> Result<()> {
     .await?;
 
     // Inject a failure streak plus clear the gate so the next refresh runs.
-    // Adaptive fetching is off so the 304 is scheduled by its max-age alone.
     {
         let conn = tc.database_conn()?;
         conn.execute(
-            "UPDATE feeds SET consecutive_failures = 5, next_fetch_at = NULL, adaptive_fetch = 0
+            "UPDATE feeds SET consecutive_failures = 5, next_fetch_at = NULL
              WHERE id = ?1",
             [feed_id],
         )?;

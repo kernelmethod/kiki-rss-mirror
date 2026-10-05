@@ -78,4 +78,4 @@ All of these are on by default. Turn them off with
 | `api-docs`        | The interactive API reference at `/docs`, and `kiki docs`.           |
 | `metrics`         | Prometheus metrics at `/metrics`.                                    |
 | `web-ui`          | `kiki web`.                                                          |
-| `default-plugins` | The plugins `kiki init` installs (`filter`, `auto-tag`, `sanitize`, `strip-tracking`). |
+| `default-plugins` | The plugins `kiki init` installs (`filter`, `auto-tag`, `sanitize`, `strip-tracking`, `adaptive-fetch`). |

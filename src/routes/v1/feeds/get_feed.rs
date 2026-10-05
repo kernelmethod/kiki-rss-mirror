@@ -5,7 +5,6 @@ use crate::routes::v1::entries::list_entries::{NOT_HIDDEN, UNREAD};
 use crate::routes::v1::feeds::format_data::{
     load_atom_feed_data, load_rss_feed_data, AtomFeedData, RssFeedData,
 };
-use crate::routes::v1::feeds::update_feed::AdaptiveFetch;
 use crate::server::AppState;
 use crate::tasks::FetchError;
 use axum::{
@@ -72,9 +71,6 @@ pub struct GetFeedDetailResponse {
     /// the most recent fetch succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_fetch_error_at: Option<String>,
-    /// This feed's adaptive-fetch setting.
-    #[serde(default)]
-    pub adaptive_fetch: AdaptiveFetch,
     /// RSS-specific feed-level data. Present only when the feed is ingested
     /// as RSS.
     pub rss: Option<RssFeedData>,
@@ -109,8 +105,7 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
             "SELECT id, title, url, description, last_checked, last_fetch_error, last_fetch_error_at, min_fetch_interval_seconds, auth_type,
                 (SELECT COUNT(*) FROM entries e WHERE e.feed_id = feeds.id AND {NOT_HIDDEN}),
                 site_url, {},
-                (SELECT COUNT(*) FROM entries e WHERE e.feed_id = feeds.id AND {UNREAD}),
-                adaptive_fetch
+                (SELECT COUNT(*) FROM entries e WHERE e.feed_id = feeds.id AND {UNREAD})
                 FROM feeds WHERE id = ?1 LIMIT 1",
             favicon_hash_sql("feeds.id")
         )) {
@@ -143,10 +138,9 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
             let last_fetch_error_at = row.get::<usize, Option<i64>>(6)?.and_then(|ts| {
                 chrono::DateTime::from_timestamp_secs(ts).map(|d| d.to_rfc3339())
             });
-            let adaptive_fetch = AdaptiveFetch::from_db(row.get(13)?);
-            Ok((feed, last_fetch_error, last_fetch_error_at, adaptive_fetch))
+            Ok((feed, last_fetch_error, last_fetch_error_at))
         });
-        let (feed, last_fetch_error, last_fetch_error_at, adaptive_fetch) = match query_result {
+        let (feed, last_fetch_error, last_fetch_error_at) = match query_result {
             Ok(f) => f,
             Err(_e) => return (StatusCode::NOT_FOUND, "Feed not found").into_response(),
         };
@@ -171,7 +165,6 @@ pub async fn get_feed(State(state): State<AppState>, Path(id): Path<i64>) -> Res
             feed,
             last_fetch_error,
             last_fetch_error_at,
-            adaptive_fetch,
             rss,
             atom,
         };

@@ -71,6 +71,8 @@ pub mod services;
 pub mod settings;
 
 #[cfg(test)]
+mod adaptive_fetch_tests;
+#[cfg(test)]
 mod auto_tag_tests;
 #[cfg(test)]
 mod filter_tests;
