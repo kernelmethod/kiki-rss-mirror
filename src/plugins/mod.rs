@@ -747,6 +747,7 @@ impl Plugin {
             config: serde_json::Value::Object(self.config.clone()).to_string(),
             modules,
             time_budget: self.manifest.time_budget(),
+            permissions: self.manifest.permissions.clone(),
         })
     }
 }
