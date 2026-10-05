@@ -1,3 +1,4 @@
+use super::login::current_viewer;
 use axum::{
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
@@ -109,10 +110,22 @@ pub(super) fn render_layout(
     content: &str,
     csp: &str,
 ) -> Response {
+    let viewer = current_viewer();
+    let scopes: Vec<&str> = viewer.scopes.iter().map(|s| s.name()).collect();
+    let account = match &viewer.token_name {
+        Some(name) => format!(
+            "<span class=\"account\" title=\"Logged in with this API token\">{}</span>\
+             <button type=\"button\" class=\"logout\">Log out</button>",
+            escape(name)
+        ),
+        None => String::new(),
+    };
     // Fill every placeholder in one pass, so that a placeholder appearing in
     // a feed's title or content is left alone.
     let html = PLACEHOLDER.replace_all(PAGE_HTML, |caps: &regex::Captures| match &caps[1] {
         "title" => escape(title).into_owned(),
+        "scopes" => scopes.join(" "),
+        "account" => account.clone(),
         "query" => escape(query).into_owned(),
         "version" => env!("CARGO_PKG_VERSION").to_owned(),
         "content" => content.to_owned(),
@@ -138,7 +151,33 @@ pub(super) fn render_layout(
 /// Render the page for when the Kiki server cannot be reached — it may
 /// still be starting — as a 502, rather than an error the browser renders
 /// on its own.
+///
+/// If the server refused the request instead, because the logged-in
+/// token has been revoked or has expired (`401`) or lacks a scope
+/// (`403`), the page says so.
 pub(super) fn server_unavailable(e: &anyhow::Error) -> Response {
+    match e
+        .downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status)
+    {
+        Some(StatusCode::UNAUTHORIZED) => {
+            return render_page(
+                StatusCode::UNAUTHORIZED,
+                "Logged out - Kiki",
+                "<p>The token you logged in with has expired or been revoked.</p>\n\
+                 <p><a href=\"/login\">Log in again</a></p>\n",
+            )
+        }
+        Some(StatusCode::FORBIDDEN) => {
+            return render_page(
+                StatusCode::FORBIDDEN,
+                "Not allowed - Kiki",
+                "<p>The token you logged in with is not allowed to see this page.</p>\n\
+                 <p><a href=\"/\">&larr; Back to entries</a></p>\n",
+            )
+        }
+        _ => {}
+    }
     tracing::warn!("failed to reach the Kiki server: {e:#}");
     render_page(
         StatusCode::BAD_GATEWAY,

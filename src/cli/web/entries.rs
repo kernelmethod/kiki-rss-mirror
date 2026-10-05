@@ -4,6 +4,7 @@ use super::layout::{render_page, render_search_page, server_unavailable};
 use super::listing::{
     render_filter, render_pagination, render_search_help, render_sort, Listing, PageParams,
 };
+use super::login::Api;
 use super::plugins::is_same_origin;
 use super::sanitize;
 use super::tags::render_tags;
@@ -14,7 +15,7 @@ use crate::routes::v1::entries::ListEntriesResponseEntry;
 use crate::routes::v1::tags::list_tags::TagResponse;
 use crate::routes::v1::tags::tag_entries::AddTagEntriesRequest;
 use axum::{
-    extract::{Path as UrlPath, Query, State},
+    extract::{Path as UrlPath, Query},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -26,10 +27,7 @@ use std::collections::HashMap;
 /// them, newest first, each with the feed it came from, and links to the
 /// neighbouring pages. Read entries are left out unless the `show_read`
 /// query parameter is true.
-pub(super) async fn index(
-    State(api): State<reqwest::Client>,
-    Query(params): Query<PageParams>,
-) -> Response {
+pub(super) async fn index(api: Api, Query(params): Query<PageParams>) -> Response {
     let listing = Listing {
         feed: None,
         tag: None,
@@ -52,7 +50,7 @@ pub(super) async fn index(
 /// The page links back to the list of entries it was opened from: the
 /// index, a feed's page, or a tag's page.
 pub(super) async fn entry_page(
-    State(api): State<reqwest::Client>,
+    api: Api,
     UrlPath(id): UrlPath<i64>,
     Query(params): Query<PageParams>,
 ) -> Response {
@@ -87,7 +85,7 @@ pub(super) async fn entry_page(
 /// Give entry `id` the system tag `name`. Called by the save buttons' and
 /// swipe-to-read gestures' script; see [`set_entry_system_tag`].
 pub(super) async fn add_entry_system_tag(
-    State(api): State<reqwest::Client>,
+    api: Api,
     UrlPath((id, name)): UrlPath<(i64, String)>,
     headers: HeaderMap,
 ) -> Response {
@@ -97,7 +95,7 @@ pub(super) async fn add_entry_system_tag(
 /// Remove the system tag `name` from entry `id`. Called by the save
 /// buttons' script, and to undo a swipe; see [`set_entry_system_tag`].
 pub(super) async fn remove_entry_system_tag(
-    State(api): State<reqwest::Client>,
+    api: Api,
     UrlPath((id, name)): UrlPath<(i64, String)>,
     headers: HeaderMap,
 ) -> Response {
@@ -110,11 +108,12 @@ pub(super) async fn remove_entry_system_tag(
 /// the tag's name with or without its `system:` prefix, e.g. `read`.
 ///
 /// Responds with `404 Not Found` if there is no such entry or system tag,
-/// `502 Bad Gateway` if the Kiki server cannot make the change, and `403
+/// `502 Bad Gateway` if the Kiki server cannot make the change, `401` or
+/// `403` if the Kiki server refuses the logged-in token, and `403
 /// Forbidden` to requests from other sites, going by `headers`; see
 /// [`is_same_origin`].
 pub(super) async fn set_entry_system_tag(
-    api: &reqwest::Client,
+    api: &Api,
     id: i64,
     name: &str,
     headers: &HeaderMap,
@@ -141,6 +140,9 @@ pub(super) async fn set_entry_system_tag(
     match req.send().await.map(|resp| resp.status()) {
         Ok(StatusCode::OK) => StatusCode::NO_CONTENT.into_response(),
         Ok(StatusCode::NOT_FOUND) => (StatusCode::NOT_FOUND, "Entry not found.").into_response(),
+        Ok(status @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)) => {
+            (status, "Your token may not change entries.").into_response()
+        }
         Ok(status) => {
             tracing::warn!(%status, entry_id = id, %tag, add, "failed to update entry's system tag");
             (StatusCode::BAD_GATEWAY, "The entry could not be updated.").into_response()
@@ -168,7 +170,7 @@ pub(super) struct MarkReadParams {
 /// the Kiki server cannot make the change, and `403 Forbidden` to requests
 /// from other sites, going by `headers`; see [`is_same_origin`].
 pub(super) async fn mark_entries_read(
-    State(api): State<reqwest::Client>,
+    api: Api,
     Query(params): Query<MarkReadParams>,
     headers: HeaderMap,
 ) -> Response {
@@ -194,6 +196,14 @@ pub(super) async fn mark_entries_read(
         anyhow::Ok(())
     }
     .await;
+    let refused = result.as_ref().err().and_then(|e| {
+        e.downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
+            .filter(|s| matches!(*s, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN))
+    });
+    if let Some(status) = refused {
+        return (status, "Your token may not mark entries as read.").into_response();
+    }
     match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
@@ -214,10 +224,7 @@ pub(super) async fn mark_entries_read(
 /// parameter, best match first, or newest first if the `sort` parameter is
 /// `newest`. Read entries are listed too, but hidden ones are not. With no
 /// `q`, the page only asks what to search for.
-pub(super) async fn search_page(
-    State(api): State<reqwest::Client>,
-    Query(params): Query<PageParams>,
-) -> Response {
+pub(super) async fn search_page(api: Api, Query(params): Query<PageParams>) -> Response {
     let listing = Listing {
         feed: None,
         tag: None,

@@ -10,6 +10,7 @@
 - [Configuration](configuration.md)
     - [Proxies](proxy.md)
 - [The web UI](web-ui.md)
+- [API tokens](tokens.md)
 - [Running as a service](deployment.md)
 - [Plugins](plugins/index.md)
     - [Filtering entries](plugins/filter.md)

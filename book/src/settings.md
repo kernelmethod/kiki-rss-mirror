@@ -55,3 +55,4 @@ Read by `kiki web` as it starts, so restart it after a change.
 | Key | Default | Description |
 | --- | ------- | ----------- |
 | `allowed_hosts` | `[]` | Hosts the web UI answers to besides `localhost`, `127.0.0.1` and `::1`: exact names or addresses, `*.example.com` for every subdomain of `example.com`, or `*` for any host. See [The web UI](web-ui.md). |
+| `require_login` | `false` | Whether the web UI asks for an [API token](tokens.md) before showing anything, as `kiki web --require-login` does. See [Logging in](web-ui.md#logging-in). |

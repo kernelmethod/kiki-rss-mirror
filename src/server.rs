@@ -1275,7 +1275,7 @@ async fn uds_server(
         config,
         liveness,
     });
-    let app = routes::create_router(metrics).with_state(shared_state);
+    let app = routes::create_router(shared_state);
 
     let listener = UnixListener::from_std(listener)
         .with_context(|| format!("Unable to listen on Unix socket at {:?}", socket_path))?;

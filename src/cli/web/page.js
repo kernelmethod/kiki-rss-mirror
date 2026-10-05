@@ -236,7 +236,7 @@ function reducedMotion() {
 
 document.addEventListener("pointerdown", (event) => {
   const row = event.target.closest("li.swipe-read");
-  if (!row || event.pointerType !== "touch" || !event.isPrimary || swipe || row.swipeAnimations) {
+  if (!row || !hasScope("state") || event.pointerType !== "touch" || !event.isPrimary || swipe || row.swipeAnimations) {
     return;
   }
   swipe = { row, id: event.pointerId, x: event.clientX, y: event.clientY, claimed: false, dragging: false };
@@ -489,3 +489,23 @@ function showUndo(row, request) {
     }
   });
 }
+
+// Whether the token the page was rendered for has `scope`; see the
+// `data-scopes` attribute on the page's body.
+function hasScope(scope) {
+  return (document.body.dataset.scopes || "").split(" ").includes(scope);
+}
+
+// The log out button: ends the session, then goes to the login page.
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("button.logout");
+  if (!button) {
+    return;
+  }
+  button.disabled = true;
+  try {
+    await fetch("/logout", { method: "POST" });
+  } finally {
+    window.location.href = "/login";
+  }
+});

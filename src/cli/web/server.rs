@@ -5,6 +5,7 @@ use super::entries::{
 };
 use super::feeds::{feed_page, feeds_page};
 use super::hosts::{check_host, AllowedHosts};
+use super::login::{self, log_in, log_out, show_login, Gate};
 use super::plugins::{plugin_page, plugins_page, update_plugin_config};
 use super::tags::{delete_tag, tag_page, tags_page};
 use anyhow::{bail, Context, Result};
@@ -78,15 +79,31 @@ pub(super) fn api_client(socket_path: &Path) -> Result<reqwest::Client> {
 }
 
 /// Serve the web UI on `listener` until `cancel` fires, talking to the Kiki
-/// API through `api`, and answering only requests for `allowed_hosts`.
+/// API through `api` with the full access of its socket, and answering
+/// only requests for `allowed_hosts`.
+#[cfg(test)]
 pub(super) async fn serve_ui(
     listener: TcpListener,
     api: reqwest::Client,
     allowed_hosts: AllowedHosts,
     cancel: CancellationToken,
 ) -> Result<()> {
+    serve_ui_with(listener, Gate::open(api), allowed_hosts, cancel).await
+}
+
+/// Serve the web UI on `listener` until `cancel` fires, letting in those
+/// `gate` lets in, and answering only requests for `allowed_hosts`.
+pub(super) async fn serve_ui_with(
+    listener: TcpListener,
+    gate: Gate,
+    allowed_hosts: AllowedHosts,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let gate = Arc::new(gate);
     let app = Router::new()
         .route("/", get(index))
+        .route("/login", get(show_login).post(log_in))
+        .route("/logout", post(log_out))
         .route("/entries/{id}", get(entry_page))
         .route("/entries/read", post(mark_entries_read))
         .route(
@@ -102,7 +119,8 @@ pub(super) async fn serve_ui(
         .route("/plugins/{name}", get(plugin_page))
         .route("/plugins/{name}/config", post(update_plugin_config))
         .route("/assets/{hash}", get(asset))
-        .with_state(api)
+        .with_state(gate.clone())
+        .layer(middleware::from_fn_with_state(gate, login::gate))
         .layer(middleware::from_fn_with_state(
             Arc::new(allowed_hosts),
             check_host,

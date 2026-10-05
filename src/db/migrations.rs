@@ -23,7 +23,10 @@ pub struct Migration {
 ///    (the first is `0001_...`)
 /// 3. Make the same change to `src/db/include/init.sql`, which always holds
 ///    the complete current schema
-pub const MIGRATIONS: &[Migration] = &[];
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    name: "0001_api_tokens",
+    sql: include_str!("include/migrations/0001_api_tokens.sql"),
+}];
 
 /// SQL to create the migrations table. Safe to run on databases that already
 /// have it (uses `IF NOT EXISTS`).
@@ -160,6 +163,24 @@ pub(crate) mod tests {
         assert_eq!(
             count, 0,
             "no migrations should be applied on fresh database"
+        );
+        Ok(())
+    }
+
+    /// `0001_api_tokens` adds the `api_tokens` table to a database from
+    /// before it.
+    #[test]
+    fn test_0001_api_tokens() -> Result<()> {
+        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute_batch(
+            "DROP TABLE api_tokens; DELETE FROM migrations WHERE name = '0001_api_tokens';",
+        )?;
+        assert_eq!(run_pending_migrations(&mut conn)?, 1);
+        let (token, secret) =
+            crate::db::tokens::create(&conn, "t", crate::auth::Scopes::all(), None)?;
+        assert_eq!(
+            crate::db::tokens::authenticate(&conn, &secret, 0)?,
+            crate::db::tokens::Authentication::Valid(token)
         );
         Ok(())
     }

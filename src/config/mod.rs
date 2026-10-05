@@ -223,6 +223,21 @@ pub struct WebUiSettings {
     /// ```
     #[serde(default)]
     pub allowed_hosts: Vec<HostPattern>,
+
+    /// Whether the web UI requires logging in with an API token, created
+    /// with `kiki token create`, as `kiki web --require-login` does. Each
+    /// person can then do only what their token's scopes allow.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::Overrides;
+    ///
+    /// let o = Overrides::parse("[web_ui]\nrequire_login = true\n").unwrap();
+    /// assert!(o.resolve().unwrap().web_ui.require_login);
+    /// ```
+    #[serde(default)]
+    pub require_login: bool,
 }
 
 /// Environment variable overriding [`ProxySettings::url`].
