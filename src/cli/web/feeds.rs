@@ -2,9 +2,10 @@ use super::api::{fetch_entries, fetch_feed, fetch_feeds, EntryPage, Feed};
 use super::entries::render_entries;
 use super::layout::{render_page, server_unavailable};
 use super::listing::{render_pagination, Listing, PageParams};
+use super::login::Api;
 use crate::routes::v1::feeds::list_feeds::ListFeedsResponse;
 use axum::{
-    extract::{Path as UrlPath, Query, State},
+    extract::{Path as UrlPath, Query},
     http::StatusCode,
     response::Response,
 };
@@ -12,10 +13,7 @@ use quick_xml::escape::escape;
 
 /// Render the list of feeds: the total number of feeds, and one page of
 /// them, each linked to its page.
-pub(super) async fn feeds_page(
-    State(api): State<reqwest::Client>,
-    Query(params): Query<PageParams>,
-) -> Response {
+pub(super) async fn feeds_page(api: Api, Query(params): Query<PageParams>) -> Response {
     let page = params.page();
     match fetch_feeds(&api, page).await {
         Ok(feeds) => render_page(StatusCode::OK, "Feeds - Kiki", &render_feeds(&feeds, page)),
@@ -27,7 +25,7 @@ pub(super) async fn feeds_page(
 /// page of the entries retrieved from it, newest first. Read entries are
 /// left out unless the `show_read` query parameter is true.
 pub(super) async fn feed_page(
-    State(api): State<reqwest::Client>,
+    api: Api,
     UrlPath(id): UrlPath<i64>,
     Query(params): Query<PageParams>,
 ) -> Response {

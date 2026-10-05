@@ -5,6 +5,9 @@ mod feeds;
 mod hosts;
 mod layout;
 mod listing;
+mod login;
+#[cfg(test)]
+mod login_tests;
 mod plugins;
 mod sanitize;
 mod server;
@@ -20,7 +23,8 @@ use crate::sandbox::{self, SandboxConfig};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use hosts::AllowedHosts;
-use server::{api_client, serve_ui, shutdown_signal, stop_server, ServerProcess};
+use login::Gate;
+use server::{api_client, serve_ui_with, shutdown_signal, stop_server, ServerProcess};
 use std::net::SocketAddr;
 use std::path::Path;
 use tokio::net::TcpListener;
@@ -68,6 +72,13 @@ pub struct WebArgs {
     #[arg(long = "allowed-host", value_name = "HOST")]
     allowed_hosts: Vec<HostPattern>,
 
+    /// Require logging in with an API token, created with `kiki token
+    /// create`, before using the web UI. Each person can then do only what
+    /// their token's scopes allow. Also set by `kiki.toml`'s
+    /// `web_ui.require_login`.
+    #[arg(long = "require-login")]
+    require_login: bool,
+
     #[command(flatten)]
     serve: ServeArgs,
 }
@@ -103,7 +114,21 @@ impl WebArgs {
             .with_context(|| format!("unable to bind the web UI to {}", self.listen))?;
         listener.set_nonblocking(true)?;
         tracing::info!("web UI listening on http://{}", listener.local_addr()?);
-        let allowed_hosts = self.allowed_hosts(&configured_allowed_hosts()?);
+        let settings = configured_web_ui()?;
+        let allowed_hosts = self.allowed_hosts(&settings.allowed_hosts);
+        let gate = if self.require_login || settings.require_login {
+            tracing::info!("the web UI requires logging in with an API token");
+            Gate::login_required(api)
+        } else {
+            if !self.listen.ip().is_loopback() {
+                tracing::warn!(
+                    "the web UI listens on {} and does not require logging in, so anyone who \
+                     can reach it can do anything; see --require-login",
+                    self.listen
+                );
+            }
+            Gate::open(api)
+        };
 
         let server = self.spawn_server(&socket_path)?;
 
@@ -116,7 +141,7 @@ impl WebArgs {
             .worker_threads(workers)
             .enable_all()
             .build()?
-            .block_on(run_async(listener, api, allowed_hosts, server))
+            .block_on(run_async(listener, gate, allowed_hosts, server))
     }
 
     /// The hosts the web UI answers to: those given to `--allowed-host`,
@@ -218,33 +243,33 @@ impl WebArgs {
     }
 }
 
-/// The config file's `web_ui.allowed_hosts`, read from `kiki.toml` in
-/// the data directory, where the `kiki serve` child reads its own
-/// settings. Read once, before the sandbox hides the file.
+/// The config file's `web_ui` settings, read from `kiki.toml` in the data
+/// directory, where the `kiki serve` child reads its own settings. Read
+/// once, before the sandbox hides the file.
 ///
 /// # Errors
 ///
 /// Returns an error if the data directory cannot be found, or if the
 /// config file cannot be read or holds an invalid setting.
-fn configured_allowed_hosts() -> Result<Vec<HostPattern>> {
+fn configured_web_ui() -> Result<config::WebUiSettings> {
     let data_dir = paths::resolve_data_dir(&Env::from_process())?;
     let path = data_dir.path.join(config::CONFIG_FILE_NAME);
     let store =
         ConfigStore::open(&path).with_context(|| format!("failed to load config file {path:?}"))?;
-    Ok(store.current().web_ui.allowed_hosts.clone())
+    Ok(store.current().web_ui.clone())
 }
 
 /// Serve the web UI on `listener` alongside the Kiki `server`, until one of
 /// them stops.
 async fn run_async(
     listener: std::net::TcpListener,
-    api: reqwest::Client,
+    gate: Gate,
     allowed_hosts: AllowedHosts,
     mut server: ServerProcess,
 ) -> Result<()> {
     let listener = TcpListener::from_std(listener)?;
     let cancel = CancellationToken::new();
-    let web = tokio::spawn(serve_ui(listener, api, allowed_hosts, cancel.clone()));
+    let web = tokio::spawn(serve_ui_with(listener, gate, allowed_hosts, cancel.clone()));
 
     let status = tokio::select! {
         status = server.wait() => {

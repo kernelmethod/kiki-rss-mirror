@@ -167,6 +167,24 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// `0001_api_tokens` adds the `api_tokens` table to a database from
+    /// before it.
+    #[test]
+    fn test_0001_api_tokens() -> Result<()> {
+        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute_batch(
+            "DROP TABLE api_tokens; DELETE FROM migrations WHERE name = '0001_api_tokens';",
+        )?;
+        assert_eq!(run_pending_migrations(&mut conn)?, 1);
+        let (token, secret) =
+            crate::db::tokens::create(&conn, "t", crate::auth::Scopes::all(), None)?;
+        assert_eq!(
+            crate::db::tokens::authenticate(&conn, &secret, 0)?,
+            crate::db::tokens::Authentication::Valid(token)
+        );
+        Ok(())
+    }
+
     /// Migrations used to exercise the runner itself.
     pub(crate) const TEST_MIGRATIONS: &[Migration] = &[
         Migration {

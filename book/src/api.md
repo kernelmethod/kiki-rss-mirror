@@ -1,15 +1,22 @@
 # The HTTP API
 
 Everything Kiki does is available over a JSON HTTP API, served on Kiki's
-Unix socket. The [interactive API reference](../api/) lists every endpoint
-with its parameters and responses. A running server also serves the same
-reference itself, at `/docs`.
+Unix socket, and over TCP with `kiki serve --api-listen`. The
+[interactive API reference](../api/) lists every endpoint with its
+parameters, responses and the [token scope](tokens.md) it needs. A running
+server also serves the same reference itself, at `/docs`.
 
 With curl, pass the socket's path with `--unix-socket`; the host name in the
 URL is ignored:
 
 ```bash
 curl --unix-socket "$XDG_RUNTIME_DIR/kiki/kiki.sock" http://localhost/v1/feeds
+```
+
+Over TCP, send an [API token](tokens.md):
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/v1/feeds
 ```
 
 ## Concepts
@@ -57,12 +64,13 @@ another reader's API, can fetch just what changed:
 
 ## Security
 
-The Kiki API does not implement any sort of authentication. **Anybody** who
-can reach the API can read all feeds and entries, add and delete feeds and
-entries, change settings and plugins' config, and do anything else the API
-permits.
+Over TCP, every request needs an [API token](tokens.md), and may do only
+what the token's scopes allow.
 
-By default only your own user can reach the socket. If you widen that, or
-put Kiki behind a reverse proxy (see
-[Exposing Kiki over the network](deployment.md#exposing-kiki-over-the-network)),
-it is up to you to make sure only the people you trust can reach it.
+On the Unix socket, a token is optional: **anybody** who can reach the
+socket without one can read all feeds and entries, add and delete feeds and
+entries, change settings and plugins' config, and do anything else the API
+permits. By default only your own user can reach the socket. Don't widen
+that, and don't point a reverse proxy at the socket; point it at the TCP
+listener instead (see
+[Exposing Kiki over the network](deployment.md#exposing-kiki-over-the-network)).

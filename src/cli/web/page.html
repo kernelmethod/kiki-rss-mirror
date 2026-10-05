@@ -102,11 +102,22 @@
     .toast { position: fixed; left: 50%; bottom: 1rem; z-index: 2; transform: translateX(-50%); display: flex; align-items: center; gap: 1rem; padding: 0.5rem 0.75rem 0.5rem 1rem; border-radius: 0.25rem; background: #333; color: #fff; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3); white-space: nowrap; }
     .toast[hidden] { display: none; }
     .toast button { padding: 0.25rem 0.5rem; border: none; background: none; color: #9cf; font: inherit; font-weight: 600; cursor: pointer; }
+    .account { color: #666; font-size: 0.875rem; }
+    .logout { padding: 0; border: none; background: none; color: #00e; font: inherit; text-decoration: underline; cursor: pointer; }
+    .login { display: flex; flex-direction: column; gap: 0.5rem; max-width: 24rem; }
+    .login input { font: inherit; }
+    .login button { align-self: flex-start; font: inherit; }
+    .login-error { padding: 0.5rem; border: 1px solid #c00; color: #900; }
+    /* Controls the logged-in token's scopes do not allow. */
+    body:not([data-scopes~=state]) :is(.save, .mark-read) { display: none; }
+    body:not([data-scopes~=tags]) .delete-tag { display: none; }
+    body:not([data-scopes~=admin]) .admin-only { display: none; }
+    body[data-scopes=""] :is(.site-nav, .search-dialog) { display: none; }
   </style>
 </head>
-<body>
+<body data-scopes="{{scopes}}">
   <h1><a href="/">Kiki</a> <small class="version">v{{version}}</small></h1>
-  <nav class="site-nav"><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a href="/plugins">Plugins</a>
+  <nav class="site-nav"><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a class="admin-only" href="/plugins">Plugins</a>{{account}}
     <form class="search" role="search" action="/search" method="get"><input type="search" name="q" value="{{query}}" placeholder="Search entries" aria-label="Search entries"></form>
     <button type="button" class="search-open" aria-haspopup="dialog" aria-label="Search entries" title="Search entries"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg></button>
   </nav>

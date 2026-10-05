@@ -1,12 +1,13 @@
 use super::api::{encode_path_segment, fetch_optional, fetch_plugins, plugin_api_url};
 use super::feeds::safe_link;
 use super::layout::{render_form_page, render_page, server_unavailable, to_json, to_json_pretty};
+use super::login::Api;
 use super::settings;
 use crate::plugins::settings::{Setting, SettingType};
 use crate::routes::v1::plugins::list_plugins::{ListPluginsResponse, PluginResponse};
 use crate::routes::v1::plugins::plugin_config::PluginConfigResponse;
 use axum::{
-    extract::{Form, Path as UrlPath, State},
+    extract::{Form, Path as UrlPath},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
 };
@@ -16,7 +17,7 @@ use std::collections::BTreeSet;
 
 /// Render the list of installed plugins, and of the directories in the
 /// plugins directory that could not be loaded as plugins.
-pub(super) async fn plugins_page(State(api): State<reqwest::Client>) -> Response {
+pub(super) async fn plugins_page(api: Api) -> Response {
     match fetch_plugins(&api).await {
         Ok(plugins) => render_page(StatusCode::OK, "Plugins - Kiki", &render_plugins(&plugins)),
         Err(e) => server_unavailable(&e),
@@ -25,10 +26,7 @@ pub(super) async fn plugins_page(State(api): State<reqwest::Client>) -> Response
 
 /// Render the page for plugin `name`: what its manifest says about it, and
 /// its config, with a form to change each setting.
-pub(super) async fn plugin_page(
-    State(api): State<reqwest::Client>,
-    UrlPath(name): UrlPath<String>,
-) -> Response {
+pub(super) async fn plugin_page(api: Api, UrlPath(name): UrlPath<String>) -> Response {
     render_plugin_config_page(&api, &name, StatusCode::OK, None).await
 }
 
@@ -69,7 +67,7 @@ impl ConfigAction {
 /// submitted from other sites are refused with `403 Forbidden`; see
 /// [`is_same_origin`].
 pub(super) async fn update_plugin_config(
-    State(api): State<reqwest::Client>,
+    api: Api,
     UrlPath(name): UrlPath<String>,
     headers: HeaderMap,
     Form(pairs): Form<Vec<(String, String)>>,
@@ -203,7 +201,8 @@ pub(super) async fn update_plugin_config(
 /// Whether a form or request was sent from one of the web UI's own pages,
 /// going by the headers the browser sent with it, `headers`.
 ///
-/// The web UI has no login, so any site open in the same browser could
+/// The web UI has no login unless asked for one, and even then its session
+/// cookie is all a form needs, so any site open in the same browser could
 /// otherwise submit a form to it and change a plugin's config, or save an
 /// entry. Browsers say
 /// where a form came from in `Sec-Fetch-Site` or, failing that, `Origin`;
@@ -230,7 +229,7 @@ pub(super) fn is_same_origin(headers: &HeaderMap) -> bool {
 /// Render the page for plugin `name` with `status`, showing `error` above
 /// its config if there is one.
 pub(super) async fn render_plugin_config_page(
-    api: &reqwest::Client,
+    api: &Api,
     name: &str,
     status: StatusCode,
     error: Option<&str>,

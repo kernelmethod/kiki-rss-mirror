@@ -1,7 +1,8 @@
 //! The `Host` check that guards the web UI against DNS rebinding.
 //!
-//! The web UI has no login, and by default listens only on loopback. That
-//! alone does not keep other sites out: a site whose domain's DNS record
+//! The web UI has no login unless asked for one (see [`super::login`]),
+//! and by default listens only on loopback. That alone does not keep other
+//! sites out: a site whose domain's DNS record
 //! is switched to `127.0.0.1` after the page loads can then send requests
 //! to the web UI that the browser counts as same-origin, so they pass
 //! [`is_same_origin`](super::plugins::is_same_origin) and can read pages

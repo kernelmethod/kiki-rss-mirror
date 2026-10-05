@@ -1,7 +1,8 @@
 use super::layout::ASSET_CONTENT_SECURITY_POLICY;
+use super::login::Api;
 use super::API_BASE;
 use axum::{
-    extract::{Path as UrlPath, State},
+    extract::Path as UrlPath,
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -14,7 +15,7 @@ use axum::{
 /// else is served as a download, rather than rendered from the web UI's
 /// origin.
 pub(super) async fn asset(
-    State(api): State<reqwest::Client>,
+    api: Api,
     UrlPath(hash): UrlPath<String>,
     headers: HeaderMap,
 ) -> Response {

@@ -1,4 +1,5 @@
 use super::listing::{fts_query, Listing, PAGE_SIZE};
+use super::login::Api;
 use super::API_BASE;
 use crate::db::tags::SystemTag;
 use crate::routes::v1::entries::entry_assets::ListEntryAssetsResponse;
@@ -16,7 +17,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 /// Look up the ID of the system tag `tag` through the Kiki API.
-pub(super) async fn fetch_system_tag_id(api: &reqwest::Client, tag: SystemTag) -> Result<i64> {
+pub(super) async fn fetch_system_tag_id(api: &Api, tag: SystemTag) -> Result<i64> {
     let tags: ListTagsResponse = api
         .get(format!("{API_BASE}/v1/tags?kind=system"))
         .send()
@@ -38,7 +39,7 @@ pub(super) async fn fetch_system_tag_id(api: &reqwest::Client, tag: SystemTag) -
 /// If the list cannot be fetched it is logged and treated as empty, so the
 /// entry is still shown, linking to its images and attachments where they
 /// were found.
-pub(super) async fn fetch_cached_assets(api: &reqwest::Client, id: i64) -> HashMap<String, String> {
+pub(super) async fn fetch_cached_assets(api: &Api, id: i64) -> HashMap<String, String> {
     let assets: Result<ListEntryAssetsResponse> = async {
         Ok(api
             .get(format!("{API_BASE}/v1/entries/id/{id}/assets"))
@@ -81,7 +82,7 @@ pub(super) struct EntryPage {
 /// A search with no words to search for (see [`fts_query`]) matches no
 /// entries, and the Kiki API is not asked.
 pub(super) async fn fetch_entries(
-    api: &reqwest::Client,
+    api: &Api,
     listing: &Listing,
     tag: Option<&str>,
 ) -> Result<EntryPage> {
@@ -143,10 +144,7 @@ pub(super) async fn fetch_entries(
 }
 
 /// Fetch entry `id` from the Kiki API, or `None` if there is no such entry.
-pub(super) async fn fetch_entry(
-    api: &reqwest::Client,
-    id: i64,
-) -> Result<Option<GetEntryResponse>> {
+pub(super) async fn fetch_entry(api: &Api, id: i64) -> Result<Option<GetEntryResponse>> {
     let resp = api
         .get(format!("{API_BASE}/v1/entries/id/{id}"))
         .send()
@@ -158,7 +156,7 @@ pub(super) async fn fetch_entry(
 }
 
 /// Fetch page `page` (counting from 1) of `/v1/feeds` from the Kiki API.
-pub(super) async fn fetch_feeds(api: &reqwest::Client, page: u32) -> Result<ListFeedsResponse> {
+pub(super) async fn fetch_feeds(api: &Api, page: u32) -> Result<ListFeedsResponse> {
     let offset = u64::from(page - 1) * u64::from(PAGE_SIZE);
     Ok(api
         .get(format!(
@@ -172,7 +170,7 @@ pub(super) async fn fetch_feeds(api: &reqwest::Client, page: u32) -> Result<List
 }
 
 /// Fetch feed `id` from the Kiki API, or `None` if there is no such feed.
-pub(super) async fn fetch_feed(api: &reqwest::Client, id: i64) -> Result<Option<Feed>> {
+pub(super) async fn fetch_feed(api: &Api, id: i64) -> Result<Option<Feed>> {
     let resp = api
         .get(format!("{API_BASE}/v1/feeds/id/{id}"))
         .send()
@@ -184,7 +182,7 @@ pub(super) async fn fetch_feed(api: &reqwest::Client, id: i64) -> Result<Option<
 }
 
 /// Fetch page `page` (counting from 1) of `/v1/tags` from the Kiki API.
-pub(super) async fn fetch_tags(api: &reqwest::Client, page: u32) -> Result<ListTagsResponse> {
+pub(super) async fn fetch_tags(api: &Api, page: u32) -> Result<ListTagsResponse> {
     let offset = u64::from(page - 1) * u64::from(PAGE_SIZE);
     Ok(api
         .get(format!(
@@ -198,12 +196,12 @@ pub(super) async fn fetch_tags(api: &reqwest::Client, page: u32) -> Result<ListT
 }
 
 /// Fetch tag `id` from the Kiki API, or `None` if there is no such tag.
-pub(super) async fn fetch_tag(api: &reqwest::Client, id: i64) -> Result<Option<TagResponse>> {
+pub(super) async fn fetch_tag(api: &Api, id: i64) -> Result<Option<TagResponse>> {
     fetch_optional(api, format!("{API_BASE}/v1/tags/id/{id}")).await
 }
 
 /// Fetch `/v1/plugins` from the Kiki API.
-pub(super) async fn fetch_plugins(api: &reqwest::Client) -> Result<ListPluginsResponse> {
+pub(super) async fn fetch_plugins(api: &Api) -> Result<ListPluginsResponse> {
     Ok(api
         .get(format!("{API_BASE}/v1/plugins"))
         .send()
@@ -215,7 +213,7 @@ pub(super) async fn fetch_plugins(api: &reqwest::Client) -> Result<ListPluginsRe
 
 /// Fetch `url` from the Kiki API, or `None` if it is not found.
 pub(super) async fn fetch_optional<T: DeserializeOwned>(
-    api: &reqwest::Client,
+    api: &Api,
     url: String,
 ) -> Result<Option<T>> {
     let resp = api.get(url).send().await?;
