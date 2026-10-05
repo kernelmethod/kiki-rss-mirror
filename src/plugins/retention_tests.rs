@@ -281,7 +281,7 @@ fn the_retired_setting_moves_to_the_plugin() {
 fn the_plugins_own_setting_is_kept() {
     let (config, db) = config_and_db("[retention]\nmax_age_days = 30\n");
     db.write_blocking(|conn| {
-        let overrides = json!({"max_age_days": 7, "keep_saved": false});
+        let overrides = json!({"max_age_days": 7, "keep_tags": []});
         crate::db::plugins::set_config_overrides(conn, "retention", overrides.as_object().unwrap())
     })
     .unwrap()
