@@ -48,6 +48,7 @@ flags = "i"
 | `entrypoint`  | No       | The file that runs when the plugin loads, relative to the plugin directory. Defaults to `main.lua`. |
 | `description`, `authors`, `license`, `homepage` | No | Informational; shown by the API. |
 | `enabled`     | No       | Set to `false` to keep a plugin installed without running it. Defaults to `true`. |
+| `time_budget_ms` | No    | How long each call of one of the plugin's handlers may run, in milliseconds, or `"unlimited"`; see [Resource limits](#resource-limits). Defaults to `100`. |
 | `config`      | No       | A table holding the plugin's default config; see [Plugin config](#plugin-config). |
 | `settings`    | No       | An array describing the keys of `config`: their types, labels and descriptions; see [Describing settings](#describing-settings). |
 
@@ -680,12 +681,19 @@ not miss an element should check the decoded value with `get_attribute`.
 
 Every handler call runs under two hard limits:
 
-- **Time**: 100 ms per invocation. Enforced by a Lua debug hook that fires
-  every 1000 VM instructions. Scripts stuck in long-running C-level calls
+- **Time**: 100 ms per invocation, unless the plugin's manifest sets
+  `time_budget_ms` to another number of milliseconds or to `"unlimited"`.
+  Enforced by a Lua debug hook that fires every 1000 VM instructions. Scripts stuck in long-running C-level calls
   (e.g. pathological `string.gsub` patterns) can exceed this slightly before
   control returns to the VM. Time spent waiting on the server in calls to
   `kiki.store`, `kiki.entries` and `kiki.feeds` is not counted, up to one
   second per invocation; past that, waiting counts like anything else.
+
+  An unlimited handler still has a backstop: plugins run one handler at a
+  time in a separate process, and if that process doesn't answer the server
+  for 10 seconds, the server stops it, and with it every plugin, until Kiki
+  restarts. Keep `"unlimited"` for plugins you trust to finish, such as the
+  bundled `sanitize`, which every new entry passes through.
 - **Memory**: 16 MiB across the entire VM. Allocations that would exceed this
   cap fail the handler.
 - **Regexes**: compiled regexes live outside the VM, so the memory cap does not
