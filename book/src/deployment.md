@@ -54,7 +54,8 @@ On Linux, `kiki serve` sandboxes itself as it starts, with Landlock limiting
 the files it can reach and seccomp limiting its system calls. It also fetches
 and parses feeds, and runs plugins, in separate processes with sandboxes of
 their own and no access to the database. The packaged systemd units add
-systemd's own hardening on top.
+systemd's own hardening on top. The [threat model](threat-model.md) describes
+each process and what its sandbox allows.
 
 If the sandbox is demonstrably what breaks Kiki on your system,
 `kiki serve --seccomp-log-only` logs system call violations instead of
