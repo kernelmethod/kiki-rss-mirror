@@ -1440,16 +1440,23 @@ async fn placeholders_in_entries_are_not_filled_in() -> Result<()> {
     Ok(())
 }
 
-/// Every page links to the index, to the list of feeds and to the list
-/// of plugins.
+/// Every page links to the index, to the list of feeds, to the list of
+/// tags and to the settings.
 #[tokio::test]
 async fn pages_link_to_the_site_sections() -> Result<()> {
     let tc = TestBuilder::all().build()?;
     insert_entries(&tc, 1)?;
-    for path in ["/", "/entries/1", "/feeds", "/tags", "/plugins"] {
+    for path in [
+        "/",
+        "/entries/1",
+        "/feeds",
+        "/tags",
+        "/settings",
+        "/plugins",
+    ] {
         let (_, body) = get_page(tc.client()?, path).await?;
         assert!(
-            body.contains(r#"<nav class="site-nav"><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a class="admin-only" href="/plugins">Plugins</a>"#),
+            body.contains(r#"<nav class="site-nav"><a href="/feeds">Feeds</a><a href="/tags">Tags</a><a class="admin-only" href="/settings">Settings</a>"#),
             "{path}: {body}"
         );
     }
@@ -1681,6 +1688,30 @@ async fn the_plugins_page_lists_every_plugin() -> Result<()> {
     assert!(body.contains("Could not be loaded"), "{body}");
     assert!(body.contains("<strong>broken</strong>"), "{body}");
     assert!(body.contains("manifest.toml"), "{body}");
+    Ok(())
+}
+
+/// The settings page links to the plugins page, which links back to it.
+#[tokio::test]
+async fn the_settings_page_links_to_the_plugins_page() -> Result<()> {
+    let tc = TestBuilder::all().build()?;
+    let (status, body) = get_page(tc.client()?, "/settings").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<title>Settings - Kiki</title>"), "{body}");
+    assert!(
+        body.contains(r#"<section class="settings-section admin-only">"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<h3><a href="/plugins">Plugins</a></h3>"#),
+        "{body}"
+    );
+
+    let (_, body) = get_page(tc.client()?, "/plugins").await?;
+    assert!(
+        body.contains(r#"<a href="/settings">&larr; Back to settings</a>"#),
+        "{body}"
+    );
     Ok(())
 }
 

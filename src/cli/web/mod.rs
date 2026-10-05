@@ -12,6 +12,7 @@ mod plugins;
 mod sanitize;
 mod server;
 mod settings;
+mod settings_page;
 mod tags;
 #[cfg(test)]
 mod tests;

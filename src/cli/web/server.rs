@@ -7,6 +7,7 @@ use super::feeds::{feed_page, feeds_page};
 use super::hosts::{check_host, AllowedHosts};
 use super::login::{self, log_in, log_out, show_login, Gate};
 use super::plugins::{plugin_page, plugins_page, update_plugin_config};
+use super::settings_page::settings_page;
 use super::tags::{delete_tag, tag_page, tags_page};
 use anyhow::{bail, Context, Result};
 use axum::{
@@ -115,6 +116,7 @@ pub(super) async fn serve_ui_with(
         .route("/tags", get(tags_page))
         .route("/tags/{id}", get(tag_page).delete(delete_tag))
         .route("/search", get(search_page))
+        .route("/settings", get(settings_page))
         .route("/plugins", get(plugins_page))
         .route("/plugins/{name}", get(plugin_page))
         .route("/plugins/{name}/config", post(update_plugin_config))
