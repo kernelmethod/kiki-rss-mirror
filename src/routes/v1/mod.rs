@@ -1,3 +1,4 @@
+pub mod access;
 pub mod assets;
 pub mod docs;
 pub mod entries;
@@ -20,6 +21,7 @@ pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/", get(root::root))
         .route("/health", get(health::health))
+        .route("/access", get(access::access))
         .route("/shutdown", post(shutdown::shutdown))
         .nest("/assets", assets::create_router())
         .nest("/feeds", feeds::create_router())

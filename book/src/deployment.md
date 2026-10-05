@@ -100,9 +100,11 @@ reverse_proxy unix//run/kiki/kiki.sock
 ```
 
 The API holds a request that carries an API token to the token's scopes,
-but a request without one may do anything. Unless the proxy authenticates
-requests itself, anyone who can reach it can read and change everything.
-See [Security](api.md#security).
+but by default a request without one may do anything. Unless the proxy
+authenticates requests itself, anyone who can reach it can read and change
+everything, so set `anonymous_access = "token-required"` (or
+`"read-only"`) under `[api]` in `kiki.toml`. See
+[Security](api.md#security).
 
 ## Monitoring
 

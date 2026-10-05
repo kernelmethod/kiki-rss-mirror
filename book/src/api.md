@@ -58,10 +58,13 @@ another reader's API, can fetch just what changed:
 ## Security
 
 A request that carries an [API token](tokens.md) may do only what the
-token's scopes allow. A token is optional, though: **anybody** who can
-reach the API without one can read all feeds and entries, add and delete
-feeds and entries, change settings and plugins' config, and do anything
-else the API permits.
+token's scopes allow. By default a token is optional, though: **anybody**
+who can reach the API without one can read all feeds and entries, add and
+delete feeds and entries, change settings and plugins' config, and do
+anything else the API permits. Set `anonymous_access` under `[api]` in
+`kiki.toml` to `"read-only"` or `"token-required"` to limit requests
+without a token; `GET /v1/access` reports the setting to anyone. See
+[Anonymous access](tokens.md#anonymous-access).
 
 By default only your own user can reach the socket. If you widen that, or
 put Kiki behind a reverse proxy (see

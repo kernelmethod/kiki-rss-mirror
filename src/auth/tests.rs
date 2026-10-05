@@ -280,3 +280,137 @@ async fn token_use_is_recorded() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// A server whose `kiki.toml` sets `api.anonymous_access` to `access`.
+fn server_with_anonymous_access(access: &str) -> Result<TestConfig> {
+    let tc = TestBuilder::default().init_database().build()?;
+    std::fs::write(
+        tc.config_dir().join(crate::config::CONFIG_FILE_NAME),
+        format!("[api]\nanonymous_access = \"{access}\"\n"),
+    )?;
+    tc.init_server()
+}
+
+/// What `GET /v1/access` reports, without a token.
+async fn reported_access(client: &reqwest::Client) -> Result<serde_json::Value> {
+    let resp = client.get("http://localhost/v1/access").send().await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    Ok(resp.json().await?)
+}
+
+#[tokio::test]
+async fn anonymous_access_is_full_by_default() -> Result<()> {
+    let tc = TestBuilder::all().build()?;
+    let client = tc.client()?;
+    assert_eq!(
+        reported_access(&client).await?,
+        serde_json::json!({
+            "anonymous_access": "full",
+            "anonymous_scopes": ["read", "state", "tags", "feeds", "metrics", "admin"],
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_anonymous_access_allows_only_reading() -> Result<()> {
+    let tc = server_with_anonymous_access("read-only")?;
+    populate(&tc)?;
+    let client = tc.client()?;
+    let url = "http://localhost";
+    assert_eq!(
+        reported_access(&client).await?,
+        serde_json::json!({ "anonymous_access": "read-only", "anonymous_scopes": ["read"] })
+    );
+
+    for path in ["/v1/health", "/v1/", "/v1/feeds", "/v1/entries", "/v1/tags"] {
+        let resp = client.get(format!("{url}{path}")).send().await?;
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    }
+    let resp = client
+        .post(format!("{url}/v1/entries/search"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = client
+        .get(format!("{url}/v1/tokens/current"))
+        .send()
+        .await?;
+    assert_eq!(
+        resp.json::<serde_json::Value>().await?,
+        serde_json::json!({ "token": null, "scopes": ["read"] })
+    );
+
+    // Anything else asks for a token.
+    for req in [
+        client.put(format!("{url}/v1/entries/id/1/system-tags/system:read")),
+        client.delete(format!("{url}/v1/feeds/id/1")),
+        client.get(format!("{url}/v1/tokens")),
+        client.get(format!("{url}/v1/settings/retention")),
+        client.post(format!("{url}/v1/shutdown")),
+    ] {
+        let resp = req.send().await?;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{}", resp.url());
+        assert!(resp.headers().contains_key("www-authenticate"));
+    }
+    let resp = client.delete(format!("{url}/v1/feeds/id/1")).send().await?;
+    assert_eq!(
+        resp.text().await?,
+        "This request needs an API token with the feeds scope"
+    );
+
+    // A token is still held to its own scopes, which may be more or less
+    // than an anonymous request's.
+    let admin = tc.create_token("admin", "admin")?;
+    let metrics = tc.create_token("metrics", "metrics")?;
+    let resp = client
+        .delete(format!("{url}/v1/feeds/id/1"))
+        .bearer_auth(&admin)
+        .send()
+        .await?;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let resp = client
+        .get(format!("{url}/v1/feeds"))
+        .bearer_auth(&metrics)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+async fn token_required_anonymous_access_allows_only_open_routes() -> Result<()> {
+    let tc = server_with_anonymous_access("token-required")?;
+    let client = tc.client()?;
+    let url = "http://localhost";
+    assert_eq!(
+        reported_access(&client).await?,
+        serde_json::json!({ "anonymous_access": "token-required", "anonymous_scopes": [] })
+    );
+
+    for path in ["/v1/health", "/v1/", "/v1/tokens/current"] {
+        let resp = client.get(format!("{url}{path}")).send().await?;
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    }
+    for path in ["/v1/feeds", "/v1/entries", "/v1/tokens", "/metrics"] {
+        let resp = client.get(format!("{url}{path}")).send().await?;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    let read = tc.create_token("read", "read")?;
+    let resp = client
+        .get(format!("{url}/v1/feeds"))
+        .bearer_auth(&read)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The setting can be read with a token too.
+    let resp = client
+        .get(format!("{url}/v1/access"))
+        .bearer_auth(&read)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    Ok(())
+}

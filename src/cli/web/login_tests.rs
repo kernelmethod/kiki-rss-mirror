@@ -274,3 +274,15 @@ async fn without_login_everything_is_allowed() -> Result<()> {
     assert!(!page.contains("class=\"logout\""), "{page}");
     Ok(())
 }
+
+#[tokio::test]
+async fn without_login_pages_show_what_anonymous_requests_may_do() -> Result<()> {
+    use crate::auth::{Scope, Scopes};
+    let ui = Ui::start(|api| Gate::anonymous(api, Scopes::of(Scope::Read))).await?;
+    let resp = ui.get("/", None).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page = resp.text().await?;
+    assert!(page.contains("data-scopes=\"read\""), "{page}");
+    assert!(!page.contains("class=\"logout\""), "{page}");
+    Ok(())
+}
