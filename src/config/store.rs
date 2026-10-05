@@ -284,20 +284,20 @@ mod tests {
     #[test]
     fn update_keeps_changes_made_on_disk() {
         let (_td, store) = store();
-        fs::write(store.path(), "[retention]\nmax_age_days = 7\n").unwrap();
+        fs::write(store.path(), "[asset_cache]\nenabled = false\n").unwrap();
 
         store
             .update(|o| o.set("feed_fetch", "max_feed_bytes", 4096u64))
             .unwrap();
         let s = store.current();
-        assert_eq!(s.retention.max_age_days, Some(7));
+        assert!(!s.asset_cache.enabled);
         assert_eq!(s.feed_fetch.max_feed_bytes, 4096);
     }
 
     #[test]
     fn update_refuses_to_overwrite_a_file_with_an_invalid_setting() {
         let (_td, store) = store();
-        let bad = "[retention]\nmax_age_days = 0\n";
+        let bad = "[asset_cache]\nmax_bytes = -1\n";
         fs::write(store.path(), bad).unwrap();
         let err = store
             .update(|o| o.set("asset_cache", "enabled", false))

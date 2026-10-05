@@ -1,5 +1,5 @@
-//! The parts of the `kiki` Lua API that reach the server: `kiki.store`, `kiki.entries` and
-//! `kiki.feeds`.
+//! The parts of the `kiki` Lua API that reach the server, `kiki.store`, `kiki.entries` and
+//! `kiki.feeds`, and the plugin's timers, `kiki.every`.
 //!
 //! Each plugin sees its own `kiki` table, which holds these functions bound to the plugin's
 //! name and falls back to the shared `kiki` table (`kiki.on`, `kiki.log`, `kiki.regex`,
@@ -8,7 +8,9 @@
 //! whether the VM runs in the server or in the sandboxed script host.
 
 use super::config::{from_lua_value, to_lua_value};
-use crate::scripting::{ScanOptions, ScriptServices, ServiceCall, ServiceReply, TimeBudget};
+use crate::scripting::{
+    DeleteFilter, ScanOptions, ScriptServices, ServiceCall, ServiceReply, TimeBudget, TIMER_TICK,
+};
 use mlua::prelude::*;
 use mlua::RegistryKey;
 use std::collections::HashMap;
@@ -29,6 +31,27 @@ pub(super) struct ScanCallbacks {
 
 /// The scans plugins have started, keyed by scan id.
 pub(super) type Scans = Arc<Mutex<HashMap<u64, ScanCallbacks>>>;
+
+/// A timer a plugin started with `kiki.every(secs, handler)`.
+pub(super) struct Timer {
+    /// Called each time the timer is due.
+    pub handler: RegistryKey,
+    /// The name of the plugin that started the timer.
+    pub plugin: Arc<str>,
+    /// The time budget of the plugin that started the timer, for each call of `handler`.
+    pub budget: TimeBudget,
+    /// How long the timer waits between calls.
+    pub every: Duration,
+    /// When the timer is next due.
+    pub next: Instant,
+}
+
+/// The timers plugins have started, in the order they were started.
+pub(super) type Timers = Arc<Mutex<Vec<Timer>>>;
+
+/// The longest a timer may wait between calls: a year. Longer waits would outlast any
+/// server, since timers start over whenever plugins reload.
+pub const MAX_TIMER_INTERVAL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// How much of the time a handler spends waiting on the server, in calls to `kiki.store`,
 /// `kiki.entries` and `kiki.feeds`, does not count against its time budget. Past this,
@@ -97,6 +120,7 @@ pub(super) struct ApiContext {
     /// the functions then raise an error.
     pub services: Option<Arc<dyn ScriptServices>>,
     pub scans: Scans,
+    pub timers: Timers,
     /// The budget of the handler call in progress.
     pub budget: Arc<Budget>,
     /// Set while plugins' top-level chunks run, when scans cannot start yet: the runner
@@ -144,7 +168,53 @@ pub(super) fn plugin_kiki_table(
     kiki.raw_set("store", store_table(lua, plugin, ctx)?)?;
     kiki.raw_set("entries", entries_table(lua, plugin, budget, ctx)?)?;
     kiki.raw_set("feeds", feeds_table(lua, plugin, ctx)?)?;
+    kiki.raw_set("every", every_function(lua, plugin, budget, ctx)?)?;
     Ok(kiki)
+}
+
+/// Builds `kiki.every(secs, handler)` for the plugin named `plugin`, which starts a timer
+/// calling `handler` every `secs` seconds, the first time `secs` seconds from now.
+///
+/// Timers run on the server's [`TIMER_TICK`], so `secs` must be at least that long, and a
+/// timer may run up to a tick late. They last until plugins next reload.
+fn every_function(
+    lua: &Lua,
+    plugin: &str,
+    budget: TimeBudget,
+    ctx: &ApiContext,
+) -> LuaResult<LuaFunction> {
+    let plugin: Arc<str> = Arc::from(plugin);
+    let timers = ctx.timers.clone();
+    lua.create_function(move |lua, (secs, handler): (LuaValue, LuaFunction)| {
+        let err = |m: String| LuaError::RuntimeError(format!("kiki.every: {m}"));
+        let secs = match secs {
+            LuaValue::Integer(i) => i as f64,
+            LuaValue::Number(n) => n,
+            other => {
+                return Err(err(format!(
+                    "expected a number of seconds, not a {}",
+                    other.type_name()
+                )))
+            }
+        };
+        let (min, max) = (TIMER_TICK.as_secs_f64(), MAX_TIMER_INTERVAL.as_secs_f64());
+        // Written so that NaN fails it too.
+        if !(secs >= min && secs <= max) {
+            return Err(err(format!(
+                "the interval must be between {min} and {max} seconds, not {secs}"
+            )));
+        }
+        let every = Duration::from_secs_f64(secs);
+        let timer = Timer {
+            handler: lua.create_registry_value(handler)?,
+            plugin: plugin.clone(),
+            budget,
+            every,
+            next: Instant::now() + every,
+        };
+        timers.lock().unwrap_or_else(|e| e.into_inner()).push(timer);
+        Ok(())
+    })
 }
 
 fn feeds_table(lua: &Lua, plugin: &str, ctx: &ApiContext) -> LuaResult<LuaTable> {
@@ -271,7 +341,61 @@ fn entries_table(
         })?,
     )?;
 
+    let (p, c) = (plugin.to_string(), ctx.clone());
+    entries.set(
+        "delete_where",
+        lua.create_function(move |_, filter: LuaValue| {
+            let filter = delete_filter(filter)?;
+            match c.call(
+                &p,
+                "entries.delete_where",
+                ServiceCall::DeleteEntries { filter },
+            )? {
+                ServiceReply::Deleted(count) => Ok(count),
+                other => Err(unexpected("entries.delete_where", other)),
+            }
+        })?,
+    )?;
+
     Ok(entries)
+}
+
+/// Parses the argument of `kiki.entries.delete_where(filter)`.
+fn delete_filter(filter: LuaValue) -> LuaResult<DeleteFilter> {
+    let err = |m: &str| LuaError::RuntimeError(format!("kiki.entries.delete_where: {m}"));
+    let LuaValue::Table(filter) = filter else {
+        return Err(err("expected a table of filters"));
+    };
+    let mut parsed = DeleteFilter::default();
+    let mut dropped_before = None;
+    for pair in filter.pairs::<String, LuaValue>() {
+        let (key, value) = pair.map_err(|_| err("filter names must be strings"))?;
+        let int = |v: &LuaValue| match v {
+            LuaValue::Integer(i) => Ok(*i),
+            LuaValue::Number(n) if n.fract() == 0.0 => Ok(*n as i64),
+            _ => Err(err(&format!("filter '{key}' must be an integer"))),
+        };
+        match key.as_str() {
+            "dropped_before" => dropped_before = Some(int(&value)?),
+            "feed_id" => parsed.feed_id = Some(int(&value)?),
+            "published_before" => parsed.published_before = Some(int(&value)?),
+            "include_saved" => {
+                parsed.include_saved = value
+                    .as_boolean()
+                    .ok_or_else(|| err("filter 'include_saved' must be a boolean"))?
+            }
+            other => {
+                return Err(err(&format!(
+                    "unknown filter '{other}'; expected dropped_before, feed_id, \
+                     published_before or include_saved"
+                )))
+            }
+        }
+    }
+    parsed.dropped_before = dropped_before.ok_or_else(|| {
+        err("'dropped_before' is required: only entries their feed has stopped listing are deleted")
+    })?;
+    Ok(parsed)
 }
 
 /// Parses the arguments of `kiki.entries.scan([options,] handler [, on_done])`.

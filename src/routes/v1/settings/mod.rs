@@ -1,6 +1,5 @@
 pub mod assets;
 pub mod feed_fetch;
-pub mod retention;
 
 #[cfg(test)]
 mod tests;
@@ -19,10 +18,6 @@ use tracing::{event, Level};
 
 pub fn create_router() -> Router<AppState> {
     Router::new()
-        .route(
-            "/retention",
-            get(retention::get_retention).put(retention::put_retention),
-        )
         .route(
             "/asset-cache",
             get(assets::get_asset_cache_settings).put(assets::put_asset_cache_settings),

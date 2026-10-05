@@ -8,10 +8,6 @@ pub enum TaskManagerCommand {
         /// only queues feeds that are already due and leaves it unset.
         manual: bool,
     },
-    /// Run retention cleanup for the given feed.
-    CleanupFeed(i64),
-    /// Run retention cleanup across all feeds.
-    CleanupAll,
     /// Download and cache the external assets referenced by an entry
     /// (inline images plus any enclosure).
     CacheEntryAssets { entry_id: i64 },
@@ -33,8 +29,6 @@ impl TaskManagerCommand {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             TaskManagerCommand::RefreshFeed { .. } => "refresh_feed",
-            TaskManagerCommand::CleanupFeed(_) => "cleanup_feed",
-            TaskManagerCommand::CleanupAll => "cleanup_all",
             TaskManagerCommand::CacheEntryAssets { .. } => "cache_entry_assets",
             TaskManagerCommand::CacheFeedFavicon { .. } => "cache_feed_favicon",
             TaskManagerCommand::OptimizeFts => "optimize_fts",

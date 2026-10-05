@@ -211,7 +211,7 @@ fn payload_to_lua(lua: &Lua, payload: EventPayload) -> LuaResult<LuaValue> {
             t.set("title", title)?;
             Ok(LuaValue::Table(t))
         }
-        EventPayload::PluginLoad => Ok(LuaValue::Nil),
+        EventPayload::PluginLoad | EventPayload::Timer => Ok(LuaValue::Nil),
     }
 }
 
@@ -289,6 +289,8 @@ pub struct LuaScriptRunner {
     handlers: Handlers,
     // The handlers of the scans plugins have started with `kiki.entries.scan`.
     scans: api::Scans,
+    // The timers plugins have started with `kiki.every`.
+    timers: api::Timers,
     // The time budget of the handler call in progress, which service calls give time back
     // to.
     budget: Arc<Budget>,
@@ -402,6 +404,7 @@ impl LuaScriptRunner {
         let ctx = ApiContext {
             services,
             scans: Arc::new(Mutex::new(HashMap::new())),
+            timers: Arc::new(Mutex::new(Vec::new())),
             budget: Arc::new(Budget::default()),
             loading: Arc::new(AtomicBool::new(true)),
         };
@@ -414,6 +417,7 @@ impl LuaScriptRunner {
             lua: Mutex::new(lua),
             handlers,
             scans: ctx.scans,
+            timers: ctx.timers,
             budget: ctx.budget,
         })
     }
@@ -458,7 +462,48 @@ impl LuaScriptRunner {
                 set.insert(*event);
             }
         }
+        drop(guard);
+        if !self
+            .timers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            set.insert(Event::Timer);
+        }
         set
+    }
+
+    /// Calls the handler of each timer due by `now`, in the order the timers were started,
+    /// and schedules its next call.
+    ///
+    /// A timer's next call is due one interval after the one just made was, so a timer
+    /// that runs late on one tick is not late on every tick after it; one that fell more
+    /// than an interval behind is due one interval from `now`.
+    fn run_timers(&self, lua: &Lua, now: Instant) {
+        let due: Vec<(LuaFunction, Arc<str>, TimeBudget)> = {
+            let mut timers = self.timers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut due = Vec::new();
+            for timer in timers.iter_mut().filter(|t| t.next <= now) {
+                timer.next += timer.every;
+                if timer.next <= now {
+                    timer.next = now + timer.every;
+                }
+                match lua.registry_value::<LuaFunction>(&timer.handler) {
+                    Ok(function) => due.push((function, timer.plugin.clone(), timer.budget)),
+                    Err(e) => warn!(error = %e, "failed to resolve timer from Lua registry"),
+                }
+            }
+            due
+        };
+        // The timers lock is released, so handlers may start timers of their own.
+        for (function, plugin, budget) in due {
+            if let Err(e) =
+                call_with_timeout::<LuaValue>(lua, &self.budget, budget, &function, LuaValue::Nil)
+            {
+                warn!(plugin = %plugin, error = %e, "timer handler execution error; dropping");
+            }
+        }
     }
 }
 
@@ -736,6 +781,11 @@ impl ScriptRunner for LuaScriptRunner {
             .lua
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if event == Event::Timer {
+            self.run_timers(&lua, Instant::now());
+            return;
+        }
 
         let handlers = self.resolve_handlers(&lua, event);
         if handlers.is_empty() {
@@ -1418,6 +1468,128 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.title, "[EVENT] Test Title");
+    }
+
+    /// A runner with one plugin whose timer, every `secs` seconds, counts its
+    /// calls, and whose `entry.ingest` handler sets an entry's title to the
+    /// count so far.
+    fn counting_timer(secs: &str) -> LuaScriptRunner {
+        LuaScriptRunner::new(&[format!(
+            r#"
+            local count = 0
+            kiki.every({secs}, function() count = count + 1 end)
+            kiki.on("entry.ingest", function(entry)
+                entry.title = tostring(count)
+                return entry
+            end)
+            "#
+        )])
+        .unwrap()
+    }
+
+    /// How many times the timer of [`counting_timer`] has run.
+    fn timer_count(runner: &LuaScriptRunner) -> String {
+        runner
+            .dispatch_transform_entry(make_entry())
+            .unwrap()
+            .unwrap()
+            .title
+    }
+
+    fn run_timers_at(runner: &LuaScriptRunner, at: Instant) {
+        let lua = runner.lua.lock().unwrap();
+        runner.run_timers(&lua, at);
+    }
+
+    #[test]
+    fn timers_run_once_their_interval_has_passed() {
+        let start = Instant::now();
+        let runner = counting_timer("60");
+        assert!(runner.handles(Event::Timer));
+
+        run_timers_at(&runner, start);
+        assert_eq!(timer_count(&runner), "0");
+        run_timers_at(&runner, start + Duration::from_secs(61));
+        assert_eq!(timer_count(&runner), "1");
+        // Not again until another interval has passed.
+        run_timers_at(&runner, start + Duration::from_secs(62));
+        assert_eq!(timer_count(&runner), "1");
+        // A tick that comes a little early for the next call still makes
+        // it, so a late call does not make every later one late too.
+        run_timers_at(
+            &runner,
+            start + Duration::from_secs(120) + Duration::from_millis(500),
+        );
+        assert_eq!(timer_count(&runner), "2");
+        // A timer that fell far behind runs once, not once per interval
+        // it missed.
+        run_timers_at(&runner, start + Duration::from_secs(3600));
+        assert_eq!(timer_count(&runner), "3");
+        run_timers_at(&runner, start + Duration::from_secs(3610));
+        assert_eq!(timer_count(&runner), "3");
+    }
+
+    #[test]
+    fn the_timer_event_runs_due_timers_only() {
+        let runner = counting_timer("60");
+        runner.dispatch_observe(Event::Timer, EventPayload::Timer);
+        assert_eq!(timer_count(&runner), "0");
+    }
+
+    #[test]
+    fn runners_without_timers_do_not_handle_the_timer_event() {
+        let runner =
+            LuaScriptRunner::new(&["kiki.on('plugin.load', function() end)".to_string()]).unwrap();
+        assert!(!runner.handles(Event::Timer));
+    }
+
+    #[test]
+    fn timers_can_be_started_from_handlers() {
+        let runner = LuaScriptRunner::new(&[r#"
+            kiki.on("plugin.load", function()
+                kiki.every(60, function() end)
+            end)
+        "#
+        .to_string()])
+        .unwrap();
+        assert!(!runner.handles(Event::Timer));
+        runner.dispatch_observe(Event::PluginLoad, EventPayload::PluginLoad);
+        assert!(runner.handles(Event::Timer));
+    }
+
+    #[test]
+    fn failing_timers_keep_running() {
+        let start = Instant::now();
+        let runner = LuaScriptRunner::new(&[r#"
+            local count = 0
+            kiki.every(60, function() count = count + 1; error("boom") end)
+            kiki.on("entry.ingest", function(entry)
+                entry.title = tostring(count)
+                return entry
+            end)
+        "#
+        .to_string()])
+        .unwrap();
+        run_timers_at(&runner, start + Duration::from_secs(61));
+        run_timers_at(&runner, start + Duration::from_secs(122));
+        assert_eq!(timer_count(&runner), "2");
+    }
+
+    #[test]
+    fn timer_intervals_are_checked() {
+        for secs in ["59", "0", "-60", "0/0", "1e12", "'60'", "nil"] {
+            let result = LuaScriptRunner::new(&[format!("kiki.every({secs}, function() end)")]);
+            assert!(
+                matches!(result, Err(ScriptError::ScriptLoadError(_))),
+                "kiki.every({secs}) should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn the_timer_event_cannot_be_registered_for() {
+        let result = LuaScriptRunner::new(&["kiki.on('timer', function() end)".to_string()]);
+        assert!(matches!(result, Err(ScriptError::ScriptLoadError(_))));
     }
 
     #[test]

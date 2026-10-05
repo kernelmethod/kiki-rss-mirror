@@ -1,4 +1,4 @@
-use crate::plugins::{DiscoveryError, Plugin, PluginEngine, PluginSource};
+use crate::plugins::{DiscoveryError, Permission, Plugin, PluginEngine, PluginSource};
 use crate::server::AppState;
 use axum::{
     extract::State,
@@ -31,6 +31,10 @@ pub struct PluginResponse {
     pub authors: Vec<String>,
     pub license: Option<String>,
     pub homepage: Option<String>,
+    /// What the plugin's manifest asks to be allowed to do beyond what every
+    /// plugin can, such as `"entries.delete"`.
+    #[serde(default)]
+    pub permissions: Vec<Permission>,
     /// The config the plugin is running with: the defaults from its manifest,
     /// with its config overrides applied, as they were when plugins were last
     /// loaded.
@@ -54,6 +58,7 @@ impl From<&Plugin> for PluginResponse {
             authors: m.authors.clone(),
             license: m.license.clone(),
             homepage: m.homepage.clone(),
+            permissions: m.permissions.clone(),
             config: plugin.config.clone(),
         }
     }

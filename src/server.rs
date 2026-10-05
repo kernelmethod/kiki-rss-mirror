@@ -389,6 +389,16 @@ impl Server {
             );
         }
 
+        // Deleting old entries moved from the config file to a plugin.
+        if let Err(e) = plugins::migrate_retention_setting(&config, &db) {
+            tracing::warn!(
+                "could not move retention.max_age_days to the {} plugin; it is ignored \
+                 until it can be: {:#}",
+                plugins::RETENTION_PLUGIN,
+                e
+            );
+        }
+
         // Plugins are reloaded while the server runs, whenever the plugins
         // directory changes or a plugin's config is changed through the API.
         let plugins = Arc::new(
@@ -480,11 +490,7 @@ impl Server {
                 self.cancel_token.clone(),
                 metrics.clone(),
             ));
-            tokio::spawn(cleanup_loop(
-                tx.clone(),
-                self.cancel_token.clone(),
-                metrics.clone(),
-            ));
+            tokio::spawn(timer_loop(script_runner.clone(), self.cancel_token.clone()));
             tokio::spawn(retry_entry_assets_loop(
                 tx.clone(),
                 db.clone(),
@@ -711,20 +717,32 @@ async fn check_feeds_loop(
     Ok(())
 }
 
-/// Periodically sends a [`TaskManagerCommand::CleanupAll`] command to
-/// trigger retention cleanup. Runs every hour.
-async fn cleanup_loop(
-    task_manager_tx: crate::tasks::TaskSender,
-    cancel_token: CancellationToken,
-    metrics: Arc<crate::metrics::Metrics>,
-) -> Result<()> {
-    let mut interval = tokio::time::interval(Duration::from_secs(3600));
+/// Fires [`Event::Timer`](crate::scripting::Event::Timer) every
+/// [`TIMER_TICK`](crate::scripting::TIMER_TICK), so that plugins' timers,
+/// started with `kiki.every`, run. Skipped while no plugin has a timer.
+///
+/// Timer handlers may take a while, such as the `retention` plugin's,
+/// which deletes entries, so they run on the blocking thread pool, and a
+/// tick that comes while they run waits for them.
+async fn timer_loop(script_runner: ScriptRunnerHandle, cancel_token: CancellationToken) {
+    use crate::scripting::{Event, EventPayload, TIMER_TICK};
+
+    let mut interval = tokio::time::interval(TIMER_TICK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                match task_manager_tx.try_send(TaskManagerCommand::CleanupAll) {
-                    Ok(_) => metrics.record_task_enqueued("cleanup_all"),
-                    Err(e) => tracing::warn!("Failed to queue periodic cleanup: {:?}", e),
+                let Some(runner) = script_runner.current() else {
+                    continue;
+                };
+                if !runner.handles(Event::Timer) {
+                    continue;
+                }
+                let run = tokio::task::spawn_blocking(move || {
+                    runner.dispatch_observe(Event::Timer, EventPayload::Timer);
+                });
+                if let Err(e) = run.await {
+                    tracing::warn!("plugin timers failed: {e}");
                 }
             }
             _ = cancel_token.cancelled() => {
@@ -732,8 +750,6 @@ async fn cleanup_loop(
             }
         }
     }
-
-    Ok(())
 }
 
 /// How often [`retry_entry_assets_loop`] looks for asset caching to retry.
@@ -1673,7 +1689,7 @@ mod test {
         let metrics = crate::metrics::Metrics::new()?;
         let (tx, rx) = crate::tasks::queue(1);
         // A full main lane does not hold retries back...
-        tx.try_send(TaskManagerCommand::CleanupAll)?;
+        tx.try_send(TaskManagerCommand::OptimizeFts)?;
         // ...but a batch already waiting in the asset lane does.
         for queued in 0..ENTRY_ASSETS_RETRY_BATCH as i64 {
             tx.try_send(TaskManagerCommand::CacheEntryAssets {

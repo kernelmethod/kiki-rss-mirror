@@ -89,6 +89,8 @@ mod filter_tests;
 #[cfg(test)]
 mod privacy_tests;
 #[cfg(test)]
+mod retention_tests;
+#[cfg(test)]
 mod sanitize_tests;
 
 use crate::scripting::{ScriptModule, ScriptSource, TimeBudget};
@@ -270,6 +272,43 @@ impl PluginSource {
     }
 }
 
+/// Something a plugin may only do once its manifest asks for it, in its
+/// `permissions` array.
+///
+/// Permissions guard what cannot be undone. A plugin that asks for one
+/// says so where anyone installing it can see it: in its manifest, in
+/// `GET /v1/plugins`, in `kiki plugin ls` and in the web UI. The server
+/// refuses the calls a plugin makes without the permission they need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+pub enum Permission {
+    /// Delete stored entries, with `kiki.entries.delete_where`.
+    #[serde(rename = "entries.delete")]
+    EntriesDelete,
+}
+
+impl Permission {
+    /// The permission's name, as written in a manifest.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::plugins::Permission;
+    ///
+    /// assert_eq!(Permission::EntriesDelete.name(), "entries.delete");
+    /// ```
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::EntriesDelete => "entries.delete",
+        }
+    }
+}
+
+impl std::fmt::Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// The contents of a plugin's manifest, [`MANIFEST_FILE_NAME`].
 ///
 /// Fields Kiki does not know are ignored, so that plugins may carry extra
@@ -332,6 +371,12 @@ pub struct PluginManifest {
     )]
     #[schema(value_type = Option<Object>)]
     pub time_budget_ms: Option<TimeBudget>,
+
+    /// What the plugin may do beyond what every plugin can; see
+    /// [`Permission`]. A manifest naming a permission Kiki does not know is
+    /// invalid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<Permission>,
 
     /// The plugin's default config, the manifest's `[config]` table, handed
     /// to its entrypoint as its argument. The plugin's config overrides, kept
@@ -1065,6 +1110,61 @@ pub fn load_sources(discovery: &Discovery, engine: PluginEngine) -> Vec<ScriptSo
     sources
 }
 
+/// The name of the bundled plugin that deletes old entries, which took over
+/// from the config file's retired `[retention]` section.
+pub const RETENTION_PLUGIN: &str = "retention";
+
+/// The most days the retention plugin keeps an entry for once its feed has
+/// stopped listing it.
+pub const MAX_RETENTION_DAYS: i64 = 100 * 365;
+
+/// Moves the retired config file setting `retention.max_age_days` into the
+/// [`RETENTION_PLUGIN`]'s config overrides, which took over from it, and
+/// removes it from the config file. Returns whether there was a setting to
+/// move.
+///
+/// An override the plugin already has is kept. A value the config file
+/// could not have held, such as `0`, is dropped with a warning: the server
+/// refused to start with one. The setting is moved whether or not the
+/// plugin is installed, since overrides are kept by plugin name.
+///
+/// # Errors
+///
+/// Returns an error if the config file cannot be read or written, or the
+/// database cannot be. The setting is then left where it was, ignored
+/// with a warning (see [`crate::config::Overrides::resolve`]), and moved
+/// on a later start.
+pub fn migrate_retention_setting(
+    config: &crate::config::ConfigStore,
+    db: &crate::db::Db,
+) -> anyhow::Result<bool> {
+    let (section, key) = crate::config::RETIRED_RETENTION;
+    let overrides = config.overrides()?;
+    let Some(value) = overrides.get(section, key) else {
+        return Ok(false);
+    };
+    match value.as_integer() {
+        Some(days) if (1..=MAX_RETENTION_DAYS).contains(&days) => {
+            db.write_blocking(|conn| {
+                crate::db::plugins::update_config_overrides(conn, RETENTION_PLUGIN, |o| {
+                    o.entry("max_age_days")
+                        .or_insert_with(|| serde_json::json!(days));
+                })
+            })??;
+            tracing::info!(
+                "moved {section}.{key} = {days} from the config file to the \
+                 {RETENTION_PLUGIN} plugin's config"
+            );
+        }
+        _ => tracing::warn!("dropping the invalid retired setting {section}.{key} = {value}"),
+    }
+    config.update(|o| {
+        o.unset(section, key);
+        Ok(())
+    })?;
+    Ok(true)
+}
+
 /// Installs a plugin into `plugins_dir`, the system or user directory inside
 /// the plugins directory, in a directory named after it: writes its
 /// manifest and its entrypoint, containing `text`.
@@ -1118,6 +1218,7 @@ mod tests {
             homepage: None,
             enabled: true,
             time_budget_ms: None,
+            permissions: Vec::new(),
             config: Default::default(),
             settings: vec![],
         }

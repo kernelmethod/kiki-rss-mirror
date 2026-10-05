@@ -312,8 +312,8 @@ pub(super) fn render_plugin(plugin: &PluginResponse) -> String {
 }
 
 /// Render a plugin's description, and a line with its engine, whether it is
-/// a system or user plugin, whether it runs, its authors, license and
-/// homepage.
+/// a system or user plugin, whether it runs, the permissions it asks for,
+/// its authors, license and homepage.
 pub(super) fn render_plugin_details(plugin: &PluginResponse) -> String {
     let mut html = String::new();
     if let Some(description) = plugin
@@ -341,6 +341,10 @@ pub(super) fn render_plugin_details(plugin: &PluginResponse) -> String {
         }
         .to_owned(),
     );
+    if !plugin.permissions.is_empty() {
+        let names: Vec<_> = plugin.permissions.iter().map(|p| p.name()).collect();
+        parts.push(format!("permissions: {}", escape(names.join(", "))));
+    }
     if !plugin.authors.is_empty() {
         let authors: Vec<_> = plugin.authors.iter().map(escape).collect();
         parts.push(format!("by {}", authors.join(", ")));

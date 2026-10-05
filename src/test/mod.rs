@@ -721,6 +721,7 @@ impl TestConfig {
             homepage: None,
             enabled: true,
             time_budget_ms: None,
+            permissions: Vec::new(),
             config,
             settings: vec![],
         };

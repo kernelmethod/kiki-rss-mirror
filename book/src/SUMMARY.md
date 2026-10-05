@@ -19,6 +19,7 @@
     - [Sanitizing entries' HTML](plugins/sanitize.md)
     - [Stripping tracking parameters](plugins/privacy.md)
     - [Backing off from feeds that rarely change](plugins/adaptive-fetch.md)
+    - [Deleting old entries](plugins/retention.md)
 
 # For client and plugin authors
 
