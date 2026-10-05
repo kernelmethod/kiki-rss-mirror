@@ -17,6 +17,7 @@ pub mod profile;
 pub mod retention;
 pub mod tags;
 pub mod task_queue;
+pub mod tokens;
 
 pub use handle::{Db, DbError, DbOptions, DEFAULT_READERS};
 pub use pool::{blocking, ConnectionManager};
@@ -195,6 +196,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let expected_tables = [
+            "api_tokens",
             "atom_categories",
             "atom_entry_authors",
             "atom_entry_categories",
@@ -230,6 +232,7 @@ mod tests {
             "plugins",
             "rss_categories",
             "rss_entry_data",
+            "sqlite_sequence",
             "tags",
             "task_queue",
         ]

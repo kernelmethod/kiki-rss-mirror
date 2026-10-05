@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 
 /// Arguments for the `kiki serve` subcommand.
 ///
-/// Kiki serves over a Unix domain socket and nothing else. A socket is
-/// reachable only by processes that can reach its path, which is access
-/// control the server does not have to implement, authenticate, or get
-/// right; a TCP listener has none of that. Put a reverse proxy in front to
-/// expose Kiki over the network, and let it own the TLS and authentication
-/// that job needs.
+/// Kiki serves over a Unix domain socket, which is reachable only by
+/// processes that can reach its path: access control the server does not
+/// have to implement. `--api-listen` also serves the API over TCP, where
+/// every request must carry an API token (see [`crate::auth`]). The
+/// listener speaks plain HTTP, so anything beyond loopback belongs behind a
+/// reverse proxy that terminates TLS.
 #[derive(Args)]
 pub struct ServeArgs {
     /// Path to the Unix domain socket
@@ -23,6 +23,14 @@ pub struct ServeArgs {
     /// $KIKI_HOME/kiki.sock, or $XDG_RUNTIME_DIR/kiki/kiki.sock]
     #[arg(short = 'u', long = "uds", value_name = "PATH")]
     socket_path: Option<PathBuf>,
+
+    /// Also serve the API over TCP at ADDR, such as `127.0.0.1:8081`.
+    /// Every request on it but those to `/v1/health`, `/v1/` and `/docs`
+    /// must carry an API token; create one with `kiki token create`. The
+    /// listener speaks plain HTTP, so put it behind a reverse proxy that
+    /// terminates TLS before exposing it beyond this machine.
+    #[arg(long = "api-listen", value_name = "ADDR")]
+    api_listen: Option<std::net::SocketAddr>,
 
     /// Disable the OS-level sandbox (Landlock + seccomp-bpf on Linux).
     ///
@@ -126,6 +134,7 @@ impl ServeArgs {
         // not let the server create, bind or listen on a socket at all.
         // Landlock is already up, and grants the socket's directory.
         let listener = server::bind_socket(&socket_path)?;
+        let tcp_listener = self.api_listen.map(bind_api_listener).transpose()?;
 
         if let Some(config) = &sandbox_config {
             sandbox::restrict_syscalls(config).context("failed to install sandbox")?;
@@ -143,6 +152,10 @@ impl ServeArgs {
             .notifier(notifier)
             .socket_path(&socket_path)
             .listener(listener);
+        let builder = match tcp_listener {
+            Some(l) => builder.tcp_listener(l),
+            None => builder,
+        };
         #[cfg(unix)]
         let builder = builder.script_host(script_host);
         let server = builder.build();
@@ -194,6 +207,10 @@ impl ServeArgs {
     #[cfg(feature = "web-ui")]
     pub fn to_argv(&self, socket_path: &Path) -> Vec<std::ffi::OsString> {
         let mut argv = vec!["--uds".into(), socket_path.as_os_str().to_owned()];
+        if let Some(addr) = self.api_listen {
+            argv.push("--api-listen".into());
+            argv.push(addr.to_string().into());
+        }
         if self.no_sandbox {
             argv.push("--no-sandbox".into());
         }
@@ -268,6 +285,21 @@ impl ServeArgs {
         paths::validate_socket_path(&path)?;
         Ok(path)
     }
+}
+
+/// Bind the API's TCP listener to `addr`, warning if it is reachable from
+/// beyond this machine, since it speaks plain HTTP.
+fn bind_api_listener(addr: std::net::SocketAddr) -> Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(addr)
+        .with_context(|| format!("unable to bind the API to {addr}"))?;
+    listener.set_nonblocking(true)?;
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            "the API listens on {addr} over plain HTTP; API tokens sent to it can be read on \
+             the network unless a reverse proxy in front of it terminates TLS"
+        );
+    }
+    Ok(listener)
 }
 
 /// Create the directory that the Unix socket will be placed in, and return
@@ -678,7 +710,11 @@ mod tests {
     #[cfg(feature = "web-ui")]
     #[test]
     fn to_argv_round_trips() {
-        let mut argvs = vec![vec![], vec!["--no-sandbox", "--seccomp-log-only"]];
+        let mut argvs = vec![
+            vec![],
+            vec!["--api-listen", "127.0.0.1:8081"],
+            vec!["--no-sandbox", "--seccomp-log-only"],
+        ];
         #[cfg(unix)]
         argvs.push(vec!["--no-script-isolation"]);
 

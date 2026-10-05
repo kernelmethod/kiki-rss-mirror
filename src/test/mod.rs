@@ -109,6 +109,7 @@ struct HandlerState {
 pub struct TestBuilder {
     init_database: bool,
     init_server: bool,
+    tcp: bool,
 }
 
 impl TestBuilder {
@@ -117,6 +118,7 @@ impl TestBuilder {
         TestBuilder {
             init_database: true,
             init_server: true,
+            tcp: false,
         }
     }
 
@@ -132,9 +134,17 @@ impl TestBuilder {
         self
     }
 
+    /// Also serve the API on a TCP listener on loopback, where requests
+    /// need API tokens; see [`TestConfig::tcp_url`].
+    pub fn tcp(mut self) -> Self {
+        self.tcp = true;
+        self
+    }
+
     /// Build the test environment.
     pub fn build(&self) -> Result<TestConfig> {
         let mut tc = TestConfig::new()?;
+        tc.tcp = self.tcp;
 
         if self.init_database {
             tc = tc.init_database()?;
@@ -155,6 +165,10 @@ pub struct TestConfig {
     pub feed_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub feed_server_addr: Option<SocketAddr>,
     pub feed_server_state: Option<SharedFeedServerState>,
+    /// Whether [`Self::init_server`] serves the API over TCP as well.
+    pub tcp: bool,
+    /// The address of the API's TCP listener, if it has one.
+    pub tcp_addr: Option<SocketAddr>,
 }
 
 impl Drop for TestConfig {
@@ -177,6 +191,8 @@ impl TestConfig {
             feed_server_handle: None,
             feed_server_addr: None,
             feed_server_state: None,
+            tcp: false,
+            tcp_addr: None,
         };
         Ok(config)
     }
@@ -197,11 +213,19 @@ impl TestConfig {
             bail!("server has already been started");
         }
 
-        let server = ServerBuilder::new(&self.database_path())
-            .socket_path(&self.socket_path())
+        let db_path = self.database_path();
+        let socket_path = self.socket_path();
+        let mut builder = ServerBuilder::new(&db_path)
+            .socket_path(&socket_path)
             .single_threaded()
-            .worker_count(1)
-            .build();
+            .worker_count(1);
+        if self.tcp {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            listener.set_nonblocking(true)?;
+            self.tcp_addr = Some(listener.local_addr()?);
+            builder = builder.tcp_listener(listener);
+        }
+        let server = builder.build();
         self.server_token = Some(server.cancel_token());
         let handle = thread::spawn(move || server.run());
 
@@ -525,6 +549,26 @@ impl TestConfig {
         }
 
         bail!("HTTP server has not been started on {:?}", p);
+    }
+
+    /// The base URL of the API's TCP listener, such as
+    /// `http://127.0.0.1:1234`, after waiting for the server to start.
+    pub fn tcp_url(&self) -> Result<String> {
+        let Some(addr) = self.tcp_addr else {
+            bail!("the test server has no TCP listener; use TestBuilder::tcp");
+        };
+        // The listener is bound before the server starts, but only served
+        // once it is up, as the socket is.
+        let _ = self.client_builder()?;
+        Ok(format!("http://{addr}"))
+    }
+
+    /// Create an API token named `name` with `scopes` (as `kiki token
+    /// create --scopes` takes them), and return the token.
+    pub fn create_token(&self, name: &str, scopes: &str) -> Result<String> {
+        let conn = self.database_conn()?;
+        let (_, token) = crate::db::tokens::create(&conn, name, scopes.parse()?, None)?;
+        Ok(token)
     }
 
     /// Return the path to a file in the `test/` data directory.

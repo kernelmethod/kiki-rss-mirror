@@ -1,3 +1,4 @@
+use crate::auth::{self, Principal, Scope};
 use crate::routes::v1::entries::rows::{
     attach_tags, entry_columns, entry_from_row, id_range, EntrySort,
 };
@@ -9,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{event, Level};
@@ -43,6 +45,9 @@ pub struct TagEntriesResponse {
 enum TagEntriesTaskError {
     #[error("tag not found")]
     TagNotFound,
+
+    #[error("only tokens with the tags scope may tag entries with user tags")]
+    NeedsTagsScope,
 
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
@@ -148,6 +153,27 @@ pub async fn tag_entries(
     }
 }
 
+/// Check that tag `id` exists, and that entries may be added to or removed
+/// from it: any tag if `may_tag`, the request holding the `tags` scope, and
+/// otherwise only system tags, which record entries' state.
+fn check_tag(
+    conn: &rusqlite::Connection,
+    id: i64,
+    may_tag: bool,
+) -> Result<(), TagEntriesTaskError> {
+    let kind: Option<String> = conn
+        .query_row("SELECT kind FROM tags WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    match kind.as_deref() {
+        None => Err(TagEntriesTaskError::TagNotFound),
+        Some("system") => Ok(()),
+        Some(_) if may_tag => Ok(()),
+        Some(_) => Err(TagEntriesTaskError::NeedsTagsScope),
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct AddTagEntriesRequest {
     /// Only tag entries with an ID no greater than this, e.g. the newest entry the user has
@@ -202,6 +228,7 @@ pub struct AddTagEntriesResponse {
     request_body = AddTagEntriesRequest,
     responses(
         (status = 200, description = "Entries tagged", body = AddTagEntriesResponse),
+        (status = 403, description = "The token may only add entries to system tags"),
         (status = 404, description = "Tag not found"),
         (status = 500, description = "Internal server error"),
     ),
@@ -210,22 +237,15 @@ pub struct AddTagEntriesResponse {
 #[axum::debug_handler]
 pub async fn add_tag_entries(
     State(state): State<AppState>,
+    principal: Principal,
     Path(id): Path<i64>,
     Json(request): Json<AddTagEntriesRequest>,
 ) -> Result<Response, Response> {
+    let may_tag = principal.allows(Scope::Tags);
     let result = state
         .db
         .write(move |conn| {
-            let exists: bool = conn
-                .prepare("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)")
-                .inspect_err(|e| {
-                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-                })?
-                .query_row([id], |row| row.get(0))?;
-
-            if !exists {
-                return Err(TagEntriesTaskError::TagNotFound);
-            }
+            check_tag(conn, id, may_tag)?;
 
             let (up_to_id, feed_id, entry_ids) = request.sql_params();
             let tagged = conn
@@ -252,6 +272,7 @@ pub async fn add_tag_entries(
         Ok(Err(TagEntriesTaskError::TagNotFound)) => {
             Err((StatusCode::NOT_FOUND, "Tag not found").into_response())
         }
+        Ok(Err(TagEntriesTaskError::NeedsTagsScope)) => Err(auth::forbidden(Scope::Tags)),
         Ok(Err(e)) => {
             event!(Level::ERROR, "error in add_tag_entries: {:?}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())
@@ -282,6 +303,7 @@ pub struct RemoveTagEntriesResponse {
     request_body = AddTagEntriesRequest,
     responses(
         (status = 200, description = "Tag removed from entries", body = RemoveTagEntriesResponse),
+        (status = 403, description = "The token may only add entries to system tags"),
         (status = 404, description = "Tag not found"),
         (status = 500, description = "Internal server error"),
     ),
@@ -290,22 +312,15 @@ pub struct RemoveTagEntriesResponse {
 #[axum::debug_handler]
 pub async fn remove_tag_entries(
     State(state): State<AppState>,
+    principal: Principal,
     Path(id): Path<i64>,
     Json(request): Json<AddTagEntriesRequest>,
 ) -> Result<Response, Response> {
+    let may_tag = principal.allows(Scope::Tags);
     let result = state
         .db
         .write(move |conn| {
-            let exists: bool = conn
-                .prepare("SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)")
-                .inspect_err(|e| {
-                    event!(Level::ERROR, "unable to prepare SQL statement: {:?}", e);
-                })?
-                .query_row([id], |row| row.get(0))?;
-
-            if !exists {
-                return Err(TagEntriesTaskError::TagNotFound);
-            }
+            check_tag(conn, id, may_tag)?;
 
             let (up_to_id, feed_id, entry_ids) = request.sql_params();
             let untagged = conn
@@ -333,6 +348,7 @@ pub async fn remove_tag_entries(
         Ok(Err(TagEntriesTaskError::TagNotFound)) => {
             Err((StatusCode::NOT_FOUND, "Tag not found").into_response())
         }
+        Ok(Err(TagEntriesTaskError::NeedsTagsScope)) => Err(auth::forbidden(Scope::Tags)),
         Ok(Err(e)) => {
             event!(Level::ERROR, "error in remove_tag_entries: {:?}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response())

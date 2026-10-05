@@ -23,7 +23,10 @@ pub struct Migration {
 ///    (the first is `0001_...`)
 /// 3. Make the same change to `src/db/include/init.sql`, which always holds
 ///    the complete current schema
-pub const MIGRATIONS: &[Migration] = &[];
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    name: "0001_api_tokens",
+    sql: include_str!("include/migrations/0001_api_tokens.sql"),
+}];
 
 /// SQL to create the migrations table. Safe to run on databases that already
 /// have it (uses `IF NOT EXISTS`).

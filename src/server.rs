@@ -62,6 +62,7 @@ pub struct ServerBuilder<'a> {
     db_path: &'a Path,
     socket_path: Option<PathBuf>,
     listener: Option<std::os::unix::net::UnixListener>,
+    tcp_listener: Option<std::net::TcpListener>,
     config_path: Option<PathBuf>,
     plugins_dir: Option<PathBuf>,
     autofetch: bool,
@@ -78,6 +79,7 @@ impl<'a> ServerBuilder<'a> {
             db_path,
             socket_path: None,
             listener: None,
+            tcp_listener: None,
             config_path: None,
             plugins_dir: None,
             autofetch: false,
@@ -103,6 +105,17 @@ impl<'a> ServerBuilder<'a> {
     /// the server removes the socket file there when it stops.
     pub fn listener(mut self, listener: std::os::unix::net::UnixListener) -> Self {
         self.listener = Some(listener);
+        self
+    }
+
+    /// Also serve the API on `listener`, a TCP listener already bound by the
+    /// caller, where every request but those to public routes must carry
+    /// an API token; see [`crate::auth`].
+    ///
+    /// As with [`Self::listener`], `kiki serve` binds it before installing
+    /// its seccomp filter. It must be in non-blocking mode.
+    pub fn tcp_listener(mut self, listener: std::net::TcpListener) -> Self {
+        self.tcp_listener = Some(listener);
         self
     }
 
@@ -195,6 +208,7 @@ impl<'a> ServerBuilder<'a> {
             data_dir,
             socket_path,
             listener: self.listener,
+            tcp_listener: self.tcp_listener,
             autofetch: self.autofetch,
             single_threaded: self.single_threaded,
             worker_count: self.worker_count,
@@ -250,6 +264,10 @@ pub struct Server {
     /// The socket, if the caller bound it already; see
     /// [`ServerBuilder::listener`].
     listener: Option<std::os::unix::net::UnixListener>,
+
+    /// A TCP listener to serve the API on as well, if the caller bound one;
+    /// see [`ServerBuilder::tcp_listener`].
+    tcp_listener: Option<std::net::TcpListener>,
 
     /// Whether or not to automatically fetch feed contents.
     autofetch: bool,
@@ -535,6 +553,7 @@ impl Server {
         };
         tokio::spawn(uds_server(
             listener,
+            self.tcp_listener,
             self.socket_path,
             tx.clone(),
             db.clone(),
@@ -1252,6 +1271,7 @@ pub fn bind_socket(socket_path: &Path) -> Result<std::os::unix::net::UnixListene
 #[allow(clippy::too_many_arguments)]
 async fn uds_server(
     listener: std::os::unix::net::UnixListener,
+    tcp_listener: Option<std::net::TcpListener>,
     socket_path: PathBuf,
     tx: crate::tasks::TaskSender,
     db: crate::db::Db,
@@ -1275,7 +1295,36 @@ async fn uds_server(
         config,
         liveness,
     });
-    let app = routes::create_router(metrics).with_state(shared_state);
+    // Every route checks the request's token, if it has one, and whether
+    // it needs one; see `crate::auth`. The listener a request came in on
+    // decides the latter.
+    let app = routes::create_router(metrics)
+        .layer(axum::middleware::from_fn_with_state(
+            shared_state.clone(),
+            crate::auth::authorize,
+        ))
+        .with_state(shared_state);
+
+    if let Some(tcp_listener) = tcp_listener {
+        let tcp_listener = tokio::net::TcpListener::from_std(tcp_listener)
+            .with_context(|| "Unable to listen on the API's TCP address")?;
+        let addr = tcp_listener.local_addr()?;
+        tracing::info!("Listening on http://{addr} (API tokens required)");
+        let tcp_app = app
+            .clone()
+            .layer(axum::Extension(crate::auth::Transport::Network));
+        let cancel = cancel_token.clone();
+        tokio::spawn(async move {
+            let served = axum::serve(tcp_listener, tcp_app)
+                .with_graceful_shutdown(cancel.clone().cancelled_owned())
+                .await;
+            if let Err(e) = served {
+                tracing::error!("error serving the API on {addr}: {e}");
+                cancel.cancel();
+            }
+        });
+    }
+    let app = app.layer(axum::Extension(crate::auth::Transport::Socket));
 
     let listener = UnixListener::from_std(listener)
         .with_context(|| format!("Unable to listen on Unix socket at {:?}", socket_path))?;

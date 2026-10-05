@@ -8,6 +8,7 @@ pub mod root;
 pub mod settings;
 pub mod shutdown;
 pub mod tags;
+pub mod tokens;
 
 use crate::server::AppState;
 use axum::{
@@ -26,4 +27,5 @@ pub fn create_router() -> Router<AppState> {
         .nest("/plugins", plugins::create_router())
         .nest("/settings", settings::create_router())
         .nest("/tags", tags::create_router())
+        .nest("/tokens", tokens::create_router())
 }

@@ -1,4 +1,8 @@
-use utoipa::OpenApi;
+use crate::auth::policy::{requirement, Requirement};
+use crate::auth::Scope;
+use axum::http::Method;
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme};
+use utoipa::{Modify, OpenApi};
 
 /// OpenAPI documentation for the kiki-rss API.
 #[derive(OpenApi)]
@@ -51,6 +55,10 @@ use utoipa::OpenApi;
         crate::routes::v1::settings::feed_fetch::put_feed_fetch_settings,
         crate::routes::v1::entries::cleanup::cleanup,
         crate::routes::v1::shutdown::shutdown,
+        crate::routes::v1::tokens::list_tokens,
+        crate::routes::v1::tokens::create_token,
+        crate::routes::v1::tokens::revoke_token,
+        crate::routes::v1::tokens::current_token,
     ),
     components(
         schemas(
@@ -114,6 +122,12 @@ use utoipa::OpenApi;
             crate::routes::v1::settings::feed_fetch::FeedFetchSettingsResponse,
             crate::routes::v1::settings::feed_fetch::FeedFetchSettingsRequest,
             crate::routes::v1::entries::cleanup::CleanupResponse,
+            crate::auth::Scopes,
+            crate::db::tokens::Token,
+            crate::routes::v1::tokens::ListTokensResponse,
+            crate::routes::v1::tokens::CreateTokenRequest,
+            crate::routes::v1::tokens::CreateTokenResponse,
+            crate::routes::v1::tokens::CurrentTokenResponse,
         )
     ),
     tags(
@@ -123,7 +137,9 @@ use utoipa::OpenApi;
         (name = "tags", description = "Organize feeds and entries with tags"),
         (name = "plugins", description = "Inspect installed plugins and configure them"),
         (name = "settings", description = "Global configuration settings"),
+        (name = "tokens", description = "Manage the API tokens that grant access to the API"),
     ),
+    modifiers(&TokenSecurity),
     info(
         title = "kiki-rss",
         description = "A self-hosted RSS/Atom feed aggregator API",
@@ -131,3 +147,54 @@ use utoipa::OpenApi;
     )
 )]
 pub struct ApiDoc;
+
+/// Documents the API token each operation requires, from
+/// [`crate::auth::policy`]: as a bearer security requirement naming the
+/// scope, and in the operation's description.
+struct TokenSecurity;
+
+impl Modify for TokenSecurity {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "token",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .description(Some(
+                        "An API token, created with `kiki token create`. Required on the TCP \
+                         listener; optional over the Unix socket, where a request without one \
+                         may do anything.",
+                    ))
+                    .build(),
+            ),
+        );
+
+        for (path, item) in openapi.paths.paths.iter_mut() {
+            for (method, op) in [
+                (Method::GET, &mut item.get),
+                (Method::PUT, &mut item.put),
+                (Method::POST, &mut item.post),
+                (Method::DELETE, &mut item.delete),
+                (Method::PATCH, &mut item.patch),
+            ] {
+                let Some(op) = op else { continue };
+                let (scopes, note) = match requirement(&method, path)
+                    .unwrap_or(Requirement::Scope(Scope::Admin))
+                {
+                    Requirement::Public => continue,
+                    Requirement::Authenticated => (vec![], "Requires any API token.".to_owned()),
+                    Requirement::Scope(scope) => (
+                        vec![scope.name()],
+                        format!("Requires an API token with the `{scope}` scope."),
+                    ),
+                };
+                op.security = Some(vec![SecurityRequirement::new("token", scopes)]);
+                op.description = Some(match op.description.take() {
+                    Some(d) if !d.is_empty() => format!("{d}\n\n{note}"),
+                    _ => note,
+                });
+            }
+        }
+    }
+}

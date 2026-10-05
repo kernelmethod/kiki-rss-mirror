@@ -41,6 +41,9 @@ pub enum Commands {
     /// List plugins and read or change their config
     Plugin(cli::plugin::PluginArgs),
 
+    /// Create, list and revoke API tokens
+    Token(cli::token::TokenArgs),
+
     /// Generate a static HTML page for the API documentation
     #[cfg(feature = "api-docs")]
     Docs(cli::docs::DocsArgs),
@@ -92,6 +95,7 @@ impl Commands {
             Commands::Serve(args) => args.run(),
             Commands::Opml(args) => args.run(),
             Commands::Plugin(args) => args.run(),
+            Commands::Token(args) => args.run(),
             #[cfg(feature = "api-docs")]
             Commands::Docs(args) => args.run(),
             #[cfg(feature = "systemd")]
