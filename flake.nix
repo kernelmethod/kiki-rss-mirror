@@ -114,7 +114,22 @@
             SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
           };
 
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          # What the dependency-only builds (buildDepsOnly) take of `args`. They compile
+          # Cargo.lock's crates against a dummy source and build script, so they need
+          # neither the plugins written in Rust nor the crates in plugins/ and sdk/, which
+          # aren't the main crate's dependencies. Leaving them out keeps the dependencies,
+          # Wasmtime and Cranelift among them, cached when a plugin or the SDK changes.
+          depsOnly = args: builtins.removeAttrs args [ "KIKI_PLUGINS_WASM_DIR" ] // {
+            src = let
+              notUnder = dir: path: path != toString dir
+                && !(pkgs.lib.hasPrefix (toString dir + "/") path);
+            in pkgs.lib.cleanSourceWith {
+              inherit (args) src;
+              filter = path: _type: notUnder ./plugins path && notUnder ./sdk path;
+            };
+          };
+
+          cargoArtifacts = craneLib.buildDepsOnly (depsOnly commonArgs);
 
           kiki = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
@@ -130,7 +145,7 @@
           };
 
           profiling = craneLib.buildPackage (profilingArgs // {
-            cargoArtifacts = craneLib.buildDepsOnly profilingArgs;
+            cargoArtifacts = craneLib.buildDepsOnly (depsOnly profilingArgs);
           });
 
           # Dev-profile builds for the clippy and test checks, so they don't
@@ -142,7 +157,7 @@
             CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
           };
 
-          devDeps = craneLib.buildDepsOnly devArgs;
+          devDeps = craneLib.buildDepsOnly (depsOnly devArgs);
 
           # Fully static musl binary for GitHub releases. crane cross-compiles
           # with pkgsStatic's build-platform rustc, which the binary cache
@@ -157,14 +172,22 @@
             preBuild = "unset NIX_CFLAGS_LINK";
           };
 
-          static = craneLibStatic.buildPackage staticArgs;
+          staticDeps = craneLibStatic.buildDepsOnly (depsOnly staticArgs);
+
+          static = craneLibStatic.buildPackage (staticArgs // {
+            cargoArtifacts = staticDeps;
+          });
 
           # The static build with its symbols kept, like `profiling` above.
           # nixdev runs this, so the live service can be profiled with perf.
-          staticProfiling = craneLibStatic.buildPackage (staticArgs // {
+          staticProfilingArgs = staticArgs // {
             pname = "kiki-rss-static-profiling";
             CARGO_PROFILE = "profiling";
             dontStrip = true;
+          };
+
+          staticProfiling = craneLibStatic.buildPackage (staticProfilingArgs // {
+            cargoArtifacts = craneLibStatic.buildDepsOnly (depsOnly staticProfilingArgs);
           });
 
           # The user guide (an mdBook in book/) under $out/guide, with the

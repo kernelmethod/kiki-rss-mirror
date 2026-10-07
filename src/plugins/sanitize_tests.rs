@@ -451,9 +451,13 @@ fn invalid_configs_fail_to_load() {
 fn sanitize_still_works_on_privacy_cleaned_content() {
     let manifest =
         PluginManifest::parse(include_str!("../../plugins/privacy/manifest.toml")).unwrap();
-    let mut strip = ScriptSource::new(include_str!("../../plugins/privacy/main.lua"));
-    strip.name = "privacy".to_string();
-    strip.config = Value::Object(manifest.config).to_string();
+    let strip = ScriptSource {
+        name: "privacy".to_string(),
+        config: Value::Object(manifest.config).to_string(),
+        ..ScriptSource::wasm(
+            include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/privacy.wasm")).to_vec(),
+        )
+    };
     let runner = CompositeRunner::from_sources_with(&[strip, source(json!({}))], None).unwrap();
 
     assert_eq!(
