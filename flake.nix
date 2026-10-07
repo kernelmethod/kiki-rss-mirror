@@ -34,7 +34,7 @@
                 ./plugins/Cargo.lock
                 ./sdk/rust/kiki-plugin/Cargo.toml
                 ./sdk/rust/kiki-plugin/src
-                ./wit
+                ./sdk/rust/kiki-plugin/wit
               ] ++ builtins.concatMap (crate: [
                 (./plugins + "/${crate}/Cargo.toml")
                 (./plugins + "/${crate}/src")
@@ -81,8 +81,8 @@
               # into tests via include_str! and include_bytes! (e.g.
               # plugins/filter/manifest.toml)
               pluginsFilter = path: _type: builtins.match ".*/plugins(/.*)?" path != null;
-              # The WebAssembly plugin interface, read by wasmtime's bindgen!
-              # (src/scripting/wasm.rs), and the plugin its tests run
+              # The WebAssembly plugin interface (sdk/rust/kiki-plugin/wit), read
+              # by wasmtime's bindgen! (src/scripting/wasm.rs), and the plugin its tests run
               # (tests/wasm-fixture/fixture.wasm, via include_bytes!)
               witFilter = path: _type: builtins.match ".*/wit(/.*)?" path != null;
               wasmFixtureFilter = path: _type:

@@ -47,7 +47,7 @@ rules = []
 
 The interface between Kiki and a plugin is defined in
 [WIT](https://component-model.bytecodealliance.org/design/wit.html), in
-[`wit/kiki-plugin.wit`](https://github.com/kernelmethod/kiki-rss/blob/main/wit/kiki-plugin.wit)
+[`sdk/rust/kiki-plugin/wit/kiki-plugin.wit`](https://github.com/kernelmethod/kiki-rss/blob/main/sdk/rust/kiki-plugin/wit/kiki-plugin.wit)
 in Kiki's source. A plugin is a component targeting its `plugin` world, which:
 
 - imports `kiki:plugin/host`, the counterpart of the `kiki` table Lua

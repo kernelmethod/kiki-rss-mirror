@@ -187,7 +187,7 @@ mod default_plugins {
             plugins_dir.join("Cargo.lock"),
             sdk.join("Cargo.toml"),
             sdk.join("src"),
-            root.join("wit"),
+            sdk.join("wit"),
         ];
         for name in names {
             let dir = plugins_dir.join(name);

@@ -178,7 +178,7 @@ pub fn plugins_dir(home: &Path) -> PathBuf {
 pub enum PluginEngine {
     /// Lua 5.4. See the scripting guide for the API available to Lua code.
     Lua,
-    /// A WebAssembly component targeting the `plugin` world in `wit/kiki-plugin.wit`, or a
+    /// A WebAssembly component targeting the `plugin` world in `sdk/rust/kiki-plugin/wit/kiki-plugin.wit`, or a
     /// core module carrying that world's type information, which Kiki turns into one.
     Wasm,
 }
