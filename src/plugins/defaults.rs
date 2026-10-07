@@ -364,16 +364,16 @@ mod tests {
         assert_eq!(
             paths,
             [
-                Path::new("adaptive-fetch/main.lua"),
                 Path::new("adaptive-fetch/manifest.toml"),
-                Path::new("auto-tag/main.lua"),
+                Path::new("adaptive-fetch/plugin.wasm"),
                 Path::new("auto-tag/manifest.toml"),
+                Path::new("auto-tag/plugin.wasm"),
                 Path::new("filter/manifest.toml"),
                 Path::new("filter/plugin.wasm"),
                 Path::new("privacy/manifest.toml"),
                 Path::new("privacy/plugin.wasm"),
-                Path::new("retention/main.lua"),
                 Path::new("retention/manifest.toml"),
+                Path::new("retention/plugin.wasm"),
                 Path::new("sanitize/manifest.toml"),
                 Path::new("sanitize/plugin.wasm"),
             ]
@@ -396,30 +396,38 @@ mod tests {
                 "sanitize"
             ]
         );
-        assert_eq!(
-            files[0].contents,
-            include_bytes!("../../plugins/adaptive-fetch/main.lua")
-        );
-        assert_eq!(
-            files[2].contents,
-            include_bytes!("../../plugins/auto-tag/main.lua")
-        );
-        assert_eq!(
-            files[5].contents,
-            include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm"))
-        );
-        assert_eq!(
-            files[7].contents,
-            include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/privacy.wasm"))
-        );
-        assert_eq!(
-            files[8].contents,
-            include_bytes!("../../plugins/retention/main.lua")
-        );
-        assert_eq!(
-            files[11].contents,
-            include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/sanitize.wasm"))
-        );
+        // Every default plugin is a WebAssembly plugin, built by build.rs.
+        for (i, wasm) in [
+            (
+                1,
+                &include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/plugins-wasm/adaptive-fetch.wasm"
+                ))[..],
+            ),
+            (
+                3,
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/auto-tag.wasm")),
+            ),
+            (
+                5,
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm")),
+            ),
+            (
+                7,
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/privacy.wasm")),
+            ),
+            (
+                9,
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/retention.wasm")),
+            ),
+            (
+                11,
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/sanitize.wasm")),
+            ),
+        ] {
+            assert_eq!(files[i].contents, wasm, "{}", files[i].path.display());
+        }
     }
 
     /// Syncs `dir`, returning the outcome for `filter`.

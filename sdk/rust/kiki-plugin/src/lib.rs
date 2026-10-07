@@ -139,9 +139,9 @@ pub fn parse_config<T: serde::de::DeserializeOwned>(config: &str) -> Result<T, S
 /// A Kiki plugin.
 ///
 /// One value of the type is made, with [`Plugin::new`], when the plugin loads, and every
-/// handler is called on it. Only the events in [`Plugin::EVENTS`] are delivered, so each
-/// handler the plugin implements should be listed there; the default handlers do
-/// nothing.
+/// handler is called on it. Only the events in [`Plugin::EVENTS`] (or those
+/// [`Plugin::events`] returns, if it is overridden) are delivered, so each handler the
+/// plugin implements should be listed there; the default handlers do nothing.
 ///
 /// A handler that panics traps: Kiki treats it as having failed (an entry passes through
 /// it unchanged), then starts the plugin afresh, calling [`Plugin::new`] again.
@@ -149,6 +149,14 @@ pub trait Plugin: Sized + 'static {
     /// The events the plugin handles. Timers started with [`host::every`] call
     /// [`Plugin::on_timer`] whether or not they are listed.
     const EVENTS: &'static [EventKind];
+
+    /// The events this instance of the plugin handles, made from its config: by default,
+    /// [`Plugin::EVENTS`]. Override it to leave out events the config has no use for,
+    /// since each handler costs the server a call into the plugin whenever its event
+    /// happens.
+    fn events(&self) -> Vec<EventKind> {
+        Self::EVENTS.to_vec()
+    }
 
     /// Make the plugin, from its config: a JSON object, its manifest's `[config]` table
     /// with its overrides applied.
@@ -224,8 +232,9 @@ thread_local! {
 #[doc(hidden)]
 pub fn __init<P: Plugin>(config: String) -> Result<Vec<EventKind>, String> {
     let plugin = P::new(&config)?;
+    let events = plugin.events();
     INSTANCE.with(|i| *i.borrow_mut() = Some(Box::new(plugin)));
-    Ok(P::EVENTS.to_vec())
+    Ok(events)
 }
 
 /// Call `f` with the plugin `P`, for its other exports.

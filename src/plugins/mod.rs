@@ -80,17 +80,18 @@ pub mod runtime;
 pub mod services;
 pub mod settings;
 
-#[cfg(test)]
+// The default plugins are built by build.rs only with the default-plugins feature.
+#[cfg(all(test, feature = "default-plugins"))]
 mod adaptive_fetch_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "default-plugins"))]
 mod auto_tag_tests;
-// The filter, privacy and sanitize plugins are built by build.rs only for the default
-// plugins.
 #[cfg(all(test, feature = "default-plugins"))]
 mod filter_tests;
 #[cfg(all(test, feature = "default-plugins"))]
 mod privacy_tests;
 #[cfg(test)]
+mod retention_setting_tests;
+#[cfg(all(test, feature = "default-plugins"))]
 mod retention_tests;
 #[cfg(all(test, feature = "default-plugins"))]
 mod sanitize_tests;

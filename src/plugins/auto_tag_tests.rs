@@ -1,8 +1,9 @@
-//! Tests for the `auto-tag` plugin shipped in `plugins/auto-tag/`.
+//! Tests for the `auto-tag` plugin shipped in `plugins/auto-tag/`, built from
+//! the crate in that directory by `build.rs`.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
-use crate::scripting::lua::LuaScriptRunner;
+use crate::scripting::wasm::WasmScriptRunner;
 use crate::scripting::{
     Event, EventPayload, FeedEntry, FeedInfo, ScriptRunner, ScriptServices, ScriptSource,
     ServiceCall, ServiceReply,
@@ -15,18 +16,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MANIFEST: &str = include_str!("../../plugins/auto-tag/manifest.toml");
-const MAIN: &str = include_str!("../../plugins/auto-tag/main.lua");
+const WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/auto-tag.wasm"));
 
 fn source(config: &Value) -> ScriptSource {
-    let mut source = ScriptSource::new(MAIN);
-    source.name = "auto-tag".to_string();
-    source.config = config.to_string();
-    source
+    ScriptSource {
+        name: "auto-tag".to_string(),
+        config: config.to_string(),
+        ..ScriptSource::wasm(WASM.to_vec())
+    }
 }
 
 /// The plugin, loaded with `config`.
-fn auto_tag(config: Value) -> Result<LuaScriptRunner, crate::scripting::lua::ScriptError> {
-    LuaScriptRunner::from_sources(&[source(&config)])
+fn auto_tag(config: Value) -> Result<WasmScriptRunner, String> {
+    WasmScriptRunner::from_sources_with(&[source(&config)], None).map_err(|e| e.to_string())
 }
 
 fn entry(feed_id: i64, title: &str) -> FeedEntry {
@@ -46,7 +48,7 @@ fn entry(feed_id: i64, title: &str) -> FeedEntry {
     }
 }
 
-fn tags(runner: &LuaScriptRunner, entry: FeedEntry) -> Vec<String> {
+fn tags(runner: &WasmScriptRunner, entry: FeedEntry) -> Vec<String> {
     runner
         .dispatch_transform_entry(entry)
         .unwrap()
@@ -80,8 +82,8 @@ impl ScriptServices for Feeds {
 }
 
 /// The plugin, loaded with `config`, looking feeds up in `feeds`.
-fn auto_tag_with_feeds(config: Value, feeds: &Arc<Feeds>) -> LuaScriptRunner {
-    LuaScriptRunner::from_sources_with(
+fn auto_tag_with_feeds(config: Value, feeds: &Arc<Feeds>) -> WasmScriptRunner {
+    WasmScriptRunner::from_sources_with(
         &[source(&config)],
         Some(feeds.clone() as Arc<dyn ScriptServices>),
     )
@@ -259,7 +261,7 @@ fn bad_rules_fail_to_load() {
         ),
         (json!({"rules": "x"}), "must be a list"),
     ] {
-        let err = auto_tag(config.clone()).err().unwrap().to_string();
+        let err = auto_tag(config.clone()).err().unwrap();
         assert!(err.contains(message), "{config}: {err}");
     }
 }
@@ -296,7 +298,7 @@ async fn stored_entries_are_tagged_when_the_rules_change() -> Result<()> {
     let dir = tc.user_plugins_dir().join("auto-tag");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("manifest.toml"), MANIFEST)?;
-    std::fs::write(dir.join("main.lua"), MAIN)?;
+    std::fs::write(dir.join("plugin.wasm"), WASM)?;
     let overrides = json!({"rules": [{"tag": "a", "feeds": ["https://example.com/a"]}]});
     crate::db::plugins::set_config_overrides(
         &tc.database_conn()?,

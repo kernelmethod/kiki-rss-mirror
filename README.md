@@ -134,8 +134,9 @@ EOF
 
 A rule's tag may also be `system:saved`, `system:read` or `system:hidden`.
 Whenever its rules change, the plugin also applies them to the entries already
-downloaded. It never removes tags. See
-[`plugins/auto-tag/main.lua`](plugins/auto-tag/main.lua) for every setting.
+downloaded. It never removes tags. It is written in Rust, as a WebAssembly
+plugin; see [`plugins/auto-tag/src/lib.rs`](plugins/auto-tag/src/lib.rs) for
+every setting.
 
 ### Stripping tracking parameters
 

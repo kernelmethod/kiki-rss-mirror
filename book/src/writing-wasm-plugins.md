@@ -150,7 +150,10 @@ in Kiki's source.
 
 `Plugin::new` is called once when the plugin loads, and every handler is
 called on the value it returns, so a plugin keeps what it needs, such as
-compiled regexes, in its own fields. A handler that panics traps, which is
+compiled regexes, in its own fields. The events listed in `EVENTS` are
+delivered to every instance; a plugin that needs some of them only for some
+configs can override `Plugin::events` to leave the others out, since Kiki
+calls into a plugin for every event it handles. A handler that panics traps, which is
 handled as described [below](#resource-limits). Other languages can use the
 WIT file with their own bindings generator, such as `wit-bindgen`'s for C.
 
