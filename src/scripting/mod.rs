@@ -84,6 +84,7 @@
 
 pub mod composite;
 pub mod lua;
+pub mod regex;
 #[cfg(feature = "wasm-plugins")]
 pub mod wasm;
 

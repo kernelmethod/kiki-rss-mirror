@@ -26,8 +26,8 @@
 //! Hidden entries are tagged `system:hidden`. The filter never unhides an entry.
 
 use kiki_plugin::host;
+use kiki_plugin::regex::{Regex, RegexSet};
 use kiki_plugin::{export_plugin, log, Entry, EventKind, FeedEvent, Level, Plugin, ScanOptions};
-use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use serde_json::{Map, Value};
 use std::collections::{hash_map, HashMap, HashSet};
 
@@ -35,11 +35,6 @@ const HIDDEN: &str = "system:hidden";
 
 /// The key the rules last applied to the stored entries are kept under.
 const RULES_KEY: &str = "rules";
-
-/// The limits `kiki.regex` compiles patterns with, so that a pattern the Lua plugin
-/// accepts is accepted here too, and no other.
-const REGEX_SIZE_LIMIT_BYTES: usize = 256 * 1024;
-const REGEX_DFA_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 
 /// An entry field a rule can match.
 #[derive(Clone, Copy, PartialEq)]
@@ -103,8 +98,8 @@ const DEFAULT_FIELDS: &[Field] = &[Field::Title, Field::Content];
 
 struct Rule {
     re: Regex,
-    /// The pattern, with its flags set inline, for a [`RegexSet`].
-    inline: String,
+    /// The pattern and its flags, for [`FieldSet`].
+    source: (String, String),
     fields: Vec<Field>,
     /// The feeds the rule applies to, by id, or `None` for every feed.
     feeds: Option<HashSet<i64>>,
@@ -158,9 +153,11 @@ impl Rule {
             Some(Value::String(flags)) => flags.as_str(),
             Some(_) => return fail("'flags' must be a string"),
         };
-        let re = match compile_regex(pattern, flags) {
+        // The server compiles patterns as `kiki.regex` does, so a pattern the Lua plugin
+        // accepts is accepted here too, and no other.
+        let re = match Regex::compile(pattern, flags) {
             Ok(re) => re,
-            Err(e) => return fail(&e),
+            Err(e) => return fail(&format!("kiki.regex: {e}")),
         };
 
         let (mut feeds, mut urls) = (None, HashSet::new());
@@ -187,14 +184,9 @@ impl Rule {
             Some(_) => return fail("'feeds' must be a list of feed ids or URLs"),
         }
 
-        let inline = if flags.is_empty() {
-            pattern.to_string()
-        } else {
-            format!("(?{flags}){pattern}")
-        };
         Ok(Rule {
             re,
-            inline,
+            source: (pattern.to_string(), flags.to_string()),
             fields,
             feeds,
             urls,
@@ -215,31 +207,6 @@ fn as_integer(n: &Value) -> Option<i64> {
         // `i64::MAX as f64` rounds up to 2^63, which is out of range.
         (f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64).then_some(f as i64)
     })
-}
-
-/// Compiles `pattern` as `kiki.regex(pattern, flags)` does.
-fn compile_regex(pattern: &str, flags: &str) -> Result<Regex, String> {
-    let mut builder = RegexBuilder::new(pattern);
-    builder
-        .size_limit(REGEX_SIZE_LIMIT_BYTES)
-        .dfa_size_limit(REGEX_DFA_SIZE_LIMIT_BYTES);
-    for flag in flags.chars() {
-        match flag {
-            'i' => builder.case_insensitive(true),
-            'm' => builder.multi_line(true),
-            's' => builder.dot_matches_new_line(true),
-            'x' => builder.ignore_whitespace(true),
-            'U' => builder.swap_greed(true),
-            other => {
-                return Err(format!(
-                    "kiki.regex: unknown flag '{other}'; expected any of i, m, s, x, U"
-                ))
-            }
-        };
-    }
-    builder
-        .build()
-        .map_err(|e| format!("kiki.regex: invalid pattern: {e}"))
 }
 
 fn compile_rules(config: &Map<String, Value>, name: &str) -> Result<Vec<Rule>, String> {
@@ -281,8 +248,9 @@ fn same(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// The `exclude` rules that read a field, compiled together, so that each of the field's
-/// values is searched once for all of them rather than once per rule.
+/// The `exclude` rules that read a field, matched together, so that each of the field's
+/// values goes to the server once for all of them rather than once per rule. The server
+/// shares the rules' compiled patterns between the sets and the rules.
 struct FieldSet {
     field: Field,
     set: RegexSet,
@@ -301,11 +269,9 @@ impl FieldSet {
             if rules.is_empty() {
                 continue;
             }
-            let set = RegexSetBuilder::new(rules.iter().map(|&i| &exclude[i].inline))
-                .size_limit(REGEX_SIZE_LIMIT_BYTES * rules.len())
-                .dfa_size_limit(REGEX_DFA_SIZE_LIMIT_BYTES * rules.len())
-                .build()
-                .map_err(|e| format!("filter: exclude: {e}"))?;
+            let sources: Vec<(String, String)> =
+                rules.iter().map(|&i| exclude[i].source.clone()).collect();
+            let set = RegexSet::compile(&sources).map_err(|e| format!("filter: exclude: {e}"))?;
             sets.push(FieldSet { field, set, rules });
         }
         Ok(sets)
@@ -372,12 +338,14 @@ impl Filter {
     /// Why `entry` should be hidden, or `None` if it should not be.
     fn reason_to_hide(&mut self, entry: &Entry) -> Option<String> {
         let feed_urls = &mut self.feed_urls;
-        if !self.exclude.is_empty() {
+        if !self.exclude_sets.is_empty() {
             let mut matched = vec![false; self.exclude.len()];
             for set in &self.exclude_sets {
                 for value in set.field.values(entry) {
-                    for i in set.set.matches(value).iter() {
-                        matched[set.rules[i]] = true;
+                    for i in set.set.matches(value) {
+                        if let Some(&rule) = set.rules.get(i as usize) {
+                            matched[rule] = true;
+                        }
                     }
                 }
             }

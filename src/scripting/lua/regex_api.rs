@@ -9,25 +9,17 @@
 //! # Resource limits
 //!
 //! Compiled regexes live outside the Lua allocator, so the VM's memory cap does not see
-//! them. They are bounded here instead: each compiled program is limited to
-//! [`REGEX_SIZE_LIMIT_BYTES`], its lazy DFA cache to [`REGEX_DFA_SIZE_LIMIT_BYTES`], and at
-//! most [`MAX_LIVE_REGEXES`] distinct regexes may be alive in one VM at a time. Compiling
+//! them. They are bounded instead as [`crate::scripting::regex`] describes, which compiles
+//! them as it does for WebAssembly plugins: at most [`MAX_LIVE_REGEXES`] distinct regexes
+//! may be alive in one VM at a time. Compiling
 //! the same pattern and flags again returns the regex already compiled, so a handler that
 //! builds its regexes on every call costs no more than one that builds them once.
 
+use crate::scripting::regex::MAX_LIVE_REGEXES;
 use mlua::prelude::*;
-use regex::bytes::{Regex, RegexBuilder};
+use regex::bytes::Regex;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
-
-/// Largest compiled program a single regex may have.
-pub const REGEX_SIZE_LIMIT_BYTES: usize = 256 * 1024;
-
-/// Largest lazy DFA cache a single regex may use while matching.
-pub const REGEX_DFA_SIZE_LIMIT_BYTES: usize = 256 * 1024;
-
-/// Most distinct regexes that may be alive in one VM at a time.
-pub const MAX_LIVE_REGEXES: usize = 128;
 
 /// The regexes compiled in one VM, keyed by pattern and flags.
 ///
@@ -117,27 +109,8 @@ fn compile(lua: &Lua, registry: &Registry, pattern: String, flags: String) -> Lu
         }
     }
 
-    let mut builder = RegexBuilder::new(&key.0);
-    builder
-        .size_limit(REGEX_SIZE_LIMIT_BYTES)
-        .dfa_size_limit(REGEX_DFA_SIZE_LIMIT_BYTES);
-    for flag in key.1.chars() {
-        match flag {
-            'i' => builder.case_insensitive(true),
-            'm' => builder.multi_line(true),
-            's' => builder.dot_matches_new_line(true),
-            'x' => builder.ignore_whitespace(true),
-            'U' => builder.swap_greed(true),
-            other => {
-                return Err(LuaError::RuntimeError(format!(
-                    "kiki.regex: unknown flag '{other}'; expected any of i, m, s, x, U"
-                )))
-            }
-        };
-    }
-    let regex = builder
-        .build()
-        .map_err(|e| LuaError::RuntimeError(format!("kiki.regex: invalid pattern: {e}")))?;
+    let regex = crate::scripting::regex::compile(&key.0, &key.1)
+        .map_err(|e| LuaError::RuntimeError(format!("kiki.regex: {e}")))?;
 
     let compiled = Arc::new(Compiled {
         regex,

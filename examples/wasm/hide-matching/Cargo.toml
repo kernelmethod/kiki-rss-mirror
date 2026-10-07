@@ -10,7 +10,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 kiki-plugin = { path = "../../../sdk/rust/kiki-plugin" }
-regex = "1"
 serde = { version = "1", features = ["derive"] }
 
 [profile.release]

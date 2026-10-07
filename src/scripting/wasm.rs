@@ -57,6 +57,7 @@
 //! [`MAX_TRAPS`] times in [`TRAP_WINDOW`] is disabled until plugins next reload.
 
 use super::lua::MAX_TIMER_INTERVAL;
+use super::regex::MAX_LIVE_REGEXES;
 use super::{
     parse_script_config, restore_read_only, ContentChange, DeleteFilter, Event, EventPayload,
     EventSet, FeedEntry, FetchSchedule, ScanOptions, ScanSummary, ScheduleDecision, ScriptRunner,
@@ -68,7 +69,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, error, warn};
-use wasmtime::component::{Component, HasSelf, Linker};
+use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder};
 
 mod bindings {
@@ -76,10 +77,15 @@ mod bindings {
         path: "wit",
         world: "plugin",
         imports: { default: trappable },
+        with: {
+            "kiki:plugin/regex.regex": super::HostRegex,
+            "kiki:plugin/regex.regex-set": super::HostRegexSet,
+        },
     });
 }
 
 use bindings::kiki::plugin::host::Host;
+use bindings::kiki::plugin::regex as regex_host;
 use bindings::kiki::plugin::types as wit;
 use bindings::Plugin as Bindings;
 
@@ -295,6 +301,38 @@ impl CallBudget {
     }
 }
 
+/// A regex a plugin compiled with the `regex` interface.
+pub struct HostRegex(Arc<regex::bytes::Regex>);
+
+/// A set of regexes a plugin compiled with the `regex` interface: each matched alone, for
+/// the reason [`super::regex`] gives.
+pub struct HostRegexSet(Vec<Arc<regex::bytes::Regex>>);
+
+/// The regexes a plugin has compiled, by pattern and flags, so that compiling one again,
+/// alone or in a set, shares the one already alive, as `kiki.regex` does in Lua.
+#[derive(Default)]
+struct Regexes(HashMap<(String, String), std::sync::Weak<regex::bytes::Regex>>);
+
+impl Regexes {
+    /// The regex for `pattern` and `flags`: the one alive already, or a new one, unless
+    /// the plugin has [`MAX_LIVE_REGEXES`] alive.
+    fn get(&mut self, pattern: String, flags: String) -> Result<Arc<regex::bytes::Regex>, String> {
+        let key = (pattern, flags);
+        if let Some(re) = self.0.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Ok(re);
+        }
+        self.0.retain(|_, re| re.strong_count() > 0);
+        if self.0.len() >= MAX_LIVE_REGEXES {
+            return Err(format!(
+                "too many regexes (at most {MAX_LIVE_REGEXES} may be alive at once)"
+            ));
+        }
+        let re = Arc::new(super::regex::compile(&key.0, &key.1)?);
+        self.0.insert(key, Arc::downgrade(&re));
+        Ok(re)
+    }
+}
+
 /// What a plugin's [`Store`] holds: what its calls to the host need.
 struct State {
     plugin: Arc<str>,
@@ -307,6 +345,9 @@ struct State {
     next_timer: u32,
     /// The scans the plugin has started that have not finished.
     scans: HashSet<u64>,
+    /// The regexes and regex sets the plugin holds.
+    table: ResourceTable,
+    regexes: Regexes,
 }
 
 impl State {
@@ -332,6 +373,105 @@ impl State {
         let result = services.call(&self.plugin, call);
         self.budget.give_back(start.elapsed());
         Ok(result.map_err(|e| format!("{name}: {e}")))
+    }
+}
+
+impl State {
+    /// Traps if the call into the plugin has used up its time budget, so that a plugin
+    /// matching in a loop is stopped, though matching runs outside the plugin.
+    fn check_budget(&self, name: &str) -> wasmtime::Result<()> {
+        if self.budget.expired() {
+            return Err(wasmtime::Error::msg(format!(
+                "{name}: the handler has used up its time budget"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl regex_host::Host for State {}
+
+impl regex_host::HostRegex for State {
+    fn compile(
+        &mut self,
+        pattern: String,
+        flags: String,
+    ) -> wasmtime::Result<Result<Resource<HostRegex>, String>> {
+        self.check_budget("regex.compile")?;
+        match self.regexes.get(pattern, flags) {
+            Ok(re) => Ok(Ok(self.table.push(HostRegex(re))?)),
+            Err(e) => Ok(Err(e)),
+        }
+    }
+
+    fn is_match(&mut self, re: Resource<HostRegex>, haystack: String) -> wasmtime::Result<bool> {
+        self.check_budget("regex.is-match")?;
+        Ok(self.table.get(&re)?.0.is_match(haystack.as_bytes()))
+    }
+
+    fn find(
+        &mut self,
+        re: Resource<HostRegex>,
+        haystack: String,
+        start: u32,
+    ) -> wasmtime::Result<Option<(u32, u32)>> {
+        self.check_budget("regex.find")?;
+        let start = start as usize;
+        if start > haystack.len() {
+            return Ok(None);
+        }
+        // A plugin's haystack is in its 32-bit memory, so offsets fit in a u32.
+        Ok(self
+            .table
+            .get(&re)?
+            .0
+            .find_at(haystack.as_bytes(), start)
+            .map(|m| (m.start() as u32, m.end() as u32)))
+    }
+
+    fn drop(&mut self, re: Resource<HostRegex>) -> wasmtime::Result<()> {
+        self.table.delete(re)?;
+        Ok(())
+    }
+}
+
+impl regex_host::HostRegexSet for State {
+    fn compile(
+        &mut self,
+        patterns: Vec<(String, String)>,
+    ) -> wasmtime::Result<Result<Resource<HostRegexSet>, String>> {
+        self.check_budget("regex-set.compile")?;
+        let mut set = Vec::with_capacity(patterns.len());
+        for (i, (pattern, flags)) in patterns.into_iter().enumerate() {
+            match self.regexes.get(pattern, flags) {
+                Ok(re) => set.push(re),
+                Err(e) => return Ok(Err(format!("pattern {i}: {e}"))),
+            }
+        }
+        Ok(Ok(self.table.push(HostRegexSet(set))?))
+    }
+
+    fn matches(
+        &mut self,
+        set: Resource<HostRegexSet>,
+        haystack: String,
+    ) -> wasmtime::Result<Vec<u32>> {
+        self.check_budget("regex-set.matches")?;
+        let haystack = haystack.as_bytes();
+        Ok(self
+            .table
+            .get(&set)?
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, re)| re.is_match(haystack))
+            .map(|(i, _)| i as u32)
+            .collect())
+    }
+
+    fn drop(&mut self, set: Resource<HostRegexSet>) -> wasmtime::Result<()> {
+        self.table.delete(set)?;
+        Ok(())
     }
 }
 
@@ -536,6 +676,8 @@ fn instantiate(
         timers: Vec::new(),
         next_timer: 0,
         scans: HashSet::new(),
+        table: ResourceTable::new(),
+        regexes: Regexes::default(),
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limits);

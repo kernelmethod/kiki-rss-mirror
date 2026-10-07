@@ -1,8 +1,8 @@
 //! An example Kiki plugin in Rust: hide entries whose title or content matches a
 //! regular expression. See the guide's "Writing WebAssembly plugins" chapter.
 
+use kiki_plugin::regex::Regex;
 use kiki_plugin::{export_plugin, parse_config, Entry, EventKind, Plugin};
-use regex::Regex;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -39,7 +39,7 @@ impl Plugin for HideMatching {
             .into_iter()
             .map(|rule| {
                 // A bad pattern fails the load, rather than every entry.
-                let re = Regex::new(&rule.pattern)
+                let re = Regex::compile(&rule.pattern, "")
                     .map_err(|e| format!("bad pattern {:?}: {e}", rule.pattern))?;
                 Ok((rule.field, re))
             })

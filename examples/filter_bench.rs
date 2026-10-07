@@ -168,6 +168,13 @@ const WORDS: &[&str] = &[
     "Zürich",
     "東京",
     "données",
+    // Near misses of the heavy config's words, which a regex's literal search finds and
+    // its full search then rules out.
+    "dieting",
+    "casinos",
+    "cryptography",
+    "gossiping",
+    "discounted",
 ];
 
 const TITLE_EXTRAS: &[&str] = &["Sponsored:", "Webinar:", "Ask HN:", "Show HN:", "[video]"];

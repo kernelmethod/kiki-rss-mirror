@@ -610,3 +610,78 @@ fn plugins_are_compiled_to_native_code() {
     let engine = engine().unwrap();
     assert!(!engine.is_pulley());
 }
+
+#[test]
+fn plugins_match_with_the_servers_regexes() {
+    let (plugins, recorder) = runner(&[source(
+        "a",
+        json!({
+            "regex": [r"\bkiki\b", "i"],
+            "regex_set": [["rust", "i"], ["^go", ""], ["kiki", ""]],
+        }),
+    )]);
+    plugins
+        .dispatch_transform_entry(entry("Rust and Kiki"))
+        .unwrap();
+    assert_eq!(recorder.seen("regex").unwrap(), "true Some((9, 13))");
+    assert_eq!(recorder.seen("regex-set").unwrap(), "[0]");
+
+    // Errors read as kiki.regex's do, and fail the call rather than trapping.
+    let (plugins, recorder) = runner(&[source(
+        "a",
+        json!({"regex": ["(", ""], "regex_set": [["a", ""], ["b", "q"]]}),
+    )]);
+    let out = plugins
+        .dispatch_transform_entry(entry("t"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.title, "t");
+    assert!(recorder
+        .seen("regex")
+        .unwrap()
+        .starts_with("invalid pattern: "));
+    assert!(recorder
+        .seen("regex-set")
+        .unwrap()
+        .starts_with("pattern 1: unknown flag 'q'"));
+}
+
+#[test]
+fn plugins_may_keep_only_so_many_regexes_alive() {
+    let (plugins, recorder) = runner(&[source(
+        "a",
+        json!({"regex_count": crate::scripting::regex::MAX_LIVE_REGEXES + 1}),
+    )]);
+    plugins.dispatch_transform_entry(entry("t")).unwrap();
+    let count = recorder.seen("regex-count").unwrap();
+    assert!(
+        count.starts_with(&format!("{}: too many regexes", MAX_LIVE_REGEXES)),
+        "{count}"
+    );
+    // Dropping them frees their places.
+    assert_eq!(recorder.seen("regex-after-drop").unwrap(), "ok");
+
+    let (plugins, recorder) = runner(&[source("a", json!({"regex_count": MAX_LIVE_REGEXES}))]);
+    plugins.dispatch_transform_entry(entry("t")).unwrap();
+    assert_eq!(recorder.seen("regex-count").unwrap(), "ok");
+}
+
+/// A plugin compiling a pattern it has alive already, as the filter's per-field sets do,
+/// shares it, and does not use up its places.
+#[test]
+fn regexes_alive_already_are_shared() {
+    let mut regexes = Regexes::default();
+    let first = regexes.get("kiki".into(), "i".into()).unwrap();
+    for _ in 0..2 * MAX_LIVE_REGEXES {
+        let again = regexes.get("kiki".into(), "i".into()).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+    }
+    // Different flags make a different regex.
+    let other = regexes.get("kiki".into(), String::new()).unwrap();
+    assert!(!Arc::ptr_eq(&first, &other));
+    // Once dropped, a regex no longer counts.
+    drop((first, other));
+    for i in 0..MAX_LIVE_REGEXES {
+        regexes.get(format!("x{i}"), String::new()).unwrap();
+    }
+}

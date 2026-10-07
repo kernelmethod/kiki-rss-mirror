@@ -94,6 +94,32 @@ pub mod host {
     }
 }
 
+/// Regular expressions, compiled and matched by the server: the counterpart of the Lua
+/// API's `kiki.regex`, with the same syntax, flags and limits.
+///
+/// Matching runs as native code in the server, so it is faster than a regex library built
+/// into the plugin, and leaves the plugin smaller: the `regex` crate adds about a
+/// megabyte to a WebAssembly plugin. Flags are letters: `i` (case-insensitive), `m`
+/// (multi-line), `s` (`.` matches a newline), `x` (ignore whitespace) and `U` (swap
+/// greed). A plugin may have 128 distinct patterns, with their flags, alive at once, alone
+/// or in a [`RegexSet`](regex::RegexSet): compiling one it has alive already shares it,
+/// and dropping the last regex or set holding a pattern frees its place. A set matches
+/// each of its patterns in one call, saving a call to the server per pattern.
+///
+/// ```ignore
+/// use kiki_plugin::regex::{Regex, RegexSet};
+///
+/// let re = Regex::compile(r"\bkiki\b", "i")?;
+/// assert!(re.is_match("Hello, Kiki!"));
+/// assert_eq!(re.find("a kiki", 0), Some((2, 6)));
+///
+/// let set = RegexSet::compile(&[("rust".into(), "i".into()), ("^go".into(), "".into())])?;
+/// assert_eq!(set.matches("Rust and go"), [0]);
+/// ```
+pub mod regex {
+    pub use crate::bindings::kiki::plugin::regex::{Regex, RegexSet};
+}
+
 /// Write `message` to the server log at `level`.
 pub fn log(level: Level, message: &str) {
     host::log(level, message);
