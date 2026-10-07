@@ -15,22 +15,6 @@ sudo install -m 0755 kiki /usr/local/bin/kiki
 kiki version
 ```
 
-## Distribution packages
-
-The repository holds packaging for Debian and Ubuntu (`cargo deb`), Fedora
-and other RPM-based distributions (`cargo generate-rpm`), and Arch Linux
-(`dist/PKGBUILD`). Each package installs the binary to `/usr/bin/kiki` and
-a hardened `kiki.service` system unit, creates a `kiki` user, and sets up
-its data directory in `/var/lib/kiki`. See
-[Running as a service](deployment.md) for what happens next.
-
-```bash
-cargo build --release
-cargo deb --no-build                # target/debian/kiki-rss_*.deb
-cargo generate-rpm                  # target/generate-rpm/kiki-rss-*.rpm
-(cd dist && makepkg)                # kiki-*.pkg.tar.zst
-```
-
 ## NixOS
 
 The flake provides a NixOS module that runs Kiki as a system service:

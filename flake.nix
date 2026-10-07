@@ -290,7 +290,6 @@
             checks = self.checks.${system};
 
             packages = with pkgs; [
-              cargo-deb
               mdbook
               # For build.rs to link the plugins written in Rust (see wasmPlugins)
               lld

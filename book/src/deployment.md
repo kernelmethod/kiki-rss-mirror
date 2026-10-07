@@ -18,17 +18,8 @@ question).
 
 ## As a system service
 
-The Debian, RPM and Arch packages install `kiki.service`, which runs Kiki as
-the `kiki` user with its data in `/var/lib/kiki` and its socket at
-`/run/kiki/kiki.sock`:
-
-```bash
-sudo systemctl enable --now kiki.service
-```
-
-To talk to it, add yourself to the `kiki` group, or run clients as the
-`kiki` user. On NixOS, the [NixOS module](installation.md#nixos) sets up the
-same thing.
+On NixOS, the [NixOS module](installation.md#nixos) runs Kiki as a system
+service.
 
 Before starting the server, the service runs `kiki init --check`, which sets
 up the data directory on first run and installs or updates the
@@ -53,8 +44,8 @@ space as the database takes; `--no-backup` skips the backup.
 On Linux, `kiki serve` sandboxes itself as it starts, with Landlock limiting
 the files it can reach and seccomp limiting its system calls. It also fetches
 and parses feeds, and runs plugins, in separate processes with sandboxes of
-their own and no access to the database. The packaged systemd units add
-systemd's own hardening on top. The [threat model](threat-model.md) describes
+their own and no access to the database. The user service that `kiki systemd
+install` sets up adds systemd's own hardening on top. The [threat model](threat-model.md) describes
 each process and what its sandbox allows.
 
 If the sandbox is demonstrably what breaks Kiki on your system,
