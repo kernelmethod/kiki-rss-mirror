@@ -1,7 +1,7 @@
 //! WebAssembly-based [`ScriptRunner`] implementation.
 //!
 //! A WebAssembly plugin is a [component] targeting the `plugin` world of
-//! `wit/kiki-plugin.wit`: it imports the `host` interface, Kiki's counterpart of the `kiki`
+//! `sdk/rust/kiki-plugin/wit/kiki-plugin.wit`: it imports the `host` interface, Kiki's counterpart of the `kiki`
 //! table Lua plugins get, and exports an `init` function and one function per event. A core
 //! module carrying the world's type information, as `wit-bindgen` builds for
 //! `wasm32-unknown-unknown`, is accepted too, and turned into a component when it is
@@ -74,7 +74,7 @@ use wasmtime::{Config, Engine, Store, StoreContextMut, StoreLimits, StoreLimitsB
 
 mod bindings {
     wasmtime::component::bindgen!({
-        path: "wit",
+        path: "sdk/rust/kiki-plugin/wit",
         world: "plugin",
         imports: { default: trappable },
         with: {
