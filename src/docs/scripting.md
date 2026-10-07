@@ -338,8 +338,9 @@ a new version, unless its files have been edited. It also installs
 parameters such as `utm_source` from entries' URLs and the links in their
 content, and tracking pixels from their content, and can keep images from
 being downloaded for chosen feeds with `cache_assets`; `plugins/sanitize`,
-which uses [`kiki.html`](#rewriting-html) to remove scripts, styles and
-unsafe links from entries' content; `plugins/auto-tag`, which tags
+a WebAssembly plugin written in Rust (in `plugins/sanitize-src`), which
+removes scripts, styles and unsafe links from entries' content with the same
+HTML rewriter as [`kiki.html`](#rewriting-html); `plugins/auto-tag`, which tags
 entries that match regular expressions or come from given feeds; and
 `plugins/retention`, which uses [timers](#timers) and
 [`kiki.entries.delete_where`](#deleting-entries) to delete entries some days

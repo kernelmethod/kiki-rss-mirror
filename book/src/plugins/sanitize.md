@@ -64,6 +64,9 @@ directory names sort after `sanitize` see the sanitized content, and can
 add markup back; a plugin of your own that should run on unsanitized
 content needs a name that sorts before it.
 
-See [`plugins/sanitize/main.lua`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/sanitize/main.lua)
-for the details. It is built on [`kiki.html`](../writing-plugins.md#rewriting-html),
-which plugins of your own can use to rewrite entries' HTML too.
+The plugin is written in Rust, as a [WebAssembly plugin](../writing-wasm-plugins.md);
+see [`plugins/sanitize-src`](https://github.com/kernelmethod/kiki-rss/tree/main/plugins/sanitize-src)
+for the details. It parses HTML with the same rewriter as
+[`kiki.html`](../writing-plugins.md#rewriting-html), which plugins of your own
+can use to rewrite entries' HTML too. Versions before 2.0.0 were written in
+Lua, and took the same configuration.

@@ -5,7 +5,7 @@
 # `<name>/plugin.wasm`.
 [workspace]
 resolver = "2"
-members = ["filter-src"]
+members = ["filter-src", "sanitize-src"]
 
 [profile.release]
 opt-level = 3

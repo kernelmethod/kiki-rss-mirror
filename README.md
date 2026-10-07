@@ -186,7 +186,8 @@ kiki plugin config get sanitize --defaults > sanitize.toml
 kiki plugin config set sanitize sanitize.toml
 ```
 
-See [`plugins/sanitize/main.lua`](plugins/sanitize/main.lua) for the details.
+It is written in Rust, as a WebAssembly plugin; see
+[`plugins/sanitize-src`](plugins/sanitize-src) for the details.
 
 ## Where Kiki keeps its files
 

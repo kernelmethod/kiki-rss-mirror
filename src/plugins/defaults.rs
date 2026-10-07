@@ -374,8 +374,8 @@ mod tests {
                 Path::new("privacy/manifest.toml"),
                 Path::new("retention/main.lua"),
                 Path::new("retention/manifest.toml"),
-                Path::new("sanitize/main.lua"),
                 Path::new("sanitize/manifest.toml"),
+                Path::new("sanitize/plugin.wasm"),
             ]
         );
         let plugins: Vec<_> = files.iter().map(|f| f.plugin.as_str()).collect();
@@ -417,8 +417,8 @@ mod tests {
             include_bytes!("../../plugins/retention/main.lua")
         );
         assert_eq!(
-            files[10].contents,
-            include_bytes!("../../plugins/sanitize/main.lua")
+            files[11].contents,
+            include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/sanitize.wasm"))
         );
     }
 
