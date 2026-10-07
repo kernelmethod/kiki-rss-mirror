@@ -15,8 +15,8 @@
 # mdBook output from `mdbook build book` (Nix builds into the store instead)
 /book/build
 
-# The WebAssembly plugin SDK, its examples and the test fixture build into
-# their own target directories
+# The WebAssembly plugin SDK, the test fixture and plugins written in Rust
+# build into their own target directories
 /sdk/**/target
-/examples/**/target
 /tests/wasm-fixture/target
+/plugins/filter-src/target

@@ -7,6 +7,7 @@ use kiki_plugin::{
     export_plugin, host, parse_config, DeleteFilter, Entry, EventKind, FeedEvent, FetchError,
     FetchSchedule, FetchSuccess, Level, Plugin, ScanOptions, ScanSummary,
 };
+use kiki_plugin::regex::{Regex, RegexSet};
 use serde::Deserialize;
 
 #[derive(Deserialize, Default)]
@@ -49,6 +50,15 @@ struct Config {
     /// Print to standard output, which Kiki doesn't provide, on ingesting an entry
     /// with this title.
     print_title: Option<String>,
+    /// Compile this pattern and flags with the server's `regex`, and match each ingested
+    /// entry's title with it.
+    regex: Option<(String, String)>,
+    /// Compile these patterns and flags as a set, and match each ingested entry's title
+    /// with it.
+    regex_set: Vec<(String, String)>,
+    /// On ingesting an entry, compile this many regexes and keep them all alive, then
+    /// drop them and compile one more.
+    regex_count: Option<usize>,
 }
 
 struct Fixture {
@@ -118,6 +128,42 @@ impl Plugin for Fixture {
         }
         if title == self.config.drop_title {
             return None;
+        }
+        if let Some((pattern, flags)) = &self.config.regex {
+            match Regex::compile(pattern, flags) {
+                Ok(re) => seen(
+                    "regex",
+                    format!(
+                        "{} {:?}",
+                        re.is_match(&entry.title),
+                        re.find(&entry.title, 0)
+                    ),
+                ),
+                Err(e) => seen("regex", e),
+            }
+        }
+        if !self.config.regex_set.is_empty() {
+            match RegexSet::compile(&self.config.regex_set) {
+                Ok(set) => seen("regex-set", format!("{:?}", set.matches(&entry.title))),
+                Err(e) => seen("regex-set", e),
+            }
+        }
+        if let Some(count) = self.config.regex_count {
+            let mut held = Vec::new();
+            let mut result = "ok".to_string();
+            for i in 0..count {
+                match Regex::compile(&format!("x{i}"), "") {
+                    Ok(re) => held.push(re),
+                    Err(e) => {
+                        result = format!("{i}: {e}");
+                        break;
+                    }
+                }
+            }
+            seen("regex-count", result);
+            drop(held);
+            let after = Regex::compile("y", "").map_or_else(|e| e, |_| "ok".to_string());
+            seen("regex-after-drop", after);
         }
         self.made += 1;
         if let Some(suffix) = &self.config.suffix {

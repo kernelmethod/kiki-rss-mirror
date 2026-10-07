@@ -24,7 +24,8 @@
               # (e.g. src/cli/web/*.html, src/cli/web/*.js)
               webUiFilter = path: _type: builtins.match ".*/src/.*\\.(html|js)$" path != null;
               # Bundled plugins, packed into a .tar.zst by build.rs and pulled
-              # into tests via include_str! (e.g. plugins/filter/main.lua)
+              # into tests via include_str! and include_bytes! (e.g.
+              # plugins/filter/plugin.wasm)
               pluginsFilter = path: _type: builtins.match ".*/plugins(/.*)?" path != null;
               # The WebAssembly plugin interface, read by wasmtime's bindgen!
               # (src/scripting/wasm.rs), and the plugin its tests run

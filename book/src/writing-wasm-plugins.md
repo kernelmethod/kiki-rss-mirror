@@ -53,6 +53,8 @@ in Kiki's source. A plugin is a component targeting its `plugin` world, which:
 - imports `kiki:plugin/host`, the counterpart of the `kiki` table Lua
   plugins get: `log`, `store-get` and `store-set`, `tag-entry` and
   `untag-entry`, `start-scan`, `delete-entries`, `get-feed`, and `every`;
+- imports `kiki:plugin/regex`, the counterpart of `kiki.regex`: see
+  [Regular expressions](#regular-expressions);
 - exports `init`, which Kiki calls with the plugin's config, as a JSON
   object, when the plugin loads. It returns the events the plugin handles,
   and only those are delivered to it; an error fails the load, as an error
@@ -82,7 +84,6 @@ crate-type = ["cdylib"]
 [dependencies]
 kiki-plugin = { git = "https://github.com/kernelmethod/kiki-rss" }
 serde = { version = "1", features = ["derive"] }
-regex = "1"
 
 [profile.release]
 opt-level = "s"
@@ -95,8 +96,8 @@ and in `src/lib.rs`, a plugin that hides entries whose title matches one of
 the patterns in its config:
 
 ```rust,ignore
+use kiki_plugin::regex::Regex;
 use kiki_plugin::{export_plugin, parse_config, Entry, EventKind, Plugin};
-use regex::Regex;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -116,7 +117,7 @@ impl Plugin for HideMatching {
         let patterns = config
             .patterns
             .iter()
-            .map(|p| Regex::new(p).map_err(|e| e.to_string()))
+            .map(|p| Regex::compile(p, ""))
             .collect::<Result<_, _>>()?;
         Ok(HideMatching { patterns })
     }
@@ -142,8 +143,9 @@ cp target/wasm32-wasip2/release/hide_matching.wasm \
     ~/.local/share/kiki/plugins/user/hide-matching/plugin.wasm
 ```
 
-A fuller version of this plugin, with a manifest describing its settings, is
-in [`examples/wasm/hide-matching`](https://github.com/kernelmethod/kiki-rss/tree/main/examples/wasm/hide-matching)
+For a fuller plugin, with a manifest describing its settings, see the
+[`filter`](plugins/filter.md) plugin Kiki installs by default, whose source is
+in [`plugins/filter-src`](https://github.com/kernelmethod/kiki-rss/tree/main/plugins/filter-src)
 in Kiki's source.
 
 `Plugin::new` is called once when the plugin loads, and every handler is
@@ -151,6 +153,30 @@ called on the value it returns, so a plugin keeps what it needs, such as
 compiled regexes, in its own fields. A handler that panics traps, which is
 handled as described [below](#resource-limits). Other languages can use the
 WIT file with their own bindings generator, such as `wit-bindgen`'s for C.
+
+## Regular expressions
+
+`kiki_plugin::regex`, the `regex` interface, gives plugins the regular
+expressions Lua plugins get from [`kiki.regex`](writing-plugins.md): the same
+syntax and flags, compiled and matched by Kiki itself, as native code. That is
+faster than a regex library built into the plugin, and leaves the plugin much
+smaller: the `regex` crate alone adds about a megabyte to a plugin.
+
+- `Regex::compile(pattern, flags)` compiles a pattern, with flags such as
+  `"i"` for case-insensitive; `is_match` and `find` match it.
+- `RegexSet::compile(patterns)` compiles a list of patterns and flags, whose
+  `matches` returns which of them match a string, in one call to Kiki rather
+  than one per pattern.
+
+A plugin may have 128 distinct patterns alive at once. Compiling a pattern
+it has alive already, with the same flags, shares it, so a pattern in a
+`Regex` and a `RegexSet` counts once; dropping the last one holding a
+pattern frees its place.
+
+Plugins can bundle a regex library instead, if they need something the
+interface lacks. Prefer matching each pattern alone to the `regex` crate's
+`RegexSet`, though: a set of patterns, one of which has no literal text to
+look for, can be a hundred times slower on text that is not ASCII.
 
 ## What a plugin can reach
 

@@ -151,12 +151,44 @@ interface host {
     every: func(secs: u64) -> result<u32, string>;
 }
 
+/// Regular expressions, compiled and matched by the server: the counterpart of
+/// `kiki.regex`, with the same syntax, flags and limits. Matching runs natively, so it is
+/// faster than a regex library built into the plugin, and the plugin is smaller.
+///
+/// Flags are letters: `i` (case-insensitive), `m` (multi-line), `s` (`.` matches a
+/// newline), `x` (ignore whitespace) and `U` (swap greed). A plugin may have 128
+/// distinct patterns, with their flags, alive at once, alone or in sets: compiling one it
+/// has alive already shares it, and counts nothing more.
+interface regex {
+    /// A compiled regular expression.
+    resource regex {
+        /// Compile `pattern` with `flags`.
+        compile: static func(pattern: string, %flags: string) -> result<regex, string>;
+        /// Whether the regex matches anywhere in `haystack`.
+        is-match: func(haystack: string) -> bool;
+        /// The byte offsets of the start and end of the first match in `haystack` at or
+        /// after the byte offset `start`.
+        find: func(haystack: string, start: u32) -> option<tuple<u32, u32>>;
+    }
+
+    /// Patterns matched together, in one call. Each is matched alone, as `regex` would
+    /// match it: one pass over the haystack for all of them would be slower whenever one
+    /// pattern has no literal text to look for.
+    resource regex-set {
+        /// Compile `patterns`, each a pattern and its flags.
+        compile: static func(patterns: list<tuple<string, string>>) -> result<regex-set, string>;
+        /// The indices of the patterns that match `haystack`, in order.
+        matches: func(haystack: string) -> list<u32>;
+    }
+}
+
 world plugin {
     use types.{
         event-kind, entry, fetch-success, fetch-error, feed-event,
         fetch-schedule, scan-summary,
     };
     import host;
+    import regex;
 
     /// Called when plugins load, with the plugin's config as a JSON
     /// object. Returns the events the plugin handles, or an error, which
