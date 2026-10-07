@@ -143,8 +143,9 @@ cp target/wasm32-wasip2/release/hide_matching.wasm \
     ~/.local/share/kiki/plugins/user/hide-matching/plugin.wasm
 ```
 
-A fuller version of this plugin, with a manifest describing its settings, is
-in [`examples/wasm/hide-matching`](https://github.com/kernelmethod/kiki-rss/tree/main/examples/wasm/hide-matching)
+For a fuller plugin, with a manifest describing its settings, see the
+[`filter`](plugins/filter.md) plugin Kiki installs by default, whose source is
+in [`plugins/filter-src`](https://github.com/kernelmethod/kiki-rss/tree/main/plugins/filter-src)
 in Kiki's source.
 
 `Plugin::new` is called once when the plugin loads, and every handler is
