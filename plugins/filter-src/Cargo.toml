@@ -1,9 +1,9 @@
 [package]
 name = "kiki-filter"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2021"
 publish = false
-description = "The filter plugin, written in Rust as a WebAssembly component"
+description = "Kiki's filter plugin, built into plugins/filter/plugin.wasm"
 license = "MIT"
 
 [lib]
@@ -20,5 +20,5 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
-# Not part of kiki-rss's build; tools/build-filter-wasm.sh builds it.
+# Not part of kiki-rss's build; tools/build-filter-plugin.sh builds it.
 [workspace]

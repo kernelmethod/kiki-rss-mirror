@@ -84,7 +84,7 @@ pub mod settings;
 mod adaptive_fetch_tests;
 #[cfg(test)]
 mod auto_tag_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "wasm-plugins"))]
 mod filter_tests;
 #[cfg(test)]
 mod privacy_tests;

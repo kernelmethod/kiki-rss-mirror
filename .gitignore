@@ -21,4 +21,4 @@
 /sdk/**/target
 /examples/**/target
 /tests/wasm-fixture/target
-/plugins/*/target
+/plugins/filter-src/target

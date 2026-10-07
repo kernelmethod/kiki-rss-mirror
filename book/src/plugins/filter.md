@@ -32,17 +32,10 @@ EOF
 Whenever its rules change, the filter also applies them to the entries
 already downloaded. It never unhides entries.
 
-See [`plugins/filter/main.lua`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/filter/main.lua) for every
-setting.
+See [`plugins/filter-src/src/lib.rs`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/filter-src/src/lib.rs)
+for every setting.
 
-## The WebAssembly version
-
-[`plugins/filter-wasm`](https://github.com/kernelmethod/kiki-rss/tree/main/plugins/filter-wasm)
-is the same plugin ported to Rust and built as a
-[WebAssembly component](../writing-wasm-plugins.md). It takes the same
-settings, keeps its record of the rules it has applied in the same place,
-and hides the same entries, so it can replace the Lua version in place:
-copy its `manifest.toml` and `plugin.wasm` into the `filter` plugin
-directory, in place of `manifest.toml` and `main.lua`. Rebuild
-`plugin.wasm` with `tools/build-filter-wasm.sh`, and compare the two with
-`cargo run --profile profiling --example filter_bench`.
+The filter is written in Rust, as a [WebAssembly plugin](../writing-wasm-plugins.md),
+and installed as `manifest.toml` and `plugin.wasm`. Versions before 3.1.0
+were written in Lua; they took the same settings, and `kiki init --check`
+replaces them unless they have been edited.

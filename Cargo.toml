@@ -16,10 +16,6 @@ name = "kiki"
 path = "src/main.rs"
 required-features = ["cli"]
 
-[[example]]
-name = "filter_bench"
-required-features = ["wasm-plugins"]
-
 [features]
 default = ["cli", "systemd", "api-docs", "metrics", "web-ui", "default-plugins", "wasm-plugins"]
 cli = ["clap"]
@@ -27,8 +23,9 @@ systemd = []
 api-docs = ["utoipa-scalar"]
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 web-ui = ["cli"]
-# Bundle the plugins in plugins/ that `kiki init` installs (see build.rs)
-default-plugins = ["dep:tar", "dep:zstd"]
+# Bundle the plugins in plugins/ that `kiki init` installs (see build.rs). The
+# filter plugin is a WebAssembly component, so they need WebAssembly support.
+default-plugins = ["dep:tar", "dep:zstd", "wasm-plugins"]
 # Run plugins written as WebAssembly components (see src/scripting/wasm.rs)
 wasm-plugins = ["dep:wasmtime", "dep:wit-component"]
 extra-tests = []

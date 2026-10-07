@@ -106,8 +106,9 @@ EOF
 ```
 
 Whenever its rules change, the filter also applies them to the entries already
-downloaded. It never unhides entries. See
-[`plugins/filter/main.lua`](plugins/filter/main.lua) for every setting.
+downloaded. It never unhides entries. It is written in Rust, as a WebAssembly
+plugin; see [`plugins/filter-src/src/lib.rs`](plugins/filter-src/src/lib.rs) for
+every setting.
 
 ### Tagging entries automatically
 

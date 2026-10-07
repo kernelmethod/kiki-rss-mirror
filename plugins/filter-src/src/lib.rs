@@ -1,8 +1,9 @@
 //! Hide entries whose fields match, or fail to match, regular expressions.
 //!
-//! The Lua plugin in `plugins/filter`, ported to Rust and built as a WebAssembly
-//! component. It takes the same config, records the rules it applied under the same store
-//! key, and hides the same entries, so either can replace the other.
+//! Kiki's `filter` plugin, built as a WebAssembly component into
+//! `plugins/filter/plugin.wasm` by `tools/build-filter-plugin.sh`. Versions before 3.1.0
+//! were written in Lua; this one takes the same config, records the rules it applied under
+//! the same store key, and hides the same entries.
 //!
 //! Config:
 //!
