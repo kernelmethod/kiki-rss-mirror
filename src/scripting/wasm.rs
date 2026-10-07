@@ -234,7 +234,37 @@ fn compile(plugin: &str, component: &WasmComponent) -> Result<Component, WasmErr
             hash: component.hash_hex(),
         });
     }
+    #[cfg(test)]
+    return compile_once(plugin, &component.bytes);
+    #[cfg(not(test))]
     compile_bytes(plugin, &component.bytes)
+}
+
+/// Compile `bytes` as [`compile_bytes`] does, once per test process.
+///
+/// Tests build runners from components' bytes, as the server does, so [`compile`] would
+/// compile them anew for every test; Cranelift takes seconds over a plugin such as
+/// `sanitize`, and the plugins' tests would spend most of their time compiling the same
+/// few components. Tests running at once wait for the first to compile it. Failures are
+/// not kept, so that each is reported with its own plugin's name.
+#[cfg(test)]
+fn compile_once(plugin: &str, bytes: &[u8]) -> Result<Component, WasmError> {
+    type Slot = Arc<Mutex<Option<Component>>>;
+    static COMPILED: OnceLock<Mutex<HashMap<[u8; 32], Slot>>> = OnceLock::new();
+    let slot = COMPILED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(*blake3::hash(bytes).as_bytes())
+        .or_default()
+        .clone();
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(compiled) = slot.as_ref() {
+        return Ok(compiled.clone());
+    }
+    let compiled = compile_bytes(plugin, bytes)?;
+    *slot = Some(compiled.clone());
+    Ok(compiled)
 }
 
 /// Compile `component`, the code of the plugin named `plugin`, and keep it, so that
