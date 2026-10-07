@@ -107,7 +107,7 @@ EOF
 
 Whenever its rules change, the filter also applies them to the entries already
 downloaded. It never unhides entries. It is written in Rust, as a WebAssembly
-plugin; see [`plugins/filter-src/src/lib.rs`](plugins/filter-src/src/lib.rs) for
+plugin; see [`plugins/filter/src/lib.rs`](plugins/filter/src/lib.rs) for
 every setting.
 
 ### Tagging entries automatically
@@ -186,7 +186,8 @@ kiki plugin config get sanitize --defaults > sanitize.toml
 kiki plugin config set sanitize sanitize.toml
 ```
 
-See [`plugins/sanitize/main.lua`](plugins/sanitize/main.lua) for the details.
+It is written in Rust, as a WebAssembly plugin; see
+[`plugins/sanitize/src/lib.rs`](plugins/sanitize/src/lib.rs) for the details.
 
 ## Where Kiki keeps its files
 

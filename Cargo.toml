@@ -94,6 +94,7 @@ http = "1"
 itertools = "0.14"
 serial_test = "3.4"
 tempfile = "3"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [profile.dev]
 incremental = true
@@ -168,3 +169,9 @@ true
 
 [package.metadata.generate-rpm.requires]
 systemd = "*"
+
+[[bench]]
+name = "sanitize"
+harness = false
+# The plugin is built only for the default plugins.
+required-features = ["default-plugins"]

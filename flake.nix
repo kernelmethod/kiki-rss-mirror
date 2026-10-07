@@ -22,8 +22,10 @@
           # wasm32-unknown-unknown.
           wasmPlugins = let
             fs = pkgs.lib.fileset;
-            # Each plugins/<name>-src crate, without any target directory.
-            crates = builtins.filter (pkgs.lib.hasSuffix "-src")
+            # Each plugin directory under plugins/ that is also a crate,
+            # without any target directory.
+            crates = builtins.filter
+              (name: builtins.pathExists (./plugins + "/${name}/Cargo.toml"))
               (builtins.attrNames (builtins.readDir ./plugins));
             src = fs.toSource {
               root = ./.;
@@ -53,10 +55,9 @@
             buildPhaseCargoCommand = ''
               cargo build --release --locked --workspace --target wasm32-unknown-unknown
             '';
-            # plugins/<name>-src's package is kiki-<name> (see build.rs).
+            # plugins/<name>'s package is kiki-<name> (see build.rs).
             installPhaseCommand = ''
-              for crate in *-src; do
-                name=''${crate%-src}
+              for name in ${builtins.concatStringsSep " " crates}; do
                 install -Dm644 "target/wasm32-unknown-unknown/release/kiki_''${name//-/_}.wasm" \
                   "$out/$name.wasm"
               done

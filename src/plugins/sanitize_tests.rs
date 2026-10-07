@@ -1,14 +1,16 @@
-//! Tests for the `sanitize` plugin shipped in `plugins/sanitize/`.
+//! Tests for the `sanitize` plugin shipped in `plugins/sanitize/`, built from
+//! the crate in that directory by `build.rs`.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use crate::plugins::PluginManifest;
-use crate::scripting::lua::{LuaScriptRunner, ScriptError};
+use crate::scripting::composite::CompositeRunner;
+use crate::scripting::wasm::WasmScriptRunner;
 use crate::scripting::{FeedEntry, ScriptRunner, ScriptSource, TimeBudget};
 use serde_json::{json, Value};
 
 const MANIFEST: &str = include_str!("../../plugins/sanitize/manifest.toml");
-const MAIN: &str = include_str!("../../plugins/sanitize/main.lua");
+const WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/sanitize.wasm"));
 
 /// The plugin's source, with `config` applied over its defaults.
 fn source(config: Value) -> ScriptSource {
@@ -18,19 +20,20 @@ fn source(config: Value) -> ScriptSource {
     if let Value::Object(overrides) = config {
         merged.extend(overrides);
     }
-    let mut source = ScriptSource::new(MAIN);
-    source.name = "sanitize".to_string();
-    source.config = Value::Object(merged).to_string();
-    source.time_budget = time_budget;
-    source
+    ScriptSource {
+        name: "sanitize".to_string(),
+        config: Value::Object(merged).to_string(),
+        time_budget,
+        ..ScriptSource::wasm(WASM.to_vec())
+    }
 }
 
 /// The plugin, loaded with `config` applied over its defaults.
-fn plugin(config: Value) -> Result<LuaScriptRunner, ScriptError> {
-    LuaScriptRunner::from_sources(&[source(config)])
+fn plugin(config: Value) -> Result<WasmScriptRunner, String> {
+    WasmScriptRunner::from_sources_with(&[source(config)], None).map_err(|e| e.to_string())
 }
 
-fn default_plugin() -> LuaScriptRunner {
+fn default_plugin() -> WasmScriptRunner {
     plugin(json!({})).unwrap()
 }
 
@@ -52,7 +55,7 @@ fn entry(content: Option<&str>) -> FeedEntry {
 }
 
 /// The content `content` becomes, going through `runner`.
-fn sanitize(runner: &LuaScriptRunner, content: &str) -> String {
+fn sanitize(runner: &dyn ScriptRunner, content: &str) -> String {
     runner
         .dispatch_transform_entry(entry(Some(content)))
         .unwrap()
@@ -394,18 +397,39 @@ fn a_typical_post_is_cleaned_up() {
     );
 }
 
+/// The plugin bounds the memory it uses: content it has no room to rewrite is reduced to
+/// its text, cut short where the plugin runs out of room, rather than making it trap,
+/// which would let the content through unsanitized.
 #[test]
 fn content_that_cannot_be_rewritten_is_reduced_to_text() {
-    // Another plugin, loaded first, breaks kiki.html.rewrite for everyone.
-    let breaker = ScriptSource::new(r#"kiki.html.rewrite = function() error("broken") end"#);
-    let runner = LuaScriptRunner::from_sources(&[breaker, source(json!({}))]).unwrap();
+    let runner = default_plugin();
+    let text = "a".repeat(100);
+    let unit = format!(r#"<p onclick="x()">{text} &amp; b<script>x()</script></p>"#);
+
+    let html = unit.repeat(20_000);
     assert_eq!(
-        sanitize(
-            &runner,
-            r#"<p onclick="x()">Fish &amp; chips <script>x()</script></p>"#
-        ),
-        "Fish &amp; chips x()"
+        sanitize(&runner, &html),
+        format!("<p>{text} &amp; b</p>").repeat(20_000)
     );
+
+    // About 11 MB, which with the rewritten HTML would need more than the plugin's 16 MiB.
+    // Content this large only gets into the plugin when its memory has room for it in one
+    // piece, as a fresh plugin's does: otherwise Kiki fails to hand it over, and the entry
+    // passes through the plugin unchanged, as it did through the Lua plugin.
+    let fresh = default_plugin();
+    let html = unit.repeat(80_000);
+    let out = sanitize(&fresh, &html);
+    let as_text = format!("{text} &amp; bx()");
+    assert!(out.starts_with(&as_text.repeat(2)), "{}", &out[..300]);
+    assert!(!out.contains('<'));
+    assert!(
+        out.len() > 1024 * 1024 && out.len() < html.len(),
+        "{}",
+        out.len()
+    );
+
+    // The plugin still works afterwards.
+    assert_eq!(sanitize(&fresh, "<p onclick=x>a</p>"), "<p>a</p>");
 }
 
 #[test]
@@ -430,7 +454,7 @@ fn sanitize_still_works_on_privacy_cleaned_content() {
     let mut strip = ScriptSource::new(include_str!("../../plugins/privacy/main.lua"));
     strip.name = "privacy".to_string();
     strip.config = Value::Object(manifest.config).to_string();
-    let runner = LuaScriptRunner::from_sources(&[strip, source(json!({}))]).unwrap();
+    let runner = CompositeRunner::from_sources_with(&[strip, source(json!({}))], None).unwrap();
 
     assert_eq!(
         sanitize(

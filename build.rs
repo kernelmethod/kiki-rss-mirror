@@ -8,10 +8,11 @@
 //! directory.
 //!
 //! Plugins written in Rust don't keep their `plugin.wasm` in the repository.
-//! A default plugin with a `plugins/<name>-src` crate, a member of the
-//! workspace in `plugins/Cargo.toml`, is built from it for
-//! `wasm32-unknown-unknown` into `$OUT_DIR/plugins-wasm/<name>.wasm`, and
-//! bundled as `<name>/plugin.wasm`. Set `KIKI_PLUGINS_WASM_DIR` to a directory
+//! A default plugin whose directory is also a crate, with a `Cargo.toml` and
+//! `src/` beside its `manifest.toml`, and a member of the workspace in
+//! `plugins/Cargo.toml`, is built for `wasm32-unknown-unknown` into
+//! `$OUT_DIR/plugins-wasm/<name>.wasm`, and bundled as `<name>/plugin.wasm`
+//! without its source. Set `KIKI_PLUGINS_WASM_DIR` to a directory
 //! of prebuilt `<name>.wasm` files to bundle those instead, as the Nix build
 //! does.
 
@@ -40,6 +41,11 @@ mod default_plugins {
         "retention",
         "sanitize",
     ];
+
+    /// What a plugin written in Rust has in its directory besides the plugin
+    /// itself: its crate, and whatever building it by hand leaves there,
+    /// including a `plugin.wasm` the bundled one replaces. Not bundled.
+    const CRATE_FILES: &[&str] = &["Cargo.toml", "Cargo.lock", "src", "target", "plugin.wasm"];
 
     /// How deep inside a plugin directory files are bundled. Matches the depth
     /// the server looks for source files at.
@@ -77,10 +83,13 @@ mod default_plugins {
         for name in DEFAULT_PLUGINS {
             let dir = root.join("plugins").join(name);
             let mut files = Vec::new();
-            collect_files(&dir, &dir, 0, &mut files)?;
+            let skip: &[&str] = if wasm.contains_key(name) {
+                CRATE_FILES
+            } else {
+                &[]
+            };
+            collect_files(&dir, &dir, 0, skip, &mut files)?;
             if let Some(path) = wasm.get(name) {
-                // Replaces any plugin.wasm built or copied there by hand.
-                files.retain(|(relative, _)| relative != "plugin.wasm");
                 files.push(("plugin.wasm".to_string(), path.clone()));
             }
             files.sort();
@@ -107,8 +116,8 @@ mod default_plugins {
         fs::write(out_dir.join("default-plugins.tar.zst"), compressed)
     }
 
-    /// Builds every plugin in [`DEFAULT_PLUGINS`] that has a
-    /// `plugins/<name>-src` crate into `$OUT_DIR/plugins-wasm/<name>.wasm`, or
+    /// Builds every plugin in [`DEFAULT_PLUGINS`] whose directory is a crate
+    /// into `$OUT_DIR/plugins-wasm/<name>.wasm`, or
     /// copies the prebuilt ones from [`PREBUILT_DIR`] there, and returns their
     /// paths by plugin name.
     ///
@@ -119,7 +128,7 @@ mod default_plugins {
         let names: Vec<&'static str> = DEFAULT_PLUGINS
             .iter()
             .copied()
-            .filter(|name| crate_dir(&plugins_dir, name).join("Cargo.toml").is_file())
+            .filter(|name| plugins_dir.join(name).join("Cargo.toml").is_file())
             .collect();
 
         println!("cargo:rerun-if-env-changed={PREBUILT_DIR}");
@@ -143,7 +152,7 @@ mod default_plugins {
                 (None, Some(dir)) => (
                     dir.join(format!("kiki_{}.wasm", name.replace('-', "_"))),
                     format!(
-                        "is plugins/{name}-src in plugins/Cargo.toml's members, \
+                        "is plugins/{name} in plugins/Cargo.toml's members, \
                          with its package named kiki-{name}?"
                     ),
                 ),
@@ -164,11 +173,6 @@ mod default_plugins {
         Ok(paths)
     }
 
-    /// The crate the plugin `name` is built from.
-    fn crate_dir(plugins_dir: &Path, name: &str) -> PathBuf {
-        plugins_dir.join(format!("{name}-src"))
-    }
-
     /// Builds the workspace in `plugins/`, holding the crates of the plugins
     /// `names`, and returns the directory the `.wasm` files land in.
     fn build_workspace(
@@ -186,7 +190,7 @@ mod default_plugins {
             root.join("wit"),
         ];
         for name in names {
-            let dir = crate_dir(plugins_dir, name);
+            let dir = plugins_dir.join(name);
             inputs.push(dir.join("Cargo.toml"));
             inputs.push(dir.join("src"));
         }
@@ -235,11 +239,13 @@ mod default_plugins {
 
     /// Collects every regular file under `dir`, as its `/`-separated path
     /// relative to `base` together with its full path. Hidden files and editor
-    /// backups (`*~`) are skipped.
+    /// backups (`*~`) are skipped, and so are the entries of `base` named in
+    /// `skip`.
     fn collect_files(
         base: &Path,
         dir: &Path,
         depth: usize,
+        skip: &[&str],
         files: &mut Vec<(String, PathBuf)>,
     ) -> io::Result<()> {
         if depth > MAX_DEPTH {
@@ -252,13 +258,16 @@ mod default_plugins {
             let path = entry.path();
             let file_name = entry.file_name();
             let file_name = file_name.to_string_lossy();
-            if file_name.starts_with('.') || file_name.ends_with('~') {
+            if file_name.starts_with('.')
+                || file_name.ends_with('~')
+                || (depth == 0 && skip.contains(&file_name.as_ref()))
+            {
                 continue;
             }
 
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
-                collect_files(base, &path, depth + 1, files)?;
+                collect_files(base, &path, depth + 1, skip, files)?;
             } else if file_type.is_file() {
                 println!("cargo:rerun-if-changed={}", path.display());
                 let relative = path

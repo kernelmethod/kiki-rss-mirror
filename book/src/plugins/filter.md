@@ -32,7 +32,7 @@ EOF
 Whenever its rules change, the filter also applies them to the entries
 already downloaded. It never unhides entries.
 
-See [`plugins/filter-src/src/lib.rs`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/filter-src/src/lib.rs)
+See [`plugins/filter/src/lib.rs`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/filter/src/lib.rs)
 for every setting.
 
 The filter is written in Rust, as a [WebAssembly plugin](../writing-wasm-plugins.md),
