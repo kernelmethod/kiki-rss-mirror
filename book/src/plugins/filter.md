@@ -34,3 +34,15 @@ already downloaded. It never unhides entries.
 
 See [`plugins/filter/main.lua`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/filter/main.lua) for every
 setting.
+
+## The WebAssembly version
+
+[`plugins/filter-wasm`](https://github.com/kernelmethod/kiki-rss/tree/main/plugins/filter-wasm)
+is the same plugin ported to Rust and built as a
+[WebAssembly component](../writing-wasm-plugins.md). It takes the same
+settings, keeps its record of the rules it has applied in the same place,
+and hides the same entries, so it can replace the Lua version in place:
+copy its `manifest.toml` and `plugin.wasm` into the `filter` plugin
+directory, in place of `manifest.toml` and `main.lua`. Rebuild
+`plugin.wasm` with `tools/build-filter-wasm.sh`, and compare the two with
+`cargo run --profile profiling --example filter_bench`.

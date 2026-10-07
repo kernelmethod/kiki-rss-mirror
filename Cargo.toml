@@ -16,6 +16,10 @@ name = "kiki"
 path = "src/main.rs"
 required-features = ["cli"]
 
+[[example]]
+name = "filter_bench"
+required-features = ["wasm-plugins"]
+
 [features]
 default = ["cli", "systemd", "api-docs", "metrics", "web-ui", "default-plugins", "wasm-plugins"]
 cli = ["clap"]
