@@ -9,6 +9,7 @@ use super::super::*;
 use crate::config::Settings;
 use crate::plugins::services::ServerServices;
 use crate::scripting::lua::LuaScriptRunner;
+use crate::scripting::wasm::WasmScriptRunner;
 use crate::scripting::{ScriptRunnerHandle, ScriptSource};
 use crate::test::{FeedServerState, SharedFeedServerState, TestBuilder, TestConfig};
 use anyhow::Result;
@@ -20,7 +21,10 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 const PLUGIN: &str = "adaptive-fetch";
-const MAIN: &str = include_str!("../../../plugins/adaptive-fetch/main.lua");
+const WASM: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/plugins-wasm/adaptive-fetch.wasm"
+));
 
 /// Slack for assertions on `next_fetch_at`, covering the time the test
 /// itself takes.
@@ -35,7 +39,7 @@ struct Setup {
     pool: crate::db::Db,
     /// The plugin, loaded with the config the test asked for, or `None` to
     /// refresh with no plugins at all.
-    runner: Option<LuaScriptRunner>,
+    runner: Option<WasmScriptRunner>,
 }
 
 /// Start a feed server in `state`, insert a feed pointing at it with the
@@ -64,10 +68,12 @@ async fn setup(state: FeedServerState, config: Option<Value>, interval: i64) -> 
                 CancellationToken::new(),
             );
             services.set_loaded(HashMap::from([(PLUGIN.to_string(), vec![])]));
-            let mut source = ScriptSource::new(MAIN);
-            source.name = PLUGIN.to_string();
-            source.config = config.to_string();
-            Some(LuaScriptRunner::from_sources_with(
+            let source = ScriptSource {
+                name: PLUGIN.to_string(),
+                config: config.to_string(),
+                ..ScriptSource::wasm(WASM.to_vec())
+            };
+            Some(WasmScriptRunner::from_sources_with(
                 &[source],
                 Some(Arc::new(services)),
             )?)

@@ -342,10 +342,12 @@ being downloaded for chosen feeds with `cache_assets`; `plugins/sanitize`,
 a WebAssembly plugin written in Rust (in `plugins/sanitize/src`), which
 removes scripts, styles and unsafe links from entries' content with the same
 HTML rewriter as [`kiki.html`](#rewriting-html); `plugins/auto-tag`, which tags
-entries that match regular expressions or come from given feeds; and
-`plugins/retention`, which uses [timers](#timers) and
-[`kiki.entries.delete_where`](#deleting-entries) to delete entries some days
-after their feed stops listing them.
+entries that match regular expressions or come from given feeds;
+`plugins/adaptive-fetch`, which uses [`fetch.schedule`](#scheduling-fetches) to
+back off from feeds that keep turning out unchanged; and `plugins/retention`,
+which uses [timers](#timers) and [deletes entries](#deleting-entries) some
+days after their feed stops listing them. These are WebAssembly plugins
+written in Rust too, each with its source in its directory's `src`.
 
 ## Events
 
@@ -426,7 +428,7 @@ feed's own `<ttl>` or `sy:updatePeriod`) runs out, but no sooner than
 `min_polling_cadence_seconds` and no later than the feed's own interval.
 When that hint is shorter than the interval, `fetch.schedule` fires, and its
 handlers may have Kiki wait longer. The bundled `adaptive-fetch` plugin
-(`plugins/adaptive-fetch/main.lua`) uses it to back off from feeds that keep
+(`plugins/adaptive-fetch/src/lib.rs`) uses it to back off from feeds that keep
 turning out unchanged.
 
 The payload is a table with:
