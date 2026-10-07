@@ -6,6 +6,12 @@
 //! under `plugins/` is stored under its own name at the root of the archive.
 //! `kiki init` then unpacks them into the new home directory's plugins
 //! directory.
+//!
+//! The filter plugin's `plugin.wasm` isn't kept in the repository: this script
+//! builds it from `plugins/filter-src` for `wasm32-unknown-unknown`, into
+//! `$OUT_DIR/filter-plugin.wasm`, and bundles it as `filter/plugin.wasm`. Set
+//! `KIKI_FILTER_PLUGIN_WASM` to the path of a prebuilt one to use that instead,
+//! as the Nix build does.
 
 fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
@@ -19,6 +25,7 @@ mod default_plugins {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     /// Plugins, by directory name under `plugins/`, that Kiki installs by
     /// default.
@@ -39,6 +46,15 @@ mod default_plugins {
     /// small and compressed once per build.
     const ZSTD_LEVEL: i32 = 19;
 
+    /// The target the filter plugin is built for. Kiki turns the core module
+    /// it produces into a component when it loads it. Unlike `wasm32-wasip2`,
+    /// nixpkgs' Rust toolchain ships its standard library.
+    const WASM_TARGET: &str = "wasm32-unknown-unknown";
+
+    /// Environment variable naming a prebuilt filter plugin to bundle instead
+    /// of building one.
+    const PREBUILT_FILTER: &str = "KIKI_FILTER_PLUGIN_WASM";
+
     fn env(name: &str) -> String {
         std::env::var(name).unwrap_or_else(|_| panic!("${name} is not set"))
     }
@@ -52,11 +68,18 @@ mod default_plugins {
         let root = PathBuf::from(env("CARGO_MANIFEST_DIR"));
         let out_dir = PathBuf::from(env("OUT_DIR"));
 
+        let filter_wasm = filter_plugin(&root, &out_dir)?;
+
         let mut archive = tar::Builder::new(Vec::new());
         for name in DEFAULT_PLUGINS {
             let dir = root.join("plugins").join(name);
             let mut files = Vec::new();
             collect_files(&dir, &dir, 0, &mut files)?;
+            if *name == "filter" {
+                // Replaces any plugin.wasm left over from when it was committed.
+                files.retain(|(relative, _)| relative != "plugin.wasm");
+                files.push(("plugin.wasm".to_string(), filter_wasm.clone()));
+            }
             files.sort();
 
             for (relative, path) in files {
@@ -79,6 +102,87 @@ mod default_plugins {
         let tarball = archive.into_inner()?;
         let compressed = zstd::encode_all(tarball.as_slice(), ZSTD_LEVEL)?;
         fs::write(out_dir.join("default-plugins.tar.zst"), compressed)
+    }
+
+    /// Builds the filter plugin from `plugins/filter-src` into
+    /// `$OUT_DIR/filter-plugin.wasm`, or copies the prebuilt one
+    /// [`PREBUILT_FILTER`] names there, and returns its path.
+    ///
+    /// The tests in `src/plugins/filter_tests.rs` and `src/plugins/defaults.rs`
+    /// embed it from there.
+    fn filter_plugin(root: &Path, out_dir: &Path) -> io::Result<PathBuf> {
+        let dest = out_dir.join("filter-plugin.wasm");
+
+        println!("cargo:rerun-if-env-changed={PREBUILT_FILTER}");
+        if let Some(prebuilt) = std::env::var_os(PREBUILT_FILTER) {
+            let prebuilt = PathBuf::from(prebuilt);
+            println!("cargo:rerun-if-changed={}", prebuilt.display());
+            fs::copy(&prebuilt, &dest).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("copying ${PREBUILT_FILTER} ({}): {e}", prebuilt.display()),
+                )
+            })?;
+            return Ok(dest);
+        }
+
+        let src = root.join("plugins").join("filter-src");
+        let sdk = root.join("sdk").join("rust").join("kiki-plugin");
+        for path in [
+            src.join("Cargo.toml"),
+            src.join("Cargo.lock"),
+            src.join("src"),
+            sdk.join("Cargo.toml"),
+            sdk.join("src"),
+            root.join("wit"),
+        ] {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+
+        let target_dir = out_dir.join("filter-plugin");
+        let mut cargo = Command::new(env("CARGO"));
+        cargo
+            .arg("build")
+            .arg("--release")
+            .arg("--locked")
+            .arg("--target")
+            .arg(WASM_TARGET)
+            .arg("--manifest-path")
+            .arg(src.join("Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&target_dir);
+        // Flags meant for Kiki's own build, such as cargo-llvm-cov's
+        // instrumentation or a musl target, don't apply to the plugin.
+        for var in [
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_BUILD_RUSTFLAGS",
+            "CARGO_BUILD_TARGET",
+            "CARGO_TARGET_DIR",
+            "CARGO_BUILD_TARGET_DIR",
+            "RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            cargo.env_remove(var);
+        }
+
+        let status = cargo.status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "building the filter plugin in plugins/filter-src failed ({status}). \
+                 It needs the {WASM_TARGET} target (`rustup target add {WASM_TARGET}`); \
+                 or set ${PREBUILT_FILTER} to a prebuilt plugin.wasm, or build without \
+                 the default-plugins feature"
+            )));
+        }
+
+        fs::copy(
+            target_dir
+                .join(WASM_TARGET)
+                .join("release")
+                .join("kiki_filter.wasm"),
+            &dest,
+        )?;
+        Ok(dest)
     }
 
     /// Collects every regular file under `dir`, as its `/`-separated path

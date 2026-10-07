@@ -14,6 +14,49 @@
           pkgs = nixpkgs.legacyPackages.${system};
           craneLib = crane.mkLib pkgs;
 
+          # The filter plugin, built from plugins/filter-src as WebAssembly.
+          # build.rs would build it itself, but can't fetch its dependencies
+          # inside the Nix sandbox, so it bundles this one instead (through
+          # KIKI_FILTER_PLUGIN_WASM below). nixpkgs' rustc ships the standard
+          # library for wasm32-unknown-unknown.
+          filterPlugin = let
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                ./plugins/filter-src/Cargo.toml
+                ./plugins/filter-src/Cargo.lock
+                ./plugins/filter-src/src
+                ./sdk/rust/kiki-plugin/Cargo.toml
+                ./sdk/rust/kiki-plugin/src
+                ./wit
+              ];
+            };
+          in craneLib.mkCargoDerivation {
+            pname = "kiki-filter-plugin";
+            version = (craneLib.crateNameFromCargoToml {
+              cargoToml = ./plugins/filter-src/Cargo.toml;
+            }).version;
+            inherit src;
+            cargoArtifacts = null;
+            cargoVendorDir = craneLib.vendorCargoDeps {
+              cargoLock = ./plugins/filter-src/Cargo.lock;
+            };
+            postUnpack = ''
+              cd $sourceRoot/plugins/filter-src
+              sourceRoot="."
+            '';
+            buildPhaseCargoCommand = ''
+              cargo build --release --locked --target wasm32-unknown-unknown
+            '';
+            installPhaseCommand = ''
+              install -Dm644 target/wasm32-unknown-unknown/release/kiki_filter.wasm $out/plugin.wasm
+            '';
+            doInstallCargoArtifacts = false;
+            strictDeps = true;
+            # nixpkgs' rustc links WebAssembly with lld.
+            nativeBuildInputs = [ pkgs.lld ];
+          };
+
           commonArgs = {
             src = let
               sqlFilter = path: _type: builtins.match ".*\\.sql$" path != null;
@@ -25,7 +68,7 @@
               webUiFilter = path: _type: builtins.match ".*/src/.*\\.(html|js)$" path != null;
               # Bundled plugins, packed into a .tar.zst by build.rs and pulled
               # into tests via include_str! and include_bytes! (e.g.
-              # plugins/filter/plugin.wasm)
+              # plugins/filter/manifest.toml)
               pluginsFilter = path: _type: builtins.match ".*/plugins(/.*)?" path != null;
               # The WebAssembly plugin interface, read by wasmtime's bindgen!
               # (src/scripting/wasm.rs), and the plugin its tests run
@@ -48,6 +91,8 @@
                 filter = customOrCargo;
               };
             strictDeps = true;
+
+            KIKI_FILTER_PLUGIN_WASM = "${filterPlugin}/plugin.wasm";
 
             # The test suite already runs in checks.tests; running it here too
             # roughly doubles the Nix build time (release + LTO).
@@ -94,7 +139,7 @@
           craneLibStatic = crane.mkLib pkgs.pkgsStatic;
 
           staticArgs = {
-            inherit (commonArgs) src strictDeps doCheck;
+            inherit (commonArgs) src strictDeps doCheck KIKI_FILTER_PLUGIN_WASM;
             # pkgsStatic adds -static to every link, including the glibc
             # build scripts, which then fail to link. rustc already links
             # musl binaries statically, so drop it.
@@ -223,6 +268,7 @@
 
           packages = {
             default = kiki;
+            filter-plugin = filterPlugin;
             inherit book docs coverage profiling;
           } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
             inherit static;
@@ -235,6 +281,8 @@
             packages = with pkgs; [
               cargo-deb
               mdbook
+              # For build.rs to link the filter plugin (see filterPlugin)
+              lld
             ];
           };
         }

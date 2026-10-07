@@ -20,3 +20,6 @@
 /sdk/**/target
 /tests/wasm-fixture/target
 /plugins/filter-src/target
+
+# Built from plugins/filter-src by build.rs
+/plugins/filter/plugin.wasm
