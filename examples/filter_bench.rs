@@ -7,7 +7,7 @@
 //! optimizations:
 //!
 //! ```text
-//! cargo run --profile profiling --example filter_bench [-- --entries N --rounds N]
+//! cargo run --profile profiling --example filter_bench [-- --entries N --rounds N --wasm PATH]
 //! ```
 //!
 //! For each config, it reports how long the plugin takes to load, to pass an entry
@@ -18,15 +18,22 @@ use kiki_rss::scripting::lua::LuaScriptRunner;
 use kiki_rss::scripting::wasm::WasmScriptRunner;
 use kiki_rss::scripting::{
     Event, EventPayload, FeedEntry, FeedInfo, ScriptRunner, ScriptServices, ScriptSource,
-    ServiceCall, ServiceReply,
+    ServiceCall, ServiceReply, WasmComponent,
 };
 use serde_json::{json, Value};
 use std::hint::black_box;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const MAIN: &str = include_str!("../plugins/filter/main.lua");
 const WASM: &[u8] = include_bytes!("../plugins/filter-wasm/plugin.wasm");
+
+/// The WebAssembly plugin compared: `plugin.wasm`, or the build given with `--wasm`.
+static WASM_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+
+fn wasm() -> &'static [u8] {
+    WASM_BYTES.get_or_init(|| WASM.to_vec())
+}
 
 /// The id `StartScan` answers with.
 const SCAN: u64 = 1;
@@ -71,7 +78,7 @@ impl ScriptServices for Server {
 fn load(engine: Engine, config: &Value) -> Box<dyn ScriptRunner> {
     let mut source = match engine {
         Engine::Lua => ScriptSource::new(MAIN),
-        Engine::Wasm => ScriptSource::wasm(WASM.to_vec()),
+        Engine::Wasm => ScriptSource::wasm(wasm().to_vec()),
     };
     source.name = "filter".to_string();
     source.config = config.to_string();
@@ -103,12 +110,64 @@ impl Rng {
 }
 
 const WORDS: &[&str] = &[
-    "the", "of", "and", "a", "to", "in", "is", "you", "that", "it", "he", "was", "for", "on",
-    "are", "as", "with", "his", "they", "at", "be", "this", "have", "from", "or", "one",
-    "release", "kernel", "compiler", "server", "update", "security", "performance", "memory",
-    "network", "database", "browser", "language", "library", "framework", "design", "garden",
-    "climate", "policy", "election", "market", "science", "research", "museum", "recipe",
-    "Rust", "Python", "Linux", "café", "naïve", "Zürich", "東京", "données",
+    "the",
+    "of",
+    "and",
+    "a",
+    "to",
+    "in",
+    "is",
+    "you",
+    "that",
+    "it",
+    "he",
+    "was",
+    "for",
+    "on",
+    "are",
+    "as",
+    "with",
+    "his",
+    "they",
+    "at",
+    "be",
+    "this",
+    "have",
+    "from",
+    "or",
+    "one",
+    "release",
+    "kernel",
+    "compiler",
+    "server",
+    "update",
+    "security",
+    "performance",
+    "memory",
+    "network",
+    "database",
+    "browser",
+    "language",
+    "library",
+    "framework",
+    "design",
+    "garden",
+    "climate",
+    "policy",
+    "election",
+    "market",
+    "science",
+    "research",
+    "museum",
+    "recipe",
+    "Rust",
+    "Python",
+    "Linux",
+    "café",
+    "naïve",
+    "Zürich",
+    "東京",
+    "données",
 ];
 
 const TITLE_EXTRAS: &[&str] = &["Sponsored:", "Webinar:", "Ask HN:", "Show HN:", "[video]"];
@@ -179,9 +238,26 @@ fn entries(n: usize) -> Vec<FeedEntry> {
 /// would write; and many, matching the content of every entry.
 fn configs() -> Vec<(&'static str, Value)> {
     let heavy_words = [
-        "bitcoin", "crypto", "nft", "casino", "giveaway", "discount", "coupon", "horoscope",
-        "celebrity", "gossip", "lottery", "diet", "keto", "influencer", "clickbait",
-        "you won't believe", "doctors hate", "one weird trick", "limited time", "act now",
+        "bitcoin",
+        "crypto",
+        "nft",
+        "casino",
+        "giveaway",
+        "discount",
+        "coupon",
+        "horoscope",
+        "celebrity",
+        "gossip",
+        "lottery",
+        "diet",
+        "keto",
+        "influencer",
+        "clickbait",
+        "you won't believe",
+        "doctors hate",
+        "one weird trick",
+        "limited time",
+        "act now",
     ];
     let mut heavy_exclude: Vec<Value> = heavy_words
         .iter()
@@ -224,7 +300,7 @@ fn median(mut samples: Vec<Duration>) -> Duration {
     samples[samples.len() / 2]
 }
 
-struct Result {
+struct Measurement {
     load: Duration,
     ingest: Duration,
     scan: Option<Duration>,
@@ -235,7 +311,7 @@ fn is_hidden(entry: &FeedEntry) -> bool {
     entry.tags.iter().any(|t| t == "system:hidden")
 }
 
-fn measure(engine: Engine, config: &Value, entries: &[FeedEntry], rounds: usize) -> Result {
+fn measure(engine: Engine, config: &Value, entries: &[FeedEntry], rounds: usize) -> Measurement {
     let load_time = median(
         (0..rounds)
             .map(|_| {
@@ -292,7 +368,7 @@ fn measure(engine: Engine, config: &Value, entries: &[FeedEntry], rounds: usize)
         .collect::<Option<Vec<_>>>()
         .map(median);
 
-    Result {
+    Measurement {
         load: load_time,
         ingest,
         scan,
@@ -321,6 +397,15 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n = arg(&args, "--entries", 2000);
     let rounds = arg(&args, "--rounds", 7);
+    if let Some(path) = args
+        .iter()
+        .position(|a| a == "--wasm")
+        .and_then(|i| args.get(i + 1))
+    {
+        WASM_BYTES
+            .set(std::fs::read(path).expect("reading --wasm"))
+            .unwrap();
+    }
     let entries = entries(n);
     let bytes: usize = entries
         .iter()
@@ -332,22 +417,28 @@ fn main() {
         bytes as f64 / n as f64 / 1024.0
     );
 
-    // The first WebAssembly load compiles the component to native code; later loads find
-    // it compiled, as the server does on every reload but the first.
+    // The script host compiles each component to native code once, and later loads find
+    // it compiled: so the loads measured below are the ones on every reload but the first.
     let start = Instant::now();
-    black_box(load(Engine::Wasm, &json!({})));
+    kiki_rss::scripting::wasm::put_component("filter", &WasmComponent::new(wasm().to_vec()))
+        .unwrap();
     println!(
-        "WASM first load, compiling {} KiB to native code: {}\n",
-        WASM.len() / 1024,
+        "WASM component compiled to native code ({} KiB, once per component): {}\n",
+        wasm().len() / 1024,
         fmt(start.elapsed())
     );
 
-    println!("| config | engine | load | ingest / entry | ingest entries/s | rescan / entry | hidden |");
+    println!(
+        "| config | engine | load | ingest / entry | ingest entries/s | rescan / entry | hidden |"
+    );
     println!("|---|---|---:|---:|---:|---:|---:|");
     for (name, config) in configs() {
         let lua = measure(Engine::Lua, &config, &entries, rounds);
         let wasm = measure(Engine::Wasm, &config, &entries, rounds);
-        assert_eq!(lua.hidden, wasm.hidden, "{name}: the engines hid different entries");
+        assert_eq!(
+            lua.hidden, wasm.hidden,
+            "{name}: the engines hid different entries"
+        );
         for (engine, r) in [(Engine::Lua, &lua), (Engine::Wasm, &wasm)] {
             println!(
                 "| {name} | {} | {} | {} | {:.0} | {} | {} |",

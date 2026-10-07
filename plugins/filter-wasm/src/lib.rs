@@ -27,7 +27,7 @@
 
 use kiki_plugin::host;
 use kiki_plugin::{export_plugin, log, Entry, EventKind, FeedEvent, Level, Plugin, ScanOptions};
-use regex::{Regex, RegexBuilder};
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use serde_json::{Map, Value};
 use std::collections::{hash_map, HashMap, HashSet};
 
@@ -42,7 +42,7 @@ const REGEX_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 const REGEX_DFA_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 
 /// An entry field a rule can match.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Field {
     Title,
     Url,
@@ -65,6 +65,27 @@ impl Field {
         })
     }
 
+    const ALL: [Self; 6] = [
+        Self::Title,
+        Self::Url,
+        Self::Content,
+        Self::Guid,
+        Self::Authors,
+        Self::Categories,
+    ];
+
+    /// The field's values in `entry`.
+    fn values(self, entry: &Entry) -> &[String] {
+        match self {
+            Self::Title => std::slice::from_ref(&entry.title),
+            Self::Url => entry.url.as_slice(),
+            Self::Content => entry.content.as_slice(),
+            Self::Guid => std::slice::from_ref(&entry.guid),
+            Self::Authors => &entry.authors,
+            Self::Categories => &entry.categories,
+        }
+    }
+
     /// Whether `re` matches the field of `entry`, or one of its values.
     fn matches(self, re: &Regex, entry: &Entry) -> bool {
         match self {
@@ -82,6 +103,8 @@ const DEFAULT_FIELDS: &[Field] = &[Field::Title, Field::Content];
 
 struct Rule {
     re: Regex,
+    /// The pattern, with its flags set inline, for a [`RegexSet`].
+    inline: String,
     fields: Vec<Field>,
     /// The feeds the rule applies to, by id, or `None` for every feed.
     feeds: Option<HashSet<i64>>,
@@ -164,8 +187,14 @@ impl Rule {
             Some(_) => return fail("'feeds' must be a list of feed ids or URLs"),
         }
 
+        let inline = if flags.is_empty() {
+            pattern.to_string()
+        } else {
+            format!("(?{flags}){pattern}")
+        };
         Ok(Rule {
             re,
+            inline,
             fields,
             feeds,
             urls,
@@ -252,8 +281,40 @@ fn same(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// The `exclude` rules that read a field, compiled together, so that each of the field's
+/// values is searched once for all of them rather than once per rule.
+struct FieldSet {
+    field: Field,
+    set: RegexSet,
+    /// The index in `exclude` of the rule each of the set's patterns comes from.
+    rules: Vec<usize>,
+}
+
+impl FieldSet {
+    /// One set for each field the rules in `exclude` read.
+    fn build(exclude: &[Rule]) -> Result<Vec<Self>, String> {
+        let mut sets = Vec::new();
+        for field in Field::ALL {
+            let rules: Vec<usize> = (0..exclude.len())
+                .filter(|&i| exclude[i].fields.contains(&field))
+                .collect();
+            if rules.is_empty() {
+                continue;
+            }
+            let set = RegexSetBuilder::new(rules.iter().map(|&i| &exclude[i].inline))
+                .size_limit(REGEX_SIZE_LIMIT_BYTES * rules.len())
+                .dfa_size_limit(REGEX_DFA_SIZE_LIMIT_BYTES * rules.len())
+                .build()
+                .map_err(|e| format!("filter: exclude: {e}"))?;
+            sets.push(FieldSet { field, set, rules });
+        }
+        Ok(sets)
+    }
+}
+
 struct Filter {
     exclude: Vec<Rule>,
+    exclude_sets: Vec<FieldSet>,
     include: Vec<Rule>,
     /// Whether to apply changed rules to the entries already stored.
     rescan: bool,
@@ -311,12 +372,24 @@ impl Filter {
     /// Why `entry` should be hidden, or `None` if it should not be.
     fn reason_to_hide(&mut self, entry: &Entry) -> Option<String> {
         let feed_urls = &mut self.feed_urls;
-        if let Some(rule) = self
-            .exclude
-            .iter()
-            .find(|r| r.applies(entry.feed_id, feed_urls) && r.matches(entry))
-        {
-            return Some(format!("{} matched", rule.place));
+        if !self.exclude.is_empty() {
+            let mut matched = vec![false; self.exclude.len()];
+            for set in &self.exclude_sets {
+                for value in set.field.values(entry) {
+                    for i in set.set.matches(value).iter() {
+                        matched[set.rules[i]] = true;
+                    }
+                }
+            }
+            // The first rule that matched, as the rules are tried in order.
+            if let Some(rule) = self
+                .exclude
+                .iter()
+                .zip(matched)
+                .find(|(r, matched)| *matched && r.applies(entry.feed_id, feed_urls))
+            {
+                return Some(format!("{} matched", rule.0.place));
+            }
         }
         let mut any_include = false;
         for rule in &self.include {
@@ -386,8 +459,10 @@ impl Plugin for Filter {
             "include": rule_list("include"),
         });
         let by_url = exclude.iter().chain(&include).any(|r| !r.urls.is_empty());
+        let exclude_sets = FieldSet::build(&exclude)?;
         Ok(Filter {
             exclude,
+            exclude_sets,
             include,
             rescan: config.get("rescan") != Some(&Value::Bool(false)),
             rules,
