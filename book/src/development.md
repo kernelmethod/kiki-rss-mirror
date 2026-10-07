@@ -61,6 +61,14 @@ are published, and checks every link between them.
 
 ## Benchmarks and stress tests
 
+`cargo bench` runs the benchmarks in `benches/`, with
+[Criterion](https://bheisler.github.io/criterion.rs/book/), which reports
+how much each changed since the last run:
+
+- `cargo bench --bench sanitize` times the
+  [`sanitize`](plugins/sanitize.md) plugin on entries from under a kilobyte
+  to a few hundred, through the same WebAssembly runner the server uses.
+
 `tools/` holds standalone tools with their own Cargo projects:
 
 - [`tools/stress`](https://github.com/kernelmethod/kiki-rss/tree/main/tools/stress)
