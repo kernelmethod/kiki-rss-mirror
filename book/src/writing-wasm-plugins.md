@@ -73,9 +73,11 @@ passed with each of its entries to `on-scan-entry`, and with its summary to
 
 The `kiki-plugin` crate, in
 [`sdk/rust/kiki-plugin`](https://github.com/kernelmethod/kiki-rss/tree/main/sdk/rust/kiki-plugin)
-in Kiki's source, generates the bindings and wraps them in a `Plugin` trait:
-implement the handlers your plugin needs, list the events they handle, and
-export it with `export_plugin!`. Make a library crate whose `Cargo.toml` has
+in Kiki's source, generates the bindings and wraps them in a `Plugin` trait
+and a `#[plugin]` attribute: implement `Plugin` to make your plugin from its
+config, and put `#[plugin]` on an `impl` block holding its handlers, each a
+method marked with the event it handles, such as `#[on(entry.ingest)]`. Make a
+library crate whose `Cargo.toml` has
 
 ```toml
 [lib]
@@ -97,7 +99,7 @@ the patterns in its config:
 
 ```rust,ignore
 use kiki_plugin::regex::Regex;
-use kiki_plugin::{export_plugin, parse_config, Entry, EventKind, Plugin};
+use kiki_plugin::{parse_config, plugin, Entry, Plugin};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -110,8 +112,6 @@ struct HideMatching {
 }
 
 impl Plugin for HideMatching {
-    const EVENTS: &'static [EventKind] = &[EventKind::EntryIngest];
-
     fn new(config: &str) -> Result<Self, String> {
         let config: Config = parse_config(config)?;
         let patterns = config
@@ -121,16 +121,18 @@ impl Plugin for HideMatching {
             .collect::<Result<_, _>>()?;
         Ok(HideMatching { patterns })
     }
+}
 
-    fn on_entry_ingest(&mut self, mut entry: Entry) -> Option<Entry> {
+#[plugin]
+impl HideMatching {
+    #[on(entry.ingest)]
+    fn hide_matching(&mut self, mut entry: Entry) -> Option<Entry> {
         if self.patterns.iter().any(|re| re.is_match(&entry.title)) {
             entry.tags.push("system:hidden".to_string());
         }
         Some(entry)
     }
 }
-
-export_plugin!(HideMatching);
 ```
 
 Build it for the `wasm32-wasip2` target, and install the result as the
@@ -150,10 +152,31 @@ in Kiki's source.
 
 `Plugin::new` is called once when the plugin loads, and every handler is
 called on the value it returns, so a plugin keeps what it needs, such as
-compiled regexes, in its own fields. The events listed in `EVENTS` are
-delivered to every instance; a plugin that needs some of them only for some
-configs can override `Plugin::events` to leave the others out, since Kiki
-calls into a plugin for every event it handles. A handler that panics traps, which is
+compiled regexes, in its own fields. A handler takes `&mut self` or `&self`,
+then the event's arguments:
+
+| `#[on(...)]`     | Arguments                         | Returns         |
+|------------------|-----------------------------------|-----------------|
+| `entry.parsed`   | `entry: Entry`                    |                 |
+| `entry.ingest`   | `entry: Entry`                    | `Option<Entry>` |
+| `fetch.success`  | `event: FetchSuccess`             |                 |
+| `fetch.error`    | `event: FetchError`               |                 |
+| `feed.added`     | `feed: FeedEvent`                 |                 |
+| `feed.removed`   | `feed: FeedEvent`                 |                 |
+| `plugin.load`    |                                   |                 |
+| `fetch.schedule` | `schedule: FetchSchedule`         | `Option<u64>`   |
+| `timer`          | `id: u32`                         |                 |
+| `scan.entry`     | `scan: u64, entry: Entry`         | `Option<Entry>` |
+| `scan.done`      | `scan: u64, summary: ScanSummary` |                 |
+
+The first eight are the events Lua plugins handle, by the same names; `timer`
+is for timers started with `host::every`, and `scan.entry` and `scan.done`
+for scans started with `host::start_scan`. A plugin handles the events it has
+handlers for, and only those are delivered to it. One that needs some of them
+only for some configs can implement `Plugin::wants` to leave the others out,
+since Kiki calls into a plugin for every event it handles. An unknown event,
+two handlers for one event, or a handler whose signature doesn't fit its
+event fails to compile. A handler that panics traps, which is
 handled as described [below](#resource-limits). Other languages can use the
 WIT file with their own bindings generator, such as `wit-bindgen`'s for C.
 

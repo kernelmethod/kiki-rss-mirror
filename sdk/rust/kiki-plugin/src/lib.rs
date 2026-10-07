@@ -2,28 +2,29 @@
 //!
 //! A Kiki plugin is a WebAssembly component targeting the `plugin` world of
 //! `wit/kiki-plugin.wit`. This crate generates the bindings for it and wraps them in the
-//! [`Plugin`] trait: implement the handlers your plugin needs, and export it with
-//! [`export_plugin!`].
+//! [`Plugin`] trait and the [`plugin`] attribute: implement [`Plugin`] to make the plugin
+//! from its config, and put `#[plugin]` on an `impl` block holding its handlers, each a
+//! method marked with the event it handles.
 //!
 //! ```ignore
-//! use kiki_plugin::{export_plugin, Entry, EventKind, Plugin};
+//! use kiki_plugin::{plugin, Entry, Plugin};
 //!
 //! struct Shout;
 //!
 //! impl Plugin for Shout {
-//!     const EVENTS: &'static [EventKind] = &[EventKind::EntryIngest];
-//!
 //!     fn new(_config: &str) -> Result<Self, String> {
 //!         Ok(Shout)
 //!     }
+//! }
 //!
-//!     fn on_entry_ingest(&mut self, mut entry: Entry) -> Option<Entry> {
+//! #[plugin]
+//! impl Shout {
+//!     #[on(entry.ingest)]
+//!     fn shout(&mut self, mut entry: Entry) -> Option<Entry> {
 //!         entry.title = entry.title.to_uppercase();
 //!         Some(entry)
 //!     }
 //! }
-//!
-//! export_plugin!(Shout);
 //! ```
 //!
 //! Build it as a `cdylib` for `wasm32-wasip2`:
@@ -42,6 +43,7 @@
 
 #![warn(missing_docs)]
 
+pub use kiki_plugin_macros::plugin;
 use std::any::Any;
 use std::cell::RefCell;
 
@@ -136,28 +138,15 @@ pub fn parse_config<T: serde::de::DeserializeOwned>(config: &str) -> Result<T, S
     serde_json::from_str(config).map_err(|e| format!("invalid config: {e}"))
 }
 
-/// A Kiki plugin.
+/// A Kiki plugin: how to make it from its config.
 ///
 /// One value of the type is made, with [`Plugin::new`], when the plugin loads, and every
-/// handler is called on it. Only the events in [`Plugin::EVENTS`] (or those
-/// [`Plugin::events`] returns, if it is overridden) are delivered, so each handler the
-/// plugin implements should be listed there; the default handlers do nothing.
+/// handler is called on it. The handlers are the methods marked `#[on(<event>)]` in the
+/// `impl` block of the type marked [`#[plugin]`](plugin).
 ///
 /// A handler that panics traps: Kiki treats it as having failed (an entry passes through
 /// it unchanged), then starts the plugin afresh, calling [`Plugin::new`] again.
 pub trait Plugin: Sized + 'static {
-    /// The events the plugin handles. Timers started with [`host::every`] call
-    /// [`Plugin::on_timer`] whether or not they are listed.
-    const EVENTS: &'static [EventKind];
-
-    /// The events this instance of the plugin handles, made from its config: by default,
-    /// [`Plugin::EVENTS`]. Override it to leave out events the config has no use for,
-    /// since each handler costs the server a call into the plugin whenever its event
-    /// happens.
-    fn events(&self) -> Vec<EventKind> {
-        Self::EVENTS.to_vec()
-    }
-
     /// Make the plugin, from its config: a JSON object, its manifest's `[config]` table
     /// with its overrides applied.
     ///
@@ -166,61 +155,13 @@ pub trait Plugin: Sized + 'static {
     /// An error fails the load, as a Lua plugin's error at its top level does.
     fn new(config: &str) -> Result<Self, String>;
 
-    /// `entry.parsed`: a newly parsed entry, before any changes.
-    fn on_entry_parsed(&mut self, entry: Entry) {
-        let _ = entry;
-    }
-
-    /// `entry.ingest`: change an entry, or drop it by returning `None`.
-    fn on_entry_ingest(&mut self, entry: Entry) -> Option<Entry> {
-        Some(entry)
-    }
-
-    /// `fetch.success`: a feed was fetched.
-    fn on_fetch_success(&mut self, event: FetchSuccess) {
+    /// Whether this instance of the plugin, made from its config, wants `event`, one of
+    /// the events it has a handler for: by default, every one. Return `false` for events
+    /// the config has no use for, since Kiki calls into a plugin for every event it
+    /// handles. Timers and scans the plugin started are delivered regardless.
+    fn wants(&self, event: EventKind) -> bool {
         let _ = event;
-    }
-
-    /// `fetch.error`: a feed could not be fetched.
-    fn on_fetch_error(&mut self, event: FetchError) {
-        let _ = event;
-    }
-
-    /// `feed.added`: a feed was added.
-    fn on_feed_added(&mut self, feed: FeedEvent) {
-        let _ = feed;
-    }
-
-    /// `feed.removed`: a feed was removed.
-    fn on_feed_removed(&mut self, feed: FeedEvent) {
-        let _ = feed;
-    }
-
-    /// `plugin.load`: plugins have loaded. Where to start scans.
-    fn on_plugin_load(&mut self) {}
-
-    /// `fetch.schedule`: return a longer wait before the feed's next fetch, in seconds,
-    /// or `None` to leave it.
-    fn on_fetch_schedule(&mut self, schedule: FetchSchedule) -> Option<u64> {
-        let _ = schedule;
-        None
-    }
-
-    /// A timer started with [`host::every`] is due.
-    fn on_timer(&mut self, id: u32) {
-        let _ = id;
-    }
-
-    /// An entry from the scan `scan`, started with [`host::start_scan`]. System tags added
-    /// to its `tags` are applied to it; `None` leaves it alone.
-    fn on_scan_entry(&mut self, scan: u64, entry: Entry) -> Option<Entry> {
-        let _ = (scan, entry);
-        None
-    }
-
-    /// The scan `scan` has gone through every entry.
-    fn on_scan_done(&mut self, scan: u64, summary: ScanSummary) {
-        let _ = (scan, summary);
+        true
     }
 }
 
@@ -228,11 +169,16 @@ thread_local! {
     static INSTANCE: RefCell<Option<Box<dyn Any>>> = const { RefCell::new(None) };
 }
 
-/// Make the plugin `P` from `config`, for its `init` export.
+/// Make the plugin `P` from `config`, for its `init` export, and return which of
+/// `handled`, the events it has handlers for, it wants.
 #[doc(hidden)]
-pub fn __init<P: Plugin>(config: String) -> Result<Vec<EventKind>, String> {
+pub fn __init<P: Plugin>(config: String, handled: &[EventKind]) -> Result<Vec<EventKind>, String> {
     let plugin = P::new(&config)?;
-    let events = plugin.events();
+    let events = handled
+        .iter()
+        .copied()
+        .filter(|&e| plugin.wants(e))
+        .collect();
     INSTANCE.with(|i| *i.borrow_mut() = Some(Box::new(plugin)));
     Ok(events)
 }
@@ -248,67 +194,4 @@ pub fn __with<P: Plugin, R>(f: impl FnOnce(&mut P) -> R) -> R {
             .expect("kiki-plugin: a handler was called before init");
         f(plugin)
     })
-}
-
-/// Export `$plugin`, a type implementing [`Plugin`], as the component's plugin.
-#[macro_export]
-macro_rules! export_plugin {
-    ($plugin:ty) => {
-        const _: () = {
-            struct KikiPluginExports;
-
-            impl $crate::bindings::Guest for KikiPluginExports {
-                fn init(
-                    config: ::std::string::String,
-                ) -> ::std::result::Result<
-                    ::std::vec::Vec<$crate::EventKind>,
-                    ::std::string::String,
-                > {
-                    $crate::__init::<$plugin>(config)
-                }
-                fn on_entry_parsed(entry: $crate::Entry) {
-                    $crate::__with::<$plugin, _>(|p| $crate::Plugin::on_entry_parsed(p, entry))
-                }
-                fn on_entry_ingest(entry: $crate::Entry) -> ::std::option::Option<$crate::Entry> {
-                    $crate::__with::<$plugin, _>(|p| $crate::Plugin::on_entry_ingest(p, entry))
-                }
-                fn on_fetch_success(event: $crate::FetchSuccess) {
-                    $crate::__with::<$plugin, _>(|p| $crate::Plugin::on_fetch_success(p, event))
-                }
-                fn on_fetch_error(event: $crate::FetchError) {
-                    $crate::__with::<$plugin, _>(|p| $crate::Plugin::on_fetch_error(p, event))
-                }
-                fn on_feed_added(feed: $crate::FeedEvent) {
-                    $crate::__with::<$plugin, _>(|p| $crate::Plugin::on_feed_added(p, feed))
-                }
-                fn on_feed_removed(feed: $crate::FeedEvent) {
-                    $crate::__with::<$plugin, _>(|p| $crate::Plugin::on_feed_removed(p, feed))
-                }
-                fn on_plugin_load() {
-                    $crate::__with::<$plugin, _>(|p| $crate::Plugin::on_plugin_load(p))
-                }
-                fn on_fetch_schedule(
-                    schedule: $crate::FetchSchedule,
-                ) -> ::std::option::Option<u64> {
-                    $crate::__with::<$plugin, _>(|p| {
-                        $crate::Plugin::on_fetch_schedule(p, schedule)
-                    })
-                }
-                fn on_timer(id: u32) {
-                    $crate::__with::<$plugin, _>(|p| $crate::Plugin::on_timer(p, id))
-                }
-                fn on_scan_entry(
-                    scan: u64,
-                    entry: $crate::Entry,
-                ) -> ::std::option::Option<$crate::Entry> {
-                    $crate::__with::<$plugin, _>(|p| $crate::Plugin::on_scan_entry(p, scan, entry))
-                }
-                fn on_scan_done(scan: u64, summary: $crate::ScanSummary) {
-                    $crate::__with::<$plugin, _>(|p| $crate::Plugin::on_scan_done(p, scan, summary))
-                }
-            }
-
-            $crate::bindings::export!(KikiPluginExports with_types_in $crate::bindings);
-        };
-    };
 }

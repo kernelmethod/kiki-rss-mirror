@@ -190,11 +190,21 @@ dependencies = [
 
 [[package]]
 name = "kiki-plugin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "kiki-plugin-macros",
  "serde",
  "serde_json",
  "wit-bindgen",
+]
+
+[[package]]
+name = "kiki-plugin-macros"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

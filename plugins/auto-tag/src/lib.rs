@@ -39,9 +39,7 @@
 //! was given since with the rule's tag.
 
 use kiki_plugin::regex::Regex;
-use kiki_plugin::{
-    export_plugin, host, log, Entry, EventKind, FeedEvent, Level, Plugin, ScanOptions, ScanSummary,
-};
+use kiki_plugin::{host, log, plugin, Entry, FeedEvent, Level, Plugin, ScanOptions, ScanSummary};
 use serde_json::{Map, Value};
 use std::collections::{hash_map, HashMap, HashSet};
 
@@ -364,12 +362,6 @@ impl AutoTag {
 }
 
 impl Plugin for AutoTag {
-    const EVENTS: &'static [EventKind] = &[
-        EventKind::EntryIngest,
-        EventKind::FeedRemoved,
-        EventKind::PluginLoad,
-    ];
-
     fn new(config: &str) -> Result<Self, String> {
         let config: Map<String, Value> =
             serde_json::from_str(config).map_err(|e| format!("auto-tag: invalid config: {e}"))?;
@@ -393,8 +385,12 @@ impl Plugin for AutoTag {
             scan: None,
         })
     }
+}
 
-    fn on_entry_ingest(&mut self, mut entry: Entry) -> Option<Entry> {
+#[plugin]
+impl AutoTag {
+    #[on(entry.ingest)]
+    fn tag_ingested(&mut self, mut entry: Entry) -> Option<Entry> {
         for tag in self.tags_for(&entry) {
             // An earlier plugin may have added the tag already.
             if !entry.tags.contains(&tag) {
@@ -405,7 +401,8 @@ impl Plugin for AutoTag {
     }
 
     // A feed's id may be given to a new feed once it is removed.
-    fn on_feed_removed(&mut self, feed: FeedEvent) {
+    #[on(feed.removed)]
+    fn forget_feed(&mut self, feed: FeedEvent) {
         self.feed_urls.forget(feed.id);
     }
 
@@ -417,7 +414,8 @@ impl Plugin for AutoTag {
     // The rules are only recorded as applied once the scan has gone through every entry.
     // A scan cut short, by a reload or the server stopping, runs again from the start on
     // the next load.
-    fn on_plugin_load(&mut self) {
+    #[on(plugin.load)]
+    fn apply_changed_rules(&mut self) {
         if !self.rescan {
             return;
         }
@@ -454,7 +452,8 @@ impl Plugin for AutoTag {
         }
     }
 
-    fn on_scan_entry(&mut self, scan: u64, entry: Entry) -> Option<Entry> {
+    #[on(scan.entry)]
+    fn tag_stored(&mut self, scan: u64, entry: Entry) -> Option<Entry> {
         let id = entry.id?;
         if self.scan.is_none_or(|(current, _)| current != scan) {
             return None;
@@ -476,7 +475,8 @@ impl Plugin for AutoTag {
         None
     }
 
-    fn on_scan_done(&mut self, scan: u64, summary: ScanSummary) {
+    #[on(scan.done)]
+    fn finish_scan(&mut self, scan: u64, summary: ScanSummary) {
         let Some((_, tagged)) = self.scan.take_if(|(current, _)| *current == scan) else {
             return;
         };
@@ -490,5 +490,3 @@ impl Plugin for AutoTag {
         self.record_applied();
     }
 }
-
-export_plugin!(AutoTag);

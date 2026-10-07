@@ -3,8 +3,8 @@
 //! What it does is chosen by its config; see [`Config`]. It reports what it sees by
 //! storing values under `seen:<what>` with `store-set`, which the tests record.
 
-use kiki_plugin::{
-    export_plugin, host, parse_config, DeleteFilter, Entry, EventKind, FeedEvent, FetchError,
+use kiki_plugin::{plugin, 
+    host, parse_config, DeleteFilter, Entry, FeedEvent, FetchError,
     FetchSchedule, FetchSuccess, Level, Plugin, ScanOptions, ScanSummary,
 };
 use kiki_plugin::regex::{Regex, RegexSet};
@@ -71,17 +71,6 @@ fn seen(what: &str, value: impl Into<String>) {
 }
 
 impl Plugin for Fixture {
-    const EVENTS: &'static [EventKind] = &[
-        EventKind::EntryParsed,
-        EventKind::EntryIngest,
-        EventKind::FetchSuccess,
-        EventKind::FetchError,
-        EventKind::FeedAdded,
-        EventKind::FeedRemoved,
-        EventKind::PluginLoad,
-        EventKind::FetchSchedule,
-    ];
-
     fn new(config: &str) -> Result<Self, String> {
         let config: Config = parse_config(config)?;
         if let Some(message) = &config.init_error {
@@ -103,12 +92,17 @@ impl Plugin for Fixture {
         kiki_plugin::log(Level::Info, "fixture loaded");
         Ok(Fixture { config, made: 0 })
     }
+}
 
-    fn on_entry_parsed(&mut self, entry: Entry) {
+#[plugin]
+impl Fixture {
+    #[on(entry.parsed)]
+    fn entry_parsed(&mut self, entry: Entry) {
         seen("entry.parsed", entry.title);
     }
 
-    fn on_entry_ingest(&mut self, mut entry: Entry) -> Option<Entry> {
+    #[on(entry.ingest)]
+    fn entry_ingest(&mut self, mut entry: Entry) -> Option<Entry> {
         let title = Some(entry.title.clone());
         if title == self.config.trap_title {
             panic!("trap requested");
@@ -179,23 +173,28 @@ impl Plugin for Fixture {
         Some(entry)
     }
 
-    fn on_fetch_success(&mut self, event: FetchSuccess) {
+    #[on(fetch.success)]
+    fn fetch_success(&mut self, event: FetchSuccess) {
         seen("fetch.success", format!("{} {} {}", event.feed_id, event.status, event.url));
     }
 
-    fn on_fetch_error(&mut self, event: FetchError) {
+    #[on(fetch.error)]
+    fn fetch_error(&mut self, event: FetchError) {
         seen("fetch.error", format!("{} {} {}", event.feed_id, event.kind, event.message));
     }
 
-    fn on_feed_added(&mut self, feed: FeedEvent) {
+    #[on(feed.added)]
+    fn feed_added(&mut self, feed: FeedEvent) {
         seen("feed.added", format!("{} {}", feed.id, feed.url));
     }
 
-    fn on_feed_removed(&mut self, feed: FeedEvent) {
+    #[on(feed.removed)]
+    fn feed_removed(&mut self, feed: FeedEvent) {
         seen("feed.removed", format!("{} {}", feed.id, feed.url));
     }
 
-    fn on_plugin_load(&mut self) {
+    #[on(plugin.load)]
+    fn plugin_load(&mut self) {
         seen("plugin.load", format!("made {}", self.made));
         if self.config.scan {
             match host::start_scan(ScanOptions {
@@ -248,18 +247,21 @@ impl Plugin for Fixture {
         }
     }
 
-    fn on_fetch_schedule(&mut self, schedule: FetchSchedule) -> Option<u64> {
+    #[on(fetch.schedule)]
+    fn fetch_schedule(&mut self, schedule: FetchSchedule) -> Option<u64> {
         self.config.wait_secs.map(|w| w.max(schedule.wait_secs))
     }
 
-    fn on_timer(&mut self, id: u32) {
+    #[on(timer)]
+    fn timer(&mut self, id: u32) {
         if Some(id) == self.config.trap_timer {
             panic!("trap requested");
         }
         seen("timer", id.to_string());
     }
 
-    fn on_scan_entry(&mut self, scan: u64, mut entry: Entry) -> Option<Entry> {
+    #[on(scan.entry)]
+    fn scan_entry(&mut self, scan: u64, mut entry: Entry) -> Option<Entry> {
         let tag = self.config.scan_tag.clone()?;
         let _ = scan;
         entry.tags.push(tag);
@@ -267,12 +269,11 @@ impl Plugin for Fixture {
         Some(entry)
     }
 
-    fn on_scan_done(&mut self, scan: u64, summary: ScanSummary) {
+    #[on(scan.done)]
+    fn scan_done(&mut self, scan: u64, summary: ScanSummary) {
         seen(
             "scan-done",
             format!("{scan} {} {}", summary.scanned, summary.updated),
         );
     }
 }
-
-export_plugin!(Fixture);

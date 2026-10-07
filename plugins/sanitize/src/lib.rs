@@ -37,7 +37,7 @@
 //! entries already stored. Plugins that run after this one (those whose directory names
 //! sort after "sanitize") see the sanitized content, and can add markup back.
 
-use kiki_plugin::{export_plugin, log, Entry, EventKind, Level, Plugin};
+use kiki_plugin::{log, plugin, Entry, Level, Plugin};
 use lol_html::html_content::{Comment, Element};
 use lol_html::{
     DocumentContentHandlers, ElementContentHandlers, HtmlRewriter, MemorySettings, Settings,
@@ -534,15 +534,17 @@ fn numeric_reference(code: u32) -> char {
 }
 
 impl Plugin for Sanitize {
-    const EVENTS: &'static [EventKind] = &[EventKind::EntryIngest];
-
     fn new(config: &str) -> Result<Self, String> {
         let config: Map<String, Value> =
             serde_json::from_str(config).map_err(|e| format!("sanitize: invalid config: {e}"))?;
         Sanitize::from_config(&config)
     }
+}
 
-    fn on_entry_ingest(&mut self, mut entry: Entry) -> Option<Entry> {
+#[plugin]
+impl Sanitize {
+    #[on(entry.ingest)]
+    fn sanitize_ingested(&mut self, mut entry: Entry) -> Option<Entry> {
         if let Some(content) = entry.content.take() {
             entry.content = Some(match self.rewrite(&content) {
                 Ok(sanitized) => sanitized,
@@ -562,5 +564,3 @@ impl Plugin for Sanitize {
         Some(entry)
     }
 }
-
-export_plugin!(Sanitize);

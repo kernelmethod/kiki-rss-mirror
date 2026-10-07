@@ -26,7 +26,8 @@ keep their source in their own directory, `plugins/<name>`: a crate named
 `kiki-<name>` in the Cargo workspace in `plugins/`, with its `Cargo.toml` and
 `src/` beside the plugin's `manifest.toml`. Their `plugin.wasm` isn't kept in
 the repository: `build.rs` builds the workspace whenever it or the SDK in
-`sdk/rust/kiki-plugin` changes, and bundles each plugin as its manifest and
+`sdk/rust/kiki-plugin`, or its macros in `sdk/rust/kiki-plugin-macros`,
+changes, and bundles each plugin as its manifest and
 `<name>/plugin.wasm`, without the crate. To port another default plugin, make
 its directory a crate and add it to the workspace's `members`. To
 bundle prebuilt plugins instead, set `KIKI_PLUGINS_WASM_DIR` to a directory

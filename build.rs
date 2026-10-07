@@ -181,13 +181,15 @@ mod default_plugins {
         names: &[&str],
         out_dir: &Path,
     ) -> io::Result<PathBuf> {
-        let sdk = root.join("sdk").join("rust").join("kiki-plugin");
+        let sdk = root.join("sdk").join("rust");
         let mut inputs = vec![
             plugins_dir.join("Cargo.toml"),
             plugins_dir.join("Cargo.lock"),
-            sdk.join("Cargo.toml"),
-            sdk.join("src"),
-            sdk.join("wit"),
+            sdk.join("kiki-plugin").join("Cargo.toml"),
+            sdk.join("kiki-plugin").join("src"),
+            sdk.join("kiki-plugin").join("wit"),
+            sdk.join("kiki-plugin-macros").join("Cargo.toml"),
+            sdk.join("kiki-plugin-macros").join("src"),
         ];
         for name in names {
             let dir = plugins_dir.join(name);

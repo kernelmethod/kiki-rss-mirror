@@ -42,9 +42,7 @@
 //! of entries already stored, so adding a parameter or a tracker to the list does not
 //! clean the entries downloaded before.
 
-use kiki_plugin::{
-    export_plugin, host, log, Entry, EventKind, FeedEvent, FetchSuccess, Level, Plugin,
-};
+use kiki_plugin::{host, log, plugin, Entry, FeedEvent, FetchSuccess, Level, Plugin};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -589,19 +587,17 @@ fn read_tag(html: &str, mut pos: usize) -> Option<(ImageAttributes<'_>, usize)> 
 }
 
 impl Plugin for Privacy {
-    const EVENTS: &'static [EventKind] = &[
-        EventKind::EntryIngest,
-        EventKind::FetchSuccess,
-        EventKind::FeedRemoved,
-    ];
-
     fn new(config: &str) -> Result<Self, String> {
         let config: Map<String, Value> =
             serde_json::from_str(config).map_err(|e| format!("privacy: invalid config: {e}"))?;
         Privacy::from_config(&config)
     }
+}
 
-    fn on_entry_ingest(&mut self, mut entry: Entry) -> Option<Entry> {
+#[plugin]
+impl Privacy {
+    #[on(entry.ingest)]
+    fn clean_ingested(&mut self, mut entry: Entry) -> Option<Entry> {
         if let Some(cleaned) = entry.url.as_deref().and_then(|url| self.clean_url(url)) {
             entry.url = Some(cleaned);
         }
@@ -623,13 +619,13 @@ impl Plugin for Privacy {
 
     // A feed's URL changes when it is permanently redirected, and a removed feed's id may
     // be given to a new feed.
-    fn on_fetch_success(&mut self, event: FetchSuccess) {
+    #[on(fetch.success)]
+    fn forget_skip_on_fetch(&mut self, event: FetchSuccess) {
         self.skips.remove(&event.feed_id);
     }
 
-    fn on_feed_removed(&mut self, feed: FeedEvent) {
+    #[on(feed.removed)]
+    fn forget_feed(&mut self, feed: FeedEvent) {
         self.skips.remove(&feed.id);
     }
 }
-
-export_plugin!(Privacy);

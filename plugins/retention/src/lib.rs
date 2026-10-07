@@ -20,7 +20,7 @@
 //! * `keep_tags`: never delete entries tagged with any of these tags. Defaults to
 //!   `["system:saved"]`; `[]` keeps none.
 
-use kiki_plugin::{export_plugin, host, log, DeleteFilter, EventKind, Level, Plugin};
+use kiki_plugin::{host, log, plugin, DeleteFilter, EventKind, Level, Plugin};
 use serde_json::{Map, Value};
 
 /// The time, from WASI's wall clock, which Kiki gives plugins. The standard library has
@@ -112,8 +112,6 @@ impl Retention {
 }
 
 impl Plugin for Retention {
-    const EVENTS: &'static [EventKind] = &[EventKind::PluginLoad];
-
     fn new(config: &str) -> Result<Self, String> {
         let config: Map<String, Value> =
             serde_json::from_str(config).map_err(|e| format!("retention: invalid config: {e}"))?;
@@ -125,21 +123,20 @@ impl Plugin for Retention {
     }
 
     // With nothing to delete, the plugin handles nothing.
-    fn events(&self) -> Vec<EventKind> {
-        if self.days > 0 {
-            Self::EVENTS.to_vec()
-        } else {
-            vec![]
-        }
-    }
-
-    fn on_plugin_load(&mut self) {
-        self.clean_up();
-    }
-
-    fn on_timer(&mut self, _id: u32) {
-        self.clean_up();
+    fn wants(&self, _event: EventKind) -> bool {
+        self.days > 0
     }
 }
 
-export_plugin!(Retention);
+#[plugin]
+impl Retention {
+    #[on(plugin.load)]
+    fn clean_up_on_load(&mut self) {
+        self.clean_up();
+    }
+
+    #[on(timer)]
+    fn clean_up_hourly(&mut self, _id: u32) {
+        self.clean_up();
+    }
+}

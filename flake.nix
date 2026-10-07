@@ -35,6 +35,8 @@
                 ./sdk/rust/kiki-plugin/Cargo.toml
                 ./sdk/rust/kiki-plugin/src
                 ./sdk/rust/kiki-plugin/wit
+                ./sdk/rust/kiki-plugin-macros/Cargo.toml
+                ./sdk/rust/kiki-plugin-macros/src
               ] ++ builtins.concatMap (crate: [
                 (./plugins + "/${crate}/Cargo.toml")
                 (./plugins + "/${crate}/src")

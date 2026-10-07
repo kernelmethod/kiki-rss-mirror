@@ -35,8 +35,8 @@
 //! restarts; a feed at level zero has no key.
 
 use kiki_plugin::{
-    export_plugin, host, log, ContentChange, EventKind, FeedEvent, FetchSchedule, FetchSuccess,
-    Level, Plugin,
+    host, log, plugin, ContentChange, EventKind, FeedEvent, FetchSchedule, FetchSuccess, Level,
+    Plugin,
 };
 use serde_json::{Map, Value};
 use std::collections::{hash_map, HashMap, HashSet};
@@ -234,12 +234,6 @@ impl AdaptiveFetch {
 }
 
 impl Plugin for AdaptiveFetch {
-    const EVENTS: &'static [EventKind] = &[
-        EventKind::FetchSchedule,
-        EventKind::FeedRemoved,
-        EventKind::FetchSuccess,
-    ];
-
     fn new(config: &str) -> Result<Self, String> {
         let config: Map<String, Value> = serde_json::from_str(config)
             .map_err(|e| format!("adaptive-fetch: invalid config: {e}"))?;
@@ -253,15 +247,17 @@ impl Plugin for AdaptiveFetch {
 
     // A feed's URL changes when it is permanently redirected. Only watched for when feeds
     // are named by URL, since every handler costs each fetch a little.
-    fn events(&self) -> Vec<EventKind> {
-        let mut events = vec![EventKind::FetchSchedule, EventKind::FeedRemoved];
-        if !self.only.urls.is_empty() || !self.exclude.urls.is_empty() {
-            events.push(EventKind::FetchSuccess);
-        }
-        events
+    fn wants(&self, event: EventKind) -> bool {
+        event != EventKind::FetchSuccess
+            || !self.only.urls.is_empty()
+            || !self.exclude.urls.is_empty()
     }
+}
 
-    fn on_fetch_schedule(&mut self, fetch: FetchSchedule) -> Option<u64> {
+#[plugin]
+impl AdaptiveFetch {
+    #[on(fetch.schedule)]
+    fn stretch_wait(&mut self, fetch: FetchSchedule) -> Option<u64> {
         let feed_id = fetch.feed_id;
         if !self.applies(feed_id) {
             self.set_level(feed_id, 0);
@@ -291,7 +287,8 @@ impl Plugin for AdaptiveFetch {
     }
 
     // A removed feed's id may be given to a new feed.
-    fn on_feed_removed(&mut self, feed: FeedEvent) {
+    #[on(feed.removed)]
+    fn forget_feed(&mut self, feed: FeedEvent) {
         self.feed_urls.forget(feed.id);
         self.levels.insert(feed.id, 0);
         if let Err(e) = host::store_set(&store_key(feed.id), None) {
@@ -306,9 +303,8 @@ impl Plugin for AdaptiveFetch {
         }
     }
 
-    fn on_fetch_success(&mut self, fetch: FetchSuccess) {
+    #[on(fetch.success)]
+    fn forget_url(&mut self, fetch: FetchSuccess) {
         self.feed_urls.forget(fetch.feed_id);
     }
 }
-
-export_plugin!(AdaptiveFetch);

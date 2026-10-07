@@ -1,10 +1,5 @@
 //! Hide entries whose fields match, or fail to match, regular expressions.
 //!
-//! Kiki's `filter` plugin, built as WebAssembly by Kiki's `build.rs` (see `plugins/Cargo.toml`) and installed as
-//! `plugins/filter/plugin.wasm`. Versions before 3.1.0
-//! were written in Lua; this one takes the same config, records the rules it applied under
-//! the same store key, and hides the same entries.
-//!
 //! Config:
 //!
 //! * `exclude`: a list of rules. An entry matching any of them is hidden.
@@ -28,7 +23,7 @@
 
 use kiki_plugin::host;
 use kiki_plugin::regex::{Regex, RegexSet};
-use kiki_plugin::{export_plugin, log, Entry, EventKind, FeedEvent, Level, Plugin, ScanOptions};
+use kiki_plugin::{log, plugin, Entry, FeedEvent, Level, Plugin, ScanOptions};
 use serde_json::{Map, Value};
 use std::collections::{hash_map, HashMap, HashSet};
 
@@ -393,12 +388,6 @@ impl Filter {
 }
 
 impl Plugin for Filter {
-    const EVENTS: &'static [EventKind] = &[
-        EventKind::EntryIngest,
-        EventKind::FeedRemoved,
-        EventKind::PluginLoad,
-    ];
-
     fn new(config: &str) -> Result<Self, String> {
         let config: Map<String, Value> =
             serde_json::from_str(config).map_err(|e| format!("filter: invalid config: {e}"))?;
@@ -440,14 +429,19 @@ impl Plugin for Filter {
             scan: None,
         })
     }
+}
 
-    fn on_entry_ingest(&mut self, mut entry: Entry) -> Option<Entry> {
+#[plugin]
+impl Filter {
+    #[on(entry.ingest)]
+    fn filter_ingested(&mut self, mut entry: Entry) -> Option<Entry> {
         self.filter(&mut entry);
         Some(entry)
     }
 
     // A feed's id may be given to a new feed once it is removed.
-    fn on_feed_removed(&mut self, feed: FeedEvent) {
+    #[on(feed.removed)]
+    fn forget_feed(&mut self, feed: FeedEvent) {
         if self.by_url {
             self.feed_urls.0.remove(&feed.id);
         }
@@ -461,7 +455,8 @@ impl Plugin for Filter {
     // The rules are only recorded as applied once the scan has gone through every entry.
     // A scan cut short, by a reload or the server stopping, runs again from the start on
     // the next load.
-    fn on_plugin_load(&mut self) {
+    #[on(plugin.load)]
+    fn apply_changed_rules(&mut self) {
         if !self.rescan {
             return;
         }
@@ -501,12 +496,14 @@ impl Plugin for Filter {
         }
     }
 
-    fn on_scan_entry(&mut self, scan: u64, mut entry: Entry) -> Option<Entry> {
+    #[on(scan.entry)]
+    fn filter_stored(&mut self, scan: u64, mut entry: Entry) -> Option<Entry> {
         // Entries left as they are need not be sent back.
         (self.scan == Some(scan) && self.filter(&mut entry)).then_some(entry)
     }
 
-    fn on_scan_done(&mut self, scan: u64, summary: kiki_plugin::ScanSummary) {
+    #[on(scan.done)]
+    fn finish_scan(&mut self, scan: u64, summary: kiki_plugin::ScanSummary) {
         if self.scan != Some(scan) {
             return;
         }
@@ -532,5 +529,3 @@ impl Filter {
         }
     }
 }
-
-export_plugin!(Filter);
