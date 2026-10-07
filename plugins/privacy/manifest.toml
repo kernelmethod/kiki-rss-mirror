@@ -1,9 +1,14 @@
 name = "privacy"
-version = "1.2.0"
-engine = "lua"
+version = "2.0.0"
+engine = "wasm"
+entrypoint = "plugin.wasm"
 description = "Strip tracking parameters, such as utm_source, from the URLs in new entries, and tracking pixels from their content, and skip downloading images for chosen feeds"
 license = "MIT"
 homepage = "https://github.com/kernelmethod/kiki-rss"
+
+# Written in Rust, as a WebAssembly component: its source is beside this
+# manifest in Kiki's repository. Versions before 2.0.0 were written in Lua,
+# and took the same config.
 
 # Removes the query parameters named in `params` from each new entry's URL,
 # and, unless `content` is false, from the links (href and src attributes)
@@ -12,7 +17,7 @@ homepage = "https://github.com/kernelmethod/kiki-rss"
 # false, it also removes tracking pixels from each new entry's content:
 # images declared 1x1 or smaller, and images from the `trackers`. For the
 # feeds in `skip_assets`, it keeps Kiki from downloading entries' images
-# and enclosures at all. See main.lua for the details.
+# and enclosures at all. See src/lib.rs for the details.
 #
 # To strip more parameters, add them to the list, for example with
 # `kiki plugin config get privacy --defaults`, editing its output and

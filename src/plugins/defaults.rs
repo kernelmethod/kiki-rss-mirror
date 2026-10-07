@@ -370,8 +370,8 @@ mod tests {
                 Path::new("auto-tag/manifest.toml"),
                 Path::new("filter/manifest.toml"),
                 Path::new("filter/plugin.wasm"),
-                Path::new("privacy/main.lua"),
                 Path::new("privacy/manifest.toml"),
+                Path::new("privacy/plugin.wasm"),
                 Path::new("retention/main.lua"),
                 Path::new("retention/manifest.toml"),
                 Path::new("sanitize/manifest.toml"),
@@ -409,8 +409,8 @@ mod tests {
             include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm"))
         );
         assert_eq!(
-            files[6].contents,
-            include_bytes!("../../plugins/privacy/main.lua")
+            files[7].contents,
+            include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/privacy.wasm"))
         );
         assert_eq!(
             files[8].contents,

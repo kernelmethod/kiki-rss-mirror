@@ -182,6 +182,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiki-privacy"
+version = "2.0.0"
+dependencies = [
+ "kiki-plugin",
+ "serde_json",
+]
+
+[[package]]
 name = "kiki-sanitize"
 version = "2.0.0"
 dependencies = [

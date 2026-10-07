@@ -84,10 +84,11 @@ pub mod settings;
 mod adaptive_fetch_tests;
 #[cfg(test)]
 mod auto_tag_tests;
-// The filter and sanitize plugins are built by build.rs only for the default plugins.
+// The filter, privacy and sanitize plugins are built by build.rs only for the default
+// plugins.
 #[cfg(all(test, feature = "default-plugins"))]
 mod filter_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "default-plugins"))]
 mod privacy_tests;
 #[cfg(test)]
 mod retention_tests;

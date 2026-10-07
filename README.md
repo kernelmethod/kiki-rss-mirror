@@ -166,7 +166,8 @@ URL, in `skip_assets`:
 echo 'skip_assets = [3, "https://example.com/feed.xml"]' | kiki plugin config set privacy
 ```
 
-See [`plugins/privacy/main.lua`](plugins/privacy/main.lua) for the details.
+It is written in Rust, as a WebAssembly plugin; see
+[`plugins/privacy/src/lib.rs`](plugins/privacy/src/lib.rs) for the details.
 
 ### Sanitizing entries' HTML
 

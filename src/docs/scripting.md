@@ -334,7 +334,8 @@ written in Rust, as a WebAssembly plugin, rather than in Lua; see
 `plugins/filter/src/lib.rs` for the settings it takes. `kiki init --check` installs it into an
 existing home directory too, and updates it when a new release of Kiki bundles
 a new version, unless its files have been edited. It also installs
-`plugins/privacy`, which uses `entry.ingest` to remove tracking
+`plugins/privacy`, a WebAssembly plugin written in Rust (in
+`plugins/privacy/src`), which uses `entry.ingest` to remove tracking
 parameters such as `utm_source` from entries' URLs and the links in their
 content, and tracking pixels from their content, and can keep images from
 being downloaded for chosen feeds with `cache_assets`; `plugins/sanitize`,
