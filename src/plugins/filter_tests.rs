@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MANIFEST: &str = include_str!("../../plugins/filter/manifest.toml");
-const WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/filter-plugin.wasm"));
+const WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm"));
 
 /// The filter, loaded with `config`, looking feeds up in `services`.
 fn load(

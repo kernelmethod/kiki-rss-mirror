@@ -19,7 +19,8 @@
 # build into their own target directories
 /sdk/**/target
 /tests/wasm-fixture/target
-/plugins/filter-src/target
+/plugins/target
+/plugins/*/target
 
-# Built from plugins/filter-src by build.rs
-/plugins/filter/plugin.wasm
+# Built from plugins/<name>-src by build.rs
+/plugins/*/plugin.wasm

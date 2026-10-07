@@ -7,11 +7,13 @@
 //! `kiki init` then unpacks them into the new home directory's plugins
 //! directory.
 //!
-//! The filter plugin's `plugin.wasm` isn't kept in the repository: this script
-//! builds it from `plugins/filter-src` for `wasm32-unknown-unknown`, into
-//! `$OUT_DIR/filter-plugin.wasm`, and bundles it as `filter/plugin.wasm`. Set
-//! `KIKI_FILTER_PLUGIN_WASM` to the path of a prebuilt one to use that instead,
-//! as the Nix build does.
+//! Plugins written in Rust don't keep their `plugin.wasm` in the repository.
+//! A default plugin with a `plugins/<name>-src` crate, a member of the
+//! workspace in `plugins/Cargo.toml`, is built from it for
+//! `wasm32-unknown-unknown` into `$OUT_DIR/plugins-wasm/<name>.wasm`, and
+//! bundled as `<name>/plugin.wasm`. Set `KIKI_PLUGINS_WASM_DIR` to a directory
+//! of prebuilt `<name>.wasm` files to bundle those instead, as the Nix build
+//! does.
 
 fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
@@ -22,6 +24,7 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(feature = "default-plugins")]
 mod default_plugins {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
@@ -46,14 +49,14 @@ mod default_plugins {
     /// small and compressed once per build.
     const ZSTD_LEVEL: i32 = 19;
 
-    /// The target the filter plugin is built for. Kiki turns the core module
-    /// it produces into a component when it loads it. Unlike `wasm32-wasip2`,
-    /// nixpkgs' Rust toolchain ships its standard library.
+    /// The target plugins written in Rust are built for. Kiki turns the core
+    /// modules it produces into components when it loads them. Unlike
+    /// `wasm32-wasip2`, nixpkgs' Rust toolchain ships its standard library.
     const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
-    /// Environment variable naming a prebuilt filter plugin to bundle instead
-    /// of building one.
-    const PREBUILT_FILTER: &str = "KIKI_FILTER_PLUGIN_WASM";
+    /// Environment variable naming a directory of prebuilt plugins, as
+    /// `<name>.wasm`, to bundle instead of building them.
+    const PREBUILT_DIR: &str = "KIKI_PLUGINS_WASM_DIR";
 
     fn env(name: &str) -> String {
         std::env::var(name).unwrap_or_else(|_| panic!("${name} is not set"))
@@ -68,17 +71,17 @@ mod default_plugins {
         let root = PathBuf::from(env("CARGO_MANIFEST_DIR"));
         let out_dir = PathBuf::from(env("OUT_DIR"));
 
-        let filter_wasm = filter_plugin(&root, &out_dir)?;
+        let wasm = wasm_plugins(&root, &out_dir)?;
 
         let mut archive = tar::Builder::new(Vec::new());
         for name in DEFAULT_PLUGINS {
             let dir = root.join("plugins").join(name);
             let mut files = Vec::new();
             collect_files(&dir, &dir, 0, &mut files)?;
-            if *name == "filter" {
-                // Replaces any plugin.wasm left over from when it was committed.
+            if let Some(path) = wasm.get(name) {
+                // Replaces any plugin.wasm built or copied there by hand.
                 files.retain(|(relative, _)| relative != "plugin.wasm");
-                files.push(("plugin.wasm".to_string(), filter_wasm.clone()));
+                files.push(("plugin.wasm".to_string(), path.clone()));
             }
             files.sort();
 
@@ -104,55 +107,108 @@ mod default_plugins {
         fs::write(out_dir.join("default-plugins.tar.zst"), compressed)
     }
 
-    /// Builds the filter plugin from `plugins/filter-src` into
-    /// `$OUT_DIR/filter-plugin.wasm`, or copies the prebuilt one
-    /// [`PREBUILT_FILTER`] names there, and returns its path.
+    /// Builds every plugin in [`DEFAULT_PLUGINS`] that has a
+    /// `plugins/<name>-src` crate into `$OUT_DIR/plugins-wasm/<name>.wasm`, or
+    /// copies the prebuilt ones from [`PREBUILT_DIR`] there, and returns their
+    /// paths by plugin name.
     ///
-    /// The tests in `src/plugins/filter_tests.rs` and `src/plugins/defaults.rs`
-    /// embed it from there.
-    fn filter_plugin(root: &Path, out_dir: &Path) -> io::Result<PathBuf> {
-        let dest = out_dir.join("filter-plugin.wasm");
+    /// Tests, such as those in `src/plugins/filter_tests.rs`, embed them from
+    /// there.
+    fn wasm_plugins(root: &Path, out_dir: &Path) -> io::Result<BTreeMap<&'static str, PathBuf>> {
+        let plugins_dir = root.join("plugins");
+        let names: Vec<&'static str> = DEFAULT_PLUGINS
+            .iter()
+            .copied()
+            .filter(|name| crate_dir(&plugins_dir, name).join("Cargo.toml").is_file())
+            .collect();
 
-        println!("cargo:rerun-if-env-changed={PREBUILT_FILTER}");
-        if let Some(prebuilt) = std::env::var_os(PREBUILT_FILTER) {
-            let prebuilt = PathBuf::from(prebuilt);
-            println!("cargo:rerun-if-changed={}", prebuilt.display());
-            fs::copy(&prebuilt, &dest).map_err(|e| {
+        println!("cargo:rerun-if-env-changed={PREBUILT_DIR}");
+        let prebuilt = std::env::var_os(PREBUILT_DIR).map(PathBuf::from);
+        let release_dir = match &prebuilt {
+            Some(_) => None,
+            None if names.is_empty() => None,
+            None => Some(build_workspace(root, &plugins_dir, &names, out_dir)?),
+        };
+
+        let wasm_dir = out_dir.join("plugins-wasm");
+        fs::create_dir_all(&wasm_dir)?;
+        let mut paths = BTreeMap::new();
+        for name in names {
+            let (from, hint) = match (&prebuilt, &release_dir) {
+                (Some(dir), _) => {
+                    let from = dir.join(format!("{name}.wasm"));
+                    println!("cargo:rerun-if-changed={}", from.display());
+                    (from, format!("is it missing from ${PREBUILT_DIR}?"))
+                }
+                (None, Some(dir)) => (
+                    dir.join(format!("kiki_{}.wasm", name.replace('-', "_"))),
+                    format!(
+                        "is plugins/{name}-src in plugins/Cargo.toml's members, \
+                         with its package named kiki-{name}?"
+                    ),
+                ),
+                (None, None) => unreachable!("plugins are built when there are any"),
+            };
+            let dest = wasm_dir.join(format!("{name}.wasm"));
+            fs::copy(&from, &dest).map_err(|e| {
                 io::Error::new(
                     e.kind(),
-                    format!("copying ${PREBUILT_FILTER} ({}): {e}", prebuilt.display()),
+                    format!(
+                        "copying the {name} plugin from {}: {e}; {hint}",
+                        from.display()
+                    ),
                 )
             })?;
-            return Ok(dest);
+            paths.insert(name, dest);
         }
+        Ok(paths)
+    }
 
-        let src = root.join("plugins").join("filter-src");
+    /// The crate the plugin `name` is built from.
+    fn crate_dir(plugins_dir: &Path, name: &str) -> PathBuf {
+        plugins_dir.join(format!("{name}-src"))
+    }
+
+    /// Builds the workspace in `plugins/`, holding the crates of the plugins
+    /// `names`, and returns the directory the `.wasm` files land in.
+    fn build_workspace(
+        root: &Path,
+        plugins_dir: &Path,
+        names: &[&str],
+        out_dir: &Path,
+    ) -> io::Result<PathBuf> {
         let sdk = root.join("sdk").join("rust").join("kiki-plugin");
-        for path in [
-            src.join("Cargo.toml"),
-            src.join("Cargo.lock"),
-            src.join("src"),
+        let mut inputs = vec![
+            plugins_dir.join("Cargo.toml"),
+            plugins_dir.join("Cargo.lock"),
             sdk.join("Cargo.toml"),
             sdk.join("src"),
             root.join("wit"),
-        ] {
+        ];
+        for name in names {
+            let dir = crate_dir(plugins_dir, name);
+            inputs.push(dir.join("Cargo.toml"));
+            inputs.push(dir.join("src"));
+        }
+        for path in inputs {
             println!("cargo:rerun-if-changed={}", path.display());
         }
 
-        let target_dir = out_dir.join("filter-plugin");
+        let target_dir = out_dir.join("plugins-target");
         let mut cargo = Command::new(env("CARGO"));
         cargo
             .arg("build")
             .arg("--release")
             .arg("--locked")
+            .arg("--workspace")
             .arg("--target")
             .arg(WASM_TARGET)
             .arg("--manifest-path")
-            .arg(src.join("Cargo.toml"))
+            .arg(plugins_dir.join("Cargo.toml"))
             .arg("--target-dir")
             .arg(&target_dir);
         // Flags meant for Kiki's own build, such as cargo-llvm-cov's
-        // instrumentation or a musl target, don't apply to the plugin.
+        // instrumentation or a musl target, don't apply to the plugins.
         for var in [
             "RUSTFLAGS",
             "CARGO_ENCODED_RUSTFLAGS",
@@ -168,21 +224,13 @@ mod default_plugins {
         let status = cargo.status()?;
         if !status.success() {
             return Err(io::Error::other(format!(
-                "building the filter plugin in plugins/filter-src failed ({status}). \
+                "building the plugins in plugins/ failed ({status}). \
                  It needs the {WASM_TARGET} target (`rustup target add {WASM_TARGET}`); \
-                 or set ${PREBUILT_FILTER} to a prebuilt plugin.wasm, or build without \
-                 the default-plugins feature"
+                 or set ${PREBUILT_DIR} to a directory of prebuilt <name>.wasm files, \
+                 or build without the default-plugins feature"
             )));
         }
-
-        fs::copy(
-            target_dir
-                .join(WASM_TARGET)
-                .join("release")
-                .join("kiki_filter.wasm"),
-            &dest,
-        )?;
-        Ok(dest)
+        Ok(target_dir.join(WASM_TARGET).join("release"))
     }
 
     /// Collects every regular file under `dir`, as its `/`-separated path

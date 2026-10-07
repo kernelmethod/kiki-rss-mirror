@@ -406,7 +406,7 @@ mod tests {
         );
         assert_eq!(
             files[5].contents,
-            include_bytes!(concat!(env!("OUT_DIR"), "/filter-plugin.wasm"))
+            include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm"))
         );
         assert_eq!(
             files[6].contents,
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(sync_filter(td.path()), SyncOutcome::Updated);
         assert_eq!(
             std::fs::read(&main).unwrap(),
-            include_bytes!(concat!(env!("OUT_DIR"), "/filter-plugin.wasm"))
+            include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm"))
         );
         assert!(!td.path().join("filter").join("old.lua").exists());
         assert_eq!(sync_filter(td.path()), SyncOutcome::UpToDate);
@@ -557,7 +557,7 @@ mod tests {
         assert!(!dir.join("main.lua").exists());
         assert_eq!(
             std::fs::read(dir.join("plugin.wasm")).unwrap(),
-            include_bytes!(concat!(env!("OUT_DIR"), "/filter-plugin.wasm"))
+            include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm"))
         );
         assert_eq!(
             std::fs::read(dir.join("manifest.toml")).unwrap(),

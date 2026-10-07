@@ -14,42 +14,52 @@
           pkgs = nixpkgs.legacyPackages.${system};
           craneLib = crane.mkLib pkgs;
 
-          # The filter plugin, built from plugins/filter-src as WebAssembly.
-          # build.rs would build it itself, but can't fetch its dependencies
-          # inside the Nix sandbox, so it bundles this one instead (through
-          # KIKI_FILTER_PLUGIN_WASM below). nixpkgs' rustc ships the standard
-          # library for wasm32-unknown-unknown.
-          filterPlugin = let
-            src = pkgs.lib.fileset.toSource {
+          # The default plugins written in Rust: the workspace in plugins/,
+          # built as WebAssembly into $out/<name>.wasm. build.rs would build
+          # them itself, but can't fetch their dependencies inside the Nix
+          # sandbox, so it bundles these instead (through KIKI_PLUGINS_WASM_DIR
+          # below). nixpkgs' rustc ships the standard library for
+          # wasm32-unknown-unknown.
+          wasmPlugins = let
+            fs = pkgs.lib.fileset;
+            # Each plugins/<name>-src crate, without any target directory.
+            crates = builtins.filter (pkgs.lib.hasSuffix "-src")
+              (builtins.attrNames (builtins.readDir ./plugins));
+            src = fs.toSource {
               root = ./.;
-              fileset = pkgs.lib.fileset.unions [
-                ./plugins/filter-src/Cargo.toml
-                ./plugins/filter-src/Cargo.lock
-                ./plugins/filter-src/src
+              fileset = fs.unions ([
+                ./plugins/Cargo.toml
+                ./plugins/Cargo.lock
                 ./sdk/rust/kiki-plugin/Cargo.toml
                 ./sdk/rust/kiki-plugin/src
                 ./wit
-              ];
+              ] ++ builtins.concatMap (crate: [
+                (./plugins + "/${crate}/Cargo.toml")
+                (./plugins + "/${crate}/src")
+              ]) crates);
             };
           in craneLib.mkCargoDerivation {
-            pname = "kiki-filter-plugin";
-            version = (craneLib.crateNameFromCargoToml {
-              cargoToml = ./plugins/filter-src/Cargo.toml;
-            }).version;
+            pname = "kiki-rss-wasm-plugins";
+            version = (craneLib.crateNameFromCargoToml { cargoToml = ./Cargo.toml; }).version;
             inherit src;
             cargoArtifacts = null;
             cargoVendorDir = craneLib.vendorCargoDeps {
-              cargoLock = ./plugins/filter-src/Cargo.lock;
+              cargoLock = ./plugins/Cargo.lock;
             };
             postUnpack = ''
-              cd $sourceRoot/plugins/filter-src
+              cd $sourceRoot/plugins
               sourceRoot="."
             '';
             buildPhaseCargoCommand = ''
-              cargo build --release --locked --target wasm32-unknown-unknown
+              cargo build --release --locked --workspace --target wasm32-unknown-unknown
             '';
+            # plugins/<name>-src's package is kiki-<name> (see build.rs).
             installPhaseCommand = ''
-              install -Dm644 target/wasm32-unknown-unknown/release/kiki_filter.wasm $out/plugin.wasm
+              for crate in *-src; do
+                name=''${crate%-src}
+                install -Dm644 "target/wasm32-unknown-unknown/release/kiki_''${name//-/_}.wasm" \
+                  "$out/$name.wasm"
+              done
             '';
             doInstallCargoArtifacts = false;
             strictDeps = true;
@@ -92,7 +102,7 @@
               };
             strictDeps = true;
 
-            KIKI_FILTER_PLUGIN_WASM = "${filterPlugin}/plugin.wasm";
+            KIKI_PLUGINS_WASM_DIR = "${wasmPlugins}";
 
             # The test suite already runs in checks.tests; running it here too
             # roughly doubles the Nix build time (release + LTO).
@@ -139,7 +149,7 @@
           craneLibStatic = crane.mkLib pkgs.pkgsStatic;
 
           staticArgs = {
-            inherit (commonArgs) src strictDeps doCheck KIKI_FILTER_PLUGIN_WASM;
+            inherit (commonArgs) src strictDeps doCheck KIKI_PLUGINS_WASM_DIR;
             # pkgsStatic adds -static to every link, including the glibc
             # build scripts, which then fail to link. rustc already links
             # musl binaries statically, so drop it.
@@ -268,7 +278,7 @@
 
           packages = {
             default = kiki;
-            filter-plugin = filterPlugin;
+            wasm-plugins = wasmPlugins;
             inherit book docs coverage profiling;
           } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
             inherit static;
@@ -281,7 +291,7 @@
             packages = with pkgs; [
               cargo-deb
               mdbook
-              # For build.rs to link the filter plugin (see filterPlugin)
+              # For build.rs to link the plugins written in Rust (see wasmPlugins)
               lld
             ];
           };

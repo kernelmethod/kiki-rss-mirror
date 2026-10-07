@@ -21,12 +21,15 @@ nix build .#checks.x86_64-linux.tests     # or fmt, clippy, book
 nix flake check                           # all of them
 ```
 
-The [filter](plugins/filter.md) plugin is written in Rust, in
-`plugins/filter-src`, and its `plugin.wasm` isn't kept in the repository:
-`build.rs` builds it whenever it or the SDK in `sdk/rust/kiki-plugin`
-changes, and bundles it with the other default plugins. To bundle a prebuilt
-one instead, set `KIKI_FILTER_PLUGIN_WASM` to its path, as the Nix build
-does.
+Default plugins written in Rust, such as the [filter](plugins/filter.md),
+keep their source in `plugins/<name>-src`, a crate named `kiki-<name>` in
+the Cargo workspace in `plugins/`, and their `plugin.wasm` isn't kept in the
+repository: `build.rs` builds the workspace whenever it or the SDK in
+`sdk/rust/kiki-plugin` changes, and bundles each as `<name>/plugin.wasm`. To
+port another default plugin, add its crate to the workspace's `members`. To
+bundle prebuilt plugins instead, set `KIKI_PLUGINS_WASM_DIR` to a directory
+holding them as `<name>.wasm`, as the Nix build does
+(`nix build .#wasm-plugins` builds that directory).
 
 ## Reports
 
