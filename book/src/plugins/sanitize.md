@@ -65,7 +65,7 @@ add markup back; a plugin of your own that should run on unsanitized
 content needs a name that sorts before it.
 
 The plugin is written in Rust, as a [WebAssembly plugin](../writing-wasm-plugins.md);
-see [`plugins/sanitize-src`](https://github.com/kernelmethod/kiki-rss/tree/main/plugins/sanitize-src)
+see [`plugins/sanitize/src/lib.rs`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/sanitize/src/lib.rs)
 for the details. It parses HTML with the same rewriter as
 [`kiki.html`](../writing-plugins.md#rewriting-html), which plugins of your own
 can use to rewrite entries' HTML too. Versions before 2.0.0 were written in

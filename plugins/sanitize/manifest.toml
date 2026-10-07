@@ -6,8 +6,8 @@ description = "Sanitize the HTML content of new entries: keep only the elements 
 license = "MIT"
 homepage = "https://github.com/kernelmethod/kiki-rss"
 
-# Written in Rust, as a WebAssembly component: its source is in
-# plugins/sanitize-src in Kiki's repository. Versions before 2.0.0 were
+# Written in Rust, as a WebAssembly component: its source is beside this
+# manifest in Kiki's repository. Versions before 2.0.0 were
 # written in Lua, and took the same config.
 #
 # Every new entry passes through this plugin, and rewriting a long entry's
@@ -21,7 +21,7 @@ time_budget_ms = "unlimited"
 # styles, frames, embedded objects, SVG and MathML are always removed, and
 # so are comments and event handler attributes. URL attributes, such as
 # href and src, must be relative or use one of the `url_schemes`. See
-# plugins/sanitize-src/src/lib.rs for the details.
+# src/lib.rs for the details.
 #
 # To change what it keeps, start from its defaults, for example with
 # `kiki plugin config get sanitize --defaults`, edit them and pass them to

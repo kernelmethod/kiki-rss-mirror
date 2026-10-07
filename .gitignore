@@ -22,5 +22,5 @@
 /plugins/target
 /plugins/*/target
 
-# Built from plugins/<name>-src by build.rs
+# Built from the crate in plugins/<name> by build.rs
 /plugins/*/plugin.wasm

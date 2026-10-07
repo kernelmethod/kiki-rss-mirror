@@ -1,5 +1,5 @@
 //! Tests for the `sanitize` plugin shipped in `plugins/sanitize/`, built from
-//! `plugins/sanitize-src/` by `build.rs`.
+//! the crate in that directory by `build.rs`.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 

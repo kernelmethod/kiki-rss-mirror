@@ -22,11 +22,13 @@ nix flake check                           # all of them
 ```
 
 Default plugins written in Rust, such as the [filter](plugins/filter.md),
-keep their source in `plugins/<name>-src`, a crate named `kiki-<name>` in
-the Cargo workspace in `plugins/`, and their `plugin.wasm` isn't kept in the
-repository: `build.rs` builds the workspace whenever it or the SDK in
-`sdk/rust/kiki-plugin` changes, and bundles each as `<name>/plugin.wasm`. To
-port another default plugin, add its crate to the workspace's `members`. To
+keep their source in their own directory, `plugins/<name>`: a crate named
+`kiki-<name>` in the Cargo workspace in `plugins/`, with its `Cargo.toml` and
+`src/` beside the plugin's `manifest.toml`. Their `plugin.wasm` isn't kept in
+the repository: `build.rs` builds the workspace whenever it or the SDK in
+`sdk/rust/kiki-plugin` changes, and bundles each plugin as its manifest and
+`<name>/plugin.wasm`, without the crate. To port another default plugin, make
+its directory a crate and add it to the workspace's `members`. To
 bundle prebuilt plugins instead, set `KIKI_PLUGINS_WASM_DIR` to a directory
 holding them as `<name>.wasm`, as the Nix build does
 (`nix build .#wasm-plugins` builds that directory).
