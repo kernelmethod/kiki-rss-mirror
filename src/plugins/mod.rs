@@ -84,7 +84,8 @@ pub mod settings;
 mod adaptive_fetch_tests;
 #[cfg(test)]
 mod auto_tag_tests;
-#[cfg(all(test, feature = "wasm-plugins"))]
+// The filter is built by build.rs only for the default plugins.
+#[cfg(all(test, feature = "default-plugins"))]
 mod filter_tests;
 #[cfg(test)]
 mod privacy_tests;

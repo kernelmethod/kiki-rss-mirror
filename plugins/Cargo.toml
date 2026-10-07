@@ -1,0 +1,15 @@
+# The default plugins written in Rust, as WebAssembly components: each
+# `<name>-src` crate here is the source of the plugin in `<name>/`, and its
+# package is named `kiki-<name>`. Not part of kiki-rss's build: kiki-rss's
+# build.rs builds them all for wasm32-unknown-unknown and bundles each as
+# `<name>/plugin.wasm`.
+[workspace]
+resolver = "2"
+members = ["filter-src"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

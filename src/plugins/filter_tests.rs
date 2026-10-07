@@ -1,5 +1,5 @@
 //! Tests for the `filter` plugin shipped in `plugins/filter/`, built from
-//! `plugins/filter-src/` by `tools/build-filter-plugin.sh`.
+//! `plugins/filter-src/` by `build.rs`.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MANIFEST: &str = include_str!("../../plugins/filter/manifest.toml");
-const WASM: &[u8] = include_bytes!("../../plugins/filter/plugin.wasm");
+const WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm"));
 
 /// The filter, loaded with `config`, looking feeds up in `services`.
 fn load(

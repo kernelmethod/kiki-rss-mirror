@@ -14,6 +14,59 @@
           pkgs = nixpkgs.legacyPackages.${system};
           craneLib = crane.mkLib pkgs;
 
+          # The default plugins written in Rust: the workspace in plugins/,
+          # built as WebAssembly into $out/<name>.wasm. build.rs would build
+          # them itself, but can't fetch their dependencies inside the Nix
+          # sandbox, so it bundles these instead (through KIKI_PLUGINS_WASM_DIR
+          # below). nixpkgs' rustc ships the standard library for
+          # wasm32-unknown-unknown.
+          wasmPlugins = let
+            fs = pkgs.lib.fileset;
+            # Each plugins/<name>-src crate, without any target directory.
+            crates = builtins.filter (pkgs.lib.hasSuffix "-src")
+              (builtins.attrNames (builtins.readDir ./plugins));
+            src = fs.toSource {
+              root = ./.;
+              fileset = fs.unions ([
+                ./plugins/Cargo.toml
+                ./plugins/Cargo.lock
+                ./sdk/rust/kiki-plugin/Cargo.toml
+                ./sdk/rust/kiki-plugin/src
+                ./wit
+              ] ++ builtins.concatMap (crate: [
+                (./plugins + "/${crate}/Cargo.toml")
+                (./plugins + "/${crate}/src")
+              ]) crates);
+            };
+          in craneLib.mkCargoDerivation {
+            pname = "kiki-rss-wasm-plugins";
+            version = (craneLib.crateNameFromCargoToml { cargoToml = ./Cargo.toml; }).version;
+            inherit src;
+            cargoArtifacts = null;
+            cargoVendorDir = craneLib.vendorCargoDeps {
+              cargoLock = ./plugins/Cargo.lock;
+            };
+            postUnpack = ''
+              cd $sourceRoot/plugins
+              sourceRoot="."
+            '';
+            buildPhaseCargoCommand = ''
+              cargo build --release --locked --workspace --target wasm32-unknown-unknown
+            '';
+            # plugins/<name>-src's package is kiki-<name> (see build.rs).
+            installPhaseCommand = ''
+              for crate in *-src; do
+                name=''${crate%-src}
+                install -Dm644 "target/wasm32-unknown-unknown/release/kiki_''${name//-/_}.wasm" \
+                  "$out/$name.wasm"
+              done
+            '';
+            doInstallCargoArtifacts = false;
+            strictDeps = true;
+            # nixpkgs' rustc links WebAssembly with lld.
+            nativeBuildInputs = [ pkgs.lld ];
+          };
+
           commonArgs = {
             src = let
               sqlFilter = path: _type: builtins.match ".*\\.sql$" path != null;
@@ -25,7 +78,7 @@
               webUiFilter = path: _type: builtins.match ".*/src/.*\\.(html|js)$" path != null;
               # Bundled plugins, packed into a .tar.zst by build.rs and pulled
               # into tests via include_str! and include_bytes! (e.g.
-              # plugins/filter/plugin.wasm)
+              # plugins/filter/manifest.toml)
               pluginsFilter = path: _type: builtins.match ".*/plugins(/.*)?" path != null;
               # The WebAssembly plugin interface, read by wasmtime's bindgen!
               # (src/scripting/wasm.rs), and the plugin its tests run
@@ -48,6 +101,8 @@
                 filter = customOrCargo;
               };
             strictDeps = true;
+
+            KIKI_PLUGINS_WASM_DIR = "${wasmPlugins}";
 
             # The test suite already runs in checks.tests; running it here too
             # roughly doubles the Nix build time (release + LTO).
@@ -94,7 +149,7 @@
           craneLibStatic = crane.mkLib pkgs.pkgsStatic;
 
           staticArgs = {
-            inherit (commonArgs) src strictDeps doCheck;
+            inherit (commonArgs) src strictDeps doCheck KIKI_PLUGINS_WASM_DIR;
             # pkgsStatic adds -static to every link, including the glibc
             # build scripts, which then fail to link. rustc already links
             # musl binaries statically, so drop it.
@@ -223,6 +278,7 @@
 
           packages = {
             default = kiki;
+            wasm-plugins = wasmPlugins;
             inherit book docs coverage profiling;
           } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
             inherit static;
@@ -235,6 +291,8 @@
             packages = with pkgs; [
               cargo-deb
               mdbook
+              # For build.rs to link the plugins written in Rust (see wasmPlugins)
+              lld
             ];
           };
         }

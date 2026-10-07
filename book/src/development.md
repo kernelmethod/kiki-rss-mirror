@@ -1,8 +1,10 @@
 # Building and testing
 
-Kiki is a Rust project. With a stable Rust toolchain:
+Kiki is a Rust project. With a stable Rust toolchain and its
+`wasm32-unknown-unknown` target:
 
 ```bash
+rustup target add wasm32-unknown-unknown
 cargo build                 # debug build, in target/debug/kiki
 cargo build --release       # release build, in target/release/kiki
 cargo test
@@ -18,6 +20,16 @@ of the flake's checks:
 nix build .#checks.x86_64-linux.tests     # or fmt, clippy, book
 nix flake check                           # all of them
 ```
+
+Default plugins written in Rust, such as the [filter](plugins/filter.md),
+keep their source in `plugins/<name>-src`, a crate named `kiki-<name>` in
+the Cargo workspace in `plugins/`, and their `plugin.wasm` isn't kept in the
+repository: `build.rs` builds the workspace whenever it or the SDK in
+`sdk/rust/kiki-plugin` changes, and bundles each as `<name>/plugin.wasm`. To
+port another default plugin, add its crate to the workspace's `members`. To
+bundle prebuilt plugins instead, set `KIKI_PLUGINS_WASM_DIR` to a directory
+holding them as `<name>.wasm`, as the Nix build does
+(`nix build .#wasm-plugins` builds that directory).
 
 ## Reports
 

@@ -60,9 +60,12 @@ To run Kiki without installing it, use `nix run github:kernelmethod/kiki-rss
 
 ## From source
 
-Kiki builds with a recent stable Rust toolchain:
+Kiki builds with a recent stable Rust toolchain, with the
+`wasm32-unknown-unknown` target for the [filter](plugins/filter.md) plugin,
+which the build compiles to WebAssembly:
 
 ```bash
+rustup target add wasm32-unknown-unknown
 cargo install --locked --git https://github.com/kernelmethod/kiki-rss kiki-rss
 ```
 

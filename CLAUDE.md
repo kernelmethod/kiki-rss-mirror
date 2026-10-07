@@ -29,6 +29,7 @@ Modules in the codebase are structured as follows:
   - `routes/` - HTTP route handlers organized by API version
   - `cli/` - Command-line interface commands
   - `test/` - Test modules and test data
+- `plugins/` - The plugins Kiki installs by default; `<name>-src/` holds the Rust source of a WebAssembly one, in the Cargo workspace in `plugins/Cargo.toml`, which `build.rs` builds (needs `rustup target add wasm32-unknown-unknown`)
 - `book/` - The user guide (an mdBook), published with the landing page in `book/landing/`
 
 ## Code Style Guidelines
