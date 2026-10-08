@@ -49,8 +49,8 @@ use crate::process::ipc::{
 };
 use crate::scripting::wasm::WasmScriptRunner;
 use crate::scripting::{
-    Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary, ScheduleDecision,
-    ScriptRunner, ScriptServices, ScriptSource, ServiceCall, ServiceReply,
+    Event, EventPayload, EventSet, FeedEntry, FetchSchedule, PluginRun, ScanSummary,
+    ScheduleDecision, ScriptRunner, ScriptServices, ScriptSource, ServiceCall, ServiceReply,
 };
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -487,6 +487,14 @@ impl ScriptRunner for SubprocessScriptRunner {
     }
 
     fn dispatch_transform_entry(&self, entry: FeedEntry) -> Result<Option<FeedEntry>> {
+        self.dispatch_transform_entry_timed(entry, &mut Vec::new())
+    }
+
+    fn dispatch_transform_entry_timed(
+        &self,
+        entry: FeedEntry,
+        runs: &mut Vec<PluginRun>,
+    ) -> Result<Option<FeedEntry>> {
         if !self.handles(Event::EntryIngest) {
             return Ok(Some(entry));
         }
@@ -494,7 +502,10 @@ impl ScriptRunner for SubprocessScriptRunner {
             entry: entry.clone(),
         };
         match self.host.request(&request) {
-            Ok(HostResponse::Entry { entry }) => Ok(entry),
+            Ok(HostResponse::Entry { entry, runs: done }) => {
+                runs.extend(done);
+                Ok(entry)
+            }
             Ok(other) => {
                 warn!("script host: expected an Entry response, got {other:?}");
                 Ok(Some(entry))
@@ -739,13 +750,19 @@ fn serve(
         }
 
         HostRequest::TransformEntry { entry } => match runner.as_ref() {
-            None => HostResponse::Entry { entry: Some(entry) },
-            Some(r) => match r.dispatch_transform_entry(entry) {
-                Ok(entry) => HostResponse::Entry { entry },
-                Err(e) => HostResponse::Failed {
-                    message: format!("{e}"),
-                },
+            None => HostResponse::Entry {
+                entry: Some(entry),
+                runs: Vec::new(),
             },
+            Some(r) => {
+                let mut runs = Vec::new();
+                match r.dispatch_transform_entry_timed(entry, &mut runs) {
+                    Ok(entry) => HostResponse::Entry { entry, runs },
+                    Err(e) => HostResponse::Failed {
+                        message: format!("{e}"),
+                    },
+                }
+            }
         },
 
         HostRequest::Schedule { schedule } => match runner.as_ref() {

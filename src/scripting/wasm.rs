@@ -59,9 +59,9 @@
 use super::regex::MAX_LIVE_REGEXES;
 use super::{
     parse_script_config, restore_read_only, ContentChange, DeleteFilter, Event, EventPayload,
-    EventSet, FeedEntry, FetchSchedule, ScanOptions, ScanSummary, ScheduleDecision, ScriptRunner,
-    ScriptServices, ScriptSource, ServiceCall, ServiceReply, TimeBudget, WasmComponent,
-    MAX_TIMER_INTERVAL, SCAN_SLICE, TIMER_TICK,
+    EventSet, FeedEntry, FetchSchedule, PluginRun, ScanOptions, ScanSummary, ScheduleDecision,
+    ScriptRunner, ScriptServices, ScriptSource, ServiceCall, ServiceReply, TimeBudget,
+    WasmComponent, MAX_TIMER_INTERVAL, SCAN_SLICE, TIMER_TICK,
 };
 use crate::db::tags::{is_reserved_tag_name, SystemTag};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1219,6 +1219,14 @@ impl ScriptRunner for WasmScriptRunner {
     }
 
     fn dispatch_transform_entry(&self, entry: FeedEntry) -> anyhow::Result<Option<FeedEntry>> {
+        self.dispatch_transform_entry_timed(entry, &mut Vec::new())
+    }
+
+    fn dispatch_transform_entry_timed(
+        &self,
+        entry: FeedEntry,
+        runs: &mut Vec<PluginRun>,
+    ) -> anyhow::Result<Option<FeedEntry>> {
         let mut current = entry;
         let mut dispatch = self.dispatch();
         for plugin in self.plugins().iter_mut() {
@@ -1226,8 +1234,13 @@ impl ScriptRunner for WasmScriptRunner {
                 continue;
             }
             let input = entry_to_wit(current.clone());
+            let start = Instant::now();
             let returned = plugin.call(&mut dispatch, "entry.ingest handler", |b, s| {
                 b.call_on_entry_ingest(s, &input)
+            });
+            runs.push(PluginRun {
+                plugin: plugin.name.to_string(),
+                seconds: start.elapsed().as_secs_f64(),
             });
             match returned {
                 // A failed handler passes the entry through unmodified.
