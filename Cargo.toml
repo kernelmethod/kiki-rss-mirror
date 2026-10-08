@@ -104,10 +104,11 @@ debug = true
 opt-level = 0
 
 [profile.release]
-# Fat LTO with a single codegen unit cuts the binary by about 14% compared
-# with thin LTO, at the cost of a slower release build.
-lto = "fat"
-codegen-units = 1
+# Thin LTO rather than fat LTO with a single codegen unit. Fat LTO makes the
+# binary about 14% smaller, but compiling kiki-rss takes a third more memory
+# (2.6 GiB rather than 1.9 GiB) and more than twice as long, and CI's release
+# builds share one host with the rest of CI.
+lto = "thin"
 strip = true
 
 # A release build that profilers can read: the same optimizations, but with
