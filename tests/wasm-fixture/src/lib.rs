@@ -4,11 +4,12 @@
 //! What it does is chosen by its config; see [`Config`]. It reports what it sees by
 //! storing values under `seen:<what>` with `store-set`, which the tests record.
 
-use kiki_plugin::{plugin, 
-    host, parse_config, DeleteFilter, Entry, FeedEvent, FetchError,
-    FetchSchedule, FetchSuccess, Level, Plugin, ScanOptions, ScanSummary,
-};
+use kiki_plugin::html::{self, Edits, Place};
 use kiki_plugin::regex::{Regex, RegexSet};
+use kiki_plugin::{
+    host, parse_config, plugin, DeleteFilter, Entry, FeedEvent, FetchError, FetchSchedule,
+    FetchSuccess, Level, Plugin, ScanOptions, ScanSummary,
+};
 use serde::Deserialize;
 
 /// Keys the fixture doesn't know are ignored, so that tests of plugins' configs can
@@ -62,6 +63,9 @@ struct Config {
     /// On ingesting an entry, compile this many regexes and keep them all alive, then
     /// drop them and compile one more.
     regex_count: Option<usize>,
+    /// Select the elements this selector matches in each ingested entry's title, as HTML,
+    /// then rewrite the title, numbering them in an attribute and removing comments.
+    html: Option<String>,
 }
 
 struct Fixture {
@@ -70,7 +74,10 @@ struct Fixture {
 }
 
 fn seen(what: &str, value: impl Into<String>) {
-    let _ = host::store_set(&format!("seen:{what}"), Some(&format!("{:?}", value.into())));
+    let _ = host::store_set(
+        &format!("seen:{what}"),
+        Some(&format!("{:?}", value.into())),
+    );
 }
 
 impl Plugin for Fixture {
@@ -162,6 +169,34 @@ impl Fixture {
             let after = Regex::compile("y", "").map_or_else(|e| e, |_| "ok".to_string());
             seen("regex-after-drop", after);
         }
+        if let Some(selector) = &self.config.html {
+            match html::select(&entry.title, selector) {
+                Ok(elements) => {
+                    let mut edits = Edits::new();
+                    edits.remove_comments();
+                    let described: Vec<String> = elements
+                        .iter()
+                        .map(|el| {
+                            edits
+                                .set_attribute(el.index(), "data-i", &el.index().to_string())
+                                .insert_text(el.index(), Place::Append, "<&>");
+                            let attributes: Vec<String> =
+                                el.attributes().map(|(n, v)| format!("{n}={v}")).collect();
+                            format!(
+                                "{} {:?} {}",
+                                el.tag_name(),
+                                el.namespace(),
+                                attributes.join(" ")
+                            )
+                        })
+                        .collect();
+                    seen("html-select", described.join(", "));
+                    let out = html::rewrite(&entry.title, selector, &edits).unwrap_or_else(|e| e);
+                    seen("html-rewrite", out);
+                }
+                Err(e) => seen("html-select", e),
+            }
+        }
         self.made += 1;
         if let Some(suffix) = &self.config.suffix {
             entry.title.push_str(suffix);
@@ -178,12 +213,18 @@ impl Fixture {
 
     #[on(fetch.success)]
     fn fetch_success(&mut self, event: FetchSuccess) {
-        seen("fetch.success", format!("{} {} {}", event.feed_id, event.status, event.url));
+        seen(
+            "fetch.success",
+            format!("{} {} {}", event.feed_id, event.status, event.url),
+        );
     }
 
     #[on(fetch.error)]
     fn fetch_error(&mut self, event: FetchError) {
-        seen("fetch.error", format!("{} {} {}", event.feed_id, event.kind, event.message));
+        seen(
+            "fetch.error",
+            format!("{} {} {}", event.feed_id, event.kind, event.message),
+        );
     }
 
     #[on(feed.added)]
@@ -245,7 +286,12 @@ impl Fixture {
             let elapsed = start.elapsed();
             seen(
                 "wasi",
-                format!("{} {} {}", map["a"], wall > 1_700_000_000, elapsed.as_secs() < 1),
+                format!(
+                    "{} {} {}",
+                    map["a"],
+                    wall > 1_700_000_000,
+                    elapsed.as_secs() < 1
+                ),
             );
         }
     }

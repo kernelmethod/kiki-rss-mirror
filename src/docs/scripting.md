@@ -223,6 +223,7 @@ for `wasm32-unknown-unknown`, which Kiki turns into one), which:
   `store-get` and `store-set`, `tag-entry` and `untag-entry`, `start-scan`,
   `delete-entries`, `get-feed`, and `every`;
 - imports `kiki:plugin/regex`: see [Regular expressions](#regular-expressions);
+- imports `kiki:plugin/html`: see [Parsing HTML](#parsing-html);
 - exports `init`, which Kiki calls with the plugin's config, as a JSON
   object, when the plugin loads. It returns the events the plugin handles,
   and only those are delivered to it; an error fails the load;
@@ -717,11 +718,72 @@ pattern alone to the `regex` crate's `RegexSet`, though: a set of patterns,
 one of which has no literal text to look for, can be a hundred times slower
 on text that is not ASCII.
 
+## Parsing HTML
+
+`kiki_plugin::html`, the `html` interface, parses and rewrites HTML, such as
+an entry's content, in Kiki itself, with
+[`lol_html`](https://github.com/cloudflare/lol-html), the streaming HTML
+rewriter Kiki uses for its own HTML. That is faster than a parser built into
+the plugin, and leaves the plugin much smaller: `lol_html` adds about 600 KB
+to a plugin. Don't edit HTML with string searches or regexes: they see
+`<a href="x">` where a browser sees something else, which is how
+sanitizers built on them get bypassed.
+
+Kiki can't call into a plugin while the plugin is calling Kiki, so a
+rewrite takes two passes:
+
+1. `html::select(html, selector)` returns the elements a CSS selector, such
+   as `"a[href], img"` or `"*"`, matches, in document order. Each has a tag
+   name, lowercase, a namespace (HTML, or SVG or MathML inside an `<svg>` or
+   a `<math>`) and its attributes, with lowercase names.
+2. The plugin records what to do with them in `Edits`, by each element's
+   `index()`.
+3. `html::rewrite(html, selector, &edits)` parses the same HTML with the
+   same selector again, makes the edits, and returns the rewritten HTML.
+
+```rust,ignore
+use kiki_plugin::html::{self, Edits};
+
+fn nofollow(content: &str) -> Result<String, String> {
+    let mut edits = Edits::new();
+    for a in html::select(content, "a[href]")?.iter() {
+        if a.attribute("href").is_some_and(|href| href.starts_with("http")) {
+            edits.set_attribute(a.index(), "rel", "nofollow");
+        }
+    }
+    html::rewrite(content, "a[href]", &edits)
+}
+```
+
+An element can be removed with its content (`remove`), or have its tags
+removed and its content kept (`remove_and_keep_content`). Its attributes can
+be set and removed, and it can be renamed. Content can be inserted before
+or after it, at the start or end of its content, in place of its content,
+or in place of the element itself, either as text, which is escaped, or as
+HTML, which is inserted as it is. `edits.remove_comments()` removes the
+HTML's comments too. An edit that sets an invalid attribute or tag name, or
+is for an element past the last one matched, fails the rewrite.
+
+Attribute values are decoded, as a browser decodes them: the value of
+`href="&#106;avascript:"` is `javascript:`. Values set are escaped, so a
+value read and set again is written out as what was read: a plugin that
+checks a URL and sets it again writes what it checked.
+`html::unescape(s)` decodes the character references in other text, and
+`html::escape(s)` escapes `&`, `<`, `>`, `"` and `'` for putting text into
+HTML.
+
+Parsing runs outside the plugin's memory, so it has limits of its own: the
+parser may use 4 MiB for its buffers, and what a call returns may take at
+most 8 MiB. Each call also checks how much room the plugin's memory has for
+what it returns, and fails rather than return more than that, since a
+plugin with no room for a result would trap. Parsing counts against the
+handler's [time budget](#resource-limits).
+
 ## What a plugin can reach
 
 A plugin runs in a sandbox of its own: it shares no memory with Kiki or with
-any other plugin, and can reach nothing but what the `host` and `regex`
-interfaces offer. Of [WASI](https://wasi.dev/), the system interface
+any other plugin, and can reach nothing but what the `host`, `regex` and
+`html` interfaces offer. Of [WASI](https://wasi.dev/), the system interface
 WebAssembly toolchains build on, Kiki provides only randomness
 (`wasi:random`) and the clocks (`wasi:clocks`' `now` and `resolution`), which
 libraries use without being asked: Rust's `HashMap` seeds its hasher from
@@ -754,6 +816,8 @@ Every call into a plugin runs under hard limits:
 - **Memory**: 16 MiB for each plugin, and 512 KiB of stack.
 - **Regexes**: compiled regexes live outside the plugin's memory, and have
   limits of their own; see [Regular expressions](#regular-expressions).
+- **HTML**: parsing HTML happens outside the plugin's memory too, with
+  limits of its own; see [Parsing HTML](#parsing-html).
 
 Kiki compiles each plugin to native code when it loads, once for each
 distinct `plugin.wasm`, so changing only a plugin's config reloads it without

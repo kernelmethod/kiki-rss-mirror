@@ -49,6 +49,7 @@
 //! [`crate::process::script_host::SubprocessScriptRunner`] forwards to the child, and
 //! callers cannot tell the difference.
 
+pub mod html;
 pub mod regex;
 pub mod wasm;
 

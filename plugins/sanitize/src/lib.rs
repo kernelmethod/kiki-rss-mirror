@@ -6,7 +6,8 @@
 //! Kiki's `sanitize` plugin, built as WebAssembly by Kiki's `build.rs` (see
 //! `plugins/Cargo.toml`) and installed as `plugins/sanitize/plugin.wasm`. Versions before
 //! 2.0.0 were written in Lua, on `kiki.html`; this one takes the same config and rewrites
-//! HTML the same way, with the same parser, `lol_html`, built into the plugin.
+//! HTML the same way, with the same parser, `lol_html`, which Kiki runs for it through the
+//! SDK's `html` module.
 //!
 //! Config:
 //!
@@ -27,30 +28,27 @@
 //! decoded values, so a value is stored as it was checked: however a URL hides its scheme
 //! behind character references, what is stored is what was checked. Text is kept as it is.
 //!
-//! If the HTML cannot be rewritten (it needs more memory than the plugin allows itself,
-//! say), the entry's content is replaced with its text, escaped, so that unsanitized HTML
-//! is never stored. The plugin bounds its own memory use, rather than run out of the
-//! memory Kiki gives it: a plugin that runs out traps, and the entry it was given would
-//! pass through it unsanitized.
+//! If the HTML cannot be rewritten (its elements or the rewritten HTML need more memory than
+//! the plugin has, say), the entry's content is replaced with its text, escaped, so that
+//! unsanitized HTML is never stored. The plugin bounds its own memory use, rather than run
+//! out of the memory Kiki gives it: a plugin that runs out traps, and the entry it was given
+//! would pass through it unsanitized.
 //!
 //! Only entries as they are fetched are sanitized: plugins cannot change the content of
 //! entries already stored. Plugins that run after this one (those whose directory names
 //! sort after "sanitize") see the sanitized content, and can add markup back.
 
+use kiki_plugin::html::{self, Edits, Element, Namespace};
 use kiki_plugin::{log, plugin, Entry, Level, Plugin};
-use lol_html::html_content::{Comment, Element};
-use lol_html::{
-    DocumentContentHandlers, ElementContentHandlers, HtmlRewriter, MemorySettings, Settings,
-};
 use serde_json::{Map, Value};
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-/// Most memory the rewriter may use for its buffers during one rewrite.
-const HTML_MEMORY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+/// Longest content the plugin writes as text.
+const OUTPUT_LIMIT_BYTES: usize = html::MAX_RESULT_BYTES;
 
-/// Longest content the plugin writes, rewritten or as text.
-const OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+/// How much text [`as_text`] has Kiki unescape at a time, so that it needs little memory
+/// besides the text.
+const UNESCAPE_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Elements removed with their content whatever the config says: they run scripts, apply
 /// styles, embed other documents, change how the page around them behaves, or hold raw
@@ -214,90 +212,49 @@ impl Sanitize {
         !URL_ATTRIBUTES.contains(&name) || self.url_allowed(value)
     }
 
-    fn sanitize_element(&self, el: &mut Element) {
+    /// Record in `edits` what to do with `el`.
+    fn sanitize_element(&self, el: &Element<'_>, edits: &mut Edits) {
+        let index = el.index();
         let name = el.tag_name();
-        let foreign = matches!(
-            el.namespace_uri(),
-            "http://www.w3.org/2000/svg" | "http://www.w3.org/1998/Math/MathML"
-        );
-        if foreign || self.dropped.contains(&name) {
-            el.remove();
+        let foreign = matches!(el.namespace(), Namespace::Svg | Namespace::Mathml);
+        if foreign || self.dropped.contains(name) {
+            edits.remove(index);
             return;
         }
-        if !self.allowed.contains(&name) {
-            el.remove_and_keep_content();
+        if !self.allowed.contains(name) {
+            edits.remove_and_keep_content(index);
             return;
         }
 
         // Remove every attribute, then set the ones that are allowed again from their
-        // decoded values.
-        let attributes: Vec<(String, String)> = el
-            .attributes()
-            .iter()
-            .map(|a| (a.name(), a.value()))
-            .collect();
-        for (attribute, _) in &attributes {
-            el.remove_attribute(attribute);
+        // decoded values, which Kiki escapes as it writes them.
+        for (attribute, _) in el.attributes() {
+            edits.remove_attribute(index, attribute);
         }
         let mut has_src = false;
-        for (attribute, value) in &attributes {
-            let value = decode_attribute(value);
-            if self.attribute_allowed(&name, attribute)
-                && self.value_allowed(attribute, &value)
-                && el
-                    .set_attribute(attribute, &escape_attribute(&value))
-                    .is_ok()
-            {
+        for (attribute, value) in el.attributes() {
+            if self.attribute_allowed(name, attribute) && self.value_allowed(attribute, value) {
+                edits.set_attribute(index, attribute, value);
                 has_src |= attribute == "src";
             }
         }
 
         if name == "img" && !has_src {
-            el.remove();
+            edits.remove(index);
         }
     }
 
     /// `html`, sanitized, or why it could not be.
-    fn rewrite(&self, html: &str) -> Result<String, String> {
-        // Sanitized HTML is seldom longer than it was.
-        let mut out = Bounded::with_capacity(html.len());
-        let mut rewriter = HtmlRewriter::new(
-            Settings {
-                element_content_handlers: vec![(
-                    Cow::Owned("*".parse().map_err(|e| format!("{e}"))?),
-                    ElementContentHandlers::default().element(|el: &mut Element| {
-                        self.sanitize_element(el);
-                        Ok(())
-                    }),
-                )],
-                document_content_handlers: vec![DocumentContentHandlers::default().comments(
-                    |c: &mut Comment| {
-                        c.remove();
-                        Ok(())
-                    },
-                )],
-                memory_settings: MemorySettings {
-                    max_allowed_memory_usage: HTML_MEMORY_LIMIT_BYTES,
-                    ..MemorySettings::default()
-                },
-                ..Settings::new()
-            },
-            |chunk: &[u8]| {
-                out.push(chunk);
-            },
-        );
-        let result = rewriter
-            .write(html.as_bytes())
-            .and_then(|()| rewriter.end());
-        if out.full {
-            return Err(format!(
-                "the rewritten HTML is longer than {OUTPUT_LIMIT_BYTES} bytes, or too large \
-                 to hold"
-            ));
+    fn rewrite(&self, content: &str) -> Result<String, String> {
+        let mut edits = Edits::new();
+        edits.remove_comments();
+        // Dropped before the rewrite, which needs the memory.
+        let elements = html::select(content, "*")?;
+        for el in elements.iter() {
+            self.sanitize_element(&el, &mut edits);
         }
-        result.map_err(|e| format!("unable to rewrite the HTML: {e}"))?;
-        // The output is the input's UTF-8, with ASCII markup removed or added.
-        String::from_utf8(out.bytes).map_err(|e| format!("the rewritten HTML is not UTF-8: {e}"))
+        drop(elements);
+        html::rewrite(content, "*", &edits)
     }
 }
 
@@ -382,7 +339,14 @@ fn as_text(html: String) -> String {
 
     let mut out = Bounded::with_capacity(text.len() + text.len() / 8);
     let mut buf = [0; 4];
-    decode(&text, |piece| {
+    let mut rest = text.as_str();
+    while !rest.is_empty() {
+        let (piece, after) = rest.split_at(unescape_split(rest));
+        rest = after;
+        // Out of room to unescape the next piece: what is written so far will do.
+        let Ok(piece) = html::unescape(piece) else {
+            break;
+        };
         for c in piece.chars() {
             let escaped = match c {
                 '&' => "&amp;",
@@ -393,144 +357,32 @@ fn as_text(html: String) -> String {
                 c => c.encode_utf8(&mut buf),
             };
             if !out.push(escaped.as_bytes()) {
-                return false;
+                return out.into_string();
             }
         }
-        true
-    });
+    }
     out.into_string()
 }
 
-/// Escape `s` for use as a double-quoted attribute value. `lol_html` escapes the double
-/// quotes itself, so only `&` is escaped here: escaping `"` too would escape it twice.
-fn escape_attribute(s: &str) -> Cow<'_, str> {
-    if s.contains('&') {
-        Cow::Owned(s.replace('&', "&amp;"))
-    } else {
-        Cow::Borrowed(s)
+/// Where to cut the first piece of `text` to unescape: after about
+/// [`UNESCAPE_CHUNK_BYTES`], before a character that cannot be part of a character
+/// reference, which is an `&` followed by ASCII letters, digits, `#` and `;`. Only a
+/// numeric reference longer than the chunk, with thousands of digits, is cut in two, and
+/// the text is escaped again in any case.
+fn unescape_split(text: &str) -> usize {
+    if text.len() <= UNESCAPE_CHUNK_BYTES {
+        return text.len();
     }
-}
-
-/// Decode the character references in `s`, an attribute value, the way a browser does.
-///
-/// Numeric references are decoded with or without their terminating `;`, with the code
-/// points the HTML standard replaces mapped as it says. Named references are decoded when
-/// they end in `;`; the few legacy names a browser also decodes without the `;` are left
-/// as they are. The same decoding as `kiki.html`'s, which the Lua plugin used.
-fn decode_attribute(s: &str) -> Cow<'_, str> {
-    if !s.contains('&') {
-        return Cow::Borrowed(s);
+    let mut end = UNESCAPE_CHUNK_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
     }
-    let mut out = String::with_capacity(s.len());
-    decode(s, |piece| {
-        out.push_str(piece);
-        true
-    });
-    Cow::Owned(out)
-}
-
-/// Decode the character references in `s` as [`decode_attribute`] does, passing the
-/// decoded text to `push` piece by piece, until it returns false.
-fn decode(s: &str, mut push: impl FnMut(&str) -> bool) {
-    let mut rest = s;
-    while let Some((before, after)) = rest.split_once('&') {
-        if !push(before) {
-            return;
-        }
-        let pushed = match decode_reference(after) {
-            Some((decoded, len)) => {
-                rest = after.get(len..).unwrap_or_default();
-                push(&decoded)
-            }
-            None => {
-                rest = after;
-                push("&")
-            }
-        };
-        if !pushed {
-            return;
-        }
-    }
-    push(rest);
-}
-
-/// Decode the character reference at the start of `s`, the text following an `&`,
-/// returning what it stands for and how much of `s` it takes up, or `None` if `s` does not
-/// start with one.
-fn decode_reference(s: &str) -> Option<(Cow<'static, str>, usize)> {
-    if let Some(number) = s.strip_prefix('#') {
-        let (radix, digits, prefix_len) = match number.strip_prefix(['x', 'X']) {
-            Some(hex) => (16, hex, 2),
-            None => (10, number, 1),
-        };
-        let digits_len = digits.chars().take_while(|c| c.is_digit(radix)).count();
-        if digits_len == 0 {
-            return None;
-        }
-        // Too many digits for a u32 is past the last code point all the same.
-        let code = u32::from_str_radix(digits.get(..digits_len)?, radix).unwrap_or(u32::MAX);
-        let semicolon = digits.get(digits_len..)?.starts_with(';');
-        let len = prefix_len + digits_len + usize::from(semicolon);
-        return Some((Cow::Owned(numeric_reference(code).to_string()), len));
-    }
-
-    let name_len = s.bytes().take_while(u8::is_ascii_alphanumeric).count();
-    let name = s.get(..name_len)?;
-    if name.is_empty() || !s.get(name_len..)?.starts_with(';') {
-        return None;
-    }
-    let decoded = quick_xml::escape::resolve_html5_entity(name)?;
-    Some((Cow::Borrowed(decoded), name_len + 1))
-}
-
-/// The character the numeric character reference for `code` stands for, as the HTML
-/// standard has it.
-fn numeric_reference(code: u32) -> char {
-    /// What the references to 0x80 to 0x9F stand for: the characters Windows-1252 has
-    /// there, or `None` to keep the code point.
-    const WINDOWS_1252: [Option<char>; 32] = [
-        Some('\u{20AC}'),
-        None,
-        Some('\u{201A}'),
-        Some('\u{0192}'),
-        Some('\u{201E}'),
-        Some('\u{2026}'),
-        Some('\u{2020}'),
-        Some('\u{2021}'),
-        Some('\u{02C6}'),
-        Some('\u{2030}'),
-        Some('\u{0160}'),
-        Some('\u{2039}'),
-        Some('\u{0152}'),
-        None,
-        Some('\u{017D}'),
-        None,
-        None,
-        Some('\u{2018}'),
-        Some('\u{2019}'),
-        Some('\u{201C}'),
-        Some('\u{201D}'),
-        Some('\u{2022}'),
-        Some('\u{2013}'),
-        Some('\u{2014}'),
-        Some('\u{02DC}'),
-        Some('\u{2122}'),
-        Some('\u{0161}'),
-        Some('\u{203A}'),
-        Some('\u{0153}'),
-        None,
-        Some('\u{017E}'),
-        Some('\u{0178}'),
-    ];
-    if code == 0 {
-        return char::REPLACEMENT_CHARACTER;
-    }
-    if let Some(index) = code.checked_sub(0x80).filter(|i| *i < 32) {
-        if let Some(Some(c)) = WINDOWS_1252.get(index as usize) {
-            return *c;
-        }
-    }
-    char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER)
+    text.get(..end)
+        .unwrap_or_default()
+        .char_indices()
+        .rev()
+        .find(|&(i, c)| i > 0 && !(c.is_ascii_alphanumeric() || matches!(c, '#' | ';')))
+        .map_or(end, |(i, _)| i)
 }
 
 impl Plugin for Sanitize {

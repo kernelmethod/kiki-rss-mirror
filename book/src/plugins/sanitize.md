@@ -68,5 +68,6 @@ The plugin is written in Rust, as a [WebAssembly plugin](../writing-plugins.md);
 see [`plugins/sanitize/src/lib.rs`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/sanitize/src/lib.rs)
 for the details. It parses HTML with
 [`lol_html`](https://github.com/cloudflare/lol-html), the streaming HTML
-rewriter Kiki uses itself. Versions before 2.0.0 were written in Lua, and
-took the same configuration.
+rewriter Kiki uses itself, through the
+[`html` interface](../writing-plugins.md#parsing-html). Versions before
+2.0.0 were written in Lua, and took the same configuration.

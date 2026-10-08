@@ -85,6 +85,7 @@ mod bindings {
 }
 
 use bindings::kiki::plugin::host::Host;
+use bindings::kiki::plugin::html as html_host;
 use bindings::kiki::plugin::regex as regex_host;
 use bindings::kiki::plugin::types as wit;
 use bindings::Plugin as Bindings;
@@ -502,6 +503,118 @@ impl regex_host::HostRegexSet for State {
     fn drop(&mut self, set: Resource<HostRegexSet>) -> wasmtime::Result<()> {
         self.table.delete(set)?;
         Ok(())
+    }
+}
+
+impl State {
+    /// The result of an `html` call: a trap if the time budget ran out during it, or else
+    /// the result or its error message.
+    fn html_result<T>(
+        name: &str,
+        result: Result<T, super::html::HtmlError>,
+    ) -> wasmtime::Result<Result<T, String>> {
+        match result {
+            Ok(value) => Ok(Ok(value)),
+            Err(super::html::HtmlError::Failed(message)) => Ok(Err(format!("{name}: {message}"))),
+            Err(super::html::HtmlError::Expired) => Err(wasmtime::Error::msg(format!(
+                "{name}: the handler has used up its time budget"
+            ))),
+        }
+    }
+}
+
+fn span_to_wit(span: super::html::Span) -> html_host::Span {
+    html_host::Span {
+        start: span.start,
+        len: span.len,
+    }
+}
+
+impl html_host::Host for State {
+    fn select(
+        &mut self,
+        html: String,
+        selector: String,
+        max_bytes: u32,
+    ) -> wasmtime::Result<Result<html_host::Elements, String>> {
+        use super::html::Namespace;
+        self.check_budget("html.select")?;
+        let budget = &self.budget;
+        let selected = super::html::select(&html, &selector, max_bytes, &|| budget.expired());
+        Self::html_result(
+            "html.select",
+            selected.map(|selected| html_host::Elements {
+                elements: selected
+                    .elements
+                    .iter()
+                    .map(|el| html_host::Element {
+                        tag_name: span_to_wit(el.tag_name),
+                        namespace: match el.namespace {
+                            Namespace::Html => html_host::Namespace::Html,
+                            Namespace::Svg => html_host::Namespace::Svg,
+                            Namespace::MathMl => html_host::Namespace::Mathml,
+                        },
+                        attributes: span_to_wit(el.attributes),
+                    })
+                    .collect(),
+                attributes: selected
+                    .attributes
+                    .iter()
+                    .map(|a| html_host::Attribute {
+                        name: span_to_wit(a.name),
+                        value: span_to_wit(a.value),
+                    })
+                    .collect(),
+                text: selected.text,
+            }),
+        )
+    }
+
+    fn rewrite(
+        &mut self,
+        html: String,
+        selector: String,
+        edits: Vec<html_host::Edit>,
+        remove_comments: bool,
+        max_bytes: u32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        use super::html::{Edit, EditOp, Place};
+        use html_host::EditOp as Op;
+        self.check_budget("html.rewrite")?;
+        let place = |place: html_host::Place| match place {
+            html_host::Place::Before => Place::Before,
+            html_host::Place::After => Place::After,
+            html_host::Place::Prepend => Place::Prepend,
+            html_host::Place::Append => Place::Append,
+            html_host::Place::Inner => Place::Inner,
+            html_host::Place::Replace => Place::Replace,
+        };
+        let edits = edits
+            .into_iter()
+            .map(|edit| Edit {
+                element: edit.element,
+                op: match edit.op {
+                    Op::Remove => EditOp::Remove,
+                    Op::Unwrap => EditOp::Unwrap,
+                    Op::SetAttribute((name, value)) => EditOp::SetAttribute(name, value),
+                    Op::RemoveAttribute(name) => EditOp::RemoveAttribute(name),
+                    Op::SetTagName(name) => EditOp::SetTagName(name),
+                    Op::InsertText((at, content)) => EditOp::Insert(place(at), content, false),
+                    Op::InsertHtml((at, content)) => EditOp::Insert(place(at), content, true),
+                },
+            })
+            .collect();
+        let budget = &self.budget;
+        let out =
+            super::html::rewrite(&html, &selector, edits, remove_comments, max_bytes, &|| {
+                budget.expired()
+            });
+        Self::html_result("html.rewrite", out)
+    }
+
+    fn unescape(&mut self, s: String, max_bytes: u32) -> wasmtime::Result<Result<String, String>> {
+        self.check_budget("html.unescape")?;
+        Self::html_result("html.unescape", super::html::unescape(&s, max_bytes))
     }
 }
 

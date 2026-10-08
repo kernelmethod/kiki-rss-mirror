@@ -181,6 +181,90 @@ interface regex {
     }
 }
 
+/// HTML, parsed and rewritten by the server with `lol_html`, the streaming rewriter Kiki
+/// uses for its own HTML. Parsing runs natively, so it is faster than a parser built into
+/// the plugin, and the plugin is much smaller.
+///
+/// The server cannot call into a plugin while the plugin is calling it, so a rewrite takes
+/// two passes. `select` parses the HTML and returns the elements a CSS selector matches, in
+/// document order. The plugin decides what to do with them, and `rewrite` parses the same
+/// HTML with the same selector again, applying `edits` to the elements by their index in
+/// what `select` returned.
+///
+/// Calls that return text into the plugin's memory take `max-bytes`, the most memory the
+/// result may take there, and fail rather than return more: a plugin whose memory cannot
+/// hold a result would trap.
+interface html {
+    /// Where a piece of `elements.text` starts, in bytes, and how long it is; or, for an
+    /// element's attributes, which run of `elements.attributes` they are.
+    record span { start: u32, len: u32 }
+
+    enum namespace { html, svg, mathml }
+
+    /// An element `select` matched.
+    record element {
+        /// Its tag name, lowercase.
+        tag-name: span,
+        namespace: namespace,
+        /// Its attributes, in `elements.attributes`.
+        attributes: span,
+    }
+
+    /// An attribute: its name, lowercase, and its value, with character references
+    /// decoded as a browser decodes them.
+    record attribute { name: span, value: span }
+
+    /// The elements a selector matched, in document order, with all their text in one
+    /// string, so that the result reaches the plugin in three pieces however many
+    /// elements there are.
+    record elements {
+        text: string,
+        elements: list<element>,
+        attributes: list<attribute>,
+    }
+
+    /// Where an insertion puts its content: before or after the element, at the start or
+    /// end of its content, in place of its content, or in place of the element.
+    enum place { before, after, prepend, append, inner, replace }
+
+    variant edit-op {
+        /// Remove the element and its content.
+        remove,
+        /// Remove the element's tags, keeping its content.
+        unwrap,
+        /// Set an attribute to a value, which is escaped as needed: a value read from
+        /// `select` and set again is written out as what was read.
+        set-attribute(tuple<string, string>),
+        /// Remove an attribute, every one of the name if there are several.
+        remove-attribute(string),
+        set-tag-name(string),
+        /// Insert text, which is escaped.
+        insert-text(tuple<place, string>),
+        /// Insert HTML as it is.
+        insert-html(tuple<place, string>),
+    }
+
+    /// An edit to the element at index `element` of what `select` returned. An element's
+    /// edits are applied in the order given.
+    record edit { element: u32, op: edit-op }
+
+    /// The elements of `html` that `selector`, a CSS selector, matches.
+    select: func(html: string, selector: string, max-bytes: u32) -> result<elements, string>;
+
+    /// `html`, with `edits` applied to the elements `selector` matches, and its comments
+    /// removed if `remove-comments` is set.
+    rewrite: func(
+        html: string,
+        selector: string,
+        edits: list<edit>,
+        remove-comments: bool,
+        max-bytes: u32,
+    ) -> result<string, string>;
+
+    /// `s` with its character references decoded, as `select` decodes attribute values.
+    unescape: func(s: string, max-bytes: u32) -> result<string, string>;
+}
+
 world plugin {
     use types.{
         event-kind, entry, fetch-success, fetch-error, feed-event,
@@ -188,6 +272,7 @@ world plugin {
     };
     import host;
     import regex;
+    import html;
 
     /// Called when plugins load, with the plugin's config as a JSON
     /// object. Returns the events the plugin handles, or an error, which

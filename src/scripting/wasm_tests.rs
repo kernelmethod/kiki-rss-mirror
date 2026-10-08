@@ -635,3 +635,34 @@ fn regexes_alive_already_are_shared() {
         regexes.get(format!("x{i}"), String::new()).unwrap();
     }
 }
+
+#[test]
+fn plugins_rewrite_html_with_the_servers_parser() {
+    let (plugins, recorder) = runner(&[source("a", json!({"html": "a, svg *"}))]);
+    plugins
+        .dispatch_transform_entry(entry(
+            r#"<p><A HREF="/x?a&amp;b" title=t>x</A><!-- c --><svg><circle r="1"/></svg></p>"#,
+        ))
+        .unwrap();
+    assert_eq!(
+        recorder.seen("html-select").unwrap(),
+        "a Namespace::Html href=/x?a&b title=t, circle Namespace::Svg r=1"
+    );
+    assert_eq!(
+        recorder.seen("html-rewrite").unwrap(),
+        // A self-closing element takes no content.
+        r#"<p><A HREF="/x?a&amp;b" title=t data-i="0">x&lt;&amp;&gt;</A><svg><circle r="1" data-i="1" /></svg></p>"#
+    );
+
+    // Errors are messages, and fail the call rather than trapping.
+    let (plugins, recorder) = runner(&[source("a", json!({"html": "a["}))]);
+    let out = plugins
+        .dispatch_transform_entry(entry("<a>x</a>"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.title, "<a>x</a>");
+    assert!(recorder
+        .seen("html-select")
+        .unwrap()
+        .starts_with("html.select: invalid selector \"a[\""));
+}
