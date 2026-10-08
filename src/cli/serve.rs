@@ -38,12 +38,12 @@ pub struct ServeArgs {
     #[arg(long)]
     seccomp_log_only: bool,
 
-    /// Run Lua scripts inside the server process instead of an isolated
+    /// Run plugins inside the server process instead of an isolated
     /// child process.
     ///
-    /// Scripts are the only code Kiki executes that it did not ship, and
+    /// Plugins are the only code Kiki executes that it did not ship, and
     /// the isolated host holds no database handle, no filesystem access,
-    /// and no sockets. Turning this on puts the Lua VM back in the same
+    /// and no sockets. Turning this on puts plugins back in the same
     /// address space as the database.
     #[cfg(unix)]
     #[arg(long)]
@@ -228,10 +228,10 @@ impl ServeArgs {
         }
     }
 
-    /// Start the isolated Lua script host, unless the operator opted out.
+    /// Start the isolated script host, unless the operator opted out.
     ///
-    /// A spawn failure is fatal rather than a silent fall back to the
-    /// in-process VM: quietly running user scripts next to the database
+    /// A spawn failure is fatal rather than a silent fall back to running
+    /// plugins in process: quietly running user plugins next to the database
     /// because a `fork` failed would be a security downgrade nobody
     /// asked for. The error names the flag that makes it explicit.
     #[cfg(unix)]
@@ -241,7 +241,7 @@ impl ServeArgs {
 
         if self.no_script_isolation {
             tracing::warn!(
-                "script isolation disabled via --no-script-isolation; Lua runs in the \
+                "script isolation disabled via --no-script-isolation; plugins run in the \
                  server process, with the same database and filesystem access it has"
             );
             return Ok(None);
@@ -249,8 +249,8 @@ impl ServeArgs {
 
         let host = ScriptHost::spawn(self.seccomp_log_only, self.no_sandbox).map_err(|e| {
             anyhow!(
-                "failed to start the isolated Lua script host: {e:#}. Pass \
-                 --no-script-isolation to run scripts in the server process instead."
+                "failed to start the isolated script host: {e:#}. Pass \
+                 --no-script-isolation to run plugins in the server process instead."
             )
         })?;
         Ok(Some(Arc::new(host)))
@@ -376,10 +376,15 @@ fn build_sandbox_config(
     temp_dir: PathBuf,
     args: &ServeArgs,
 ) -> SandboxConfig {
+    #[cfg(unix)]
+    let runs_plugins = args.no_script_isolation;
+    #[cfg(not(unix))]
+    let runs_plugins = true;
     SandboxConfig::server(
         parent_or_cwd(db_path),
         socket_dir,
         temp_dir,
+        runs_plugins,
         args.seccomp_log_only,
     )
 }
@@ -699,7 +704,8 @@ mod tests {
     }
 
     /// `--no-script-isolation` returns no handle, so the server falls
-    /// back to the in-process VM rather than half-wiring an absent child.
+    /// back to running plugins in process rather than half-wiring an
+    /// absent child.
     #[cfg(unix)]
     #[test]
     fn opting_out_yields_no_script_host() {

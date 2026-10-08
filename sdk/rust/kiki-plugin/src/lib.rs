@@ -64,8 +64,7 @@ pub use bindings::kiki::plugin::types::{
     FetchSuccess, Level, ScanOptions, ScanSummary,
 };
 
-/// Calls to the server: the counterparts of the Lua API's `kiki.log`, `kiki.store`,
-/// `kiki.entries`, `kiki.feeds` and `kiki.every`.
+/// Calls to the server: logging, the plugin's store, stored entries, feeds and timers.
 pub mod host {
     pub use crate::bindings::kiki::plugin::host::*;
 
@@ -96,8 +95,7 @@ pub mod host {
     }
 }
 
-/// Regular expressions, compiled and matched by the server: the counterpart of the Lua
-/// API's `kiki.regex`, with the same syntax, flags and limits.
+/// Regular expressions, compiled and matched by the server.
 ///
 /// Matching runs as native code in the server, so it is faster than a regex library built
 /// into the plugin, and leaves the plugin smaller: the `regex` crate adds about a
@@ -152,7 +150,7 @@ pub trait Plugin: Sized + 'static {
     ///
     /// # Errors
     ///
-    /// An error fails the load, as a Lua plugin's error at its top level does.
+    /// An error fails the load, and the plugins that were running keep running.
     fn new(config: &str) -> Result<Self, String>;
 
     /// Whether this instance of the plugin, made from its config, wants `event`, one of

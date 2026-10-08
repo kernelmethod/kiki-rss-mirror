@@ -1,4 +1,5 @@
-//! A plugin for the tests of Kiki's WebAssembly engine (`src/scripting/wasm_tests.rs`).
+//! A plugin for Kiki's tests: those of its WebAssembly engine (`src/scripting/wasm_tests.rs`),
+//! and those that need a plugin to install (see `kiki_rss::test::WASM_FIXTURE`).
 //!
 //! What it does is chosen by its config; see [`Config`]. It reports what it sees by
 //! storing values under `seen:<what>` with `store-set`, which the tests record.
@@ -10,8 +11,10 @@ use kiki_plugin::{plugin,
 use kiki_plugin::regex::{Regex, RegexSet};
 use serde::Deserialize;
 
+/// Keys the fixture doesn't know are ignored, so that tests of plugins' configs can
+/// install it with configs of their own.
 #[derive(Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 struct Config {
     /// Append this to the title of each ingested entry.
     suffix: Option<String>,
@@ -39,8 +42,8 @@ struct Config {
     scan: bool,
     /// Add this system tag to each scanned entry.
     scan_tag: Option<String>,
-    /// Delete entries from `plugin.load`.
-    delete: bool,
+    /// Delete entries dropped before this time from `plugin.load`.
+    delete: Option<i64>,
     /// Store a value from `plugin.load`, and read it back.
     store: bool,
     /// Look up feed 1 from `plugin.load`.
@@ -206,9 +209,9 @@ impl Fixture {
                 Err(e) => seen("scan", e),
             }
         }
-        if self.config.delete {
+        if let Some(dropped_before) = self.config.delete {
             let result = host::delete_entries(&DeleteFilter {
-                dropped_before: 100,
+                dropped_before,
                 feed_id: None,
                 published_before: None,
                 keep_tagged: None,

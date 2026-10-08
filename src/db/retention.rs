@@ -2,7 +2,7 @@
 ///
 /// Entries are kept for as long as their feed still lists them. A refresh
 /// that no longer lists an entry marks it dropped ([`mark_dropped`]), and
-/// from then on plugins may delete it, with `kiki.entries.delete_where`
+/// from then on plugins may delete it, with `delete-entries`
 /// (see [`crate::plugins::services`]). The bundled `retention` plugin
 /// deletes entries that have been dropped for longer than its
 /// `max_age_days`, except those tagged `system:saved`.

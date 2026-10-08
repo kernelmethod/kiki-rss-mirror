@@ -1,24 +1,21 @@
-//! The Lua script host process, and the server-side client that drives it.
+//! The script host process, which runs plugins, and the server-side client
+//! that drives it.
 //!
-//! User-supplied Lua is the one place where Kiki executes code it did not
-//! ship, and — since [#58] moved TLS onto rustls — the Lua VM is also the
-//! largest remaining body of C in the server. Running it in the same
-//! address space as the SQLite handle and the asset cache means a VM
-//! escape starts out holding everything Kiki has.
-//!
-//! [#58]: https://github.com/kernelmethod/kiki-rss/pull/58
-//!
-//! WebAssembly plugins run there too, compiled to native code with
-//! Cranelift. That makes the child the one Kiki process allowed memory that
+//! Plugins are the one place where Kiki executes code it did not ship. They
+//! are WebAssembly components, compiled to native code with Cranelift, so
+//! the process that runs them is the one Kiki process allowed memory that
 //! is first writable and then executable (see [`crate::sandbox`]), and the
-//! compiler one more body of code that handles what plugins supply.
+//! compiler is one more body of code that handles what plugins supply.
+//! Running them in the same address space as the SQLite handle and the
+//! asset cache would mean a sandbox escape starts out holding everything
+//! Kiki has.
 //!
-//! This module moves the VM into a child process that holds nothing: no
+//! This module moves them into a child process that holds nothing: no
 //! database, no filesystem (Landlock with an empty ruleset), and no way
 //! to open a socket (seccomp). Its entire view of the world is one
 //! inherited socket pair and whatever the server chooses to send down it.
-//! What plugins ask of the server (`kiki.store`, `kiki.entries`,
-//! `kiki.feeds`) goes back up that socket as a [`FromHost::Call`], and
+//! What plugins ask of the server (the store, stored entries, feeds) goes
+//! back up that socket as a [`FromHost::Call`], and
 //! the server decides how to answer: the child never touches the database
 //! itself.
 //!
@@ -26,7 +23,7 @@
 //!
 //! * [`ScriptHost`] and [`SubprocessScriptRunner`] run in the server.
 //!   The runner implements [`ScriptRunner`], so callers dispatch events
-//!   exactly as they did against the in-process VM. Every response says
+//!   exactly as they would against an in-process runner. Every response says
 //!   which events the child's plugins have handlers for, and the runner
 //!   sends nothing for the rest: an event no handler would see costs no
 //!   round trip.
@@ -35,7 +32,7 @@
 //!
 //! # Failure behaviour
 //!
-//! Script-level failures — a compile error, a runtime error, a timeout —
+//! Plugin-level failures — a compile error, a trap, a timeout —
 //! are handled inside the child and reported as
 //! [`HostResponse::Failed`]; they do not disturb the connection. A
 //! failure of the *channel* (the child died, or stopped answering within
@@ -50,7 +47,7 @@
 use crate::process::ipc::{
     decode, encode, read_frame, write_frame, FromHost, HostRequest, HostResponse, MAX_FRAME_BYTES,
 };
-use crate::scripting::composite::CompositeRunner;
+use crate::scripting::wasm::WasmScriptRunner;
 use crate::scripting::{
     Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary, ScheduleDecision,
     ScriptRunner, ScriptServices, ScriptSource, ServiceCall, ServiceReply,
@@ -84,7 +81,7 @@ pub const HOST_FD_ENV: &str = "KIKI_SCRIPT_HOST_FD";
 ///
 /// Generous next to the child's own default per-handler budget
 /// ([`SCRIPT_TIMEOUT_MS`]) so that a slow chain of handlers, or a reload
-/// compiling many scripts, is never mistaken for a hung child — but
+/// loading many plugins, is never mistaken for a hung child — but
 /// short enough that a genuinely wedged host cannot pin a feed worker
 /// indefinitely. It is also the only limit on the handlers of a plugin
 /// whose budget is [`TimeBudget::Unlimited`].
@@ -92,7 +89,7 @@ pub const HOST_FD_ENV: &str = "KIKI_SCRIPT_HOST_FD";
 /// Requests that make the child load WebAssembly plugins are allowed
 /// longer; see [`ScriptHost::request`].
 ///
-/// [`SCRIPT_TIMEOUT_MS`]: crate::scripting::lua::SCRIPT_TIMEOUT_MS
+/// [`SCRIPT_TIMEOUT_MS`]: crate::scripting::SCRIPT_TIMEOUT_MS
 /// [`TimeBudget::Unlimited`]: crate::scripting::TimeBudget::Unlimited
 pub const IPC_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -242,8 +239,8 @@ impl ScriptHost {
         })
     }
 
-    /// Answer the calls plugins make through `kiki.store`, `kiki.entries`
-    /// and `kiki.feeds` with `services`.
+    /// Answer the calls plugins make to the server, such as to their
+    /// stores, with `services`.
     pub fn set_services(&self, services: Arc<dyn ScriptServices>) {
         *self.services.write().unwrap_or_else(|e| e.into_inner()) = Some(services);
     }
@@ -313,36 +310,34 @@ impl ScriptHost {
     ///
     /// * compiling a WebAssembly component gets [`COMPILE_TIME_PER_MIB`] more
     ///   per MiB of it;
-    /// * a reload gets [`WASM_LOAD_BUDGET`] more per WebAssembly plugin,
-    ///   each of which may take that long to load;
-    /// * while WebAssembly plugins are loaded, anything else gets one
+    /// * a reload gets [`WASM_LOAD_BUDGET`] more per plugin, each of which
+    ///   may take that long to load;
+    /// * while plugins are loaded, anything else gets one
     ///   [`WASM_LOAD_BUDGET`] more, since the child restarts a plugin that
     ///   trapped when it is next needed, one per request at most.
     ///
     /// [`WASM_LOAD_BUDGET`]: crate::scripting::WASM_LOAD_BUDGET
     fn timeout(&self, request: &HostRequest) -> Duration {
-        let wasm_loaded = !self
+        let loaded = !self
             .components
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty();
-        request_timeout(request, wasm_loaded)
+        request_timeout(request, loaded)
     }
 
-    /// Rebuild the child's VM from `sources`, replacing whatever it was
-    /// running. If `sources` fail to compile, the child keeps running the
-    /// VM it had.
+    /// Rebuild the child's plugins from `sources`, replacing whatever it was
+    /// running. If `sources` fail to load, the child keeps running the
+    /// plugins it had.
     ///
-    /// Each WebAssembly component the child has not compiled yet is sent
-    /// first, in a message of its own; the sources then name it by hash.
+    /// Each component the child has not compiled yet is sent first, in a
+    /// message of its own; the sources then name it by hash.
     ///
-    /// Returns the number of scripts the child compiled.
+    /// Returns the number of plugins the child loaded.
     pub fn reload(&self, mut sources: Vec<ScriptSource>) -> Result<usize, HostError> {
         let mut used = HashSet::new();
         for source in &mut sources {
-            let Some(component) = source.component.as_mut() else {
-                continue;
-            };
+            let component = &mut source.component;
             used.insert(component.hash);
             let known = self
                 .components
@@ -411,8 +406,8 @@ impl Drop for ScriptHost {
 }
 
 /// How long to wait for each frame of the answer to `request`, given
-/// whether WebAssembly plugins are loaded; see [`ScriptHost::timeout`].
-fn request_timeout(request: &HostRequest, wasm_loaded: bool) -> Duration {
+/// whether plugins are loaded; see [`ScriptHost::timeout`].
+fn request_timeout(request: &HostRequest, loaded: bool) -> Duration {
     use crate::scripting::WASM_LOAD_BUDGET;
     const MIB: usize = 1024 * 1024;
     match request {
@@ -420,11 +415,8 @@ fn request_timeout(request: &HostRequest, wasm_loaded: bool) -> Duration {
             let mib = component.bytes.len().div_ceil(MIB).max(1) as u32;
             IPC_TIMEOUT + COMPILE_TIME_PER_MIB * mib
         }
-        HostRequest::Reload { sources } => {
-            let wasm = sources.iter().filter(|s| s.component.is_some()).count() as u32;
-            IPC_TIMEOUT + WASM_LOAD_BUDGET * wasm
-        }
-        _ if wasm_loaded => IPC_TIMEOUT + WASM_LOAD_BUDGET,
+        HostRequest::Reload { sources } => IPC_TIMEOUT + WASM_LOAD_BUDGET * sources.len() as u32,
+        _ if loaded => IPC_TIMEOUT + WASM_LOAD_BUDGET,
         _ => IPC_TIMEOUT,
     }
 }
@@ -476,7 +468,7 @@ fn exchange(
 /// A [`ScriptRunner`] that forwards every dispatch to the script host
 /// child.
 ///
-/// Drop-in for [`crate::scripting::lua::LuaScriptRunner`]: same trait,
+/// Drop-in for [`WasmScriptRunner`]: same trait,
 /// same failure semantics, different address space.
 pub struct SubprocessScriptRunner {
     host: Arc<ScriptHost>,
@@ -626,21 +618,6 @@ fn scan_prefix_len(entries: &[FeedEntry], budget: usize) -> Result<usize> {
 /// Fails if the sandbox cannot be installed. Once the loop is running,
 /// a broken channel is a normal shutdown, not an error.
 pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
-    // Warm the C library's time zone cache before the door shuts.
-    // `os.date` in a script goes through `localtime(3)`, which reads
-    // /etc/localtime on its first call; the sandbox is about to make
-    // that path unreachable, so make that first call now. libc caches
-    // the parsed zone, and scripts keep seeing local time.
-    //
-    // SAFETY: `localtime` has no preconditions beyond a valid pointer to
-    // a `time_t`, and the process is still single-threaded here, so its
-    // use of a static return buffer is not a race. The result is
-    // deliberately discarded — only the caching side effect matters.
-    unsafe {
-        let epoch: libc::time_t = 0;
-        let _ = libc::localtime(&epoch);
-    }
-
     if no_sandbox {
         warn!(
             "script host: sandbox disabled via --no-sandbox; plugins run with full \
@@ -658,7 +635,7 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
         channel: channel.clone(),
     });
 
-    let mut runner: Option<CompositeRunner> = None;
+    let mut runner: Option<WasmScriptRunner> = None;
 
     loop {
         let frame = match read_frame(&mut channel.lock().unwrap_or_else(|e| e.into_inner()).reader)
@@ -734,27 +711,23 @@ impl ScriptServices for IpcServices {
 
 /// Handle a single request against the child's current VM.
 fn serve(
-    runner: &mut Option<CompositeRunner>,
+    runner: &mut Option<WasmScriptRunner>,
     services: &Arc<dyn ScriptServices>,
     request: HostRequest,
 ) -> HostResponse {
     match request {
         HostRequest::Reload { sources } => {
             let count = sources.len();
-            match CompositeRunner::from_sources_with(&sources, Some(services.clone())) {
+            match WasmScriptRunner::from_sources_with(&sources, Some(services.clone())) {
                 Ok(new_runner) => {
                     *runner = Some(new_runner);
-                    #[cfg(feature = "wasm-plugins")]
                     crate::scripting::wasm::retain_components(
-                        &sources
-                            .iter()
-                            .filter_map(|s| s.component.as_ref().map(|c| c.hash))
-                            .collect(),
+                        &sources.iter().map(|s| s.component.hash).collect(),
                     );
                     HostResponse::Reloaded { loaded: count }
                 }
                 Err(e) => {
-                    // Keep the old VM: a broken edit to a plugin should not
+                    // Keep the old plugins: a broken edit to a plugin should not
                     // switch off the plugins that were working, just as an
                     // invalid edit to the config file leaves the last good
                     // settings in force.
@@ -818,21 +791,12 @@ fn serve(
 }
 
 /// Compile `component` and keep it for the next reload.
-#[cfg(feature = "wasm-plugins")]
 fn put_component(plugin: &str, component: &crate::scripting::WasmComponent) -> HostResponse {
     match crate::scripting::wasm::put_component(plugin, component) {
         Ok(()) => HostResponse::Ack,
         Err(e) => HostResponse::Failed {
             message: format!("{e}"),
         },
-    }
-}
-
-/// See the variant of this function built with the `wasm-plugins` feature.
-#[cfg(not(feature = "wasm-plugins"))]
-fn put_component(_: &str, _: &crate::scripting::WasmComponent) -> HostResponse {
-    HostResponse::Failed {
-        message: "this build of Kiki cannot run WebAssembly plugins".to_string(),
     }
 }
 
@@ -887,11 +851,7 @@ mod tests {
         );
 
         let reload = HostRequest::Reload {
-            sources: vec![
-                ScriptSource::wasm(vec![]),
-                ScriptSource::new(""),
-                ScriptSource::wasm(vec![]),
-            ],
+            sources: vec![ScriptSource::new(vec![]), ScriptSource::new(vec![])],
         };
         assert_eq!(
             request_timeout(&reload, false),

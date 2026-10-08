@@ -1,9 +1,7 @@
 // The interface between Kiki and plugins written as WebAssembly components.
 //
 // A plugin whose manifest says `engine = "wasm"` is a component targeting the
-// `plugin` world below. It is the WebAssembly counterpart of the Lua API
-// described in the guide's "Writing plugins" chapter: the same events, the
-// same calls to the server, with the same limits and permissions.
+// `plugin` world below, described in the guide's "Writing plugins" chapter.
 //
 // It lives in the kiki-plugin crate, which generates plugins' bindings from
 // it, so that it ships with the crate; Kiki's own bindings, in
@@ -120,8 +118,8 @@ interface types {
     }
 }
 
-/// What the server does for plugins: the counterparts of `kiki.log`,
-/// `kiki.store`, `kiki.entries`, `kiki.feeds` and `kiki.every`.
+/// What the server does for plugins: logging, their stores, stored entries,
+/// feeds and timers.
 interface host {
     use types.{level, feed, scan-options, delete-filter};
 
@@ -153,9 +151,8 @@ interface host {
     every: func(secs: u64) -> result<u32, string>;
 }
 
-/// Regular expressions, compiled and matched by the server: the counterpart of
-/// `kiki.regex`, with the same syntax, flags and limits. Matching runs natively, so it is
-/// faster than a regex library built into the plugin, and the plugin is smaller.
+/// Regular expressions, compiled and matched by the server. Matching runs natively, so it
+/// is faster than a regex library built into the plugin, and the plugin is smaller.
 ///
 /// Flags are letters: `i` (case-insensitive), `m` (multi-line), `s` (`.` matches a
 /// newline), `x` (ignore whitespace) and `U` (swap greed). A plugin may have 128

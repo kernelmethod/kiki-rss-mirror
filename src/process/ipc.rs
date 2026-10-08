@@ -50,12 +50,12 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// A message from the server to the script host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HostRequest {
-    /// Discard the current VM, if any, and build a new one from
-    /// `sources`, each script with its config.
+    /// Discard the current plugins, if any, and load `sources` in their
+    /// place, each plugin with its config.
     ///
     /// Sent when the server starts, and whenever plugins are reloaded.
-    /// The WebAssembly components among `sources` carry only their hash:
-    /// each was sent beforehand with [`HostRequest::PutComponent`].
+    /// The components of `sources` carry only their hash: each was sent
+    /// beforehand with [`HostRequest::PutComponent`].
     Reload { sources: Vec<ScriptSource> },
 
     /// Run `entry` through the `entry.ingest` handler chain.
@@ -108,7 +108,7 @@ pub enum HostRequest {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HostResponse {
-    /// The VM was rebuilt; `loaded` is the number of scripts compiled.
+    /// The plugins were reloaded; `loaded` is the number of plugins loaded.
     Reloaded { loaded: usize },
 
     /// The handler chain ran. `None` means a handler filtered the entry
@@ -141,7 +141,7 @@ pub enum FromHost {
     /// The answer to the request being served, which ends it.
     Done {
         response: HostResponse,
-        /// The events the host's VM has at least one handler for once the
+        /// The events the host's plugins have at least one handler for once the
         /// request has been served. Plugins may register handlers at any
         /// time, so this is reported with every response.
         subscribed: EventSet,

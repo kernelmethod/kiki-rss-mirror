@@ -1,5 +1,5 @@
-//! Regular expressions as plugins write them, for every engine: `kiki.regex` in Lua, and
-//! the `regex` interface WebAssembly plugins import.
+//! Regular expressions as plugins write them, through the `regex` interface WebAssembly
+//! plugins import.
 //!
 //! Patterns are compiled with the `regex` crate, which matches in time linear in the
 //! input, so a plugin matching untrusted feed content cannot be made to backtrack for
@@ -11,7 +11,7 @@
 //! Compiled regexes live outside a plugin's own memory, so its memory cap does not see
 //! them. They are bounded here instead: each compiled program is limited to
 //! [`REGEX_SIZE_LIMIT_BYTES`] and its lazy DFA cache to [`REGEX_DFA_SIZE_LIMIT_BYTES`]. The
-//! engines also keep at most [`MAX_LIVE_REGEXES`] distinct regexes alive for a plugin at a
+//! engine also keeps at most [`MAX_LIVE_REGEXES`] distinct regexes alive for a plugin at a
 //! time, compiling a pattern and flags already alive only once.
 //!
 //! # Sets
@@ -31,8 +31,7 @@ pub const REGEX_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 /// Largest lazy DFA cache a single regex may use while matching.
 pub const REGEX_DFA_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 
-/// Most distinct regexes that may be alive at once in one Lua VM or one WebAssembly
-/// plugin.
+/// Most distinct regexes that may be alive at once in one plugin.
 pub const MAX_LIVE_REGEXES: usize = 128;
 
 /// Compiles `pattern` with `flags`.

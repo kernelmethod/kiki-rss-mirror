@@ -1,91 +1,55 @@
-//! Feed entry scripting support.
+//! Plugin support.
 //!
 //! This module provides the [`ScriptRunner`] trait for dispatching server events to
-//! user-supplied scripts, and the [`FeedEntry`] and [`EventPayload`] types that cross the
-//! scripting boundary.
+//! plugins, and the [`FeedEntry`] and [`EventPayload`] types that cross the plugin
+//! boundary.
 //!
-//! The [`lua`] sub-module provides a concrete Lua-based implementation ([`lua::LuaScriptRunner`]).
+//! Plugins are WebAssembly components, run by the [`wasm`] sub-module's
+//! [`wasm::WasmScriptRunner`]. They are shipped as directories in Kiki's home with a
+//! manifest, discovered by [`crate::plugins`]. Each plugin's `init` names the events it
+//! handles, out of those described by the [`Event`] enum.
 //!
-//! # Events
+//! # Entries
 //!
-//! Scripts are shipped as plugins: directories in Kiki's home with a manifest, discovered
-//! by [`crate::plugins`]. Each plugin's entrypoint subscribes to server events by calling
-//! `kiki.on(event_name, handler)` in its top-level chunk. The full set of events is
-//! described by the [`Event`] enum. A script's top-level chunk must not return a value —
-//! returning anything is rejected at load time.
-//!
-//! # Script contract
-//!
-//! ```lua
-//! kiki.on("entry.ingest", function(entry)
-//!     entry.title = "[kiki] " .. entry.title
-//!     return entry
-//! end)
-//! ```
-//!
-//! # Entry table fields (for `entry.*` events)
-//!
-//! | Field               | Lua type          | Mutable |
-//! |---------------------|-------------------|---------|
-//! | `feed_id`           | integer           | No      |
-//! | `syndication_format`| string            | No      |
-//! | `guid`              | string            | No      |
-//! | `published_at`      | integer or nil    | Yes     |
-//! | `title`             | string            | Yes     |
-//! | `url`               | string or nil     | Yes     |
-//! | `content`           | string or nil     | Yes     |
-//! | `authors`           | array of strings  | No      |
-//! | `categories`        | array of strings  | No      |
-//! | `tags`              | array of strings  | Yes     |
-//!
-//! `feed_id`, `syndication_format`, and `guid` are identity fields, and `authors` and
-//! `categories` describe the entry as the feed published it. They are present for scripts to
-//! read, but any modifications are ignored when converting back to [`FeedEntry`].
+//! A plugin sees an entry's every field, but may change only `published_at`, `title`,
+//! `url`, `content`, `tags` and `cache_assets`. `feed_id`, `syndication_format`, and `guid`
+//! are identity fields, and `authors` and `categories` describe the entry as the feed
+//! published it; any modifications to them are ignored when converting back to
+//! [`FeedEntry`].
 //!
 //! # Handler chaining and return values
 //!
-//! `entry.ingest` handlers run in registration order; the output of one becomes the input
-//! of the next. A handler may return `nil` to drop the entry; subsequent handlers are not
+//! `entry.ingest` handlers run in plugin order; the output of one becomes the input of the
+//! next. A handler may return nothing to drop the entry; subsequent handlers are not
 //! called. `fetch.schedule` handlers also run in order, each seeing the wait the one before
 //! it chose (see [`FetchSchedule`]). Handlers for observe-only events (everything else) are
-//! called for their side effects; their return values are discarded.
+//! called for their side effects.
 //!
 //! # Error handling
 //!
-//! If a handler fails to load, times out, or throws a runtime error, the error is logged as
-//! a warning. For `entry.ingest` the entry passes through the failing handler **unmodified**,
-//! and for `fetch.schedule` the wait is left as it was; for observe events the failure is
-//! simply dropped. A broken script never silently drops entries.
+//! If a handler times out or traps, the error is logged as a warning. For `entry.ingest`
+//! the entry passes through the failing handler **unmodified**, and for `fetch.schedule`
+//! the wait is left as it was; for observe events the failure is simply dropped. A broken
+//! plugin never silently drops entries.
 //!
 //! # Sandboxing
 //!
 //! Two layers, in different address spaces.
 //!
-//! Inside the VM: a restricted standard library. Only `string`, `table`, `math`, `os` (with
-//! dangerous functions removed), `tostring`, `tonumber`, `type`, `pairs`, `ipairs`, `select`,
-//! and `unpack` are available, plus the `kiki` table exposing `on`, `log`, `regex`, and `html`. Filesystem
-//! access, process execution, and module loading are blocked. Scripts run under a
-//! per-invocation time budget, set per plugin (see [`TimeBudget`]), and a VM-wide memory
-//! limit (see the `lua` sub-module for the concrete values).
+//! Inside the engine: each plugin runs in a WebAssembly instance of its own, which reaches
+//! nothing but the calls Kiki offers it, under a per-call time budget set per plugin (see
+//! [`TimeBudget`]) and a memory limit (see [`wasm`] for the concrete values).
 //!
-//! Around the VM: by default `kiki serve` does not host the VM at all. It runs in a separate,
-//! more tightly sandboxed process that holds no database handle, no filesystem access, and no
-//! sockets beyond the one it talks to the server over — so a VM escape lands somewhere with
-//! nothing worth having. See [`crate::process::script_host`]. The trait below is the boundary
-//! that makes this substitutable: [`lua::LuaScriptRunner`] runs the VM here,
-//! [`crate::process::script_host::SubprocessScriptRunner`] forwards to the child, and callers
-//! cannot tell the difference.
-//!
-//! # WebAssembly plugins
-//!
-//! Plugins can also be WebAssembly components (see the [`wasm`] sub-module, built with the
-//! `wasm-plugins` feature). [`composite::CompositeRunner`] runs Lua and WebAssembly plugins
-//! together, in plugin order, behind the same trait.
+//! Around the engine: by default `kiki serve` does not run plugins at all. They run in a
+//! separate, more tightly sandboxed process that holds no database handle, no filesystem
+//! access, and no sockets beyond the one it talks to the server over — so a sandbox escape
+//! lands somewhere with nothing worth having. See [`crate::process::script_host`]. The
+//! trait below is the boundary that makes this substitutable:
+//! [`wasm::WasmScriptRunner`] runs plugins here,
+//! [`crate::process::script_host::SubprocessScriptRunner`] forwards to the child, and
+//! callers cannot tell the difference.
 
-pub mod composite;
-pub mod lua;
 pub mod regex;
-#[cfg(feature = "wasm-plugins")]
 pub mod wasm;
 
 use crate::db::tags::SystemTag;
@@ -95,38 +59,25 @@ use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-/// A plugin's source code together with its configuration.
+/// A plugin's code together with its configuration.
 ///
-/// Each plugin's entrypoint is called with its config as its only argument, so a
-/// plugin reads it with `local config = ...`. That keeps one plugin's config out of reach
-/// of the others that share its VM: the plugins that ask for the same [`Permission`]s.
-///
-/// A plugin's other source files travel with it as [`ScriptModule`]s, which its code
-/// loads with `require`.
+/// The plugin's `init` is called with its config, so one plugin's config is out of reach
+/// of the others.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptSource {
-    /// The name of the plugin the source belongs to, used in error messages and stack
-    /// traces.
+    /// The name of the plugin, used in error messages.
     pub name: String,
-    /// The source code of the plugin's entrypoint.
-    pub text: String,
-    /// The script's config, as the text of a JSON object (see [`parse_script_config`]).
+    /// The plugin's config, as the text of a JSON object (see [`parse_script_config`]).
     ///
     /// Kept as text rather than as a parsed value because the script host's IPC codec is
     /// not self-describing, and so cannot carry a [`serde_json::Value`].
     pub config: String,
-    /// The plugin's other source files, which its code can `require`.
-    pub modules: Vec<ScriptModule>,
     /// How long each call of one of the plugin's handlers may run.
     pub time_budget: TimeBudget,
     /// The permissions the plugin's manifest asks for.
-    ///
-    /// The server decides what a plugin may do; the runner only keeps plugins that ask for
-    /// different permissions apart, so that none can tamper with code running with more.
     pub permissions: Vec<Permission>,
-    /// The plugin's WebAssembly component, for a plugin whose engine is `wasm`; `None` for
-    /// a Lua plugin, whose code is in [`Self::text`] and [`Self::modules`].
-    pub component: Option<WasmComponent>,
+    /// The plugin's WebAssembly component.
+    pub component: WasmComponent,
 }
 
 /// The code of a WebAssembly plugin: a component, or a core module that the runner turns
@@ -176,10 +127,24 @@ impl std::fmt::Debug for WasmComponent {
     }
 }
 
+/// Per-handler execution time budget of a plugin whose manifest does not set one (see
+/// [`TimeBudget::DEFAULT`]).
+pub const SCRIPT_TIMEOUT_MS: u64 = 100;
+
+/// How long one [`ScriptRunner::dispatch_scan`] call may keep a plugin busy before handing
+/// back the entries it has not reached, so that events queued behind a scan are not held up
+/// for long. Checked between entries, so a dispatch runs at most this plus one handler's
+/// budget.
+pub const SCAN_SLICE: Duration = Duration::from_millis(50);
+
+/// The longest a timer may wait between calls: a year. Longer waits would outlast any
+/// server, since timers start over whenever plugins reload.
+pub const MAX_TIMER_INTERVAL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 /// How long each call of a plugin's handlers may run before it is stopped.
 ///
-/// The budget covers one call of a handler, whether registered with `kiki.on` or passed to
-/// `kiki.entries.scan`, not the plugin's handlers taken together. A plugin's manifest sets
+/// The budget covers one call of a handler, whether for an event, a timer or an entry of a
+/// scan, not the plugin's handlers taken together. A plugin's manifest sets
 /// it with `time_budget_ms`; see [`crate::plugins::PluginManifest::time_budget_ms`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TimeBudget {
@@ -195,8 +160,8 @@ pub enum TimeBudget {
 
 impl TimeBudget {
     /// The budget of a plugin whose manifest does not set one:
-    /// [`lua::SCRIPT_TIMEOUT_MS`] milliseconds.
-    pub const DEFAULT: Self = Self::Millis(lua::SCRIPT_TIMEOUT_MS);
+    /// [`SCRIPT_TIMEOUT_MS`] milliseconds.
+    pub const DEFAULT: Self = Self::Millis(SCRIPT_TIMEOUT_MS);
 
     /// How long each call may run, or `None` if there is no limit.
     ///
@@ -237,62 +202,31 @@ impl std::fmt::Display for TimeBudget {
 /// WebAssembly plugin; see [`crate::process::script_host::ScriptHost`].
 pub const WASM_LOAD_BUDGET: Duration = Duration::from_secs(5);
 
-/// A source file of a plugin other than its entrypoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScriptModule {
-    /// The name the module is loaded under, such as `lib.rules` for `lib/rules.lua`. See
-    /// [`crate::plugins::module_name`].
-    pub name: String,
-    /// The module's source code.
-    pub text: String,
-}
-
 impl ScriptSource {
-    /// The config a script has when none has been set: an empty JSON object.
+    /// The config a plugin has when none has been set: an empty JSON object.
     pub const EMPTY_CONFIG: &'static str = "{}";
 
-    /// A single-file script named `script`, with an empty config and the default
-    /// [`TimeBudget`].
+    /// A plugin named `plugin` whose code is `bytes`, with an empty config, the default
+    /// [`TimeBudget`] and no permissions.
     ///
     /// # Examples
     ///
     /// ```
     /// use kiki_rss::scripting::{ScriptSource, TimeBudget};
     ///
-    /// let source = ScriptSource::new("local config = ...");
+    /// let source = ScriptSource::new(b"\0asm".to_vec());
     /// assert_eq!(source.config, "{}");
-    /// assert!(source.modules.is_empty());
     /// assert_eq!(source.time_budget, TimeBudget::DEFAULT);
     /// assert!(source.permissions.is_empty());
+    /// assert_eq!(source.component.bytes, b"\0asm");
     /// ```
-    pub fn new(text: impl Into<String>) -> Self {
+    pub fn new(bytes: Vec<u8>) -> Self {
         Self {
-            name: "script".to_string(),
-            text: text.into(),
+            name: "plugin".to_string(),
             config: Self::EMPTY_CONFIG.to_string(),
-            modules: Vec::new(),
             time_budget: TimeBudget::DEFAULT,
             permissions: Vec::new(),
-            component: None,
-        }
-    }
-
-    /// A WebAssembly plugin named `plugin` whose code is `bytes`, with an empty config and
-    /// the default [`TimeBudget`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use kiki_rss::scripting::ScriptSource;
-    ///
-    /// let source = ScriptSource::wasm(b"\0asm".to_vec());
-    /// assert!(source.text.is_empty());
-    /// assert_eq!(source.component.unwrap().bytes, b"\0asm");
-    /// ```
-    pub fn wasm(bytes: Vec<u8>) -> Self {
-        Self {
-            component: Some(WasmComponent::new(bytes)),
-            ..Self::new("")
+            component: WasmComponent::new(bytes),
         }
     }
 }
@@ -388,11 +322,11 @@ pub struct FeedEntry {
     pub cache_assets: bool,
 }
 
-/// The set of server events that scripts may subscribe to via `kiki.on(name, handler)`.
+/// The set of server events that plugins may handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Event {
     /// Fires per-entry during feed refresh, after parsing and before insertion. Handlers
-    /// may transform or filter the entry by returning a modified table or `nil`.
+    /// may transform or filter the entry by returning a modified entry or nothing.
     EntryIngest,
     /// Fires per-entry during feed refresh, immediately before `EntryIngest`. Observe-only;
     /// sees the entry exactly as parsed from the feed source.
@@ -412,9 +346,8 @@ pub enum Event {
     /// hint has it fetched again sooner than its interval. Handlers may lengthen the wait
     /// by returning a number of seconds; see [`FetchSchedule`].
     FetchSchedule,
-    /// Fires every [`TIMER_TICK`] while any plugin has a timer, started with
-    /// `kiki.every(secs, handler)`. Runs the timers that are due. Plugins cannot register
-    /// for it with `kiki.on`: it has no name [`Event::from_name`] accepts.
+    /// Fires every [`TIMER_TICK`] while any plugin has a timer, started with the host's
+    /// `every`. Runs the timers that are due.
     Timer,
 }
 
@@ -435,23 +368,6 @@ impl Event {
             Self::PluginLoad => "plugin.load",
             Self::FetchSchedule => "fetch.schedule",
             Self::Timer => "timer",
-        }
-    }
-
-    /// Parses an event name as used by `kiki.on(name, ...)` into its enum value.
-    ///
-    /// [`Event::Timer`] has no such name: plugins use timers through `kiki.every`.
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "entry.ingest" => Some(Self::EntryIngest),
-            "entry.parsed" => Some(Self::EntryParsed),
-            "fetch.success" => Some(Self::FetchSuccess),
-            "fetch.error" => Some(Self::FetchError),
-            "feed.added" => Some(Self::FeedAdded),
-            "feed.removed" => Some(Self::FeedRemoved),
-            "plugin.load" => Some(Self::PluginLoad),
-            "fetch.schedule" => Some(Self::FetchSchedule),
-            _ => None,
         }
     }
 
@@ -605,8 +521,8 @@ impl ContentChange {
 ///
 /// The event fires only when the server's freshness hint has the feed fetched again
 /// sooner than its own interval, so that `wait_secs < interval_secs`. Each handler is
-/// called with this as a table, and may return a number of seconds to wait instead, or
-/// `nil` to leave the wait as it is; the next handler sees the new wait in `wait_secs`.
+/// called with this, and may return a number of seconds to wait instead, or nothing to
+/// leave the wait as it is; the next handler sees the new wait in `wait_secs`.
 /// The server then holds the wait between the one it planned and the feed's interval:
 /// plugins can have a feed fetched less often, never more often than its server asks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -688,7 +604,7 @@ pub struct ScanSummary {
     pub updated: u64,
 }
 
-/// A request from a plugin to the server, made through the `kiki` Lua API.
+/// A request from a plugin to the server, made through the host interface.
 ///
 /// Plugins may run in a sandboxed process with no database access (see
 /// [`crate::process::script_host`]), so everything they ask of the server goes through
@@ -720,7 +636,7 @@ pub enum ServiceCall {
     DeleteEntries { filter: DeleteFilter },
 }
 
-/// A feed, as plugins see it through `kiki.feeds.get`.
+/// A feed, as plugins see it through `get-feed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedInfo {
     /// The feed's id: the `feed_id` of its entries.
@@ -757,7 +673,7 @@ pub trait ScriptServices: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a message, raised as a Lua error in the calling plugin, if the call fails.
+    /// Returns a message, returned as an error to the calling plugin, if the call fails.
     fn call(&self, plugin: &str, call: ServiceCall) -> Result<ServiceReply, String>;
 }
 
@@ -814,7 +730,7 @@ pub trait ScriptRunner: Send + Sync {
     /// with [`ServiceCall::StartScan`].
     ///
     /// Returns, for each entry handled, what the handler returned: the entry, possibly
-    /// modified, or `None` if the handler returned `nil` or failed. So that a scan never
+    /// modified, or `None` if the handler returned nothing or failed. So that a scan never
     /// holds up other events for long, the runner may stop after handling only some of
     /// `entries` (but at least one); the results then cover that prefix, and the caller
     /// passes the rest again. Returns `Ok(None)` if the runner has

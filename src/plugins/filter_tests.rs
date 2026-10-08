@@ -26,7 +26,7 @@ fn load(
     let source = ScriptSource {
         name: "filter".to_string(),
         config: config.to_string(),
-        ..ScriptSource::wasm(WASM.to_vec())
+        ..ScriptSource::new(WASM.to_vec())
     };
     WasmScriptRunner::from_sources_with(&[source], services).map_err(|e| e.to_string())
 }
@@ -65,7 +65,7 @@ fn tags(runner: &WasmScriptRunner, entry: FeedEntry) -> Vec<String> {
         .tags
 }
 
-/// Answers `kiki.feeds.get` for feed `n` in 1..=3 with the URL
+/// Answers `get-feed` for feed `n` in 1..=3 with the URL
 /// `https://example.com/feed{n}`, counting the lookups.
 #[derive(Default)]
 struct Feeds {

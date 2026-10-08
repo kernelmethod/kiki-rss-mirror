@@ -47,7 +47,7 @@ instead.
 
 The plugin uses [timers](../writing-plugins.md#timers) and
 [deletes entries](../writing-plugins.md#deleting-entries). It is written in
-Rust, as a [WebAssembly plugin](../writing-wasm-plugins.md); see
+Rust, as a [WebAssembly plugin](../writing-plugins.md); see
 [`plugins/retention/src/lib.rs`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/retention/src/lib.rs)
 for the details. Versions before 2.0.0 were written in Lua, and took the same
 configuration.

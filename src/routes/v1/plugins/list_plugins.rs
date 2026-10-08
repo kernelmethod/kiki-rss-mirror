@@ -13,10 +13,8 @@ pub struct PluginResponse {
     pub name: String,
     /// The plugin's version, from its manifest.
     pub version: String,
-    /// The scripting engine the plugin is written for.
+    /// The engine the plugin is written for.
     pub engine: PluginEngine,
-    /// Whether this build of Kiki can run the plugin's engine.
-    pub engine_supported: bool,
     /// Whether the plugin is enabled in its manifest.
     pub enabled: bool,
     /// The file the plugin's code starts from, relative to its directory.
@@ -49,7 +47,6 @@ impl From<&Plugin> for PluginResponse {
             name: m.name.clone(),
             version: m.version.clone(),
             engine: m.engine,
-            engine_supported: m.engine.is_supported(),
             enabled: m.enabled,
             entrypoint: m.entrypoint().to_string(),
             directory: plugin.dir_name(),
@@ -139,11 +136,7 @@ mod test {
     #[tokio::test]
     async fn test_list_plugins() -> Result<()> {
         let tc = TestBuilder::default().init_database().build()?;
-        tc.install_lua_plugin(
-            "passthrough",
-            r#"kiki.on("entry.ingest", function(entry) return entry end)"#,
-            serde_json::json!({"x": 1}),
-        )?;
+        tc.install_plugin("passthrough", serde_json::json!({"x": 1}))?;
         std::fs::create_dir_all(tc.user_plugins_dir().join("broken"))?;
         let tc = tc.init_server()?;
         let client = tc.client()?;
@@ -156,8 +149,8 @@ mod test {
         let plugin = &body.plugins[0];
         assert_eq!(plugin.name, "passthrough");
         assert_eq!(plugin.version, "1.0.0");
-        assert_eq!(plugin.engine, PluginEngine::Lua);
-        assert_eq!(plugin.entrypoint, "main.lua");
+        assert_eq!(plugin.engine, PluginEngine::Wasm);
+        assert_eq!(plugin.entrypoint, "plugin.wasm");
         assert_eq!(plugin.source, PluginSource::User);
         assert_eq!(plugin.directory, "passthrough");
         assert!(plugin.enabled);

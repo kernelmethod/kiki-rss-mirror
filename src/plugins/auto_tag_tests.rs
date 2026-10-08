@@ -22,7 +22,7 @@ fn source(config: &Value) -> ScriptSource {
     ScriptSource {
         name: "auto-tag".to_string(),
         config: config.to_string(),
-        ..ScriptSource::wasm(WASM.to_vec())
+        ..ScriptSource::new(WASM.to_vec())
     }
 }
 
@@ -56,7 +56,7 @@ fn tags(runner: &WasmScriptRunner, entry: FeedEntry) -> Vec<String> {
         .tags
 }
 
-/// Answers `kiki.feeds.get` for feed `n` in 1..=3 with the URL
+/// Answers `get-feed` for feed `n` in 1..=3 with the URL
 /// `https://example.com/feed{n}`, counting the lookups.
 #[derive(Default)]
 struct Feeds {

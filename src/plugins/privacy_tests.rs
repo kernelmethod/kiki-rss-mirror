@@ -23,7 +23,7 @@ fn load(
     let source = ScriptSource {
         name: "privacy".to_string(),
         config: config.to_string(),
-        ..ScriptSource::wasm(WASM.to_vec())
+        ..ScriptSource::new(WASM.to_vec())
     };
     WasmScriptRunner::from_sources_with(&[source], services).map_err(|e| e.to_string())
 }
@@ -361,7 +361,7 @@ fn assets_are_not_cached_for_feeds_given_by_id() {
     assert!(!caches_assets(&runner, 3));
 }
 
-/// Answers `kiki.feeds.get` for feed `n` in 1..=3 with the URL
+/// Answers `get-feed` for feed `n` in 1..=3 with the URL
 /// `https://example.com/feed{n}`, counting the lookups.
 #[derive(Default)]
 struct Feeds {

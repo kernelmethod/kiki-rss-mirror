@@ -2,7 +2,7 @@
 
 Plugins are small programs that Kiki runs as entries arrive: to hide
 them, tag them, clean them up, or anything else you can write. They are
-written in Lua, or compiled to WebAssembly from languages such as Rust. Each
+compiled to WebAssembly from languages such as Rust. Each
 lives in its own directory under `plugins/` in Kiki's [data
 directory](../configuration/environment.md): in `plugins/system/` if it came
 with Kiki, and in `plugins/user/` if you installed it.

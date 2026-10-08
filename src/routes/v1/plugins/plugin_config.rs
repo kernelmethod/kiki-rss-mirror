@@ -383,7 +383,7 @@ mod test {
     /// `{"a": 1, "b": 2}`, and a database, but no server yet.
     fn installed() -> Result<TestConfig> {
         let tc = TestBuilder::default().init_database().build()?;
-        tc.install_lua_plugin("hello", "", json!({"a": 1, "b": 2}))?;
+        tc.install_plugin("hello", json!({"a": 1, "b": 2}))?;
         Ok(tc)
     }
 
@@ -451,22 +451,21 @@ mod test {
     #[tokio::test]
     async fn test_a_config_that_fails_to_load_keeps_the_old_one() -> Result<()> {
         let tc = TestBuilder::default().init_database().build()?;
-        tc.install_lua_plugin(
-            "hello",
-            "local config = ...\nif config.fail then error('bad config') end",
-            json!({"a": 1}),
-        )?;
+        tc.install_plugin("hello", json!({"a": 1}))?;
         let tc = tc.init_server()?;
         let client = tc.client()?;
 
         let resp = client
             .patch(URL)
-            .json(&json!({"fail": true}))
+            .json(&json!({"init_error": "bad config"}))
             .send()
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.json::<PluginConfigResponse>().await?;
-        assert_eq!(Value::Object(body.config), json!({"a": 1, "fail": true}));
+        assert_eq!(
+            Value::Object(body.config),
+            json!({"a": 1, "init_error": "bad config"})
+        );
         assert_eq!(Value::Object(body.active), json!({"a": 1}));
         assert!(body.reload_failed);
         assert!(
@@ -477,7 +476,7 @@ mod test {
             "{:?}",
             body.reload_error
         );
-        assert_eq!(stored(&tc)?, json!({"fail": true}));
+        assert_eq!(stored(&tc)?, json!({"init_error": "bad config"}));
 
         // Fixing the config applies it.
         let resp = client.put(URL).json(&json!({"a": 2})).send().await?;
@@ -576,11 +575,11 @@ mod test {
         std::fs::create_dir_all(&dir)?;
         std::fs::write(
             dir.join("manifest.toml"),
-            "name = 'hello'\nversion = '1.0.0'\nengine = 'lua'\n\
+            "name = 'hello'\nversion = '1.0.0'\nengine = 'wasm'\n\
              [config]\nn = 1\n\
              [[settings]]\nname = 'n'\ntype = 'integer'\nmin = 0\n",
         )?;
-        std::fs::write(dir.join("main.lua"), "")?;
+        std::fs::write(dir.join("plugin.wasm"), &*crate::test::WASM_FIXTURE)?;
         let tc = tc.init_server()?;
         let client = tc.client()?;
 

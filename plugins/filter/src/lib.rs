@@ -10,8 +10,8 @@
 //!
 //! A rule is an object with:
 //!
-//! * `pattern`: the regular expression, in the syntax of `kiki.regex`.
-//! * `flags`: optional `kiki.regex` flags, such as `"i"` for case-insensitive.
+//! * `pattern`: the regular expression, in the syntax of the server's regexes.
+//! * `flags`: optional regex flags, such as `"i"` for case-insensitive.
 //! * `fields`: the entry fields to match: a list of names, from title, url, content,
 //!   authors, categories and guid. A rule matches if the pattern matches any of them (for
 //!   authors and categories, any one of the entry's). Missing or empty, it is
@@ -149,8 +149,8 @@ impl Rule {
             Some(Value::String(flags)) => flags.as_str(),
             Some(_) => return fail("'flags' must be a string"),
         };
-        // The server compiles patterns as `kiki.regex` does, so a pattern the Lua plugin
-        // accepts is accepted here too, and no other.
+        // The server compiles patterns as the Lua plugin's `kiki.regex` did, so a pattern
+        // the Lua plugin accepted is accepted here too, and no other.
         let re = match Regex::compile(pattern, flags) {
             Ok(re) => re,
             Err(e) => return fail(&format!("kiki.regex: {e}")),

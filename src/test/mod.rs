@@ -27,6 +27,13 @@ static ATOM_CONTENT: LazyLock<Vec<u8>> = LazyLock::new(|| {
         .expect("failed to read test/example_atom.xml")
 });
 
+/// The WebAssembly plugin in `tests/wasm-fixture`, whose config chooses what
+/// it does, and which ignores config keys it doesn't know.
+pub static WASM_FIXTURE: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/wasm-fixture/fixture.wasm"))
+        .expect("failed to read tests/wasm-fixture/fixture.wasm")
+});
+
 /// Configurable state for the test feed server, allowing tests to control
 /// which HTTP cache headers are returned and to inspect request counts.
 #[derive(Default)]
@@ -699,21 +706,16 @@ impl TestConfig {
         crate::plugins::PluginSource::User.dir(&self.plugins_dir())
     }
 
-    /// Install a Lua plugin named `name` whose entrypoint is `text`, with
-    /// config `config`, into [`Self::user_plugins_dir`].
-    pub fn install_lua_plugin(
-        &self,
-        name: &str,
-        text: &str,
-        config: serde_json::Value,
-    ) -> Result<PathBuf> {
+    /// Install a plugin named `name`, running [`WASM_FIXTURE`] with config
+    /// `config`, into [`Self::user_plugins_dir`].
+    pub fn install_plugin(&self, name: &str, config: serde_json::Value) -> Result<PathBuf> {
         let serde_json::Value::Object(config) = config else {
             bail!("plugin config must be a JSON object");
         };
         let manifest = crate::plugins::PluginManifest {
             name: name.to_string(),
             version: "1.0.0".to_string(),
-            engine: crate::plugins::PluginEngine::Lua,
+            engine: crate::plugins::PluginEngine::Wasm,
             entrypoint: None,
             description: None,
             authors: vec![],
@@ -725,7 +727,7 @@ impl TestConfig {
             config,
             settings: vec![],
         };
-        crate::plugins::install(&self.user_plugins_dir(), &manifest, text)
+        crate::plugins::install(&self.user_plugins_dir(), &manifest, &WASM_FIXTURE)
     }
 
     pub fn socket_path(&self) -> PathBuf {

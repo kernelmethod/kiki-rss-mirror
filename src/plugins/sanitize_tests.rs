@@ -4,7 +4,6 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use crate::plugins::PluginManifest;
-use crate::scripting::composite::CompositeRunner;
 use crate::scripting::wasm::WasmScriptRunner;
 use crate::scripting::{FeedEntry, ScriptRunner, ScriptSource, TimeBudget};
 use serde_json::{json, Value};
@@ -24,7 +23,7 @@ fn source(config: Value) -> ScriptSource {
         name: "sanitize".to_string(),
         config: Value::Object(merged).to_string(),
         time_budget,
-        ..ScriptSource::wasm(WASM.to_vec())
+        ..ScriptSource::new(WASM.to_vec())
     }
 }
 
@@ -415,7 +414,7 @@ fn content_that_cannot_be_rewritten_is_reduced_to_text() {
     // About 11 MB, which with the rewritten HTML would need more than the plugin's 16 MiB.
     // Content this large only gets into the plugin when its memory has room for it in one
     // piece, as a fresh plugin's does: otherwise Kiki fails to hand it over, and the entry
-    // passes through the plugin unchanged, as it did through the Lua plugin.
+    // passes through the plugin unchanged.
     let fresh = default_plugin();
     let html = unit.repeat(80_000);
     let out = sanitize(&fresh, &html);
@@ -454,11 +453,11 @@ fn sanitize_still_works_on_privacy_cleaned_content() {
     let strip = ScriptSource {
         name: "privacy".to_string(),
         config: Value::Object(manifest.config).to_string(),
-        ..ScriptSource::wasm(
+        ..ScriptSource::new(
             include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/privacy.wasm")).to_vec(),
         )
     };
-    let runner = CompositeRunner::from_sources_with(&[strip, source(json!({}))], None).unwrap();
+    let runner = WasmScriptRunner::from_sources_with(&[strip, source(json!({}))], None).unwrap();
 
     assert_eq!(
         sanitize(

@@ -4,7 +4,6 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use super::*;
-use crate::scripting::composite::CompositeRunner;
 use crate::scripting::FeedInfo;
 use serde_json::json;
 
@@ -67,7 +66,7 @@ fn source(name: &str, config: serde_json::Value) -> ScriptSource {
     ScriptSource {
         name: name.to_string(),
         config: config.to_string(),
-        ..ScriptSource::wasm(FIXTURE.to_vec())
+        ..ScriptSource::new(FIXTURE.to_vec())
     }
 }
 
@@ -228,33 +227,29 @@ fn init_errors_fail_the_load() {
     assert!(matches!(err, WasmError::Init { .. }), "{err}");
     assert!(err.to_string().contains("bad config"), "{err}");
 
-    let err = WasmScriptRunner::from_sources_with(
-        &[source("a", json!({ "no_such_option": true }))],
-        None,
-    )
-    .err()
-    .unwrap();
+    let err = WasmScriptRunner::from_sources_with(&[source("a", json!({ "suffix": true }))], None)
+        .err()
+        .unwrap();
     assert!(err.to_string().contains("invalid config"), "{err}");
 }
 
 #[test]
 fn bad_components_fail_to_compile() {
-    let err =
-        WasmScriptRunner::from_sources_with(&[ScriptSource::wasm(b"not wasm".to_vec())], None)
-            .err()
-            .unwrap();
+    let err = WasmScriptRunner::from_sources_with(&[ScriptSource::new(b"not wasm".to_vec())], None)
+        .err()
+        .unwrap();
     assert!(matches!(err, WasmError::Compile { .. }), "{err}");
 
     // A component that doesn't target the plugin world.
     let other = wat::parse_str("(component)").unwrap();
-    let err = WasmScriptRunner::from_sources_with(&[ScriptSource::wasm(other)], None)
+    let err = WasmScriptRunner::from_sources_with(&[ScriptSource::new(other)], None)
         .err()
         .unwrap();
     assert!(matches!(err, WasmError::Instantiate { .. }), "{err}");
 
     // A core module is made into a component, which here doesn't target the world either.
     let module = wat::parse_str("(module)").unwrap();
-    let err = WasmScriptRunner::from_sources_with(&[ScriptSource::wasm(module)], None)
+    let err = WasmScriptRunner::from_sources_with(&[ScriptSource::new(module)], None)
         .err()
         .unwrap();
     assert!(
@@ -275,11 +270,11 @@ fn only_components_put_are_kept() {
     bytes.extend_from_slice(&[0, 5, 4, b'k', b'e', b'e', b'p']);
     let source = ScriptSource {
         config: json!({}).to_string(),
-        ..ScriptSource::wasm(bytes)
+        ..ScriptSource::new(bytes)
     };
     runner(std::slice::from_ref(&source));
     let mut by_hash = source;
-    by_hash.component.as_mut().unwrap().bytes.clear();
+    by_hash.component.bytes.clear();
     let err = WasmScriptRunner::from_sources_with(&[by_hash], None)
         .err()
         .unwrap();
@@ -291,7 +286,7 @@ fn components_are_found_by_hash_once_compiled() {
     let component = WasmComponent::new(FIXTURE.to_vec());
     put_component("a", &component).unwrap();
     let mut source = source("a", json!({ "suffix": "!" }));
-    source.component.as_mut().unwrap().bytes.clear();
+    source.component.bytes.clear();
     let (runner, _) = runner(&[source.clone()]);
     let out = runner
         .dispatch_transform_entry(entry("t"))
@@ -303,7 +298,7 @@ fn components_are_found_by_hash_once_compiled() {
         hash: [0xab; 32],
         bytes: Vec::new(),
     };
-    source.component = Some(unknown);
+    source.component = unknown;
     let err = WasmScriptRunner::from_sources_with(&[source], None)
         .err()
         .unwrap();
@@ -397,7 +392,7 @@ fn runner_without_schedule() -> (WasmScriptRunner, Arc<Recorder>) {
 fn calls_to_the_server() {
     let (runner, recorder) = runner(&[source(
         "a",
-        json!({ "store": true, "feed": true, "delete": true }),
+        json!({ "store": true, "feed": true, "delete": 100 }),
     )]);
     runner.dispatch_observe(Event::PluginLoad, EventPayload::PluginLoad);
     assert_eq!(recorder.seen("store").unwrap(), "Ok(()) Ok(Some(42))");
@@ -508,51 +503,6 @@ fn timers() {
     assert!(err.to_string().contains("between 60"), "{err}");
 }
 
-/// Lua and WebAssembly plugins run together, in plugin order.
-#[test]
-fn mixed_engines_run_in_plugin_order() {
-    let lua = |name: &str, suffix: &str| ScriptSource {
-        name: name.to_string(),
-        ..ScriptSource::new(format!(
-            r#"kiki.on("entry.ingest", function(e) e.title = e.title .. "{suffix}" return e end)"#
-        ))
-    };
-    let runner = CompositeRunner::from_sources_with(
-        &[
-            lua("1", " lua1"),
-            source("2", json!({ "suffix": " wasm2" })),
-            lua("3", " lua3"),
-            source("4", json!({ "suffix": " wasm4", "wait_secs": 900 })),
-        ],
-        None,
-    )
-    .unwrap();
-    let out = runner
-        .dispatch_transform_entry(entry("t"))
-        .unwrap()
-        .unwrap();
-    assert_eq!(out.title, "t lua1 wasm2 lua3 wasm4");
-    assert!(runner.handles(Event::FetchSchedule));
-    assert_eq!(
-        runner
-            .dispatch_schedule(schedule(60))
-            .unwrap()
-            .unwrap()
-            .wait_secs,
-        900
-    );
-
-    let dropper = CompositeRunner::from_sources_with(
-        &[source("1", json!({ "drop_title": "t" })), lua("2", " lua2")],
-        None,
-    )
-    .unwrap();
-    assert!(dropper
-        .dispatch_transform_entry(entry("t"))
-        .unwrap()
-        .is_none());
-}
-
 /// When a timer handler traps, the timers still due were the old instance's: they are not
 /// called on the restarted one, whose own timers start afresh.
 #[test]
@@ -626,7 +576,7 @@ fn plugins_match_with_the_servers_regexes() {
     assert_eq!(recorder.seen("regex").unwrap(), "true Some((9, 13))");
     assert_eq!(recorder.seen("regex-set").unwrap(), "[0]");
 
-    // Errors read as kiki.regex's do, and fail the call rather than trapping.
+    // Errors are messages, and fail the call rather than trapping.
     let (plugins, recorder) = runner(&[source(
         "a",
         json!({"regex": ["(", ""], "regex_set": [["a", ""], ["b", "q"]]}),

@@ -51,8 +51,8 @@ pub(super) fn fire_fetch_success(
 /// Error returned when plugins could not be loaded into a script runner.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadPluginsError {
-    /// A plugin's code failed to compile or its top-level chunk failed to run. The
-    /// plugins that were running before, if any, keep running.
+    /// A plugin failed to compile, or its `init` failed. The plugins that were running
+    /// before, if any, keep running.
     #[error("failed to load plugins: {0}")]
     Compile(String),
 
@@ -71,8 +71,8 @@ pub enum LoadPluginsError {
 ///
 /// When `host` carries a sandboxed script host, the sources are shipped to that child
 /// process and `handle` receives a [`SubprocessScriptRunner`] that forwards to it.
-/// Otherwise the VM is built in this process, which is the path the library tests and
-/// `--no-script-isolation` take, and the calls plugins make through the `kiki` API are
+/// Otherwise the plugins are loaded in this process, which is the path the library tests
+/// and `--no-script-isolation` take, and the calls plugins make to the server are
 /// answered by `services`. (The host answers them with the services set on it.)
 ///
 /// Plugins that cannot be loaded are logged and skipped (see
@@ -141,10 +141,9 @@ pub fn load_script_runner(
         };
     }
 
-    // No isolated host: compile into a VM in this process.
+    // No isolated host: load the plugins in this process.
     let _ = host;
-    match crate::scripting::composite::CompositeRunner::from_sources_with(&sources, Some(services))
-    {
+    match crate::scripting::wasm::WasmScriptRunner::from_sources_with(&sources, Some(services)) {
         Ok(runner) => {
             handle.set(if empty {
                 None
@@ -174,7 +173,7 @@ fn fire_plugin_load(handle: &ScriptRunnerHandle) {
     }
 }
 
-/// Read the source of every enabled plugin in `discovery`, of every engine.
+/// Read the code of every enabled plugin in `discovery`.
 pub(super) fn load_plugin_sources(discovery: &crate::plugins::Discovery) -> Vec<ScriptSource> {
     crate::plugins::load_sources(discovery)
 }

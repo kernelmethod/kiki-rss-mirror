@@ -17,17 +17,14 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli", "systemd", "api-docs", "metrics", "web-ui", "default-plugins", "wasm-plugins"]
+default = ["cli", "systemd", "api-docs", "metrics", "web-ui", "default-plugins"]
 cli = ["clap"]
 systemd = []
 api-docs = ["utoipa-scalar"]
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 web-ui = ["cli"]
-# Bundle the plugins in plugins/ that `kiki init` installs (see build.rs). The
-# filter plugin is a WebAssembly component, so they need WebAssembly support.
-default-plugins = ["dep:tar", "dep:zstd", "wasm-plugins"]
-# Run plugins written as WebAssembly components (see src/scripting/wasm.rs)
-wasm-plugins = ["dep:wasmtime", "dep:wit-component"]
+# Bundle the plugins in plugins/ that `kiki init` installs (see build.rs).
+default-plugins = ["dep:tar", "dep:zstd"]
 extra-tests = []
 
 [dependencies]
@@ -53,7 +50,6 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 serde_bytes = "0.11"
 metrics = { version = "0.24", optional = true }
 metrics-exporter-prometheus = { version = "0.17", default-features = false, optional = true }
-mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 regex = "1"
 thiserror = "2.0.18"
 utoipa = { version = "5", features = ["axum_extras"] }
@@ -73,8 +69,8 @@ sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.3"
 subtle = "2"
-wasmtime = { version = "45", optional = true, default-features = false, features = ["cranelift", "runtime", "component-model", "std", "addr2line", "demangle"] }
-wit-component = { version = "0.248", optional = true, default-features = false }
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime", "component-model", "std", "addr2line", "demangle"] }
+wit-component = { version = "0.248", default-features = false }
 
 [build-dependencies]
 tar = { version = "0.4", default-features = false, optional = true }

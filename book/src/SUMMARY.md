@@ -25,7 +25,6 @@
 
 - [The HTTP API](api.md)
 - [Writing plugins](writing-plugins.md)
-    - [Writing WebAssembly plugins](writing-wasm-plugins.md)
 
 # Reference
 

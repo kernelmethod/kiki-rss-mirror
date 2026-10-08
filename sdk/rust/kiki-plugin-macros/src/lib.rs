@@ -13,7 +13,7 @@ use syn::{parse_macro_input, Attribute, Ident, ImplItem, ItemImpl, Token};
 /// Something the server calls a plugin for: an event, or a timer or scan the plugin
 /// started.
 struct Event {
-    /// The name `#[on(...)]` gives it, as the Lua API names it.
+    /// The name `#[on(...)]` gives it, as the guide names it.
     name: &'static str,
     /// Its `event-kind` variant, for an event a plugin says it handles; `None` for one
     /// delivered whenever it happens.
@@ -143,8 +143,8 @@ const EVENTS: &[Event] = &[
 /// | `scan.entry`     | `scan: u64, entry: Entry`         | `Option<Entry>` |
 /// | `scan.done`      | `scan: u64, summary: ScanSummary` |                 |
 ///
-/// The first eight are the events of the Lua API, by the same names. `entry.ingest`
-/// returns the entry, possibly changed, to keep it, or `None` to drop it;
+/// The first eight are the server's events; see the guide's "Writing plugins" chapter.
+/// `entry.ingest` returns the entry, possibly changed, to keep it, or `None` to drop it;
 /// `fetch.schedule` returns a longer wait before the feed's next fetch, in seconds, or
 /// `None` to leave it. `timer` is called when a timer started with `host::every` is due,
 /// and `scan.entry` and `scan.done` for a scan started with `host::start_scan`: only

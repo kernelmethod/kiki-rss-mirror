@@ -1,8 +1,8 @@
 //! WebAssembly-based [`ScriptRunner`] implementation.
 //!
 //! A WebAssembly plugin is a [component] targeting the `plugin` world of
-//! `sdk/rust/kiki-plugin/wit/kiki-plugin.wit`: it imports the `host` interface, Kiki's counterpart of the `kiki`
-//! table Lua plugins get, and exports an `init` function and one function per event. A core
+//! `sdk/rust/kiki-plugin/wit/kiki-plugin.wit`: it imports the `host` interface, through
+//! which it calls the server, and exports an `init` function and one function per event. A core
 //! module carrying the world's type information, as `wit-bindgen` builds for
 //! `wasm32-unknown-unknown`, is accepted too, and turned into a component when it is
 //! compiled.
@@ -31,7 +31,7 @@
 //! memory, whatever permissions they ask for. A plugin's `init` export is called with its
 //! config when it loads, and returns the events the plugin handles; only those are
 //! delivered to it. Its calls to the server go through [`ScriptServices`], tagged with its
-//! name, so the server checks its permissions just as it does a Lua plugin's.
+//! name, so the server can check its permissions.
 //!
 //! # Safety controls
 //!
@@ -39,7 +39,7 @@
 //!
 //! * The plugin's [`TimeBudget`], enforced with Wasmtime's epoch interruption: a thread
 //!   advances the engine's epoch every [`EPOCH_TICK`], and at each tick a running plugin
-//!   checks its deadline. As for Lua, time spent waiting on the server is given back, up to
+//!   checks its deadline. Time spent waiting on the server is given back, up to
 //!   [`MAX_CALL_ALLOWANCE`] per call. Instantiating a plugin and calling its `init` run
 //!   under [`LOAD_BUDGET`], together.
 //! * [`WASM_MEMORY_LIMIT_BYTES`] of linear memory per plugin, and limits on tables and
@@ -47,8 +47,8 @@
 //! * [`MAX_WASM_STACK`] bytes of stack.
 //!
 //! A call that traps — runs out of time or memory, or hits `unreachable`, as a Rust panic
-//! does — fails as a Lua handler's error does: the entry passes through unmodified, the
-//! wait is kept, or the failure is logged. Since a trap can leave the plugin's memory in
+//! does — fails the call: the entry passes through unmodified, the wait is kept, or the
+//! failure is logged. Since a trap can leave the plugin's memory in
 //! any state, the plugin is then started afresh: instantiated again, and its `init` called
 //! again, which starts its timers again. Its scans end. The restart waits for the next
 //! event the plugin handles, and each dispatch restarts at most one plugin, so the time a
@@ -56,12 +56,12 @@
 //! [`crate::process::script_host::ScriptHost`]. A plugin that traps more than
 //! [`MAX_TRAPS`] times in [`TRAP_WINDOW`] is disabled until plugins next reload.
 
-use super::lua::MAX_TIMER_INTERVAL;
 use super::regex::MAX_LIVE_REGEXES;
 use super::{
     parse_script_config, restore_read_only, ContentChange, DeleteFilter, Event, EventPayload,
     EventSet, FeedEntry, FetchSchedule, ScanOptions, ScanSummary, ScheduleDecision, ScriptRunner,
-    ScriptServices, ScriptSource, ServiceCall, ServiceReply, TimeBudget, WasmComponent, TIMER_TICK,
+    ScriptServices, ScriptSource, ServiceCall, ServiceReply, TimeBudget, WasmComponent,
+    MAX_TIMER_INTERVAL, SCAN_SLICE, TIMER_TICK,
 };
 use crate::db::tags::{is_reserved_tag_name, SystemTag};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -90,7 +90,7 @@ use bindings::kiki::plugin::types as wit;
 use bindings::Plugin as Bindings;
 
 /// Linear memory each plugin may use.
-pub const WASM_MEMORY_LIMIT_BYTES: usize = super::lua::SCRIPT_MEMORY_LIMIT_BYTES;
+pub const WASM_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Stack each plugin may use.
 pub const MAX_WASM_STACK: usize = 512 * 1024;
@@ -104,7 +104,7 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(5);
 pub const LOAD_BUDGET: Duration = super::WASM_LOAD_BUDGET;
 
 /// How much of the time a call spends waiting on the server does not count against its
-/// time budget, as for Lua.
+/// time budget.
 pub const MAX_CALL_ALLOWANCE: Duration = Duration::from_secs(1);
 
 /// How many traps a plugin may hit in [`TRAP_WINDOW`] before it is disabled until plugins
@@ -300,8 +300,8 @@ struct Timer {
     next: Instant,
 }
 
-/// The time budget of the call into a plugin in progress, if any. See the Lua engine's
-/// budget, which this mirrors.
+/// The time budget of the call into a plugin in progress, if any. Time the call spends
+/// waiting on the server is given back to it, up to [`MAX_CALL_ALLOWANCE`].
 #[derive(Default)]
 struct CallBudget {
     deadline: Option<Instant>,
@@ -339,7 +339,7 @@ pub struct HostRegex(Arc<regex::bytes::Regex>);
 pub struct HostRegexSet(Vec<Arc<regex::bytes::Regex>>);
 
 /// The regexes a plugin has compiled, by pattern and flags, so that compiling one again,
-/// alone or in a set, shares the one already alive, as `kiki.regex` does in Lua.
+/// alone or in a set, shares the one already alive.
 #[derive(Default)]
 struct Regexes(HashMap<(String, String), std::sync::Weak<regex::bytes::Regex>>);
 
@@ -964,7 +964,7 @@ impl WasmPlugin {
 /// See the [module documentation](self).
 pub struct WasmScriptRunner {
     /// The plugins, in the order they load in. Behind a mutex since a store is used by one
-    /// call at a time, and to run one call at a time, as the Lua engine does.
+    /// call at a time, and to run one call at a time.
     plugins: Mutex<Vec<WasmPlugin>>,
     linker: Linker<State>,
     services: Option<Arc<dyn ScriptServices>>,
@@ -995,15 +995,7 @@ impl WasmScriptRunner {
         for source in sources {
             parse_script_config(&source.config)?;
             let name: Arc<str> = Arc::from(source.name.as_str());
-            let component = match &source.component {
-                Some(component) => compile(&source.name, component)?,
-                None => {
-                    return Err(WasmError::Compile {
-                        plugin: source.name.clone(),
-                        message: "the plugin has no WebAssembly component".to_string(),
-                    })
-                }
-            };
+            let component = compile(&source.name, &source.component)?;
             // Toolchains such as Rust's for `wasm32-wasip2` import WASI whether or not a
             // plugin uses it. Kiki defines the harmless parts; the rest trap if called.
             wasi::define(&mut linker, engine, &component, &mut wasi_defined).map_err(|e| {
@@ -1070,8 +1062,7 @@ impl WasmScriptRunner {
         self.plugins().iter().any(|p| p.has_scan(scan_id))
     }
 
-    /// Calls `on-timer` for each timer due by `now`, and schedules its next call, as the
-    /// Lua engine does.
+    /// Calls `on-timer` for each timer due by `now`, and schedules its next call.
     fn run_timers(&self, now: Instant) {
         let mut dispatch = self.dispatch();
         let mut plugins = self.plugins();
@@ -1252,7 +1243,7 @@ impl ScriptRunner for WasmScriptRunner {
         let mut results = Vec::with_capacity(entries.len());
         for entry in entries {
             // At least one entry is always handled, so the scan makes progress.
-            if !results.is_empty() && start.elapsed() >= super::lua::SCAN_SLICE {
+            if !results.is_empty() && start.elapsed() >= SCAN_SLICE {
                 break;
             }
             if !plugin.has_scan(scan_id) {

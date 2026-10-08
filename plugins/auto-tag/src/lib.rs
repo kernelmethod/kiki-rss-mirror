@@ -16,8 +16,8 @@
 //!
 //! * `tag`: the tag to add: a user tag, or one of the system tags `system:read`,
 //!   `system:saved` and `system:hidden`.
-//! * `pattern`: an optional regular expression, in the syntax of the host's regexes
-//!   (Lua's `kiki.regex`). Without it, the rule matches every entry from its feeds.
+//! * `pattern`: an optional regular expression, in the syntax of the host's regexes.
+//!   Without it, the rule matches every entry from its feeds.
 //! * `flags`: optional regex flags, such as `"i"` for case-insensitive.
 //! * `fields`: the entry fields to match the pattern against: a list of names, from
 //!   `title`, `url`, `content`, `authors`, `categories` and `guid`. The pattern matches if

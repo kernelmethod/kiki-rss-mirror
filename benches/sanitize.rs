@@ -27,7 +27,7 @@ fn plugin() -> WasmScriptRunner {
         name: "sanitize".to_string(),
         config: Value::Object(manifest.config.clone()).to_string(),
         time_budget: manifest.time_budget(),
-        ..ScriptSource::wasm(WASM.to_vec())
+        ..ScriptSource::new(WASM.to_vec())
     };
     WasmScriptRunner::from_sources_with(&[source], None).expect("the plugin loads")
 }

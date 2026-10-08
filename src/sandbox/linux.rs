@@ -197,12 +197,12 @@ pub fn restrict_syscalls(config: &SandboxConfig) -> Result<()> {
 /// `MemoryDenyWriteExecute=` installs where the kernel has it, here
 /// applied however Kiki is started.
 ///
-/// Every process gets it but the script host, when Kiki is built with the
-/// `wasm-plugins` feature: it compiles WebAssembly plugins to native code
-/// with Cranelift, which writes the code and then makes it executable (see
-/// [`crate::scripting::wasm`]). The server starts the script host before
-/// it refuses such memory itself, so the host does not inherit it. Lua 5.4
-/// is an interpreter, with no JIT, and no other process needs it.
+/// Every process gets it but the script host: it compiles WebAssembly
+/// plugins to native code with Cranelift, which writes the code and then
+/// makes it executable (see [`crate::scripting::wasm`]). The server starts
+/// the script host before it refuses such memory itself, so the host does
+/// not inherit it. The server goes without it too when it runs plugins
+/// itself, with `--no-script-isolation`. No other process needs it.
 ///
 /// The setting cannot be undone, and is inherited by forked children and
 /// kept across `execve` (so the feed fetcher's worker, parser and resolver
@@ -265,9 +265,16 @@ enum Mdwe {
 }
 
 /// Whether processes with `profile` refuse writable and executable memory:
-/// all but the script host, when it runs WebAssembly plugins.
+/// all but those that compile WebAssembly plugins.
 fn refuses_write_exec(profile: &SandboxProfile) -> bool {
-    !(cfg!(feature = "wasm-plugins") && matches!(profile, SandboxProfile::ScriptHost))
+    !matches!(
+        profile,
+        SandboxProfile::ScriptHost
+            | SandboxProfile::Server {
+                runs_plugins: true,
+                ..
+            }
+    )
 }
 
 /// Whether this process already refuses writable and executable memory
@@ -384,6 +391,7 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
             data_dir,
             socket_dir,
             temp_dir,
+            ..
         } => {
             // The socket usually lives in the data directory, in which case
             // the one rule already covers it.
@@ -1006,12 +1014,22 @@ fn detect_arch() -> Option<seccompiler::TargetArch> {
 mod tests {
     use super::*;
 
-    /// Only the script host may have writable and executable memory, and
-    /// only when it runs WebAssembly plugins.
+    /// Only the process that runs plugins, the script host unless the
+    /// server runs them itself, may have writable and executable memory.
     #[test]
-    fn only_the_script_host_may_write_and_execute_memory() {
+    fn only_the_process_running_plugins_may_write_and_execute_memory() {
+        let server = |runs_plugins| {
+            SandboxConfig::server(
+                PathBuf::new(),
+                PathBuf::new(),
+                PathBuf::new(),
+                runs_plugins,
+                false,
+            )
+        };
+        assert!(!refuses_write_exec(&server(true).profile));
         let all = [
-            SandboxConfig::server(PathBuf::new(), PathBuf::new(), PathBuf::new(), false),
+            server(false),
             SandboxConfig::script_host(false),
             SandboxConfig::feed_fetcher(false),
             SandboxConfig::feed_worker(false),
@@ -1023,7 +1041,7 @@ mod tests {
             let script_host = matches!(config.profile, SandboxProfile::ScriptHost);
             assert_eq!(
                 refuses_write_exec(&config.profile),
-                !(script_host && cfg!(feature = "wasm-plugins")),
+                !script_host,
                 "{}",
                 config.profile_name()
             );
@@ -1150,6 +1168,7 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/kiki"),
             socket_dir: PathBuf::from("/run/kiki"),
             temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
+            runs_plugins: false,
         });
         assert_eq!(
             rw,
@@ -1163,6 +1182,7 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/kiki"),
             socket_dir: PathBuf::from("/var/lib/kiki"),
             temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
+            runs_plugins: false,
         });
         assert_eq!(rw, vec![PathBuf::from("/var/lib/kiki")]);
     }
@@ -1176,6 +1196,7 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/kiki"),
             socket_dir: PathBuf::from("/var/lib/kiki"),
             temp_dir: PathBuf::from("/var/tmp/kiki"),
+            runs_plugins: false,
         });
         assert_eq!(
             rw,
@@ -1192,6 +1213,7 @@ mod tests {
                 data_dir: PathBuf::from("/var/lib/kiki"),
                 socket_dir: PathBuf::from("/var/lib/kiki"),
                 temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
+                runs_plugins: false,
             },
             SandboxProfile::ScriptHost,
             SandboxProfile::FeedFetcher,
@@ -1303,6 +1325,7 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/kiki"),
             socket_dir: PathBuf::from("/var/lib/kiki"),
             temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
+            runs_plugins: false,
         });
         for p in &ro {
             assert!(
@@ -1386,6 +1409,7 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/kiki"),
             socket_dir: PathBuf::from("/var/lib/kiki"),
             temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
+            runs_plugins: false,
         });
         assert!(!denied.contains(&libc::SYS_accept4));
         for nr in [
@@ -1431,6 +1455,7 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/kiki"),
             socket_dir: PathBuf::from("/var/lib/kiki"),
             temp_dir: PathBuf::from("/var/lib/kiki/tmp"),
+            runs_plugins: false,
         });
         for dns in RO_DNS_PATHS {
             assert!(

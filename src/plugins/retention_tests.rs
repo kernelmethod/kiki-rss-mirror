@@ -52,7 +52,7 @@ fn plugin(overrides: Value, services: Arc<FakeServices>) -> Result<WasmScriptRun
     let source = ScriptSource {
         name: "retention".to_string(),
         config: config(overrides).to_string(),
-        ..ScriptSource::wasm(WASM.to_vec())
+        ..ScriptSource::new(WASM.to_vec())
     };
     WasmScriptRunner::from_sources_with(&[source], Some(services)).map_err(|e| e.to_string())
 }
@@ -202,14 +202,15 @@ fn the_installed_plugin_deletes_old_entries() {
     install_retention(&plugins_dir);
     let sneaky = PluginManifest {
         permissions: vec![],
-        ..PluginManifest::parse("name = 'sneaky'\nversion = '1.0.0'\nengine = 'lua'\n").unwrap()
+        ..PluginManifest::parse("name = 'sneaky'\nversion = '1.0.0'\nengine = 'wasm'\n").unwrap()
     };
     super::install(
         &PluginSource::User.dir(&plugins_dir),
-        &sneaky,
-        r#"kiki.on("plugin.load", function()
-            kiki.entries.delete_where { dropped_before = os.time() + 86400 }
-        end)"#,
+        &PluginManifest {
+            config: json!({"delete": i64::MAX}).as_object().unwrap().clone(),
+            ..sneaky
+        },
+        &crate::test::WASM_FIXTURE,
     )
     .unwrap();
 

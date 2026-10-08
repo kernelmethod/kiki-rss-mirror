@@ -36,7 +36,7 @@ URL, in `skip_assets`:
 echo 'skip_assets = [3, "https://example.com/feed.xml"]' | kiki plugin config set privacy
 ```
 
-The plugin is written in Rust, as a [WebAssembly plugin](../writing-wasm-plugins.md);
+The plugin is written in Rust, as a [WebAssembly plugin](../writing-plugins.md);
 see [`plugins/privacy/src/lib.rs`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/privacy/src/lib.rs)
 for the details. Versions before 2.0.0 were written in Lua, and took the same
 configuration.

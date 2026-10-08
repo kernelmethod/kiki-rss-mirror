@@ -84,7 +84,7 @@ fn load(config: Value, services: Option<Arc<FakeServices>>) -> Result<WasmScript
     let source = ScriptSource {
         name: "adaptive-fetch".to_string(),
         config: config.to_string(),
-        ..ScriptSource::wasm(WASM.to_vec())
+        ..ScriptSource::new(WASM.to_vec())
     };
     let services = services.map(|s| s as Arc<dyn ScriptServices>);
     WasmScriptRunner::from_sources_with(&[source], services).map_err(|e| e.to_string())

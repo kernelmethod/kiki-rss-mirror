@@ -304,9 +304,9 @@ mod tests {
 
     #[test]
     fn hidden_and_backup_files_are_ignored() {
-        assert!(is_ignored(Path::new("/p/filter/.main.lua.swp")));
-        assert!(is_ignored(Path::new("/p/filter/main.lua~")));
-        assert!(!is_ignored(Path::new("/p/filter/main.lua")));
+        assert!(is_ignored(Path::new("/p/filter/.plugin.wasm.swp")));
+        assert!(is_ignored(Path::new("/p/filter/plugin.wasm~")));
+        assert!(!is_ignored(Path::new("/p/filter/plugin.wasm")));
         assert!(!is_ignored(Path::new("/p/filter")));
     }
 }

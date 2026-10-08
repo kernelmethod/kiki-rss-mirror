@@ -35,7 +35,7 @@ already downloaded. It never unhides entries.
 See [`plugins/filter/src/lib.rs`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/filter/src/lib.rs)
 for every setting.
 
-The filter is written in Rust, as a [WebAssembly plugin](../writing-wasm-plugins.md),
+The filter is written in Rust, as a [WebAssembly plugin](../writing-plugins.md),
 and installed as `manifest.toml` and `plugin.wasm`. Versions before 3.1.0
 were written in Lua; they took the same settings, and `kiki init --check`
 replaces them unless they have been edited.
