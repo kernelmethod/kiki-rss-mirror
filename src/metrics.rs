@@ -371,13 +371,6 @@ mod imp {
                 SharedString::const_str("Duration of task-manager commands, labeled by type."),
             );
             r.describe_gauge(
-                KeyName::from_const_str("kiki_task_queue_depth"),
-                None,
-                SharedString::const_str(
-                    "Current number of pending commands in the task-manager queue.",
-                ),
-            );
-            r.describe_gauge(
                 KeyName::from_const_str("kiki_workers_total"),
                 None,
                 SharedString::const_str("Total number of task-manager worker tasks spawned."),
@@ -386,33 +379,6 @@ mod imp {
                 KeyName::from_const_str("kiki_workers_busy"),
                 None,
                 SharedString::const_str("Task-manager workers currently processing a command."),
-            );
-            r.describe_gauge(
-                KeyName::from_const_str("kiki_feeds_refresh_in_progress"),
-                None,
-                SharedString::const_str("Feeds currently being refreshed by a worker."),
-            );
-
-            r.describe_gauge(
-                KeyName::from_const_str("kiki_db_pool_connections"),
-                None,
-                SharedString::const_str(
-                    "Total connections in the database connection pools, readers and writer.",
-                ),
-            );
-            r.describe_gauge(
-                KeyName::from_const_str("kiki_db_pool_connections_idle"),
-                None,
-                SharedString::const_str(
-                    "Idle connections in the database connection pools, readers and writer.",
-                ),
-            );
-            r.describe_gauge(
-                KeyName::from_const_str("kiki_db_pool_connections_in_use"),
-                None,
-                SharedString::const_str(
-                    "In-use connections in the database connection pools, readers and writer.",
-                ),
             );
             r.describe_histogram(
                 KeyName::from_const_str("kiki_db_pool_acquire_duration_seconds"),
@@ -524,7 +490,7 @@ mod imp {
                 KeyName::from_const_str("kiki_plugin_execution_duration_seconds"),
                 None,
                 SharedString::const_str(
-                    "Duration of running an entry through the plugins' `entry.ingest` handlers.",
+                    "Duration of a plugin's `entry.ingest` handler for one entry, labeled by plugin.",
                 ),
             );
 
@@ -778,11 +744,6 @@ mod imp {
                 .record(duration_seconds);
         }
 
-        pub fn set_task_queue_depth(&self, depth: f64) {
-            let key = Key::from_name("kiki_task_queue_depth");
-            self.recorder.register_gauge(&key, &METADATA).set(depth);
-        }
-
         pub fn set_workers_total(&self, total: f64) {
             let key = Key::from_name("kiki_workers_total");
             self.recorder.register_gauge(&key, &METADATA).set(total);
@@ -798,25 +759,7 @@ mod imp {
             self.recorder.register_gauge(&key, &METADATA).decrement(1.0);
         }
 
-        pub fn set_feeds_refresh_in_progress(&self, n: f64) {
-            let key = Key::from_name("kiki_feeds_refresh_in_progress");
-            self.recorder.register_gauge(&key, &METADATA).set(n);
-        }
-
         // ----- Database pool -----
-
-        pub fn set_db_pool_state(&self, total: f64, idle: f64) {
-            let key = Key::from_name("kiki_db_pool_connections");
-            self.recorder.register_gauge(&key, &METADATA).set(total);
-
-            let key = Key::from_name("kiki_db_pool_connections_idle");
-            self.recorder.register_gauge(&key, &METADATA).set(idle);
-
-            let key = Key::from_name("kiki_db_pool_connections_in_use");
-            self.recorder
-                .register_gauge(&key, &METADATA)
-                .set((total - idle).max(0.0));
-        }
 
         pub fn record_db_pool_acquire(&self, duration_seconds: f64, ok: bool) {
             let key = Key::from_name("kiki_db_pool_acquire_duration_seconds");
@@ -970,14 +913,20 @@ mod imp {
             self.recorder.register_counter(&key, &METADATA).increment(1);
         }
 
-        pub fn record_plugin_execution(&self, duration_seconds: f64, outcome: &'static str) {
+        pub fn record_plugin_execution(&self, outcome: &'static str) {
             let key = Key::from_parts(
                 "kiki_plugin_executions_total",
                 vec![Label::new("outcome", outcome)],
             );
             self.recorder.register_counter(&key, &METADATA).increment(1);
+        }
 
-            let key = Key::from_name("kiki_plugin_execution_duration_seconds");
+        /// Record how long `plugin`'s `entry.ingest` handler took on one entry.
+        pub fn record_plugin_run(&self, plugin: &str, duration_seconds: f64) {
+            let key = Key::from_parts(
+                "kiki_plugin_execution_duration_seconds",
+                vec![Label::new("plugin", plugin.to_string())],
+            );
             self.recorder
                 .register_histogram(&key, &METADATA)
                 .record(duration_seconds);
@@ -1099,20 +1048,13 @@ mod stub {
         ) {
         }
         #[inline]
-        pub fn set_task_queue_depth(&self, _depth: f64) {}
-        #[inline]
         pub fn set_workers_total(&self, _total: f64) {}
         #[inline]
         pub fn inc_workers_busy(&self) {}
         #[inline]
         pub fn dec_workers_busy(&self) {}
-        #[inline]
-        pub fn set_feeds_refresh_in_progress(&self, _n: f64) {}
-
         // ----- Database pool -----
 
-        #[inline]
-        pub fn set_db_pool_state(&self, _total: f64, _idle: f64) {}
         #[inline]
         pub fn record_db_pool_acquire(&self, _duration_seconds: f64, _ok: bool) {}
         #[inline]
@@ -1169,7 +1111,9 @@ mod stub {
         #[inline]
         pub fn record_plugin_load_error(&self) {}
         #[inline]
-        pub fn record_plugin_execution(&self, _duration_seconds: f64, _outcome: &'static str) {}
+        pub fn record_plugin_execution(&self, _outcome: &'static str) {}
+        #[inline]
+        pub fn record_plugin_run(&self, _plugin: &str, _duration_seconds: f64) {}
     }
 }
 

@@ -555,6 +555,16 @@ pub struct ScheduleDecision {
     pub plugin: String,
 }
 
+/// How long one plugin's handler ran, from
+/// [`ScriptRunner::dispatch_transform_entry_timed`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginRun {
+    /// The plugin whose handler ran.
+    pub plugin: String,
+    /// How long the handler took, in seconds.
+    pub seconds: f64,
+}
+
 /// Which stored entries a scan visits. See [`ServiceCall::StartScan`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanOptions {
@@ -706,6 +716,19 @@ pub trait ScriptRunner: Send + Sync {
     /// - `Ok(None)` — a handler filtered the entry out; it should not be inserted.
     /// - `Err(_)` — an unrecoverable failure; the caller decides how to proceed.
     fn dispatch_transform_entry(&self, entry: FeedEntry) -> anyhow::Result<Option<FeedEntry>>;
+
+    /// As [`Self::dispatch_transform_entry`], also appending to `runs` how long each plugin's
+    /// handler took.
+    ///
+    /// The default runs the handlers without timing them, leaving `runs` as it was.
+    fn dispatch_transform_entry_timed(
+        &self,
+        entry: FeedEntry,
+        runs: &mut Vec<PluginRun>,
+    ) -> anyhow::Result<Option<FeedEntry>> {
+        let _ = runs;
+        self.dispatch_transform_entry(entry)
+    }
 
     /// Pass `schedule` through each `fetch.schedule` handler in registration order.
     ///

@@ -477,7 +477,6 @@ impl Server {
         }
 
         tokio::spawn(metrics_sampler_loop(
-            tx.clone(),
             db.clone(),
             self.cancel_token.clone(),
             metrics.clone(),
@@ -602,11 +601,10 @@ fn warn_pss_unreadable(role: crate::process::stats::Role) {
 
 /// Periodically sample observable process state into the metrics recorder.
 ///
-/// Covers DB pool utilization, task queue depth, domain totals that are
-/// cheap to read (feed/entry counts, feeds with fetch errors, database size),
-/// and the CPU and memory used by kiki's processes.
+/// Covers domain totals that are cheap to read (feed/entry counts, feeds with
+/// fetch errors, database size), and the CPU and memory used by kiki's
+/// processes.
 async fn metrics_sampler_loop(
-    task_manager_tx: crate::tasks::TaskSender,
     db: crate::db::Db,
     cancel_token: CancellationToken,
     metrics: Arc<crate::metrics::Metrics>,
@@ -617,10 +615,6 @@ async fn metrics_sampler_loop(
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let (connections, idle) = db.connections();
-                metrics.set_db_pool_state(connections as f64, idle as f64);
-                metrics.set_task_queue_depth(task_manager_tx.len() as f64);
-
                 // Sample domain totals less frequently to avoid running
                 // COUNT(*) against the database every 5s. 30s cadence.
                 if iterations.is_multiple_of(6) {

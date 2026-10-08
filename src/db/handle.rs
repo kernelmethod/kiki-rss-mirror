@@ -188,16 +188,6 @@ impl Db {
         let at = Location::caller();
         super::blocking(|| run(&self.writer, at, f))
     }
-
-    /// The number of connections open, and of those idle, across the
-    /// read pool and the writer.
-    pub fn connections(&self) -> (u32, u32) {
-        let (r, w) = (self.readers.state(), self.writer.state());
-        (
-            r.connections + w.connections,
-            r.idle_connections + w.idle_connections,
-        )
-    }
 }
 
 thread_local! {
