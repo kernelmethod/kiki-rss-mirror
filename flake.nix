@@ -157,6 +157,13 @@
             # Line tables are enough for backtraces, and full debug info
             # noticeably slows down codegen.
             CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
+          } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            # Link with mold: every doctest is its own binary linked against
+            # all of Wasmtime and Cranelift, and ld.bfd takes far longer and
+            # far more memory to link them. mold-wrapped is mold behind
+            # nixpkgs' linker wrapper, so it gets the same rpaths and flags.
+            RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
+            nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.mold-wrapped ];
           };
 
           devDeps = craneLib.buildDepsOnly (depsOnly devArgs);
