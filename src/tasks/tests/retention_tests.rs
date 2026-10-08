@@ -1,6 +1,6 @@
 //! Retention as driven by feed refreshes: entries are updated in place,
 //! marked dropped when their feed stops listing them, and only deleted, by
-//! plugins calling `kiki.entries.delete_where`, once they have been
+//! plugins calling `delete-entries`, once they have been
 //! dropped.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -219,7 +219,7 @@ async fn empty_feed_marks_nothing_dropped() -> Result<()> {
     Ok(())
 }
 
-/// Deletes, as `kiki.entries.delete_where` does, the entries `filter`
+/// Deletes, as `delete-entries` does, the entries `filter`
 /// describes.
 fn delete(f: &FileFeed, filter: DeleteFilter) -> u64 {
     let db = make_pool(&f.tc.database_path()).unwrap();

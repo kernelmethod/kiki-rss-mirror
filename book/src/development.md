@@ -1,8 +1,10 @@
 # Building and testing
 
-Kiki is a Rust project. With a stable Rust toolchain:
+Kiki is a Rust project. With a stable Rust toolchain and its
+`wasm32-unknown-unknown` target:
 
 ```bash
+rustup target add wasm32-unknown-unknown
 cargo build                 # debug build, in target/debug/kiki
 cargo build --release       # release build, in target/release/kiki
 cargo test
@@ -18,6 +20,19 @@ of the flake's checks:
 nix build .#checks.x86_64-linux.tests     # or fmt, clippy, book
 nix flake check                           # all of them
 ```
+
+Default plugins written in Rust, such as the [filter](plugins/filter.md),
+keep their source in their own directory, `plugins/<name>`: a crate named
+`kiki-<name>` in the Cargo workspace in `plugins/`, with its `Cargo.toml` and
+`src/` beside the plugin's `manifest.toml`. Their `plugin.wasm` isn't kept in
+the repository: `build.rs` builds the workspace whenever it or the SDK in
+`sdk/rust/kiki-plugin`, or its macros in `sdk/rust/kiki-plugin-macros`,
+changes, and bundles each plugin as its manifest and
+`<name>/plugin.wasm`, without the crate. To port another default plugin, make
+its directory a crate and add it to the workspace's `members`. To
+bundle prebuilt plugins instead, set `KIKI_PLUGINS_WASM_DIR` to a directory
+holding them as `<name>.wasm`, as the Nix build does
+(`nix build .#wasm-plugins` builds that directory).
 
 ## Reports
 
@@ -46,6 +61,14 @@ mdbook serve book --open
 are published, and checks every link between them.
 
 ## Benchmarks and stress tests
+
+`cargo bench` runs the benchmarks in `benches/`, with
+[Criterion](https://bheisler.github.io/criterion.rs/book/), which reports
+how much each changed since the last run:
+
+- `cargo bench --bench sanitize` times the
+  [`sanitize`](plugins/sanitize.md) plugin on entries from under a kilobyte
+  to a few hundred, through the same WebAssembly runner the server uses.
 
 `tools/` holds standalone tools with their own Cargo projects:
 

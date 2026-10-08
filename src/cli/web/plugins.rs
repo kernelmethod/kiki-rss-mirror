@@ -332,9 +332,7 @@ pub(super) fn render_plugin_details(plugin: &PluginResponse) -> String {
         format!("{} plugin", plugin.source.name()),
     ];
     parts.push(
-        if !plugin.engine_supported {
-            "engine not supported by this build"
-        } else if plugin.enabled {
+        if plugin.enabled {
             "enabled"
         } else {
             "disabled"

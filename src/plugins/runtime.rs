@@ -171,7 +171,7 @@ impl PluginRuntime {
             .read_blocking(|conn| crate::db::plugins::all_config_overrides(conn))??;
         discovery.apply_config_overrides(overrides);
 
-        let sources = super::load_sources(&discovery, super::PluginEngine::Lua);
+        let sources = super::load_sources(&discovery);
         let loaded = sources.len();
         let changed = last_sources.as_ref() != Some(&sources);
         let discovery = Arc::new(discovery);
@@ -304,9 +304,9 @@ mod tests {
 
     #[test]
     fn hidden_and_backup_files_are_ignored() {
-        assert!(is_ignored(Path::new("/p/filter/.main.lua.swp")));
-        assert!(is_ignored(Path::new("/p/filter/main.lua~")));
-        assert!(!is_ignored(Path::new("/p/filter/main.lua")));
+        assert!(is_ignored(Path::new("/p/filter/.plugin.wasm.swp")));
+        assert!(is_ignored(Path::new("/p/filter/plugin.wasm~")));
+        assert!(!is_ignored(Path::new("/p/filter/plugin.wasm")));
         assert!(!is_ignored(Path::new("/p/filter")));
     }
 }

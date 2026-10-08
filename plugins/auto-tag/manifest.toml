@@ -1,14 +1,19 @@
 name = "auto-tag"
-version = "1.0.0"
-engine = "lua"
+version = "2.0.0"
+engine = "wasm"
+entrypoint = "plugin.wasm"
 description = "Tag entries whose fields match regular expressions, or that come from given feeds"
 license = "MIT"
 homepage = "https://github.com/kernelmethod/kiki-rss"
 
+# Written in Rust, as a WebAssembly component: its source is beside this
+# manifest in Kiki's repository. Versions before 2.0.0 were written in Lua,
+# and took the same config.
+
 # Each rule adds its `tag` to the entries it matches: entries whose fields
 # match its `pattern`, from its `feeds`, or both, when it has both. A rule's
 # `feeds` names feeds by id, or by the URL they are fetched from. See
-# main.lua for every setting.
+# src/lib.rs for every setting.
 #
 # The rules are empty by default. Set them in the web UI or with, for
 # example, `kiki plugin config set auto-tag rules.toml`, where rules.toml

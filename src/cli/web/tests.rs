@@ -1673,7 +1673,7 @@ async fn the_feed_page_pages_through_the_entries() -> Result<()> {
 #[tokio::test]
 async fn the_plugins_page_lists_every_plugin() -> Result<()> {
     let tc = TestBuilder::default().init_database().build()?;
-    tc.install_lua_plugin("passthrough", "", serde_json::json!({}))?;
+    tc.install_plugin("passthrough", serde_json::json!({}))?;
     std::fs::create_dir_all(tc.user_plugins_dir().join("broken"))?;
     let tc = tc.init_server()?;
 
@@ -1698,11 +1698,15 @@ async fn the_plugins_page_shows_permissions() -> Result<()> {
     let manifest = crate::plugins::PluginManifest {
         permissions: vec![crate::plugins::Permission::EntriesDelete],
         ..crate::plugins::PluginManifest::parse(
-            "name = 'pruner'\nversion = '1.0.0'\nengine = 'lua'\n",
+            "name = 'pruner'\nversion = '1.0.0'\nengine = 'wasm'\n",
         )?
     };
-    crate::plugins::install(&tc.user_plugins_dir(), &manifest, "")?;
-    tc.install_lua_plugin("passthrough", "", serde_json::json!({}))?;
+    crate::plugins::install(
+        &tc.user_plugins_dir(),
+        &manifest,
+        &crate::test::WASM_FIXTURE,
+    )?;
+    tc.install_plugin("passthrough", serde_json::json!({}))?;
     let tc = tc.init_server()?;
 
     let (status, body) = get_page(tc.client()?, "/plugins").await?;
@@ -1792,9 +1796,8 @@ async fn post_form(
 /// `{"greeting": "hi", "count": 1, "tags": ["a"]}`, and the server running.
 fn hello_plugin() -> Result<crate::test::TestConfig> {
     let tc = TestBuilder::default().init_database().build()?;
-    tc.install_lua_plugin(
+    tc.install_plugin(
         "hello",
-        "",
         serde_json::json!({"greeting": "hi", "count": 1, "tags": ["a"]}),
     )?;
     tc.init_server()
@@ -1958,7 +1961,7 @@ fn rules_plugin() -> Result<crate::test::TestConfig> {
         r#"
         name = "rules"
         version = "1.0.0"
-        engine = "lua"
+        engine = "wasm"
 
         [config]
         on = true
@@ -2009,7 +2012,7 @@ fn rules_plugin() -> Result<crate::test::TestConfig> {
         type = "string"
         "#,
     )?;
-    std::fs::write(dir.join("main.lua"), "")?;
+    std::fs::write(dir.join("plugin.wasm"), &*crate::test::WASM_FIXTURE)?;
     tc.init_server()
 }
 
@@ -2306,24 +2309,27 @@ async fn invalid_settings_are_reported() -> Result<()> {
 #[tokio::test]
 async fn settings_that_fail_to_load_are_reported() -> Result<()> {
     let tc = TestBuilder::default().init_database().build()?;
-    tc.install_lua_plugin(
-        "hello",
-        "local config = ...\nif config.fail then error('refusing to load') end",
-        serde_json::json!({}),
-    )?;
+    tc.install_plugin("hello", serde_json::json!({}))?;
     let tc = tc.init_server()?;
 
     let (status, body) = post_form(
         tc.client()?,
         "/plugins/hello/config",
-        &[("action", "set"), ("key", "fail"), ("value", "true")],
+        &[
+            ("action", "set"),
+            ("key", "init_error"),
+            ("value", r#""refusing to load""#),
+        ],
         &[],
     )
     .await?;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(body.contains("refusing to load"), "{body}");
     assert!(body.contains(r#"class="notice""#), "{body}");
-    assert_eq!(stored_overrides(&tc)?, serde_json::json!({"fail": true}));
+    assert_eq!(
+        stored_overrides(&tc)?,
+        serde_json::json!({"init_error": "refusing to load"})
+    );
     Ok(())
 }
 

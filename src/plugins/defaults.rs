@@ -364,18 +364,18 @@ mod tests {
         assert_eq!(
             paths,
             [
-                Path::new("adaptive-fetch/main.lua"),
                 Path::new("adaptive-fetch/manifest.toml"),
-                Path::new("auto-tag/main.lua"),
+                Path::new("adaptive-fetch/plugin.wasm"),
                 Path::new("auto-tag/manifest.toml"),
-                Path::new("filter/main.lua"),
+                Path::new("auto-tag/plugin.wasm"),
                 Path::new("filter/manifest.toml"),
-                Path::new("privacy/main.lua"),
+                Path::new("filter/plugin.wasm"),
                 Path::new("privacy/manifest.toml"),
-                Path::new("retention/main.lua"),
+                Path::new("privacy/plugin.wasm"),
                 Path::new("retention/manifest.toml"),
-                Path::new("sanitize/main.lua"),
+                Path::new("retention/plugin.wasm"),
                 Path::new("sanitize/manifest.toml"),
+                Path::new("sanitize/plugin.wasm"),
             ]
         );
         let plugins: Vec<_> = files.iter().map(|f| f.plugin.as_str()).collect();
@@ -396,30 +396,38 @@ mod tests {
                 "sanitize"
             ]
         );
-        assert_eq!(
-            files[0].contents,
-            include_bytes!("../../plugins/adaptive-fetch/main.lua")
-        );
-        assert_eq!(
-            files[2].contents,
-            include_bytes!("../../plugins/auto-tag/main.lua")
-        );
-        assert_eq!(
-            files[4].contents,
-            include_bytes!("../../plugins/filter/main.lua")
-        );
-        assert_eq!(
-            files[6].contents,
-            include_bytes!("../../plugins/privacy/main.lua")
-        );
-        assert_eq!(
-            files[8].contents,
-            include_bytes!("../../plugins/retention/main.lua")
-        );
-        assert_eq!(
-            files[10].contents,
-            include_bytes!("../../plugins/sanitize/main.lua")
-        );
+        // Every default plugin is a WebAssembly plugin, built by build.rs.
+        for (i, wasm) in [
+            (
+                1,
+                &include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/plugins-wasm/adaptive-fetch.wasm"
+                ))[..],
+            ),
+            (
+                3,
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/auto-tag.wasm")),
+            ),
+            (
+                5,
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm")),
+            ),
+            (
+                7,
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/privacy.wasm")),
+            ),
+            (
+                9,
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/retention.wasm")),
+            ),
+            (
+                11,
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/sanitize.wasm")),
+            ),
+        ] {
+            assert_eq!(files[i].contents, wasm, "{}", files[i].path.display());
+        }
     }
 
     /// Syncs `dir`, returning the outcome for `filter`.
@@ -445,13 +453,13 @@ mod tests {
     /// both the plugin and its record the same way.
     fn install_older_filter(dir: &Path) -> std::path::PathBuf {
         assert_eq!(sync_filter(dir), SyncOutcome::Installed);
-        let main = dir.join("filter").join("main.lua");
+        let main = dir.join("filter").join("plugin.wasm");
         std::fs::write(&main, "-- an older release").unwrap();
         let mut record = read_record(dir).unwrap();
         record
             .get_mut("filter")
             .unwrap()
-            .insert("main.lua".into(), hash(b"-- an older release"));
+            .insert("plugin.wasm".into(), hash(b"-- an older release"));
         write_record(dir, &record).unwrap();
         main
     }
@@ -508,7 +516,7 @@ mod tests {
         assert_eq!(sync_filter(td.path()), SyncOutcome::Updated);
         assert_eq!(
             std::fs::read(&main).unwrap(),
-            include_bytes!("../../plugins/filter/main.lua")
+            include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm"))
         );
         assert!(!td.path().join("filter").join("old.lua").exists());
         assert_eq!(sync_filter(td.path()), SyncOutcome::UpToDate);
@@ -530,6 +538,38 @@ mod tests {
                 "retention",
                 "sanitize"
             ]
+        );
+    }
+
+    /// Before 3.1.0, the filter was written in Lua. Installed and left as
+    /// it was, it is replaced with the WebAssembly version, and its Lua
+    /// source removed.
+    #[test]
+    fn the_lua_filter_is_replaced() {
+        let td = TempDir::new().unwrap();
+        assert_eq!(sync_filter(td.path()), SyncOutcome::Installed);
+        let dir = td.path().join("filter");
+        let lua = b"-- the filter, in Lua";
+        let manifest = b"name = \"filter\"\nversion = \"3.0.0\"\nengine = \"lua\"\n";
+        std::fs::remove_file(dir.join("plugin.wasm")).unwrap();
+        std::fs::write(dir.join("main.lua"), lua).unwrap();
+        std::fs::write(dir.join("manifest.toml"), manifest).unwrap();
+        let mut record = read_record(td.path()).unwrap();
+        let files = record.get_mut("filter").unwrap();
+        files.clear();
+        files.insert("main.lua".into(), hash(lua));
+        files.insert("manifest.toml".into(), hash(manifest));
+        write_record(td.path(), &record).unwrap();
+
+        assert_eq!(sync_filter(td.path()), SyncOutcome::Updated);
+        assert!(!dir.join("main.lua").exists());
+        assert_eq!(
+            std::fs::read(dir.join("plugin.wasm")).unwrap(),
+            include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm"))
+        );
+        assert_eq!(
+            std::fs::read(dir.join("manifest.toml")).unwrap(),
+            include_bytes!("../../plugins/filter/manifest.toml")
         );
     }
 

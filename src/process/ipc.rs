@@ -33,7 +33,7 @@
 
 use crate::scripting::{
     Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary, ScheduleDecision,
-    ScriptSource, ServiceCall, ServiceReply,
+    ScriptSource, ServiceCall, ServiceReply, WasmComponent,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, IoSlice, Read, Write};
@@ -50,10 +50,12 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// A message from the server to the script host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HostRequest {
-    /// Discard the current VM, if any, and build a new one from
-    /// `sources`, each script with its config.
+    /// Discard the current plugins, if any, and load `sources` in their
+    /// place, each plugin with its config.
     ///
     /// Sent when the server starts, and whenever plugins are reloaded.
+    /// The components of `sources` carry only their hash: each was sent
+    /// beforehand with [`HostRequest::PutComponent`].
     Reload { sources: Vec<ScriptSource> },
 
     /// Run `entry` through the `entry.ingest` handler chain.
@@ -85,6 +87,19 @@ pub enum HostRequest {
     /// Run `schedule` through the `fetch.schedule` handler chain. Answered
     /// with [`HostResponse::Schedule`].
     Schedule { schedule: FetchSchedule },
+
+    /// Compile `component`, the code of the WebAssembly plugin named
+    /// `plugin`, and keep it, so that a later [`HostRequest::Reload`] can
+    /// name it by hash alone. Answered
+    /// with [`HostResponse::Ack`], or [`HostResponse::Failed`] if it does
+    /// not compile.
+    ///
+    /// Each component gets a message of its own, so that a few large ones
+    /// don't make a `Reload` too large for a frame.
+    PutComponent {
+        plugin: String,
+        component: WasmComponent,
+    },
 }
 
 /// A message from the script host back to the server.
@@ -93,7 +108,7 @@ pub enum HostRequest {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HostResponse {
-    /// The VM was rebuilt; `loaded` is the number of scripts compiled.
+    /// The plugins were reloaded; `loaded` is the number of plugins loaded.
     Reloaded { loaded: usize },
 
     /// The handler chain ran. `None` means a handler filtered the entry
@@ -126,7 +141,7 @@ pub enum FromHost {
     /// The answer to the request being served, which ends it.
     Done {
         response: HostResponse,
-        /// The events the host's VM has at least one handler for once the
+        /// The events the host's plugins have at least one handler for once the
         /// request has been served. Plugins may register handlers at any
         /// time, so this is reported with every response.
         subscribed: EventSet,

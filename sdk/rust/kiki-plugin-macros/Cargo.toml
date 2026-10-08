@@ -1,0 +1,18 @@
+[package]
+name = "kiki-plugin-macros"
+version = "0.2.0"
+edition = "2021"
+description = "The #[plugin] attribute of the kiki-plugin crate"
+license = "MIT"
+repository = "https://github.com/kernelmethod/kiki-rss"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+# Not part of kiki-rss's build; used through kiki-plugin, in ../kiki-plugin.
+[workspace]

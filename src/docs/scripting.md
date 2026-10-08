@@ -1,8 +1,13 @@
 # Writing plugins for Kiki
 
-Kiki has a Lua scripting engine that plugins use to hook into server events —
-transforming incoming entries, reacting to feed lifecycle changes, or logging
-when something interesting happens.
+Plugins hook into Kiki's server events: transforming incoming entries,
+reacting to feed lifecycle changes, tagging and deleting stored entries, or
+logging when something interesting happens.
+
+A plugin is a [WebAssembly component](https://component-model.bytecodealliance.org/),
+written in Rust or any other language that compiles to one. Kiki compiles it
+to native code when it loads, and runs it in a sandbox of its own, in a
+separate process from the database.
 
 ## Plugins
 
@@ -10,21 +15,19 @@ Plugins live in the `plugins/` directory in Kiki's home (next to `kiki.db`;
 `kiki init` creates it), which holds two directories: `system/`, for the
 plugins bundled with Kiki, which `kiki init` installs and updates, and
 `user/`, for the plugins you install yourself. A plugin is a directory
-inside one of them. Every plugin has a manifest, `manifest.toml`, at its
-root, and its code alongside:
+inside one of them, holding a manifest, `manifest.toml`, and its code, the
+compiled component:
 
 ```text
 plugins/
 ├── system/
 │   └── filter/
 │       ├── manifest.toml
-│       └── main.lua
+│       └── plugin.wasm
 └── user/
     └── hide-sponsored/
         ├── manifest.toml
-        ├── main.lua
-        └── lib/
-            └── rules.lua
+        └── plugin.wasm
 ```
 
 Both kinds load, run and take config the same way. The API shows which kind
@@ -37,27 +40,24 @@ its version, and the engine its code is written for:
 ```toml
 name = "hide-sponsored"
 version = "1.0.0"
-engine = "lua"
+engine = "wasm"
 description = "Hide sponsored posts"
 authors = ["Jane Doe <jane@example.com>"]
 license = "MIT"
 homepage = "https://example.com/hide-sponsored"
-entrypoint = "main.lua"
+entrypoint = "plugin.wasm"
 enabled = true
 
 [config]
-[[config.rules]]
-field = "title"
-pattern = '\bsponsored\b'
-flags = "i"
+patterns = ['\bsponsored\b']
 ```
 
 | Field         | Required | Meaning |
 |---------------|----------|---------|
 | `name`        | Yes      | The plugin's name: lowercase letters, digits, `-` and `_`, starting with a letter or digit, at most 64 characters. Must be unique among installed plugins. |
 | `version`     | Yes      | The plugin's version, as `MAJOR.MINOR.PATCH` with an optional pre-release or build suffix ([Semantic Versioning](https://semver.org)). |
-| `engine`      | Yes      | The engine the plugin's code is written for. Currently only `"lua"`. |
-| `entrypoint`  | No       | The file that runs when the plugin loads, relative to the plugin directory. Defaults to `main.lua`. |
+| `engine`      | Yes      | The engine the plugin's code is written for: always `"wasm"`. |
+| `entrypoint`  | No       | The plugin's component, relative to the plugin directory. Defaults to `plugin.wasm`. It may be at most 7 MiB. |
 | `description`, `authors`, `license`, `homepage` | No | Informational; shown by the API. |
 | `enabled`     | No       | Set to `false` to keep a plugin installed without running it. Defaults to `true`. |
 | `time_budget_ms` | No    | How long each call of one of the plugin's handlers may run, in milliseconds, or `"unlimited"`; see [Resource limits](#resource-limits). Defaults to `100`. |
@@ -75,10 +75,10 @@ delete its directory. A directory placed directly in `plugins/` isn't loaded,
 and is listed under `errors` in `GET /v1/plugins`. A running server watches the plugins directory and reloads its
 plugins whenever a file in it changes (hidden files, such as editors' swap
 files, are ignored), and whenever a plugin's config is changed. A reload
-rebuilds every plugin: each entrypoint runs again, and then the
+rebuilds every plugin: each is made afresh from its config, and then the
 [`plugin.load`](#events) handlers run. If the plugins fail to load, say
-because of a syntax error or a bad regex in a config, the plugins that were
-running keep running, as they were, and the error is logged.
+because a component is broken or a config has a bad regex, the plugins that
+were running keep running, as they were, and the error is logged.
 Plugins load in the order of their directory names, system and user plugins
 together (a system plugin first, if two directories have the same name), so
 prefixing directory names with numbers (`10-filter`, `20-tag`) controls the
@@ -92,97 +92,161 @@ manifest and config. Both show the plugins as they were last loaded.
 
 When the server runs sandboxed (the default), it can only read files inside
 Kiki's home, so a plugin directory that is a symbolic link to somewhere else
-cannot be loaded. Symbolic links *inside* a plugin directory are ignored.
+cannot be loaded.
 
-## The `kiki` global
+## Writing a plugin in Rust
 
-Every script runs inside a sandboxed Lua 5.4 VM with a restricted standard
-library (`string`, `table`, `math`, and the safe subset of `os`). On top of
-that, kiki exposes a single additional global — the `kiki` table:
+The `kiki-plugin` crate, in
+[`sdk/rust/kiki-plugin`](https://github.com/kernelmethod/kiki-rss/tree/main/sdk/rust/kiki-plugin)
+in Kiki's source, generates the bindings to Kiki and wraps them in a `Plugin`
+trait and a `#[plugin]` attribute: implement `Plugin` to make your plugin
+from its config, and put `#[plugin]` on an `impl` block holding its handlers,
+each a method marked with the event it handles, such as `#[on(entry.ingest)]`.
+Make a library crate whose `Cargo.toml` has
 
-- `kiki.on(event_name, handler)` — register `handler` to fire every time
-  `event_name` is emitted.
-- `kiki.log(level, message)` — write `message` to the server log at the given
-  level. `level` must be one of `"debug"`, `"info"`, `"warn"`, or `"error"`.
-- `kiki.regex(pattern [, flags])` — compile a regular expression. See
-  [Regular expressions](#regular-expressions) below.
-- `kiki.html` — rewrite HTML, such as an entry's content, with a real HTML
-  parser. See [Rewriting HTML](#rewriting-html) below.
-- `kiki.store` — the plugin's own key-value store, kept in the database. See
-  [Storing data](#storing-data).
-- `kiki.entries` — tag the entries already stored, scan through them, and
-  delete them. See [Stored entries](#stored-entries) and
-  [Deleting entries](#deleting-entries).
-- `kiki.feeds` — look up the feeds entries come from. See [Feeds](#feeds).
-- `kiki.every(secs, handler)` — call `handler` every `secs` seconds. See
-  [Timers](#timers).
+```toml
+[lib]
+crate-type = ["cdylib"]
 
-The sandbox removes `dofile`, `loadfile`, `debug`, `io`, `package`, and the
-destructive `os.*` calls (`execute`, `exit`, `getenv`, `remove`, `rename`,
-`tmpname`). Scripts cannot read from disk, make network requests, or spawn
-processes. `require` loads only the plugin's own modules; see
-[Modules](#modules).
+[dependencies]
+kiki-plugin = { git = "https://github.com/kernelmethod/kiki-rss" }
+serde = { version = "1", features = ["derive"] }
 
-Each plugin runs in an environment of its own: globals a plugin defines are
-not visible to other plugins. Plugins that ask for the same
-[permissions](#permissions) share a VM, and with it the standard library
-tables, so one that changes `string` or `table` changes them for the others
-too. Plugins that ask for different permissions run in separate VMs, so a
-plugin can't tamper with code that runs with permissions it lacks.
-
-## Script structure
-
-The recommended shape for a plugin's entrypoint is to register one or more
-event handlers via `kiki.on` at the top level. The entrypoint's top-level chunk
-runs when plugins load: when the server starts, and again on every reload.
-Handlers fire later, each time their event is emitted.
-
-```lua
-kiki.on("entry.ingest", function(entry)
-    entry.title = "[kiki] " .. entry.title
-    return entry
-end)
-
-kiki.on("fetch.error", function(err)
-    kiki.log("warn", "feed " .. err.feed_id .. " failed: " .. err.message)
-end)
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
 ```
 
-A script's top-level chunk must not return a value — scripts register
-handlers through `kiki.on` side effects only. Returning anything from the
-chunk is rejected at load time.
+and in `src/lib.rs`, a plugin that hides entries whose title matches one of
+the patterns in its config:
 
-## Modules
+```rust,ignore
+use kiki_plugin::regex::Regex;
+use kiki_plugin::{parse_config, plugin, Entry, Plugin};
+use serde::Deserialize;
 
-A plugin can split its code across several files. Every `.lua` file in the
-plugin directory other than the entrypoint is a module, named after its path
-with `/` replaced by `.` and the extension dropped: `lib/rules.lua` is
-`lib.rules`, and `lib/init.lua` is `lib`. `require(name)` runs a module the
-first time it is called and returns what the module returned (or `true` if it
-returned nothing); later calls return the same value.
+#[derive(Deserialize)]
+struct Config {
+    patterns: Vec<String>,
+}
 
-```lua
--- lib/rules.lua
-local M = {}
-function M.compile(rules) --[[ ... ]] end
-return M
+struct HideMatching {
+    patterns: Vec<Regex>,
+}
+
+impl Plugin for HideMatching {
+    fn new(config: &str) -> Result<Self, String> {
+        let config: Config = parse_config(config)?;
+        let patterns = config
+            .patterns
+            .iter()
+            .map(|p| Regex::compile(p, "i"))
+            .collect::<Result<_, _>>()?;
+        Ok(HideMatching { patterns })
+    }
+}
+
+#[plugin]
+impl HideMatching {
+    #[on(entry.ingest)]
+    fn hide_matching(&mut self, mut entry: Entry) -> Option<Entry> {
+        if self.patterns.iter().any(|re| re.is_match(&entry.title)) {
+            entry.tags.push("system:hidden".to_string());
+        }
+        Some(entry)
+    }
+}
 ```
 
-```lua
--- main.lua
-local rules = require("lib.rules")
+Build it for the `wasm32-wasip2` target, and install the result as the
+plugin's `plugin.wasm`:
+
+```sh
+rustup target add wasm32-wasip2
+cargo build --release --target wasm32-wasip2
+cp target/wasm32-wasip2/release/hide_matching.wasm \
+    ~/.local/share/kiki/plugins/user/hide-matching/plugin.wasm
 ```
 
-A plugin can only `require` its own modules. A plugin's source files may total
-at most 1 MiB.
+For fuller plugins, with manifests describing their settings, see the ones
+Kiki installs by default, whose source is in
+[`plugins/`](https://github.com/kernelmethod/kiki-rss/tree/main/plugins) in
+Kiki's source: [`filter`](plugins/filter.md), [`auto-tag`](plugins/auto-tag.md),
+[`sanitize`](plugins/sanitize.md), [`privacy`](plugins/privacy.md),
+[`adaptive-fetch`](plugins/adaptive-fetch.md) and
+[`retention`](plugins/retention.md).
+
+`Plugin::new` is called once when the plugin loads, and every handler is
+called on the value it returns, so a plugin keeps what it needs, such as
+compiled regexes, in its own fields. An error from `Plugin::new` fails the
+load. A handler takes `&mut self` or `&self`, then the event's arguments:
+
+| `#[on(...)]`     | Arguments                         | Returns         |
+|------------------|-----------------------------------|-----------------|
+| `entry.parsed`   | `entry: Entry`                    |                 |
+| `entry.ingest`   | `entry: Entry`                    | `Option<Entry>` |
+| `fetch.success`  | `event: FetchSuccess`             |                 |
+| `fetch.error`    | `event: FetchError`               |                 |
+| `feed.added`     | `feed: FeedEvent`                 |                 |
+| `feed.removed`   | `feed: FeedEvent`                 |                 |
+| `plugin.load`    |                                   |                 |
+| `fetch.schedule` | `schedule: FetchSchedule`         | `Option<u64>`   |
+| `timer`          | `id: u32`                         |                 |
+| `scan.entry`     | `scan: u64, entry: Entry`         | `Option<Entry>` |
+| `scan.done`      | `scan: u64, summary: ScanSummary` |                 |
+
+The first eight are the server's [events](#events); `timer` is for
+[timers](#timers), and `scan.entry` and `scan.done` for
+[scans](#stored-entries). A plugin handles the events it has handlers for,
+and only those are delivered to it. One that needs some of them only for
+some configs can implement `Plugin::wants` to leave the others out, since
+Kiki calls into a plugin for every event it handles. An unknown event, two
+handlers for one event, or a handler whose signature doesn't fit its event
+fails to compile. A handler that panics traps, which is handled as described
+under [Resource limits](#resource-limits).
+
+The calls a plugin makes to the server are in `kiki_plugin::host`, and
+`kiki_plugin::log` writes to Kiki's log.
+
+## The interface
+
+The interface between Kiki and a plugin is defined in
+[WIT](https://component-model.bytecodealliance.org/design/wit.html), in
+[`sdk/rust/kiki-plugin/wit/kiki-plugin.wit`](https://github.com/kernelmethod/kiki-rss/blob/main/sdk/rust/kiki-plugin/wit/kiki-plugin.wit)
+in Kiki's source. A plugin is a component targeting its `plugin` world (or a
+core module carrying that world's type information, as `wit-bindgen` builds
+for `wasm32-unknown-unknown`, which Kiki turns into one), which:
+
+- imports `kiki:plugin/host`, the plugin's calls to the server: `log`,
+  `store-get` and `store-set`, `tag-entry` and `untag-entry`, `start-scan`,
+  `delete-entries`, `get-feed`, and `every`;
+- imports `kiki:plugin/regex`: see [Regular expressions](#regular-expressions);
+- imports `kiki:plugin/html`: see [Parsing HTML](#parsing-html);
+- exports `init`, which Kiki calls with the plugin's config, as a JSON
+  object, when the plugin loads. It returns the events the plugin handles,
+  and only those are delivered to it; an error fails the load;
+- exports a function for each event: `on-entry-ingest`, `on-fetch-schedule`,
+  `on-plugin-load` and so on, and `on-timer`, `on-scan-entry` and
+  `on-scan-done` for timers and scans.
+
+`every(secs)` returns a timer's id, which is passed to `on-timer` each time
+the timer is due, and `start-scan(options)` returns a scan's id, which is
+passed with each of its entries to `on-scan-entry`, and with its summary to
+`on-scan-done`. Values in the plugin's store are JSON text.
+
+The Rust crate wraps all of this; other languages can use the WIT file with
+their own bindings generator, such as `wit-bindgen`'s for C.
 
 ## Plugin config
 
-Every plugin has a config, handed to the plugin's entrypoint as its argument,
-converted to a Lua table, so a plugin reads it with `local config = ...`. The
-config is the `[config]` table in the plugin's manifest (its defaults), with
-the keys of its config overrides (a JSON object) applied over it. Each plugin
-sees only its own config. A plugin with no config gets an empty table.
+Every plugin has a config, handed to it when it loads as a JSON object: the
+`config` argument of `Plugin::new`, which `kiki_plugin::parse_config`
+deserializes. The config is the `[config]` table in the plugin's manifest
+(its defaults), with the keys of its config overrides (a JSON object)
+applied over it. Each plugin sees only its own config. A plugin with no
+config gets an empty object.
 
 Overrides are kept in Kiki's database, keyed by plugin name, and set through
 the API under `/v1/plugins/name/{name}/config`: `GET` shows the plugin's
@@ -204,6 +268,16 @@ so it takes effect at once. If the plugins fail to load with it, it is still
 saved, but the plugins keep running with the config they had; the API's
 response says why in `reload_error`, and `kiki plugin config set` and the web
 UI report it.
+
+TOML tables become JSON objects, and arrays become arrays. TOML dates and
+times become strings in their RFC 3339 form, and `inf` and `nan` are not
+allowed.
+
+Check the config, and compile any regexes it holds, in `Plugin::new`, as
+above, so that a bad pattern fails when the plugin loads, not on every
+entry. Note that if any plugin fails to load when the server starts, no
+plugins run until it is fixed (a plugin whose *manifest* is invalid is
+merely skipped); on a reload, the plugins that were running keep running.
 
 ### Describing settings
 
@@ -271,108 +345,40 @@ saved before a plugin described or tightened a setting keep running as they
 are; the web UI shows ones that no longer match as JSON, and saving that key
 again must give a value that matches.
 
-Tables (and JSON objects) become Lua tables keyed by string, and arrays become
-sequences indexed from 1. TOML dates and times become strings in their
-RFC 3339 form, and `inf` and `nan` are not allowed. A `null` override
-becomes `nil`, so a key set to `null` is absent from its table.
-
-For example, this script hides entries whose fields match a configured
-regular expression, or whose fields do *not* match one when `invert` is set:
-
-```lua
-local config = ...
-
-local rules = {}
-for _, rule in ipairs(config.rules or {}) do
-    table.insert(rules, {
-        field = rule.field,
-        re = kiki.regex(rule.pattern, rule.flags),
-        invert = rule.invert == true,
-    })
-end
-
-kiki.on("entry.ingest", function(entry)
-    for _, rule in ipairs(rules) do
-        local value = entry[rule.field] or ""
-        if rule.re:is_match(value) ~= rule.invert then
-            table.insert(entry.tags, "system:hidden")
-            break
-        end
-    end
-    return entry
-end)
-```
-
-configured with, say, these overrides (sent with
-`PUT /v1/plugins/name/{name}/config`):
-
-```json
-{
-  "rules": [
-    { "field": "title", "pattern": "\\b(sponsored|webinar)\\b", "flags": "i" },
-    { "field": "content", "pattern": "rust", "flags": "i", "invert": true }
-  ]
-}
-```
-
-Compiling the regexes in the top-level chunk means a bad pattern in the
-config fails when the plugin loads, not on every entry. Note that if any
-plugin's code fails to load when the server starts, no plugins run until it is
-fixed (a plugin whose *manifest* is invalid is merely skipped); on a reload,
-the plugins that were running keep running.
-
-Kiki ships a complete version of this plugin as `plugins/filter` in its
-source, and `kiki init` installs it by default (unless Kiki was built without
-the `default-plugins` feature, or `--no-default-plugins` is passed); see its
-`main.lua` for the settings it takes. `kiki init --check` installs it into an
-existing home directory too, and updates it when a new release of Kiki bundles
-a new version, unless its files have been edited. It also installs
-`plugins/privacy`, which uses `entry.ingest` to remove tracking
-parameters such as `utm_source` from entries' URLs and the links in their
-content, and tracking pixels from their content, and can keep images from
-being downloaded for chosen feeds with `cache_assets`; `plugins/sanitize`,
-which uses [`kiki.html`](#rewriting-html) to remove scripts, styles and
-unsafe links from entries' content; `plugins/auto-tag`, which tags
-entries that match regular expressions or come from given feeds; and
-`plugins/retention`, which uses [timers](#timers) and
-[`kiki.entries.delete_where`](#deleting-entries) to delete entries some days
-after their feed stops listing them.
-
 ## Events
 
 | Event            | Payload                                    | Purpose |
 |------------------|--------------------------------------------|---------|
-| `entry.parsed`   | entry table (see below)                    | Observe a newly-parsed entry, before any transformations. Return value is ignored. |
-| `entry.ingest`   | entry table (see below)                    | **Transform or filter** a parsed entry. Return the (possibly modified) entry to keep it, or `nil` to drop it. |
-| `fetch.success`  | `{ feed_id, status, url, content_length }` | Fires after a successful (2xx) feed fetch, once the response body has been read. |
-| `fetch.error`    | `{ feed_id, kind, status, message, retry_after }` | Fires when a feed fetch fails. `kind` is one of `"http"`, `"timeout"`, `"network"`, `"too_many_redirects"`, `"body_too_large"`, `"parse"`, or `"fetcher"` (the isolated feed fetcher itself failed, e.g. its worker crashed while handling this feed). `status` and `retry_after` are populated only when available. |
-| `feed.added`     | `{ id, url, title }`                       | Fires after a feed is created via the HTTP API. |
-| `feed.removed`   | `{ id, url, title }`                       | Fires after a feed is deleted via the HTTP API, or merged into another feed because it permanently redirected to that feed's URL (its entries then belong to the other feed). `id`, `url`, `title` reflect the feed's state immediately before deletion. |
+| `entry.parsed`   | `Entry` (see below)                        | Observe a newly-parsed entry, before any transformations. |
+| `entry.ingest`   | `Entry` (see below)                        | **Transform or filter** a parsed entry. Return the (possibly modified) entry to keep it, or `None` to drop it. |
+| `fetch.success`  | `FetchSuccess`: `feed_id`, `status`, `url`, `content_length` | Fires after a successful (2xx) feed fetch, once the response body has been read. |
+| `fetch.error`    | `FetchError`: `feed_id`, `kind`, `status`, `message`, `retry_after` | Fires when a feed fetch fails. `kind` is one of `"http"`, `"timeout"`, `"network"`, `"too_many_redirects"`, `"body_too_large"`, `"parse"`, or `"fetcher"` (the isolated feed fetcher itself failed, e.g. its worker crashed while handling this feed). `status` and `retry_after` are set only when available. |
+| `feed.added`     | `FeedEvent`: `id`, `url`, `title`          | Fires after a feed is created via the HTTP API. |
+| `feed.removed`   | `FeedEvent`: `id`, `url`, `title`          | Fires after a feed is deleted via the HTTP API, or merged into another feed because it permanently redirected to that feed's URL (its entries then belong to the other feed). `id`, `url`, `title` reflect the feed's state immediately before deletion. |
 | `plugin.load`    | none                                       | Fires once plugins have loaded: when the server starts, and after every reload. Where to start a [scan](#stored-entries) of stored entries. |
-| `fetch.schedule` | `{ feed_id, status, change, hint_secs, interval_secs, min_cadence_secs, wait_secs }` | **Lengthen the wait** before a feed's next fetch. Return a number of seconds, or `nil` to leave it. See [Scheduling fetches](#scheduling-fetches). |
+| `fetch.schedule` | `FetchSchedule` (see below)                | **Lengthen the wait** before a feed's next fetch. Return a number of seconds, or `None` to leave it. See [Scheduling fetches](#scheduling-fetches). |
 
 `entry.ingest` and `fetch.schedule` are **transform** events: their handlers
-can change what happens. All other events are observe-only; their return
-values are discarded.
+can change what happens. All other events are observe-only.
 
-### The entry table
+### The entry
 
-The payload for `entry.parsed` and `entry.ingest` is a Lua table with the
+The payload of `entry.parsed` and `entry.ingest` is an entry with the
 following fields:
 
-| Field               | Lua type          | Mutable |
+| Field               | Type              | Mutable |
 |---------------------|-------------------|---------|
-| `id`                | integer, or `nil` for entries being ingested | No |
+| `id`                | integer, or none for entries being ingested | No |
 | `feed_id`           | integer           | No      |
 | `syndication_format`| string (`"rss"` or `"atom"`) | No |
 | `guid`              | string            | No      |
-| `published_at`      | integer (Unix timestamp) or `nil` | Yes |
+| `published_at`      | integer (Unix timestamp), or none | Yes |
 | `title`             | string            | Yes     |
-| `url`               | string or `nil`   | Yes     |
-| `content`           | string (HTML) or `nil` | Yes |
-| `authors`           | array of strings  | No      |
-| `categories`        | array of strings  | No      |
-| `tags`              | array of strings  | Yes     |
+| `url`               | string, or none   | Yes     |
+| `content`           | string (HTML), or none | Yes |
+| `authors`           | list of strings   | No      |
+| `categories`        | list of strings   | No      |
+| `tags`              | list of strings   | Yes     |
 | `cache_assets`      | boolean           | Yes     |
 
 `authors` holds an RSS item's `<author>`, or the names of an Atom entry's
@@ -381,33 +387,31 @@ of an Atom entry's `<category>`s.
 
 `cache_assets` starts `true`. A handler that sets it to `false` keeps Kiki
 from downloading the images in the entry's content, and its enclosure, into
-the asset cache, each time the entry is fetched; setting it to `nil` leaves it
-`true`. The entry itself is stored all the same. (It has no effect on
-entries handed to a [scan](#stored-entries).)
+the asset cache, each time the entry is fetched. The entry itself is stored
+all the same. (It has no effect on entries handed to a
+[scan](#stored-entries).)
 
 `tags` starts empty. A `tags` holding any user tag replaces the entry's user
 tags; one holding only system tags leaves them alone.
 
-Scripts may also add the system tags `system:read`, `system:saved`, and
+Plugins may also add the system tags `system:read`, `system:saved`, and
 `system:hidden` to `tags`. These are applied only when the entry is first
 stored: after that an entry's system tags record what the user has done with
 it (read it, saved it, hidden or unhidden it), and later refreshes leave them
 alone. Handlers never remove system tags through `tags` (though a plugin can
-with `kiki.entries.untag`). Any other name starting with `system:` is
-reserved, and is ignored with a warning.
+with `untag-entry`). Any other name starting with `system:` is reserved, and
+is ignored with a warning.
 
 `id`, `feed_id`, `syndication_format`, and `guid` are identity fields, and
 `authors` and `categories` describe the entry as its feed published it.
-Handlers may read them, but any modifications are discarded when the entry is
-converted back out of Lua.
+Handlers may read them, but any modifications are discarded.
 
 ### Handler chaining
 
-Multiple handlers may be registered for the same event; they run in
-registration order (which matches the order of their plugins' directory
-names). For `entry.ingest`, the output of one
-handler becomes the input to the next — if any handler returns `nil`, the
-entry is dropped immediately and subsequent handlers do not run.
+Handlers for the same event run in the order of their plugins' directory
+names. For `entry.ingest`, the output of one handler becomes the input to
+the next — if any handler returns `None`, the entry is dropped immediately
+and subsequent handlers do not run.
 
 ## Scheduling fetches
 
@@ -417,93 +421,93 @@ feed's own `<ttl>` or `sy:updatePeriod`) runs out, but no sooner than
 `min_polling_cadence_seconds` and no later than the feed's own interval.
 When that hint is shorter than the interval, `fetch.schedule` fires, and its
 handlers may have Kiki wait longer. The bundled `adaptive-fetch` plugin
-(`plugins/adaptive-fetch/main.lua`) uses it to back off from feeds that keep
+(`plugins/adaptive-fetch/src/lib.rs`) uses it to back off from feeds that keep
 turning out unchanged.
 
-The payload is a table with:
+The payload has:
 
 | Field              | Meaning |
 |--------------------|---------|
 | `feed_id`          | The feed that was fetched. |
 | `status`           | `200`, or `304` for `Not Modified`. |
-| `change`           | `"changed"` if the feed's content differs from the last fetch, `"unchanged"` if not (a `304`, or the same body again), or `"unknown"` if there is nothing to compare against, as on a feed's first fetch. |
+| `change`           | `Changed` if the feed's content differs from the last fetch, `Unchanged` if not (a `304`, or the same body again), or `Unknown` if there is nothing to compare against, as on a feed's first fetch. |
 | `hint_secs`        | The freshness hint, in seconds. |
 | `interval_secs`    | The feed's fetch interval, in seconds. |
 | `min_cadence_secs` | The server's `min_polling_cadence_seconds`. |
 | `wait_secs`        | The wait before the next fetch, in seconds. |
 
-A handler returns the number of seconds to wait instead (fractions are
-rounded down), or `nil` to leave the wait as it is. Handlers run in order,
-each seeing the wait the one before chose in `wait_secs`. Kiki then holds
-the wait between the one it planned and the feed's interval: a plugin can
-have a feed fetched less often than its server asks, but never more often,
-and never less often than its interval.
+A handler returns the number of seconds to wait instead, or `None` to leave
+the wait as it is. Handlers run in order, each seeing the wait the one
+before chose in `wait_secs`. Kiki then holds the wait between the one it
+planned and the feed's interval: a plugin can have a feed fetched less often
+than its server asks, but never more often, and never less often than its
+interval.
 
-```lua
--- Fetch no feed more than once every ten minutes.
-kiki.on("fetch.schedule", function(fetch)
-    return math.max(fetch.wait_secs, 600)
-end)
+```rust,ignore
+// Fetch no feed more than once every ten minutes.
+#[on(fetch.schedule)]
+fn at_most_every_ten_minutes(&mut self, schedule: FetchSchedule) -> Option<u64> {
+    Some(schedule.wait_secs.max(600))
+}
 ```
 
 The event fires on every such fetch, so a handler should be quick, and keep
-what it needs from the server, such as values in `kiki.store`, in a table of
-its own rather than asking for them every time.
+what it needs from the server, such as values in its store, in its own
+fields rather than asking for them every time.
 
 ## Storing data
 
-`kiki.store` keeps data for the plugin in Kiki's database, so it outlives
-reloads and restarts. Each plugin has a store of its own.
+A plugin has a key-value store of its own in Kiki's database, so what it
+keeps there outlives reloads and restarts.
 
-- `kiki.store.get(key)` returns the value stored under the string `key`, or
-  `nil`.
-- `kiki.store.set(key, value)` stores `value` under `key`, or removes the key
-  when `value` is `nil`.
+- `store-get(key)` returns the value stored under the string `key`, as JSON
+  text, or none.
+- `store-set(key, value)` stores `value`, JSON text, under `key`, or removes
+  the key when `value` is none.
 
-Values are kept as JSON: `nil`, booleans, numbers, strings, and tables of
-them. A table whose keys are exactly `1..n` is kept as a list, and any other
-as an object, whose keys must be strings; tables may nest 32 deep. Keys are 1
-to 256 bytes long, a value may take up 64 KiB as JSON, and a plugin may keep
-1024 keys.
+In Rust, `kiki_plugin::host::get` and `set` deserialize and serialize the
+values with `serde`. Keys are 1 to 256 bytes long, a value may take up
+64 KiB as JSON, and a plugin may keep 1024 keys.
 
 ## Stored entries
 
-`entry.ingest` sees each entry once, as it arrives. `kiki.entries` reaches the
-entries already stored, such as those fetched before a plugin was installed or
-its config changed:
+`entry.ingest` sees each entry once, as it arrives. These calls reach the
+entries already stored, such as those fetched before a plugin was installed
+or its config changed:
 
-- `kiki.entries.tag(id, name)` adds the tag `name` to the stored entry with id
+- `tag-entry(id, name)` adds the tag `name` to the stored entry with id
   `id`, creating the tag if it is a new user tag, and returns whether the
   entry did not already have it. `name` may be a system tag, such as
   `system:hidden`. Plugins cannot create new user tags once there are 10,000
   user tags; they can still use the ones that exist.
-- `kiki.entries.untag(id, name)` removes the tag, returning whether the entry
-  had it. System tags can be removed too, so a plugin can mark as unread,
+- `untag-entry(id, name)` removes the tag, returning whether the entry had
+  it. System tags can be removed too, so a plugin can mark as unread,
   unsave or unhide entries the user marked; use this with care.
-- `kiki.entries.scan([options,] handler [, on_done])` starts a scan: in the
-  background, every stored entry that `options` selects is passed to
-  `handler`, oldest first, as an entry table with its `id` set and `tags`
-  empty. As with a new entry, the system tags the handler adds to `tags` are
-  applied to the entry; nothing else it changes is kept, and returning `nil`
-  leaves the entry as it is. To change anything else, the handler calls
-  `kiki.entries.tag` or `untag`. Once the scan has gone through every entry,
-  `on_done`, if given, is called with a table holding `scanned`, how many
-  entries the handler saw, and `updated`, how many gained a system tag. It is
-  not called for a scan that ends early. Returns the scan's id.
+- `start-scan(options)` starts a scan, and returns its id: in the
+  background, every stored entry that `options` selects is passed to the
+  plugin's `scan.entry` handler, with the scan's id, oldest first, with its
+  `id` set and `tags` empty. As with a new entry, the system tags the handler
+  adds to `tags` are applied to the entry; nothing else it changes is kept,
+  and returning `None` leaves the entry as it is. To change anything else,
+  the handler calls `tag-entry` or `untag-entry`. Once the scan has gone
+  through every entry, the plugin's `scan.done` handler is called with the
+  scan's id and a summary holding `scanned`, how many entries the handler
+  saw, and `updated`, how many gained a system tag. It is not called for a
+  scan that ends early.
 
-User tags added with `kiki.entries.tag` last only until an `entry.ingest`
+User tags added with `tag-entry` last only until an `entry.ingest`
 handler next sets the entry's user tags: when an entry is fetched again and a
 handler returns any user tag for it, its user tags are replaced with the ones
 returned, as they would be for tags added by hand. Tags that must last are best
 set by the same plugin, on ingest as well as on stored entries.
 
-`options` is a table with any of:
+`options` has:
 
 | Option           | Meaning |
 |------------------|---------|
-| `feed_id`        | Only scan the entries of this feed. |
-| `since`          | Only scan entries published at or after this Unix timestamp. |
-| `include_hidden` | Also scan entries tagged `system:hidden`, which are skipped by default. |
+| `feed_id`        | Only scan the entries of this feed, if set. |
+| `since`          | Only scan entries published at or after this Unix timestamp, if set. |
+| `include_hidden` | Also scan entries tagged `system:hidden`, which are skipped otherwise. |
 
 Each call of the handler has the usual [time budget](#resource-limits), so a
 scan can visit any number of entries. Scans and feed refreshes take turns
@@ -512,44 +516,81 @@ about 50 ms of handling, any events a refresh has queued up go first. A scan
 therefore slows refreshes down by a little, rather than holding them up for
 long. A plugin runs one scan at a time: starting another cancels the first.
 Reloading the plugins ends every scan, and so does stopping the server; a scan
-is not resumed afterwards, and its `on_done` is not called.
+is not resumed afterwards, and its `scan.done` is not called.
 
-Scans cannot start while plugins are loading, from the top-level chunk:
-start them from a `plugin.load` handler. Since `plugin.load` fires on every
-reload, including those for other plugins' changes, keep track in
-`kiki.store` of what a scan has already applied, and record it from `on_done`,
+Scans cannot start while plugins are loading, from `Plugin::new`: start them
+from a `plugin.load` handler. Since `plugin.load` fires on every reload,
+including those for other plugins' changes, keep track in the plugin's
+store of what a scan has already applied, and record it from `scan.done`,
 once the scan has finished: a scan that was cut short then runs again on the
 next load. This plugin hides stored entries matching a configured pattern, but
 only when the pattern changes, so that entries the user has since unhidden
 stay unhidden:
 
-```lua
-local config = ...
-local re = kiki.regex(config.pattern, "i")
+```rust,ignore
+use kiki_plugin::regex::Regex;
+use kiki_plugin::{host, parse_config, plugin, Entry, Plugin, ScanOptions, ScanSummary};
+use serde::Deserialize;
 
-local function hide(entry)
-    if re:is_match(entry.title) then
-        table.insert(entry.tags, "system:hidden")
-    end
-    return entry
-end
+#[derive(Deserialize)]
+struct Config {
+    pattern: String,
+}
 
-kiki.on("entry.ingest", hide)
+struct Hide {
+    pattern: String,
+    re: Regex,
+}
 
-kiki.on("plugin.load", function()
-    if kiki.store.get("pattern") ~= config.pattern then
-        kiki.entries.scan(hide, function()
-            kiki.store.set("pattern", config.pattern)
-        end)
-    end
-end)
+impl Plugin for Hide {
+    fn new(config: &str) -> Result<Self, String> {
+        let Config { pattern } = parse_config(config)?;
+        let re = Regex::compile(&pattern, "i")?;
+        Ok(Hide { pattern, re })
+    }
+}
+
+impl Hide {
+    fn hide(&self, mut entry: Entry) -> Option<Entry> {
+        if self.re.is_match(&entry.title) {
+            entry.tags.push("system:hidden".to_string());
+        }
+        Some(entry)
+    }
+}
+
+#[plugin]
+impl Hide {
+    #[on(entry.ingest)]
+    fn ingest(&mut self, entry: Entry) -> Option<Entry> {
+        self.hide(entry)
+    }
+
+    #[on(plugin.load)]
+    fn load(&mut self) {
+        if host::get::<String>("pattern").ok().flatten() != Some(self.pattern.clone()) {
+            let options = ScanOptions { feed_id: None, since: None, include_hidden: false };
+            let _ = host::start_scan(options);
+        }
+    }
+
+    #[on(scan.entry)]
+    fn scan(&mut self, _scan: u64, entry: Entry) -> Option<Entry> {
+        self.hide(entry)
+    }
+
+    #[on(scan.done)]
+    fn done(&mut self, _scan: u64, _summary: ScanSummary) {
+        let _ = host::set("pattern", &self.pattern);
+    }
+}
 ```
 
 ## Deleting entries
 
-`kiki.entries.delete_where(filter)` deletes stored entries, and returns how
-many it deleted. Deleting cannot be undone, so it needs the
-`entries.delete` [permission](#permissions).
+`delete-entries(filter)` deletes stored entries, and returns how many it
+deleted. Deleting cannot be undone, so it needs the `entries.delete`
+[permission](#permissions).
 
 It only ever deletes entries their feed has stopped listing: an entry still
 in its feed would be fetched again on the feed's next refresh, and stored as
@@ -558,48 +599,37 @@ lists an entry; `filter` says which of those entries to delete:
 
 | Filter             | Meaning |
 |--------------------|---------|
-| `dropped_before`   | Required. Delete entries their feed stopped listing before this Unix timestamp. |
-| `feed_id`          | Only delete the entries of this feed. |
-| `published_before` | Only delete entries published before this Unix timestamp. Entries with no publication date are kept. |
-| `keep_tagged`      | Keep entries tagged with any of these tags: a tag name, or a list of them. Defaults to `"system:saved"`; `{}` deletes entries however they are tagged. |
+| `dropped_before`   | Delete entries their feed stopped listing before this Unix timestamp. |
+| `feed_id`          | Only delete the entries of this feed, if set. |
+| `published_before` | Only delete entries published before this Unix timestamp, if set. Entries with no publication date are kept. |
+| `keep_tagged`      | Keep entries tagged with any of these tags. Defaults to `["system:saved"]` when not set; an empty list deletes entries however they are tagged. |
 
-An unknown filter raises an error, as does a missing `dropped_before` or a
-`system:` name in `keep_tagged` that is not a system tag. To keep saved
-entries and entries with the user tag `keep` too, pass
-`keep_tagged = { "system:saved", "keep" }`: setting `keep_tagged` replaces
-the default, rather than adding to it. Kiki
-deletes the entries a few hundred at a time, so that a large deletion does
-not hold up feed refreshes for long, but the call returns only once they are
-all deleted; a plugin that may delete many entries at once may need a longer
-[time budget](#resource-limits). This deletes entries that left their feed
-more than 30 days ago, and is most of the bundled `retention` plugin:
-
-```lua
-local DAY = 24 * 60 * 60
-
-local function clean_up()
-    kiki.entries.delete_where({ dropped_before = os.time() - 30 * DAY })
-end
-
-kiki.on("plugin.load", clean_up)
-kiki.every(60 * 60, clean_up)
-```
+A `system:` name in `keep_tagged` that is not a system tag fails the call. To
+keep saved entries and entries with the user tag `keep` too, pass
+`["system:saved", "keep"]`: setting `keep_tagged` replaces the default,
+rather than adding to it. Kiki deletes the entries a few hundred at a time,
+so that a large deletion does not hold up feed refreshes for long, but the
+call returns only once they are all deleted; a plugin that may delete many
+entries at once may need a longer [time budget](#resource-limits). The
+bundled `retention` plugin deletes entries some days after their feed stops
+listing them, when it loads and then once an hour; see
+`plugins/retention/src/lib.rs`.
 
 ## Timers
 
-`kiki.every(secs, handler)` calls `handler`, with no arguments, every `secs`
-seconds, the first time `secs` seconds after `kiki.every` is called. Kiki
-checks for timers that are due once a minute, so `secs` must be at least
-`60`, and at most a year, and a timer may run up to a minute late; one that
-runs late does not make the next one late too. Each call has the plugin's
-usual [time budget](#resource-limits), and an error in one is logged, and
-does not stop the timer.
+`every(secs)` starts a timer, and returns its id: the plugin's `timer`
+handler is called with the id every `secs` seconds, the first time `secs`
+seconds after `every` is called. Kiki checks for timers that are due once a
+minute, so `secs` must be at least `60`, and at most a year, and a timer may
+run up to a minute late; one that runs late does not make the next one late
+too. Each call has the plugin's usual [time budget](#resource-limits), and a
+failure in one is logged, and does not stop the timer.
 
-A timer can be started from the top-level chunk or from a handler. Timers
-are not kept across reloads: when plugins reload, every timer stops, and the
-top-level chunk starts its timers again. Since a timer's first call is a
-whole interval away, a plugin that wants to do its work as soon as it loads
-should do it from a `plugin.load` handler as well, as above.
+A timer can be started from `Plugin::new` or from a handler. Timers are not
+kept across reloads: when plugins reload, every timer stops, and the plugin,
+made afresh, starts its timers again. Since a timer's first call is a whole
+interval away, a plugin that wants to do its work as soon as it loads should
+do it from a `plugin.load` handler as well.
 
 ## Permissions
 
@@ -612,81 +642,57 @@ permissions = ["entries.delete"]
 
 | Permission       | Allows |
 |------------------|--------|
-| `entries.delete` | Deleting stored entries, with [`kiki.entries.delete_where`](#deleting-entries). |
+| `entries.delete` | Deleting stored entries, with [`delete-entries`](#deleting-entries). |
 
-A call a plugin has not asked for permission to make raises an error. A
-manifest naming a permission Kiki does not know is invalid. The permissions
-each plugin asks for are shown by `kiki plugin ls`, the web UI and
-`GET /v1/plugins`, so that you can see what a plugin may do before you
-install it.
+A call a plugin has not asked for permission to make fails. A manifest naming
+a permission Kiki does not know is invalid. The permissions each plugin asks
+for are shown by `kiki plugin ls`, the web UI and `GET /v1/plugins`, so that
+you can see what a plugin may do before you install it.
 
 ## Feeds
 
-An entry names its feed only by `feed_id`. `kiki.feeds.get(id)` looks the
-feed up, returning a table with its `id`, `url` (the URL it is fetched from,
-or `nil`) and `title`, or `nil` if there is no feed with that id. Feed ids
-depend on the order feeds were added in, so this is how a plugin can apply
-settings to feeds named by URL:
-
-```lua
-local config = ...
-local urls = {}
-for _, url in ipairs(config.feeds or {}) do
-    urls[url] = true
-end
-
-local seen = {}
-kiki.on("entry.ingest", function(entry)
-    if seen[entry.feed_id] == nil then
-        local feed = kiki.feeds.get(entry.feed_id)
-        seen[entry.feed_id] = feed ~= nil and urls[feed.url] == true
-    end
-    if seen[entry.feed_id] then
-        table.insert(entry.tags, "watched")
-    end
-    return entry
-end)
-```
+An entry names its feed only by `feed_id`. `get-feed(id)` looks the feed up,
+returning its `id`, `url` (the URL it is fetched from, if any) and `title`,
+or none if there is no feed with that id. Feed ids depend on the order feeds
+were added in, so this is how a plugin can apply settings to feeds named by
+URL.
 
 Each lookup is a call to the server, so a plugin that looks feeds up for
-every entry is best off remembering the answers, as above. A feed's URL
-changes when fetching it is permanently redirected (or, if another feed has
-the new URL already, the feed is merged into that one and removed), and a
-removed feed's id
-may be given to a feed added later (listen for `feed.removed` to forget it).
+every entry is best off remembering the answers, in a map keyed by feed id. A
+feed's URL changes when fetching it is permanently redirected (or, if another
+feed has the new URL already, the feed is merged into that one and removed),
+and a removed feed's id may be given to a feed added later (handle
+`feed.removed` to forget it).
 
 ## Calls to the server
 
-Calls to `kiki.store`, `kiki.entries` and `kiki.feeds` go to the server,
-which answers them from the database, and checks that the plugin has the
-[permission](#permissions) a call needs. Time a handler spends waiting on them
-does not count against its [time budget](#resource-limits), up to a second
-per handler call.
+Calls to the plugin's store, to stored entries and to feeds go to the
+server, which answers them from the database, and checks that the plugin has
+the [permission](#permissions) a call needs. A call that fails returns an
+error message. Time a handler spends waiting on them does not count against
+its [time budget](#resource-limits), up to a second per handler call.
 
 ## Regular expressions
 
-Lua's built-in patterns have no alternation (`a|b`) and no case-insensitive
-matching. For anything beyond simple matching, `kiki.regex` compiles a
-pattern with Rust's [`regex`](https://docs.rs/regex) crate:
+`kiki_plugin::regex`, the `regex` interface, compiles and matches regular
+expressions in Kiki itself, as native code. That is faster than a regex
+library built into the plugin, and leaves the plugin much smaller: the
+`regex` crate alone adds about a megabyte to a plugin.
 
-```lua
-local promo = kiki.regex([[\b(sponsored|giveaway|webinar)\b]], "i")
+- `Regex::compile(pattern, flags)` compiles a pattern; `is_match` and `find`
+  match it. `find(haystack, start)` returns the byte offsets of the start
+  and end of the first match at or after `start`.
+- `RegexSet::compile(patterns)` compiles a list of patterns and flags, whose
+  `matches` returns which of them match a string, in one call to Kiki rather
+  than one per pattern.
 
-kiki.on("entry.ingest", function(entry)
-    if promo:is_match(entry.title) then
-        table.insert(entry.tags, "promo")
-    end
-    return entry
-end)
-```
+The pattern syntax is the [`regex`](https://docs.rs/regex) crate's: it
+supports character classes, alternation, repetition, named groups and inline
+flags such as `(?i)`, but not look-around or backreferences. In exchange,
+matching always runs in time linear in the input, so a hostile feed cannot
+make a pattern run for ever.
 
-The pattern syntax is the `regex` crate's: it supports character classes,
-alternation, repetition, named groups and inline flags such as `(?i)`, but not
-look-around or backreferences. In exchange, matching always runs in time
-linear in the input, so a hostile feed cannot make a pattern run for ever.
-Long Lua bracket strings (`[[...]]`) avoid having to double every backslash.
-
-`flags` is an optional string of single-letter flags:
+`flags` is a string of single-letter flags:
 
 | Flag | Meaning |
 |------|---------|
@@ -696,173 +702,163 @@ Long Lua bracket strings (`[[...]]`) avoid having to double every backslash.
 | `x`  | Ignore whitespace and allow `#` comments in the pattern. |
 | `U`  | Swap the meaning of greedy and lazy repetition. |
 
-An invalid pattern or flag raises an error. Compile regexes at the top of a
-script, as above, so that a mistake fails when the script loads rather than on
-every entry.
+An invalid pattern or flag fails the compile with a message. Compile regexes
+in `Plugin::new`, so that a mistake fails when the plugin loads rather than
+on every entry.
 
-A compiled regex has these methods. Positions are 1-based byte offsets, as with
-Lua's `string` functions; `init`, where accepted, is where to start searching
-and may be negative to count from the end.
+A plugin may have 128 distinct patterns alive at once. Compiling a pattern
+it has alive already, with the same flags, shares it, so a pattern in a
+`Regex` and a `RegexSet` counts once; dropping the last one holding a
+pattern frees its place. Each compiled pattern is limited to 256 KiB of
+compiled program, plus a matching cache of the same size.
 
-| Method | Returns |
-|--------|---------|
-| `re:is_match(s)` | `true` if the regex matches anywhere in `s`. |
-| `re:find(s [, init])` | The start and end of the first match, or `nil`. |
-| `re:match(s [, init])` | The text of the first match, or `nil`. |
-| `re:captures(s [, init])` | A table of the first match's groups, or `nil`. `[0]` is the whole match, `[1]`, `[2]`, … are the numbered groups and named groups are also available by name. A group that took no part in the match is `false`. |
-| `re:match_all(s)` | An array of the text of every non-overlapping match. |
-| `re:replace(s, replacement [, limit])` | `s` with matches replaced by `replacement`, in which `$1` or `${name}` expand to a group (write `$$` for a literal `$`). Replaces every match, or only the first `limit`. |
-| `re:split(s [, limit])` | An array of the parts of `s` between matches, splitting into at most `limit` parts if given. |
+Plugins can bundle a regex library instead, if they need something the
+interface lacks, such as captures or replacement. Prefer matching each
+pattern alone to the `regex` crate's `RegexSet`, though: a set of patterns,
+one of which has no literal text to look for, can be a hundred times slower
+on text that is not ASCII.
 
-`re.pattern` and `re.flags` hold the pattern and flags the regex was compiled
-with, and `kiki.regex.escape(s)` returns `s` with every metacharacter escaped,
-for matching it literally. `kiki.regex.new(pattern [, flags])` is the same as
-`kiki.regex(pattern [, flags])`.
+## Parsing HTML
 
-Compiling the same pattern with the same flags again returns the regex that is
-already compiled, so building a regex inside a handler is cheap, if less tidy.
-
-## Rewriting HTML
-
-An entry's `content` is HTML, which Lua's string patterns cannot parse
-reliably: a pattern looking for `<img src="...">` misses images written
-`<IMG SRC=...>`, and finds them inside comments and attribute values.
-`kiki.html.rewrite(html, handlers)` parses `html` with
+`kiki_plugin::html`, the `html` interface, parses and rewrites HTML, such as
+an entry's content, in Kiki itself, with
 [`lol_html`](https://github.com/cloudflare/lol-html), the streaming HTML
-rewriter Kiki uses itself, calls `handlers` for the parts of it they ask
-for, and returns the rewritten HTML:
+rewriter Kiki uses for its own HTML. That is faster than a parser built into
+the plugin, and leaves the plugin much smaller: `lol_html` adds about 600 KB
+to a plugin. Don't edit HTML with string searches or regexes: they see
+`<a href="x">` where a browser sees something else, which is how
+sanitizers built on them get bypassed.
 
-```lua
-kiki.on("entry.ingest", function(entry)
-    if entry.content ~= nil then
-        entry.content = kiki.html.rewrite(entry.content, {
-            elements = {
-                -- Remove every <script>, with its content.
-                { "script", function(el) el:remove() end },
-                -- Open links to other sites in a new tab.
-                { "a[href^='http']", function(el)
-                    el:set_attribute("target", "_blank")
-                    el:set_attribute("rel", "noopener")
-                end },
-            },
-            comments = function(comment) comment:remove() end,
-        })
-    end
-    return entry
-end)
+Kiki can't call into a plugin while the plugin is calling Kiki, so a
+rewrite takes two passes:
+
+1. `html::select(html, selector)` returns the elements a CSS selector, such
+   as `"a[href], img"` or `"*"`, matches, in document order. Each has a tag
+   name, lowercase, a namespace (HTML, or SVG or MathML inside an `<svg>` or
+   a `<math>`) and its attributes, with lowercase names.
+2. The plugin records what to do with them in `Edits`, by each element's
+   `index()`.
+3. `html::rewrite(html, selector, &edits)` parses the same HTML with the
+   same selector again, makes the edits, and returns the rewritten HTML.
+
+```rust,ignore
+use kiki_plugin::html::{self, Edits};
+
+fn nofollow(content: &str) -> Result<String, String> {
+    let mut edits = Edits::new();
+    for a in html::select(content, "a[href]")?.iter() {
+        if a.attribute("href").is_some_and(|href| href.starts_with("http")) {
+            edits.set_attribute(a.index(), "rel", "nofollow");
+        }
+    }
+    html::rewrite(content, "a[href]", &edits)
+}
 ```
 
-`handlers` is a table with any of:
+An element can be removed with its content (`remove`), or have its tags
+removed and its content kept (`remove_and_keep_content`). Its attributes can
+be set and removed, and it can be renamed. Content can be inserted before
+or after it, at the start or end of its content, in place of its content,
+or in place of the element itself, either as text, which is escaped, or as
+HTML, which is inserted as it is. `edits.remove_comments()` removes the
+HTML's comments too. An edit that sets an invalid attribute or tag name, or
+is for an element past the last one matched, fails the rewrite.
 
-| Key        | Meaning |
-|------------|---------|
-| `elements` | A list of `{ selector, handler }` pairs. `handler` is called with each element matching the CSS `selector`, such as `"img"`, `"a[href]"`, `"div.ad > p"` or `"*"`. An element matching several selectors goes to each of their handlers, in the order they are listed. |
-| `comments` | A function called with each comment. |
-| `text`     | A function called with each chunk of text. |
+Attribute values are decoded, as a browser decodes them: the value of
+`href="&#106;avascript:"` is `javascript:`. Values set are escaped, so a
+value read and set again is written out as what was read: a plugin that
+checks a URL and sets it again writes what it checked.
+`html::unescape(s)` decodes the character references in other text, and
+`html::escape(s)` escapes `&`, `<`, `>`, `"` and `'` for putting text into
+HTML.
 
-The selectors `lol_html` supports are listed in
-[its documentation](https://docs.rs/lol_html/latest/lol_html/struct.Selector.html):
-type, class, id and attribute selectors, `*`, and the descendant and child
-combinators, among others. An invalid selector raises an error.
+Parsing runs outside the plugin's memory, so it has limits of its own: the
+parser may use 4 MiB for its buffers, and what a call returns may take at
+most 8 MiB. Each call also checks how much room the plugin's memory has for
+what it returns, and fails rather than return more than that, since a
+plugin with no room for a result would trap. Parsing counts against the
+handler's [time budget](#resource-limits).
 
-A handler is passed an object for its element, comment or text chunk, which
-it changes by calling its methods. Its return value is ignored. Changes are
-applied once the handler returns, and the object can't be used after that:
-keeping it and calling it later raises an error. An error raised in a
-handler stops the rewrite and is raised by `kiki.html.rewrite`.
+## What a plugin can reach
 
-The methods that insert content take it as text, which is escaped, unless
-their last argument is `"html"`: `el:append("<b>")` inserts the text `<b>`,
-while `el:append("<b>bold</b>", "html")` inserts a bold element.
+A plugin runs in a sandbox of its own: it shares no memory with Kiki or with
+any other plugin, and can reach nothing but what the `host`, `regex` and
+`html` interfaces offer. Of [WASI](https://wasi.dev/), the system interface
+WebAssembly toolchains build on, Kiki provides only randomness
+(`wasi:random`) and the clocks (`wasi:clocks`' `now` and `resolution`), which
+libraries use without being asked: Rust's `HashMap` seeds its hasher from
+it, for instance. There are no files, no network, no environment and no
+standard streams. A plugin built for `wasm32-wasip2` still loads, but calling
+any of them, as `std::fs`, `std::env` or `println!` do, traps. Write to
+Kiki's log with `log` instead.
 
-An element has these fields and methods:
-
-| Field or method | Meaning |
-|-----------------|---------|
-| `el.tag_name` | The element's name, in lowercase, such as `"img"`. |
-| `el.namespace` | `"html"`, or `"svg"` or `"mathml"` for elements inside `<svg>` or `<math>`. |
-| `el.is_self_closing` | Whether the tag was written self-closing, as in `<br/>`. |
-| `el.can_have_content` | Whether the element can have content: `false` for void elements such as `<img>`. |
-| `el.removed` | Whether the element has been removed or replaced. |
-| `el:get_attribute(name)` | The value of the attribute `name`, or `nil`. |
-| `el:has_attribute(name)` | Whether the element has the attribute. |
-| `el:attributes()` | A list of the element's attributes, each a table with its `name` (in lowercase) and `value`. |
-| `el:set_attribute(name, value)` | Set an attribute, adding it if the element doesn't have it. |
-| `el:remove_attribute(name)` | Remove an attribute. |
-| `el:set_tag_name(name)` | Rename the element. |
-| `el:before(content [, "html"])`, `el:after(...)` | Insert content before or after the element. |
-| `el:prepend(content [, "html"])`, `el:append(...)` | Insert content at the start or end of the element's content. |
-| `el:set_inner_content(content [, "html"])` | Replace the element's content. |
-| `el:replace(content [, "html"])` | Replace the element, and its content. |
-| `el:remove()` | Remove the element and its content. |
-| `el:remove_and_keep_content()` | Remove the element's tags, keeping its content. |
-
-Attribute names are matched ignoring case. Attribute values are decoded:
-`get_attribute` returns `/a?x=1&y=2` for `href="/a?x=1&amp;y=2"`, as a
-browser reads it, and `set_attribute` escapes the value it is given, so
-setting a value a handler has read writes it back unchanged.
-
-A comment has a `text` field and a `set_text(text)` method (the text may
-not contain `-->`), and a chunk of text has a `text` field, holding the text
-as it is written in the HTML, character references and all, and a
-`last_in_text_node` field, which is `true` for the last chunk of a run of
-text: a long run of text may come in several chunks. Both have a `removed`
-field and the methods `before`, `after`, `replace` and `remove`, which work
-as they do for elements.
-
-`kiki.html.escape(s)` escapes `&`, `<`, `>`, `"` and `'` in `s`, for
-putting text into HTML; `kiki.html.unescape(s)` decodes the character
-references in `s`.
-
-`lol_html` rewrites HTML as a stream, without building a document tree. It
-doesn't add missing end tags or remove stray ones, and selectors can't look
-at what comes after an element, so `:has()` and the sibling combinators
-aren't supported. Attribute selectors match values as they are written in
-the HTML, before character references are decoded, so a handler that must
-not miss an element should check the decoded value with `get_attribute`.
+Plugins run in the script host, a separate process from the server that
+holds no database handle, no filesystem access and no sockets but the one it
+talks to the server over, so a plugin that broke out of its sandbox would
+find nothing worth having. See the [threat model](threat-model.md#a-misbehaving-plugin).
 
 ## Resource limits
 
-Every handler call runs under two hard limits:
+Every call into a plugin runs under hard limits:
 
-- **Time**: 100 ms per invocation, unless the plugin's manifest sets
+- **Time**: 100 ms per call, unless the plugin's manifest sets
   `time_budget_ms` to another number of milliseconds or to `"unlimited"`.
-  Enforced by a Lua debug hook that fires every 1000 VM instructions. Scripts stuck in long-running C-level calls
-  (e.g. pathological `string.gsub` patterns) can exceed this slightly before
-  control returns to the VM. Time spent waiting on the server in calls to
-  `kiki.store`, `kiki.entries` and `kiki.feeds` is not counted, up to one
-  second per invocation; past that, waiting counts like anything else.
+  Time spent waiting on the server, in [calls to it](#calls-to-the-server),
+  is not counted, up to one second per call; past that, waiting counts like
+  anything else. Loading a plugin, which runs its `init`, may take up to 5
+  seconds.
 
   An unlimited handler still has a backstop: plugins run one handler at a
   time in a separate process, and if that process doesn't answer the server
   for 10 seconds, the server stops it, and with it every plugin, until Kiki
   restarts. Keep `"unlimited"` for plugins you trust to finish, such as the
   bundled `sanitize`, which every new entry passes through.
-- **Memory**: 16 MiB for each VM, shared by the plugins that ask for the
-  same [permissions](#permissions). Allocations that would exceed this cap
-  fail the handler.
-- **Regexes**: compiled regexes live outside the VM, so the memory cap does not
-  count them. Each is instead limited to 256 KiB of compiled program (plus a
-  matching cache of the same size), and at most 128 distinct regexes may be
-  alive at once; exceeding either raises an error. Regexes a script no longer refers to are freed by Lua's garbage
-  collector.
-- **HTML rewriting**: `kiki.html.rewrite` works outside the VM too. Its
-  buffers may take up 4 MiB, the HTML it returns may be at most 8 MiB long,
-  and it takes at most 256 element handlers; exceeding any of these raises an
-  error. Its handlers run within the time budget of the handler that called
-  it.
+- **Memory**: 16 MiB for each plugin, and 512 KiB of stack.
+- **Regexes**: compiled regexes live outside the plugin's memory, and have
+  limits of their own; see [Regular expressions](#regular-expressions).
+- **HTML**: parsing HTML happens outside the plugin's memory too, with
+  limits of its own; see [Parsing HTML](#parsing-html).
 
-When a handler errors, times out, or exceeds the memory cap:
+Kiki compiles each plugin to native code when it loads, once for each
+distinct `plugin.wasm`, so changing only a plugin's config reloads it without
+compiling it again.
+
+When a handler traps, whether it ran out of time or memory, panicked, or
+called into WASI that Kiki doesn't provide, it fails:
 
 - For `entry.ingest`, the entry passes through that handler **unmodified** —
-  a broken script will never silently drop entries.
+  a broken plugin will never silently drop entries.
 - For `fetch.schedule`, the wait is left as it was, and the next handler runs.
-  A handler that returns something other than `nil` or a number of seconds
-  that is not negative counts as failing.
-- For observe events, the failure is logged and dropped.
+- For other events, the failure is logged and dropped.
 
-## Upgrading from database scripts
+A trap can leave the plugin's memory in any state, so the plugin is then
+started afresh the next time it is needed: Kiki loads it again and calls
+`init`, which starts its timers again, while the scans it had started end.
+Timers that were due when the plugin trapped aren't called. Kiki restarts at
+most one plugin per event, so a plugin may miss an event or two if several
+trap at once. A plugin that traps more than five times in ten minutes is
+disabled until plugins next reload.
 
-Earlier versions of Kiki stored scripts in the database and managed them
-through the `/v1/scripts/*` API. `kiki migrate` drops those scripts along with
-the tables they were kept in; to keep using a script, install it as a plugin.
+## Security
+
+Compiling plugins to native code means the process plugins run in, the
+script host, has to be able to write code to memory and then run it, which
+Kiki's other processes are not allowed to do (nor is the server, unless it
+runs plugins itself, with `kiki serve --no-script-isolation`). Systemd's
+`MemoryDenyWriteExecute=` would stop it, and is inherited by every process of
+a service, so the units Kiki ships don't set it; if you wrote your own,
+remove it, or plugins will fail to compile. See the
+[threat model](threat-model.md#a-misbehaving-plugin) for what this means.
+
+## Upgrading from Lua plugins
+
+Earlier versions of Kiki ran plugins written in Lua, as well as WebAssembly
+ones. Kiki no longer runs Lua: a plugin whose manifest says `engine = "lua"`
+is listed under `errors` in `GET /v1/plugins`, and skipped. To keep using
+one, rewrite it as a WebAssembly plugin. The plugins Kiki bundles were all
+rewritten in Rust, taking the same configs, and `kiki init --check` replaces
+their Lua versions, unless you edited them.
+
+Earlier still, Kiki stored scripts in the database and managed them through
+the `/v1/scripts/*` API. `kiki migrate` drops those scripts along with the
+tables they were kept in.

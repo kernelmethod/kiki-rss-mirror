@@ -1,8 +1,9 @@
-//! Tests for the `filter` plugin shipped in `plugins/filter/`.
+//! Tests for the `filter` plugin shipped in `plugins/filter/`, built from
+//! the crate in that directory by `build.rs`.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
-use crate::scripting::lua::LuaScriptRunner;
+use crate::scripting::wasm::WasmScriptRunner;
 use crate::scripting::{
     Event, EventPayload, FeedEntry, FeedInfo, ScriptRunner, ScriptServices, ScriptSource,
     ServiceCall, ServiceReply,
@@ -15,14 +16,24 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MANIFEST: &str = include_str!("../../plugins/filter/manifest.toml");
-const MAIN: &str = include_str!("../../plugins/filter/main.lua");
+const WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm"));
+
+/// The filter, loaded with `config`, looking feeds up in `services`.
+fn load(
+    config: Value,
+    services: Option<Arc<dyn ScriptServices>>,
+) -> Result<WasmScriptRunner, String> {
+    let source = ScriptSource {
+        name: "filter".to_string(),
+        config: config.to_string(),
+        ..ScriptSource::new(WASM.to_vec())
+    };
+    WasmScriptRunner::from_sources_with(&[source], services).map_err(|e| e.to_string())
+}
 
 /// The filter, loaded with `config`.
-fn filter(config: Value) -> Result<LuaScriptRunner, crate::scripting::lua::ScriptError> {
-    let mut source = ScriptSource::new(MAIN);
-    source.name = "filter".to_string();
-    source.config = config.to_string();
-    LuaScriptRunner::from_sources(&[source])
+fn filter(config: Value) -> Result<WasmScriptRunner, String> {
+    load(config, None)
 }
 
 fn entry(feed_id: i64, title: &str) -> FeedEntry {
@@ -42,11 +53,11 @@ fn entry(feed_id: i64, title: &str) -> FeedEntry {
     }
 }
 
-fn hidden(runner: &LuaScriptRunner, entry: FeedEntry) -> bool {
+fn hidden(runner: &WasmScriptRunner, entry: FeedEntry) -> bool {
     tags(runner, entry).iter().any(|t| t == "system:hidden")
 }
 
-fn tags(runner: &LuaScriptRunner, entry: FeedEntry) -> Vec<String> {
+fn tags(runner: &WasmScriptRunner, entry: FeedEntry) -> Vec<String> {
     runner
         .dispatch_transform_entry(entry)
         .unwrap()
@@ -54,7 +65,7 @@ fn tags(runner: &LuaScriptRunner, entry: FeedEntry) -> Vec<String> {
         .tags
 }
 
-/// Answers `kiki.feeds.get` for feed `n` in 1..=3 with the URL
+/// Answers `get-feed` for feed `n` in 1..=3 with the URL
 /// `https://example.com/feed{n}`, counting the lookups.
 #[derive(Default)]
 struct Feeds {
@@ -80,12 +91,8 @@ impl ScriptServices for Feeds {
 }
 
 /// The filter, loaded with `config`, looking feeds up in `feeds`.
-fn filter_with_feeds(config: Value, feeds: &Arc<Feeds>) -> LuaScriptRunner {
-    let mut source = ScriptSource::new(MAIN);
-    source.name = "filter".to_string();
-    source.config = config.to_string();
-    LuaScriptRunner::from_sources_with(&[source], Some(feeds.clone() as Arc<dyn ScriptServices>))
-        .unwrap()
+fn filter_with_feeds(config: Value, feeds: &Arc<Feeds>) -> WasmScriptRunner {
+    load(config, Some(feeds.clone() as Arc<dyn ScriptServices>)).unwrap()
 }
 
 #[test]
@@ -277,9 +284,17 @@ fn bad_rules_fail_to_load() {
             "exclude[1]",
         ),
     ] {
-        let err = filter(config.clone()).err().unwrap().to_string();
+        let err = filter(config.clone()).err().unwrap();
         assert!(err.contains(message), "{config}: {err}");
     }
+}
+
+/// Installs the filter into the plugin directory `dir`.
+fn install(dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("manifest.toml"), MANIFEST)?;
+    std::fs::write(dir.join("plugin.wasm"), WASM)?;
+    Ok(())
 }
 
 /// End to end, through a server: stored entries are filtered when the
@@ -305,9 +320,7 @@ async fn stored_entries_are_filtered_when_the_rules_change() -> Result<()> {
             .collect::<Result<_>>()?
     };
     let dir = tc.user_plugins_dir().join("filter");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("manifest.toml"), MANIFEST)?;
-    std::fs::write(dir.join("main.lua"), MAIN)?;
+    install(&dir)?;
     let overrides = json!({"exclude": [{"fields": ["title"], "pattern": "sponsored"}]});
     crate::db::plugins::set_config_overrides(
         &tc.database_conn()?,
@@ -397,9 +410,7 @@ async fn dropped_tag_rules_do_not_rescan() -> Result<()> {
         id
     };
     let dir = tc.user_plugins_dir().join("filter");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("manifest.toml"), MANIFEST)?;
-    std::fs::write(dir.join("main.lua"), MAIN)?;
+    install(&dir)?;
 
     let tc = tc.init_server()?;
     // A scan, had one started, would have finished long since.

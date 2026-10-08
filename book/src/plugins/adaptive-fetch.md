@@ -35,6 +35,7 @@ from Kiki's [data directory](../configuration/environment.md), or set `enabled =
 `manifest.toml`. Either way, `kiki init --check` leaves it as you left it.
 
 The plugin uses the [`fetch.schedule`](../writing-plugins.md#scheduling-fetches)
-event; see
-[`plugins/adaptive-fetch/main.lua`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/adaptive-fetch/main.lua)
-for the details.
+event. It is written in Rust, as a [WebAssembly plugin](../writing-plugins.md);
+see [`plugins/adaptive-fetch/src/lib.rs`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/adaptive-fetch/src/lib.rs)
+for the details. Versions before 2.0.0 were written in Lua, and took the same
+configuration.

@@ -1358,14 +1358,23 @@ mod script_isolation {
     use super::*;
     use kiki_rss::process::script_host;
 
-    /// A script that stamps every ingested entry's title, so a test can tell
-    /// from the API alone whether the handler actually ran.
-    const TITLE_STAMPING_SCRIPT: &str = r#"kiki.on("entry.ingest", function(entry) entry.title = "[scripted] " .. entry.title; return entry end)"#;
+    /// The WebAssembly plugin the tests install, whose config chooses what
+    /// it does; see `tests/wasm-fixture`.
+    const FIXTURE: &[u8] = include_bytes!("wasm-fixture/fixture.wasm");
+
+    /// The title of the entry in the feed [`spawn_local_rss_server`] serves.
+    const TITLE: &str = "hello from a sandboxed fetch";
+
+    /// A config that stamps every ingested entry's title, so a test can
+    /// tell from the API alone whether the handler actually ran.
+    fn title_stamping() -> serde_json::Value {
+        serde_json::json!({"suffix": " [plugin]"})
+    }
 
     impl Kiki {
         /// PIDs of this server's script host children, read out of /proc.
         ///
-        /// The isolation is only real if the Lua VM is somewhere else, so
+        /// The isolation is only real if plugins run somewhere else, so
         /// the tests check the process tree rather than taking the log's
         /// word for it.
         fn script_host_pids(&mut self) -> Vec<u32> {
@@ -1402,35 +1411,46 @@ mod script_isolation {
             .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
     }
 
-    /// Spawn `kiki serve` with a plugin whose entrypoint is `source`
-    /// installed, and wait for the server to report it loaded.
-    fn spawn_with_script(extra_args: &[&str], source: &str) -> Kiki {
-        spawn_with_configured_script(extra_args, source, serde_json::json!({}))
-    }
-
-    /// As [`spawn_with_script`], giving the plugin the config `config`.
-    /// Plugins are only discovered when the server starts, so the plugin
-    /// is installed before it is spawned.
-    fn spawn_with_configured_script(
-        extra_args: &[&str],
-        source: &str,
-        config: serde_json::Value,
-    ) -> Kiki {
+    /// Install the fixture as the plugin in `dir`, named `name`, with
+    /// config `config`.
+    fn install_plugin(dir: &Path, name: &str, config: serde_json::Value) {
         let manifest = serde_json::json!({
-            "name": "test-plugin",
+            "name": name,
             "version": "1.0.0",
-            "engine": "lua",
+            "engine": "wasm",
             "config": config,
         });
         let manifest = toml::to_string(&manifest).expect("serialize manifest.toml");
+        std::fs::create_dir_all(dir).expect("create plugin directory");
+        std::fs::write(dir.join("plugin.wasm"), FIXTURE).expect("write plugin.wasm");
+        std::fs::write(dir.join("manifest.toml"), manifest).expect("write manifest.toml");
+    }
+
+    /// Spawn `kiki serve` with the fixture installed as a plugin with
+    /// config `config`, and wait for the server to report it loaded.
+    /// Plugins are only discovered when the server starts, so the plugin
+    /// is installed before it is spawned.
+    fn spawn_with_plugin(extra_args: &[&str], config: serde_json::Value) -> Kiki {
         let mut kiki = Kiki::spawn_with(extra_args, |home| {
             let plugin = home.join("plugins").join("user").join("test-plugin");
-            std::fs::create_dir_all(&plugin).expect("create plugin directory");
-            std::fs::write(plugin.join("main.lua"), source).expect("write main.lua");
-            std::fs::write(plugin.join("manifest.toml"), manifest).expect("write manifest.toml");
+            install_plugin(&plugin, "test-plugin", config);
         });
-        kiki.wait_for_plugins_loaded(1, Duration::from_secs(10));
+        kiki.wait_for_plugins_loaded(1, Duration::from_secs(20));
         kiki
+    }
+
+    /// The value the fixture stored under `seen:<what>` in the plugin
+    /// `plugin`'s store, in the database in `home`, if any.
+    fn seen(home: &Path, plugin: &str, what: &str) -> Option<String> {
+        let conn = rusqlite::Connection::open(home.join("kiki.db")).expect("open db");
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM plugin_store WHERE plugin = ?1 AND key = ?2",
+                rusqlite::params![plugin, format!("seen:{what}")],
+                |row| row.get(0),
+            )
+            .ok()?;
+        Some(serde_json::from_str(&value).expect("a JSON string"))
     }
 
     /// Refresh `feed_id` and poll until an entry shows up, returning its
@@ -1468,8 +1488,8 @@ mod script_isolation {
         created.json()["id"].as_i64().expect("id")
     }
 
-    /// The headline property: by default the Lua VM lives in a child
-    /// process, not in the server.
+    /// The headline property: by default plugins run in a child process,
+    /// not in the server.
     #[test]
     fn scripts_run_in_a_separate_process_by_default() {
         let mut kiki = Kiki::spawn(&[]);
@@ -1506,109 +1526,83 @@ mod script_isolation {
         kiki.shutdown();
     }
 
-    /// End to end: a script installed as a plugin transforms a real
-    /// entry, with the VM in the sandboxed child and the database in the
-    /// server. This is the test that fails if anything in the IPC path —
-    /// framing, serialisation, the child's sandbox — is wrong.
+    /// End to end: a plugin, compiled to native code in the sandboxed
+    /// script host, transforms a real entry, as its config says to, with
+    /// the database in the server. This is the test that fails if anything
+    /// in the IPC path — framing, serialisation, the child's sandbox — is
+    /// wrong, if the host refuses the writable and executable memory
+    /// Cranelift needs, or if a component or its config does not make it
+    /// across the IPC channel.
     #[test]
-    fn an_isolated_script_transforms_an_ingested_entry() {
+    fn an_isolated_plugin_transforms_an_ingested_entry() {
         let (addr, _server) = spawn_local_rss_server();
-        let mut kiki = spawn_with_script(&[], TITLE_STAMPING_SCRIPT);
+        let mut kiki = spawn_with_plugin(&[], title_stamping());
         assert_eq!(kiki.script_host_pids().len(), 1);
 
         let feed_id = create_local_feed(&mut kiki, addr);
         let title = refresh_and_read_title(&mut kiki, feed_id);
-        assert!(
-            title.starts_with("[scripted] "),
-            "entry title was not transformed by the isolated script host: {title:?}"
+        assert_eq!(
+            title,
+            format!("{TITLE} [plugin]"),
+            "entry title was not transformed by the isolated script host"
         );
         kiki.shutdown();
     }
 
-    /// The server skips sending the script host events nothing handles,
-    /// going by the handlers the host reports with each response. A handler
-    /// registered after loading, here by a `plugin.load` handler, must
-    /// still be reached.
+    /// Plugins run in turn, in the order of their directory names.
     #[test]
-    fn a_handler_registered_after_loading_still_runs() {
+    fn isolated_plugins_run_in_directory_order() {
         let (addr, _server) = spawn_local_rss_server();
-        let mut kiki = spawn_with_script(
-            &[],
-            r#"
-            kiki.on("plugin.load", function()
-                kiki.on("entry.ingest", function(entry)
-                    entry.title = "[late] " .. entry.title
-                    return entry
-                end)
-            end)
-            "#,
-        );
+        let mut kiki = Kiki::spawn_with(&[], |home| {
+            let user = home.join("plugins").join("user");
+            install_plugin(
+                &user.join("10-a"),
+                "a",
+                serde_json::json!({"suffix": " [a]"}),
+            );
+            install_plugin(
+                &user.join("20-b"),
+                "b",
+                serde_json::json!({"suffix": " [b]"}),
+            );
+        });
+        kiki.wait_for_plugins_loaded(2, Duration::from_secs(20));
 
         let feed_id = create_local_feed(&mut kiki, addr);
         let title = refresh_and_read_title(&mut kiki, feed_id);
-        assert!(
-            title.starts_with("[late] "),
-            "a handler registered by plugin.load did not run: {title:?}"
-        );
+        assert_eq!(title, format!("{TITLE} [a] [b]"));
+        kiki.assert_still_running();
         kiki.shutdown();
     }
 
-    /// A script's config crosses the IPC channel to the script host and
-    /// reaches the script's top-level chunk.
+    /// Regexes compile and match in the server, under its own sandbox, for
+    /// plugins in the script host, not just in the in-process runner the
+    /// unit tests use.
     #[test]
-    fn an_isolated_script_receives_its_config() {
+    fn an_isolated_plugin_can_use_regexes() {
         let (addr, _server) = spawn_local_rss_server();
-        let mut kiki = spawn_with_configured_script(
+        let mut kiki = spawn_with_plugin(
             &[],
-            r#"
-            local config = ...
-            kiki.on("entry.ingest", function(entry)
-                entry.title = config.prefix .. entry.title
-                return entry
-            end)
-            "#,
-            serde_json::json!({"prefix": "[configured] "}),
+            serde_json::json!({"regex": [r"^HELLO from (\w+)", "i"]}),
         );
 
         let feed_id = create_local_feed(&mut kiki, addr);
-        let title = refresh_and_read_title(&mut kiki, feed_id);
-        assert!(
-            title.starts_with("[configured] "),
-            "entry title was not transformed using the script's config: {title:?}"
+        refresh_and_read_title(&mut kiki, feed_id);
+        let home = kiki._dir.path().to_path_buf();
+        assert_eq!(
+            seen(&home, "test-plugin", "regex").as_deref(),
+            Some("true Some((0, 12))")
         );
-        kiki.shutdown();
-    }
-
-    /// `kiki.regex` compiles and matches inside the script host, under the
-    /// child's own sandbox, not just in the in-process VM the unit tests use.
-    #[test]
-    fn an_isolated_script_can_use_regexes() {
-        let (addr, _server) = spawn_local_rss_server();
-        let mut kiki = spawn_with_script(
-            &[],
-            r#"
-            local re = kiki.regex([[^hello from (?P<how>\w+)]], "i")
-            kiki.on("entry.ingest", function(entry)
-                local caps = re:captures(entry.title)
-                if caps then entry.title = "[" .. caps.how .. "] " .. entry.title end
-                return entry
-            end)
-            "#,
-        );
-
-        let feed_id = create_local_feed(&mut kiki, addr);
-        let title = refresh_and_read_title(&mut kiki, feed_id);
-        assert_eq!(title, "[a] hello from a sandboxed fetch");
         kiki.shutdown();
     }
 
     /// `--no-script-isolation` is the documented escape hatch: no child, and
-    /// scripts still work. If this passes while the test above fails, the
-    /// problem is in the IPC layer rather than in the scripting engine.
+    /// plugins still work. If this passes while the test above fails, the
+    /// problem is in the IPC layer rather than in the plugin engine.
     #[test]
-    fn no_script_isolation_runs_lua_in_the_server_process() {
+    fn no_script_isolation_runs_plugins_in_the_server_process() {
         let (addr, _server) = spawn_local_rss_server();
-        let mut kiki = spawn_with_script(&["--no-script-isolation"], TITLE_STAMPING_SCRIPT);
+        let mut kiki = spawn_with_plugin(&["--no-script-isolation"], title_stamping());
 
         assert!(
             kiki.script_host_pids().is_empty(),
@@ -1617,9 +1611,10 @@ mod script_isolation {
 
         let feed_id = create_local_feed(&mut kiki, addr);
         let title = refresh_and_read_title(&mut kiki, feed_id);
-        assert!(
-            title.starts_with("[scripted] "),
-            "in-process script did not transform the entry: {title:?}"
+        assert_eq!(
+            title,
+            format!("{TITLE} [plugin]"),
+            "in-process plugin did not transform the entry"
         );
         kiki.shutdown();
     }
@@ -1640,62 +1635,47 @@ mod script_isolation {
         );
     }
 
-    /// A broken script must not take the host down with it: the failure is
+    /// A broken plugin must not take the host down with it: the failure is
     /// reported over IPC, the entry passes through unmodified, and the
     /// child keeps serving.
     #[test]
-    fn a_failing_script_leaves_the_host_running() {
+    fn a_failing_plugin_leaves_the_host_running() {
         let (addr, _server) = spawn_local_rss_server();
-        let mut kiki = spawn_with_script(
+        let mut kiki = spawn_with_plugin(
             &[],
-            r#"kiki.on("entry.ingest", function(entry) error("boom") end)"#,
+            serde_json::json!({"trap_title": TITLE, "suffix": " [plugin]"}),
         );
         let before = kiki.script_host_pids();
 
         let feed_id = create_local_feed(&mut kiki, addr);
         let title = refresh_and_read_title(&mut kiki, feed_id);
-        assert!(
-            !title.is_empty(),
-            "a failing handler must not drop the entry"
+        assert_eq!(
+            title, TITLE,
+            "a failing handler must pass the entry on unmodified"
         );
 
         assert_eq!(
             before,
             kiki.script_host_pids(),
-            "a script error must not kill the host process"
+            "a trapping plugin must not kill the host process"
         );
         kiki.assert_still_running();
         kiki.shutdown();
     }
 
-    /// Plugins in the sandboxed host can reach the server through the
-    /// `kiki` API: their store, tagging entries, and scans of stored
-    /// entries, started from `plugin.load`. Editing the plugin reloads it,
-    /// which runs `plugin.load` again.
+    /// Plugins in the sandboxed host can reach the server through the host
+    /// interface: their store, and scans of stored entries, started from
+    /// `plugin.load`. Editing the plugin reloads it, which runs
+    /// `plugin.load` again.
     #[test]
     fn plugins_in_the_host_can_scan_and_tag_stored_entries() {
-        const SCRIPT: &str = r#"
-            local pattern = "spam"
-            kiki.on("plugin.load", function()
-                kiki.store.set("loads", (kiki.store.get("loads") or 0) + 1)
-                kiki.entries.scan(function(entry)
-                    if entry.title:find(pattern) then
-                        table.insert(entry.tags, "system:hidden")
-                    end
-                    if entry.title:find("tagme") then
-                        kiki.entries.tag(entry.id, "tagged")
-                    end
-                    return entry
-                end)
-            end)
-        "#;
-        let manifest = "name = 'scanner'\nversion = '1.0.0'\nengine = 'lua'\n";
+        let config = |tag: &str| serde_json::json!({"scan": true, "scan_tag": tag});
         let mut kiki = Kiki::spawn_with(&[], |home| {
             let conn = rusqlite::Connection::open(home.join("kiki.db")).expect("open db");
             conn.execute("INSERT INTO feeds (title) VALUES ('f')", [])
                 .expect("insert feed");
             let feed = conn.last_insert_rowid();
-            for title in ["ham", "spam", "tagme"] {
+            for title in ["a", "b"] {
                 conn.execute(
                     "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
                      VALUES (?1, 'rss', ?2, 0, ?2, 'u')",
@@ -1704,9 +1684,7 @@ mod script_isolation {
                 .expect("insert entry");
             }
             let plugin = home.join("plugins").join("user").join("scanner");
-            std::fs::create_dir_all(&plugin).expect("create plugin directory");
-            std::fs::write(plugin.join("manifest.toml"), manifest).expect("write manifest");
-            std::fs::write(plugin.join("main.lua"), SCRIPT).expect("write main.lua");
+            install_plugin(&plugin, "scanner", config("system:hidden"));
         });
         assert_eq!(kiki.script_host_pids().len(), 1);
 
@@ -1727,41 +1705,31 @@ mod script_isolation {
                 .expect("rows")
         };
         let wait_for = |what: &str, cond: &dyn Fn() -> bool| {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(20);
             while !cond() {
                 assert!(Instant::now() < deadline, "timed out waiting for {what}");
                 thread::sleep(Duration::from_millis(50));
             }
         };
 
-        wait_for("spam to be hidden", &|| {
-            tags_of("spam") == ["system:hidden"]
+        wait_for("the entries to be hidden", &|| {
+            tags_of("a") == ["system:hidden"] && tags_of("b") == ["system:hidden"]
         });
-        wait_for("tagme to be tagged", &|| tags_of("tagme") == ["tagged"]);
-        assert!(tags_of("ham").is_empty());
-        let loads = || -> String {
-            let conn = rusqlite::Connection::open(home.join("kiki.db")).expect("open db");
-            conn.query_row(
-                "SELECT value FROM plugin_store WHERE plugin = 'scanner' AND key = 'loads'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or_default()
-        };
-        assert_eq!(loads(), "1");
+        // The fixture changes scanned entries' titles too, which is ignored.
+        assert!(seen(&home, "scanner", "plugin.load").is_some());
+        assert!(seen(&home, "scanner", "scan").is_some());
 
         // Editing the plugin reloads it, through the plugins directory
-        // watcher, and its new scan hides ham too.
-        std::fs::write(
-            home.join("plugins")
-                .join("user")
-                .join("scanner")
-                .join("main.lua"),
-            SCRIPT.replace(r#"local pattern = "spam""#, r#"local pattern = "ham""#),
-        )
-        .expect("rewrite main.lua");
-        wait_for("ham to be hidden", &|| tags_of("ham") == ["system:hidden"]);
-        assert_eq!(loads(), "2");
+        // watcher, and its new scan saves the entries.
+        install_plugin(
+            &home.join("plugins").join("user").join("scanner"),
+            "scanner",
+            config("system:saved"),
+        );
+        wait_for("the entries to be saved", &|| {
+            tags_of("a") == ["system:hidden", "system:saved"]
+                && tags_of("b") == ["system:hidden", "system:saved"]
+        });
 
         assert_eq!(kiki.script_host_pids().len(), 1);
         kiki.assert_still_running();
@@ -1773,17 +1741,6 @@ mod script_isolation {
     /// to send at all is skipped, and the scan carries on past it.
     #[test]
     fn scans_of_large_entries_go_through_every_entry() {
-        const SCRIPT: &str = r#"
-            kiki.on("plugin.load", function()
-                kiki.entries.scan(function(entry)
-                    table.insert(entry.tags, "system:hidden")
-                    return entry
-                end, function(summary)
-                    kiki.store.set("scanned", summary.scanned)
-                end)
-            end)
-        "#;
-        let manifest = "name = 'scanner'\nversion = '1.0.0'\nengine = 'lua'\n";
         // 25 entries of 480 KiB, about 12 MB: one dispatch's worth, which
         // used to fail the scan for exceeding the 8 MiB frame limit.
         let large = "x".repeat(480 * 1024);
@@ -1807,30 +1764,27 @@ mod script_isolation {
             insert("huge".to_string(), &huge);
             insert("small".to_string(), "x");
             let plugin = home.join("plugins").join("user").join("scanner");
-            std::fs::create_dir_all(&plugin).expect("create plugin directory");
-            std::fs::write(plugin.join("manifest.toml"), manifest).expect("write manifest");
-            std::fs::write(plugin.join("main.lua"), SCRIPT).expect("write main.lua");
+            install_plugin(
+                &plugin,
+                "scanner",
+                serde_json::json!({"scan": true, "scan_tag": "system:hidden"}),
+            );
         });
 
-        let db = kiki._dir.path().join("kiki.db");
+        let home = kiki._dir.path().to_path_buf();
+        let db = home.join("kiki.db");
         let deadline = Instant::now() + Duration::from_secs(30);
-        let scanned = loop {
+        let done = loop {
             kiki.assert_still_running();
-            let conn = rusqlite::Connection::open(&db).expect("open db");
-            let scanned: Option<String> = conn
-                .query_row(
-                    "SELECT value FROM plugin_store WHERE plugin = 'scanner' AND key = 'scanned'",
-                    [],
-                    |row| row.get(0),
-                )
-                .ok();
-            if let Some(scanned) = scanned {
-                break scanned;
+            if let Some(done) = seen(&home, "scanner", "scan-done") {
+                break done;
             }
             assert!(Instant::now() < deadline, "the scan never finished");
             thread::sleep(Duration::from_millis(100));
         };
-        assert_eq!(scanned, "27");
+        // The scan's id, then how many entries it scanned and updated.
+        let summary: Vec<&str> = done.split(' ').skip(1).collect();
+        assert_eq!(summary, ["27", "26"]);
 
         let conn = rusqlite::Connection::open(&db).expect("open db");
         let hidden: Vec<String> = conn
@@ -2276,6 +2230,7 @@ mod landlock_scoping {
                 dir.path().to_path_buf(),
                 dir.path().to_path_buf(),
                 dir.path().to_path_buf(),
+                false,
                 false,
             ),
             "script-host" => SandboxConfig::script_host(false),

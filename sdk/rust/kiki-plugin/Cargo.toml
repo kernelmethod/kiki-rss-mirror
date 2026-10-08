@@ -1,0 +1,21 @@
+[package]
+name = "kiki-plugin"
+version = "0.2.0"
+edition = "2021"
+description = "Write Kiki plugins in Rust, as WebAssembly components"
+license = "MIT"
+repository = "https://github.com/kernelmethod/kiki-rss"
+
+[dependencies]
+kiki-plugin-macros = { path = "../kiki-plugin-macros", version = "0.2.0" }
+wit-bindgen = { version = "0.57", default-features = false, features = ["macros", "realloc", "std"] }
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = ["serde"]
+# Typed configs and store values, through serde_json
+serde = ["dep:serde", "dep:serde_json"]
+
+# Not part of kiki-rss's build; see wit/kiki-plugin.wit, in this crate, for the interface.
+[workspace]

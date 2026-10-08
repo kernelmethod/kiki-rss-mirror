@@ -36,7 +36,8 @@
 //! network connections at all. Within it, the worker downloads, the parser
 //! parses, and the resolver looks hostnames up, each in a process of its
 //! own. The server keeps the database, scheduling, and script dispatch.
-//! The script host ([`script_host`]) runs user-supplied Lua.
+//! The script host ([`script_host`]) runs plugins: user-supplied
+//! WebAssembly, compiled to native code.
 //!
 //! # Spawning order
 //!
@@ -54,10 +55,10 @@
 //!
 //! * A **script host** that dies cannot be replaced, and scripting stays
 //!   disabled until the server is restarted. Since the host's own error
-//!   handling keeps script failures — compile errors, runtime errors,
-//!   timeouts — inside the child, the ways it can actually die are an OOM
+//!   handling keeps plugin failures — compile errors, traps, timeouts —
+//!   inside the child, the ways it can actually die are an OOM
 //!   kill, a panic, or a seccomp violation, and refusing to hand a fresh
-//!   VM to whatever caused the last one to die is the safer default.
+//!   host to whatever caused the last one to die is the safer default.
 //! * The **feed fetcher** is a supervisor that starts a replacement worker
 //!   whenever the last one dies, because fetching is Kiki's core job: its
 //!   profile is the one that may `execve`, and then only the kiki
@@ -95,7 +96,7 @@ pub mod stats;
 #[cfg(unix)]
 pub const CHILD_FD: std::os::unix::io::RawFd = 3;
 
-/// A shared handle to the script host, or `None` when Lua runs in the
+/// A shared handle to the script host, or `None` when plugins run in the
 /// server process.
 ///
 /// Aliased so that call sites which only pass the handle along do not

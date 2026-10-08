@@ -14,6 +14,62 @@
           pkgs = nixpkgs.legacyPackages.${system};
           craneLib = crane.mkLib pkgs;
 
+          # The default plugins written in Rust: the workspace in plugins/,
+          # built as WebAssembly into $out/<name>.wasm. build.rs would build
+          # them itself, but can't fetch their dependencies inside the Nix
+          # sandbox, so it bundles these instead (through KIKI_PLUGINS_WASM_DIR
+          # below). nixpkgs' rustc ships the standard library for
+          # wasm32-unknown-unknown.
+          wasmPlugins = let
+            fs = pkgs.lib.fileset;
+            # Each plugin directory under plugins/ that is also a crate,
+            # without any target directory.
+            crates = builtins.filter
+              (name: builtins.pathExists (./plugins + "/${name}/Cargo.toml"))
+              (builtins.attrNames (builtins.readDir ./plugins));
+            src = fs.toSource {
+              root = ./.;
+              fileset = fs.unions ([
+                ./plugins/Cargo.toml
+                ./plugins/Cargo.lock
+                ./sdk/rust/kiki-plugin/Cargo.toml
+                ./sdk/rust/kiki-plugin/src
+                ./sdk/rust/kiki-plugin/wit
+                ./sdk/rust/kiki-plugin-macros/Cargo.toml
+                ./sdk/rust/kiki-plugin-macros/src
+              ] ++ builtins.concatMap (crate: [
+                (./plugins + "/${crate}/Cargo.toml")
+                (./plugins + "/${crate}/src")
+              ]) crates);
+            };
+          in craneLib.mkCargoDerivation {
+            pname = "kiki-rss-wasm-plugins";
+            version = (craneLib.crateNameFromCargoToml { cargoToml = ./Cargo.toml; }).version;
+            inherit src;
+            cargoArtifacts = null;
+            cargoVendorDir = craneLib.vendorCargoDeps {
+              cargoLock = ./plugins/Cargo.lock;
+            };
+            postUnpack = ''
+              cd $sourceRoot/plugins
+              sourceRoot="."
+            '';
+            buildPhaseCargoCommand = ''
+              cargo build --release --locked --workspace --target wasm32-unknown-unknown
+            '';
+            # plugins/<name>'s package is kiki-<name> (see build.rs).
+            installPhaseCommand = ''
+              for name in ${builtins.concatStringsSep " " crates}; do
+                install -Dm644 "target/wasm32-unknown-unknown/release/kiki_''${name//-/_}.wasm" \
+                  "$out/$name.wasm"
+              done
+            '';
+            doInstallCargoArtifacts = false;
+            strictDeps = true;
+            # nixpkgs' rustc links WebAssembly with lld.
+            nativeBuildInputs = [ pkgs.lld ];
+          };
+
           commonArgs = {
             src = let
               sqlFilter = path: _type: builtins.match ".*\\.sql$" path != null;
@@ -24,8 +80,15 @@
               # (e.g. src/cli/web/*.html, src/cli/web/*.js)
               webUiFilter = path: _type: builtins.match ".*/src/.*\\.(html|js)$" path != null;
               # Bundled plugins, packed into a .tar.zst by build.rs and pulled
-              # into tests via include_str! (e.g. plugins/filter/main.lua)
+              # into tests via include_str! and include_bytes! (e.g.
+              # plugins/filter/manifest.toml)
               pluginsFilter = path: _type: builtins.match ".*/plugins(/.*)?" path != null;
+              # The WebAssembly plugin interface (sdk/rust/kiki-plugin/wit), read
+              # by wasmtime's bindgen! (src/scripting/wasm.rs), and the plugin its tests run
+              # (tests/wasm-fixture/fixture.wasm, via include_bytes!)
+              witFilter = path: _type: builtins.match ".*/wit(/.*)?" path != null;
+              wasmFixtureFilter = path: _type:
+                builtins.match ".*/tests/wasm-fixture(/fixture\\.wasm)?" path != null;
               # The guide in book/ is built separately (see `book` below);
               # leaving it out means editing it doesn't rebuild the crate.
               notBook = path: path != toString ./book
@@ -33,6 +96,7 @@
               customOrCargo = path: type: (notBook path) && (
                 (sqlFilter path type) || (xmlFilter path type) || (docsFilter path type)
                 || (webUiFilter path type) || (pluginsFilter path type)
+                || (witFilter path type) || (wasmFixtureFilter path type)
                 || (craneLib.filterCargoSources path type));
             in
               pkgs.lib.cleanSourceWith {
@@ -40,6 +104,8 @@
                 filter = customOrCargo;
               };
             strictDeps = true;
+
+            KIKI_PLUGINS_WASM_DIR = "${wasmPlugins}";
 
             # The test suite already runs in checks.tests; running it here too
             # roughly doubles the Nix build time (release + LTO).
@@ -50,7 +116,22 @@
             SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
           };
 
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          # What the dependency-only builds (buildDepsOnly) take of `args`. They compile
+          # Cargo.lock's crates against a dummy source and build script, so they need
+          # neither the plugins written in Rust nor the crates in plugins/ and sdk/, which
+          # aren't the main crate's dependencies. Leaving them out keeps the dependencies,
+          # Wasmtime and Cranelift among them, cached when a plugin or the SDK changes.
+          depsOnly = args: builtins.removeAttrs args [ "KIKI_PLUGINS_WASM_DIR" ] // {
+            src = let
+              notUnder = dir: path: path != toString dir
+                && !(pkgs.lib.hasPrefix (toString dir + "/") path);
+            in pkgs.lib.cleanSourceWith {
+              inherit (args) src;
+              filter = path: _type: notUnder ./plugins path && notUnder ./sdk path;
+            };
+          };
+
+          cargoArtifacts = craneLib.buildDepsOnly (depsOnly commonArgs);
 
           kiki = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
@@ -66,7 +147,7 @@
           };
 
           profiling = craneLib.buildPackage (profilingArgs // {
-            cargoArtifacts = craneLib.buildDepsOnly profilingArgs;
+            cargoArtifacts = craneLib.buildDepsOnly (depsOnly profilingArgs);
           });
 
           # Dev-profile builds for the clippy and test checks, so they don't
@@ -78,7 +159,7 @@
             CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
           };
 
-          devDeps = craneLib.buildDepsOnly devArgs;
+          devDeps = craneLib.buildDepsOnly (depsOnly devArgs);
 
           # Fully static musl binary for GitHub releases. crane cross-compiles
           # with pkgsStatic's build-platform rustc, which the binary cache
@@ -86,21 +167,29 @@
           craneLibStatic = crane.mkLib pkgs.pkgsStatic;
 
           staticArgs = {
-            inherit (commonArgs) src strictDeps doCheck;
+            inherit (commonArgs) src strictDeps doCheck KIKI_PLUGINS_WASM_DIR;
             # pkgsStatic adds -static to every link, including the glibc
             # build scripts, which then fail to link. rustc already links
             # musl binaries statically, so drop it.
             preBuild = "unset NIX_CFLAGS_LINK";
           };
 
-          static = craneLibStatic.buildPackage staticArgs;
+          staticDeps = craneLibStatic.buildDepsOnly (depsOnly staticArgs);
+
+          static = craneLibStatic.buildPackage (staticArgs // {
+            cargoArtifacts = staticDeps;
+          });
 
           # The static build with its symbols kept, like `profiling` above.
           # nixdev runs this, so the live service can be profiled with perf.
-          staticProfiling = craneLibStatic.buildPackage (staticArgs // {
+          staticProfilingArgs = staticArgs // {
             pname = "kiki-rss-static-profiling";
             CARGO_PROFILE = "profiling";
             dontStrip = true;
+          };
+
+          staticProfiling = craneLibStatic.buildPackage (staticProfilingArgs // {
+            cargoArtifacts = craneLibStatic.buildDepsOnly (depsOnly staticProfilingArgs);
           });
 
           # The user guide (an mdBook in book/) under $out/guide, with the
@@ -215,6 +304,7 @@
 
           packages = {
             default = kiki;
+            wasm-plugins = wasmPlugins;
             inherit book docs coverage profiling;
           } // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
             inherit static;
@@ -225,8 +315,9 @@
             checks = self.checks.${system};
 
             packages = with pkgs; [
-              cargo-deb
               mdbook
+              # For build.rs to link the plugins written in Rust (see wasmPlugins)
+              lld
             ];
           };
         }

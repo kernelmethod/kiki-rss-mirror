@@ -138,11 +138,11 @@ impl<'a> ServerBuilder<'a> {
     }
 
     /// Dispatch script events to an already-spawned, sandboxed script
-    /// host instead of a Lua VM in this process.
+    /// host instead of running plugins in this process.
     ///
     /// The host must be spawned by the caller, before it installs its own
-    /// sandbox — see [`crate::process`]. Passing `None` keeps the
-    /// in-process VM, which is what the library-level tests use.
+    /// sandbox — see [`crate::process`]. Passing `None` keeps plugins in
+    /// this process, which is what the library-level tests use.
     pub fn script_host(mut self, host: crate::process::ScriptHostHandle) -> Self {
         self.script_host = host;
         self
@@ -261,7 +261,7 @@ pub struct Server {
     worker_count: Option<usize>,
 
     /// Sandboxed script host to dispatch script events to, if one was
-    /// spawned. `None` runs Lua in this process.
+    /// spawned. `None` runs plugins in this process.
     script_host: crate::process::ScriptHostHandle,
 
     /// Sandboxed feed fetcher to retrieve and parse feeds in, if one was
@@ -719,7 +719,7 @@ async fn check_feeds_loop(
 
 /// Fires [`Event::Timer`](crate::scripting::Event::Timer) every
 /// [`TIMER_TICK`](crate::scripting::TIMER_TICK), so that plugins' timers,
-/// started with `kiki.every`, run. Skipped while no plugin has a timer.
+/// started with the host's `every`, run. Skipped while no plugin has a timer.
 ///
 /// Timer handlers may take a while, such as the `retention` plugin's,
 /// which deletes entries, so they run on the blocking thread pool, and a

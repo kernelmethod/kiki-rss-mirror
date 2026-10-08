@@ -244,7 +244,7 @@ mod test {
         args().run_in(&path)?;
         let filter = system_plugins_dir(&path).join("filter");
         assert!(filter.join(crate::plugins::MANIFEST_FILE_NAME).is_file());
-        assert!(filter.join("main.lua").is_file());
+        assert!(filter.join("plugin.wasm").is_file());
 
         let path = td.path().join("without");
         InitArgs {

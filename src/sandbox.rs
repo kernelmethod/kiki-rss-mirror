@@ -46,8 +46,11 @@
 //! * **`PR_SET_MDWE`** (Linux 6.3+) makes the kernel refuse memory that is
 //!   writable and executable, and refuse making any mapping executable
 //!   that was not already, so injected code cannot be written and then
-//!   run. Every profile gets it; it is the in-process counterpart of
-//!   systemd's `MemoryDenyWriteExecute=`.
+//!   run. It is the in-process counterpart of systemd's
+//!   `MemoryDenyWriteExecute=`. Every profile gets it but the script host,
+//!   which compiles WebAssembly plugins to native code (see
+//!   [`crate::scripting::wasm`]), and the server when it runs plugins
+//!   itself, with `--no-script-isolation`.
 //!
 //! All three are installed before the process touches untrusted
 //! input — for the server, just after it binds its listening socket; for
@@ -95,9 +98,15 @@ pub enum SandboxProfile {
         /// cache). Granted read-write access. Normally inside `data_dir`,
         /// which already covers it.
         temp_dir: PathBuf,
+
+        /// Whether the server runs plugins itself, with
+        /// `--no-script-isolation`, rather than in the script host. It then
+        /// compiles them to native code, as the script host does, and so
+        /// may not refuse writable and executable memory.
+        runs_plugins: bool,
     },
 
-    /// The Lua script host: evaluates user-supplied scripts and talks to
+    /// The script host: runs user-supplied plugins and talks to
     /// the server over an inherited socket pair, nothing else.
     ///
     /// This profile grants **no filesystem access whatsoever**, denies
@@ -189,11 +198,13 @@ pub struct SandboxConfig {
 }
 
 impl SandboxConfig {
-    /// Configuration for the main server process.
+    /// Configuration for the main server process, which runs plugins
+    /// itself if `runs_plugins`; see [`SandboxProfile::Server`].
     pub fn server(
         data_dir: PathBuf,
         socket_dir: PathBuf,
         temp_dir: PathBuf,
+        runs_plugins: bool,
         log_only: bool,
     ) -> Self {
         SandboxConfig {
@@ -201,12 +212,13 @@ impl SandboxConfig {
                 data_dir,
                 socket_dir,
                 temp_dir,
+                runs_plugins,
             },
             log_only,
         }
     }
 
-    /// Configuration for the Lua script host process.
+    /// Configuration for the script host process, which runs plugins.
     pub fn script_host(log_only: bool) -> Self {
         SandboxConfig {
             profile: SandboxProfile::ScriptHost,

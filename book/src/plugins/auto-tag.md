@@ -29,5 +29,7 @@ A rule's tag may also be `system:saved`, `system:read` or `system:hidden`.
 Whenever its rules change, the plugin also applies them to the entries
 already downloaded. It never removes tags.
 
-See [`plugins/auto-tag/main.lua`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/auto-tag/main.lua) for every
-setting.
+The plugin is written in Rust, as a [WebAssembly plugin](../writing-plugins.md);
+see [`plugins/auto-tag/src/lib.rs`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/auto-tag/src/lib.rs)
+for every setting. Versions before 2.0.0 were written in Lua, and took the same
+configuration.

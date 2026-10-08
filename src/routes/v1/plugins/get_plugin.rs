@@ -48,7 +48,7 @@ mod test {
     #[tokio::test]
     async fn test_get_plugin() -> Result<()> {
         let tc = TestBuilder::default().init_database().build()?;
-        tc.install_lua_plugin("hello", "", serde_json::json!({}))?;
+        tc.install_plugin("hello", serde_json::json!({}))?;
         let tc = tc.init_server()?;
         let client = tc.client()?;
 

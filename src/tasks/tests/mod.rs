@@ -1,5 +1,5 @@
-mod lua_script_tests;
-
+// The adaptive-fetch plugin is built by build.rs only for the default plugins.
+#[cfg(feature = "default-plugins")]
 mod adaptive_tests;
 mod asset_cache_tests;
 mod auth_tests;

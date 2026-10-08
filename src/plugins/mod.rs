@@ -13,24 +13,22 @@
 //! ├── system/
 //! │   └── filter/
 //! │       ├── manifest.toml
-//! │       └── main.lua
+//! │       └── plugin.wasm
 //! └── user/
 //!     └── hide-sponsored/
 //!         ├── manifest.toml
-//!         ├── main.lua
-//!         └── lib/
-//!             └── rules.lua
+//!         └── plugin.wasm
 //! ```
 //!
 //! The manifest names the plugin, gives its version, and declares the
-//! scripting engine its code is written for. Its `[config]` table holds the
-//! plugin's default config:
+//! engine its code is written for, which is always `wasm`: a WebAssembly
+//! component. Its `[config]` table holds the plugin's default config:
 //!
 //! ```toml
 //! name = "hide-sponsored"
 //! version = "1.0.0"
-//! engine = "lua"
-//! entrypoint = "main.lua"
+//! engine = "wasm"
+//! entrypoint = "plugin.wasm"
 //! description = "Hide sponsored posts"
 //!
 //! [config]
@@ -67,7 +65,7 @@
 //! `20-tag`) controls the order their handlers run in, across system and
 //! user plugins alike.
 //!
-//! The calls plugins make to the server through the `kiki` Lua API, such as
+//! The calls plugins make to the server through the host interface, such as
 //! scanning stored entries, are answered by [`services`].
 //!
 //! With the `default-plugins` feature, Kiki also bundles plugins from its
@@ -80,20 +78,23 @@ pub mod runtime;
 pub mod services;
 pub mod settings;
 
-#[cfg(test)]
+// The default plugins are built by build.rs only with the default-plugins feature.
+#[cfg(all(test, feature = "default-plugins"))]
 mod adaptive_fetch_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "default-plugins"))]
 mod auto_tag_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "default-plugins"))]
 mod filter_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "default-plugins"))]
 mod privacy_tests;
 #[cfg(test)]
+mod retention_setting_tests;
+#[cfg(all(test, feature = "default-plugins"))]
 mod retention_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "default-plugins"))]
 mod sanitize_tests;
 
-use crate::scripting::{ScriptModule, ScriptSource, TimeBudget};
+use crate::scripting::{ScriptSource, TimeBudget, WasmComponent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -123,14 +124,14 @@ pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 /// so it is kept small.
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
-/// Largest total size of the source files of one plugin.
+/// Largest WebAssembly plugin, in bytes.
 ///
-/// Every plugin's source is shipped to the script host in one message, so
-/// this also keeps the message well inside the host's frame limit.
-pub const MAX_PLUGIN_SOURCE_BYTES: u64 = 1024 * 1024;
+/// Each component is shipped to the script host in a message of its own, so
+/// this keeps it inside the host's frame limit.
+pub const MAX_WASM_COMPONENT_BYTES: u64 = 7 * 1024 * 1024;
 
-/// How deep inside a plugin directory source files are looked for.
-const MAX_SOURCE_DEPTH: usize = 8;
+const _: () =
+    assert!(MAX_WASM_COMPONENT_BYTES + 64 * 1024 <= crate::process::ipc::MAX_FRAME_BYTES as u64);
 
 /// Longest allowed plugin name.
 const MAX_NAME_LEN: usize = 64;
@@ -162,40 +163,37 @@ pub fn plugins_dir(home: &Path) -> PathBuf {
     home.join(PLUGINS_DIR_NAME)
 }
 
-/// The scripting engine a plugin's code is written for.
+/// The engine a plugin's code is written for.
+///
+/// WebAssembly is the only one; the manifest names it so that another
+/// could be added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PluginEngine {
-    /// Lua 5.4. See the scripting guide for the API available to Lua code.
-    Lua,
+    /// A WebAssembly component targeting the `plugin` world in `sdk/rust/kiki-plugin/wit/kiki-plugin.wit`, or a
+    /// core module carrying that world's type information, which Kiki turns into one.
+    Wasm,
 }
 
 impl PluginEngine {
     /// The engine's name, as written in a manifest.
     pub fn name(self) -> &'static str {
         match self {
-            Self::Lua => "lua",
+            Self::Wasm => "wasm",
         }
     }
 
     /// The file extension of the engine's source files, without the dot.
     pub fn source_extension(self) -> &'static str {
         match self {
-            Self::Lua => "lua",
+            Self::Wasm => "wasm",
         }
     }
 
     /// The entrypoint a plugin has when its manifest does not name one.
     pub fn default_entrypoint(self) -> &'static str {
         match self {
-            Self::Lua => "main.lua",
-        }
-    }
-
-    /// Whether this build of Kiki can run plugins written for the engine.
-    pub fn is_supported(self) -> bool {
-        match self {
-            Self::Lua => true,
+            Self::Wasm => "plugin.wasm",
         }
     }
 }
@@ -281,7 +279,7 @@ impl PluginSource {
 /// refuses the calls a plugin makes without the permission they need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum Permission {
-    /// Delete stored entries, with `kiki.entries.delete_where`.
+    /// Delete stored entries, with `delete-entries`.
     #[serde(rename = "entries.delete")]
     EntriesDelete,
 }
@@ -326,11 +324,11 @@ pub struct PluginManifest {
     /// [Semantic Versioning]: https://semver.org
     pub version: String,
 
-    /// The scripting engine the plugin's code is written for.
+    /// The engine the plugin's code is written for.
     pub engine: PluginEngine,
 
-    /// Path of the file whose code runs when the plugin is loaded, relative
-    /// to the plugin directory. Defaults to `main.lua` for Lua plugins.
+    /// Path of the plugin's WebAssembly component, relative to the plugin
+    /// directory. Defaults to `plugin.wasm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
 
@@ -359,8 +357,8 @@ pub struct PluginManifest {
     /// may run before it is stopped: a positive integer, or `"unlimited"`
     /// for no limit. Defaults to [`TimeBudget::DEFAULT`], 100 ms.
     ///
-    /// Time a handler spends waiting on the server, in calls to
-    /// `kiki.store`, `kiki.entries` and `kiki.feeds`, does not count, up to
+    /// Time a handler spends waiting on the server, in calls to its store,
+    /// stored entries and feeds, does not count, up to
     /// a second per call of the handler. An unlimited handler is still
     /// stopped, together with every other plugin, if it keeps the script
     /// host from answering for 10 seconds; see [`TimeBudget::Unlimited`].
@@ -379,7 +377,7 @@ pub struct PluginManifest {
     pub permissions: Vec<Permission>,
 
     /// The plugin's default config, the manifest's `[config]` table, handed
-    /// to its entrypoint as its argument. The plugin's config overrides, kept
+    /// to its `init` when it loads. The plugin's config overrides, kept
     /// in the database, replace these key by key.
     ///
     /// The table is held as JSON, the form configs take everywhere else; see
@@ -540,13 +538,13 @@ impl PluginManifest {
     /// let manifest = PluginManifest::parse(r#"
     ///     name = "hello"
     ///     version = "0.1.0"
-    ///     engine = "lua"
+    ///     engine = "wasm"
     ///
     ///     [config]
     ///     greeting = "hi"
     /// "#).unwrap();
-    /// assert_eq!(manifest.engine, PluginEngine::Lua);
-    /// assert_eq!(manifest.entrypoint(), "main.lua");
+    /// assert_eq!(manifest.engine, PluginEngine::Wasm);
+    /// assert_eq!(manifest.entrypoint(), "plugin.wasm");
     /// assert!(manifest.enabled);
     /// assert_eq!(manifest.config["greeting"], "hi");
     ///
@@ -611,10 +609,10 @@ pub enum PluginError {
     #[error("invalid plugin version {0:?}: versions must be of the form MAJOR.MINOR.PATCH")]
     InvalidVersion(String),
 
-    /// The entrypoint is not a relative path to a source file inside the
+    /// The entrypoint is not a relative path to a `.wasm` file inside the
     /// plugin directory.
     #[error(
-        "invalid entrypoint {0:?}: it must be a relative path to a source file inside \
+        "invalid entrypoint {0:?}: it must be a relative path to a .wasm file inside \
          the plugin directory"
     )]
     InvalidEntrypoint(String),
@@ -632,7 +630,7 @@ pub enum PluginError {
     #[error("{path} is too large: the limit is {limit} bytes")]
     TooLarge { path: PathBuf, limit: u64 },
 
-    /// A source file is not valid UTF-8.
+    /// A manifest is not valid UTF-8.
     #[error("{0} is not valid UTF-8")]
     NotUtf8(PathBuf),
 
@@ -669,7 +667,7 @@ impl Plugin {
     /// Loads the plugin from `source` in directory `dir`, reading and
     /// validating its manifest. Its config is the manifest's defaults.
     ///
-    /// Source files are not read until [`Self::load_source`].
+    /// The plugin's code is not read until [`Self::load_source`].
     ///
     /// # Errors
     ///
@@ -704,50 +702,39 @@ impl Plugin {
             .unwrap_or_default()
     }
 
-    /// Reads the plugin's source files, ready to hand to a script runner.
-    ///
-    /// Every file in the plugin directory (and its subdirectories) with the
-    /// engine's source extension is read, and becomes a module named after
-    /// its path, as described in [`module_name`]. Symbolic links inside the
-    /// plugin directory are skipped.
+    /// Reads the plugin's entrypoint, its WebAssembly component, ready to
+    /// hand to a script runner.
     ///
     /// # Errors
     ///
-    /// Returns an error if a source file cannot be read or is not UTF-8, or
-    /// if the sources are larger than [`MAX_PLUGIN_SOURCE_BYTES`] in total.
+    /// Returns an error if the component cannot be read, or is larger than
+    /// [`MAX_WASM_COMPONENT_BYTES`].
     pub fn load_source(&self) -> Result<ScriptSource, PluginError> {
-        let extension = self.manifest.engine.source_extension();
-        let mut files = Vec::new();
-        collect_source_files(&self.dir, &self.dir, extension, 0, &mut files)?;
-        files.sort();
-
-        let entrypoint = Path::new(self.manifest.entrypoint());
-        let mut total: u64 = 0;
-        let mut text = None;
-        let mut modules = Vec::with_capacity(files.len());
-        for relative in files {
-            let path = self.dir.join(&relative);
-            let source = read_source_file(&path, &mut total)?;
-            if relative == entrypoint {
-                text = Some(source);
-            } else if let Some(name) = module_name(&relative, extension) {
-                modules.push(ScriptModule { name, text: source });
-            }
-        }
-
-        // The entrypoint can be a symbolic link, which the walk skips.
-        let text = match text {
-            Some(text) => text,
-            None => read_source_file(&self.dir.join(entrypoint), &mut total)?,
+        let path = self.dir.join(self.manifest.entrypoint());
+        let io_err = |source| PluginError::Io {
+            path: path.clone(),
+            source,
         };
-
+        let len = std::fs::metadata(&path).map_err(io_err)?.len();
+        if len > MAX_WASM_COMPONENT_BYTES {
+            return Err(PluginError::TooLarge {
+                path,
+                limit: MAX_WASM_COMPONENT_BYTES,
+            });
+        }
+        let bytes = std::fs::read(&path).map_err(io_err)?;
+        if bytes.len() as u64 > MAX_WASM_COMPONENT_BYTES {
+            return Err(PluginError::TooLarge {
+                path,
+                limit: MAX_WASM_COMPONENT_BYTES,
+            });
+        }
         Ok(ScriptSource {
             name: self.manifest.name.clone(),
-            text,
             config: serde_json::Value::Object(self.config.clone()).to_string(),
-            modules,
             time_budget: self.manifest.time_budget(),
             permissions: self.manifest.permissions.clone(),
+            component: WasmComponent::new(bytes),
         })
     }
 }
@@ -778,109 +765,6 @@ pub fn apply_config_overrides(
     let mut config = defaults.clone();
     config.extend(overrides);
     config
-}
-
-/// The name that the source file at `relative` (a path inside a plugin
-/// directory) is loaded under, if it has one.
-///
-/// Directory separators become dots and the extension is dropped, so
-/// `lib/rules.lua` is `lib.rules`. A file named `init` stands for its
-/// directory: `lib/init.lua` is `lib`. Files whose path components are not
-/// valid module name parts (letters, digits and `_`, or `-`) have no name.
-///
-/// # Examples
-///
-/// ```
-/// use kiki_rss::plugins::module_name;
-/// use std::path::Path;
-///
-/// assert_eq!(module_name(Path::new("lib/rules.lua"), "lua").as_deref(), Some("lib.rules"));
-/// assert_eq!(module_name(Path::new("lib/init.lua"), "lua").as_deref(), Some("lib"));
-/// assert_eq!(module_name(Path::new("a.b.lua"), "lua"), None);
-/// ```
-pub fn module_name(relative: &Path, extension: &str) -> Option<String> {
-    if relative.extension()? != extension {
-        return None;
-    }
-    let stem = relative.with_extension("");
-    let mut parts = Vec::new();
-    for component in stem.components() {
-        let Component::Normal(part) = component else {
-            return None;
-        };
-        let part = part.to_str()?;
-        let valid = !part.is_empty()
-            && part
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-        if !valid {
-            return None;
-        }
-        parts.push(part);
-    }
-    if parts.len() > 1 && parts.last() == Some(&"init") {
-        parts.pop();
-    }
-    Some(parts.join("."))
-}
-
-/// Collects the paths, relative to `root`, of the files under `dir` with the
-/// given extension, skipping hidden entries and symbolic links.
-fn collect_source_files(
-    root: &Path,
-    dir: &Path,
-    extension: &str,
-    depth: usize,
-    out: &mut Vec<PathBuf>,
-) -> Result<(), PluginError> {
-    if depth > MAX_SOURCE_DEPTH {
-        return Ok(());
-    }
-    let entries = std::fs::read_dir(dir).map_err(|source| PluginError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| PluginError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        if entry.file_name().to_string_lossy().starts_with('.') {
-            continue;
-        }
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|source| PluginError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if file_type.is_dir() {
-            collect_source_files(root, &path, extension, depth + 1, out)?;
-        } else if file_type.is_file() && path.extension().is_some_and(|e| e == extension) {
-            if let Ok(relative) = path.strip_prefix(root) {
-                out.push(relative.to_path_buf());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Reads the source file at `path`, adding its size to `total` and failing
-/// if that takes it over [`MAX_PLUGIN_SOURCE_BYTES`].
-fn read_source_file(path: &Path, total: &mut u64) -> Result<String, PluginError> {
-    let io_err = |source| PluginError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-    let len = std::fs::metadata(path).map_err(io_err)?.len();
-    *total = total.saturating_add(len);
-    if *total > MAX_PLUGIN_SOURCE_BYTES {
-        return Err(PluginError::TooLarge {
-            path: path.to_path_buf(),
-            limit: MAX_PLUGIN_SOURCE_BYTES,
-        });
-    }
-    let bytes = std::fs::read(path).map_err(io_err)?;
-    String::from_utf8(bytes).map_err(|_| PluginError::NotUtf8(path.to_path_buf()))
 }
 
 /// Reads a manifest file, returning `None` if it does not exist.
@@ -942,9 +826,9 @@ impl Discovery {
     /// std::fs::create_dir_all(&plugin).unwrap();
     /// std::fs::write(
     ///     plugin.join("manifest.toml"),
-    ///     "name = 'hello'\nversion = '1.0.0'\nengine = 'lua'\n[config]\na = 1\nb = 2\n",
+    ///     "name = 'hello'\nversion = '1.0.0'\nengine = 'wasm'\n[config]\na = 1\nb = 2\n",
     /// ).unwrap();
-    /// std::fs::write(plugin.join("main.lua"), "").unwrap();
+    /// std::fs::write(plugin.join("plugin.wasm"), "").unwrap();
     ///
     /// let mut found = discover(dir.path()).unwrap();
     /// let overrides = json!({"b": 3});
@@ -997,9 +881,9 @@ impl Discovery {
 /// std::fs::create_dir_all(&plugin).unwrap();
 /// std::fs::write(
 ///     plugin.join("manifest.toml"),
-///     "name = 'hello'\nversion = '1.0.0'\nengine = 'lua'\n",
+///     "name = 'hello'\nversion = '1.0.0'\nengine = 'wasm'\n",
 /// ).unwrap();
-/// std::fs::write(plugin.join("main.lua"), "kiki.log('info', 'hello')").unwrap();
+/// std::fs::write(plugin.join("plugin.wasm"), "").unwrap();
 ///
 /// let found = discover(dir.path()).unwrap();
 /// assert_eq!(found.plugins.len(), 1);
@@ -1081,17 +965,14 @@ fn list_dirs(dir: &Path) -> Result<Vec<PathBuf>, PluginError> {
     Ok(dirs)
 }
 
-/// Reads the source of every enabled plugin in `discovery` whose engine is
-/// `engine`, logging each plugin that cannot be loaded.
-pub fn load_sources(discovery: &Discovery, engine: PluginEngine) -> Vec<ScriptSource> {
+/// Reads the code of every enabled plugin in `discovery`, in the order the
+/// plugins load in, logging each plugin that cannot be loaded.
+pub fn load_sources(discovery: &Discovery) -> Vec<ScriptSource> {
     let mut sources = Vec::new();
     for plugin in &discovery.plugins {
         let name = &plugin.manifest.name;
         if !plugin.manifest.enabled {
             tracing::debug!(plugin = %name, "skipping disabled plugin");
-            continue;
-        }
-        if plugin.manifest.engine != engine {
             continue;
         }
         match plugin.load_source() {
@@ -1168,7 +1049,7 @@ pub fn migrate_retention_setting(
 
 /// Installs a plugin into `plugins_dir`, the system or user directory inside
 /// the plugins directory, in a directory named after it: writes its
-/// manifest and its entrypoint, containing `text`.
+/// manifest and its entrypoint, containing `code`.
 ///
 /// The manifest's config must be representable in TOML, so it may not
 /// contain `null`.
@@ -1183,7 +1064,7 @@ pub fn migrate_retention_setting(
 pub fn install(
     plugins_dir: &Path,
     manifest: &PluginManifest,
-    text: &str,
+    code: &[u8],
 ) -> anyhow::Result<PathBuf> {
     use anyhow::Context;
 
@@ -1196,7 +1077,7 @@ pub fn install(
     let manifest_toml = toml::to_string_pretty(manifest)?;
     std::fs::write(dir.join(MANIFEST_FILE_NAME), manifest_toml)
         .with_context(|| format!("unable to write the manifest in {}", dir.display()))?;
-    std::fs::write(dir.join(manifest.entrypoint()), text)
+    std::fs::write(dir.join(manifest.entrypoint()), code)
         .with_context(|| format!("unable to write the entrypoint in {}", dir.display()))?;
     Ok(dir)
 }
@@ -1211,7 +1092,7 @@ mod tests {
         PluginManifest {
             name: name.to_string(),
             version: "1.0.0".to_string(),
-            engine: PluginEngine::Lua,
+            engine: PluginEngine::Wasm,
             entrypoint: None,
             description: None,
             authors: vec![],
@@ -1243,11 +1124,11 @@ mod tests {
     #[test]
     fn manifest_requires_name_version_and_engine() {
         for text in [
-            "version = '1.0.0'\nengine = 'lua'",
-            "name = 'a'\nengine = 'lua'",
+            "version = '1.0.0'\nengine = 'wasm'",
+            "name = 'a'\nengine = 'wasm'",
             "name = 'a'\nversion = '1.0.0'",
             "name = 'a'\nversion = '1.0.0'\nengine = 'python'",
-            "name = 'a'\nversion = '1.0.0'\nengine = 'lua'\nconfig = 1",
+            "name = 'a'\nversion = '1.0.0'\nengine = 'wasm'\nconfig = 1",
             "not toml",
         ] {
             assert!(
@@ -1263,12 +1144,12 @@ mod tests {
     #[test]
     fn manifest_validates_names() {
         for name in ["hello", "hello-world", "hello_world", "2fa", "a"] {
-            let text = format!("name = '{name}'\nversion = '1.0.0'\nengine = 'lua'");
+            let text = format!("name = '{name}'\nversion = '1.0.0'\nengine = 'wasm'");
             assert!(PluginManifest::parse(&text).is_ok(), "{name}");
         }
         let long = "a".repeat(MAX_NAME_LEN + 1);
         for name in ["", "Hello", "-a", "_a", "a b", "a/b", "..", long.as_str()] {
-            let text = format!("name = '{name}'\nversion = '1.0.0'\nengine = 'lua'");
+            let text = format!("name = '{name}'\nversion = '1.0.0'\nengine = 'wasm'");
             assert!(
                 matches!(
                     PluginManifest::parse(&text),
@@ -1288,11 +1169,11 @@ mod tests {
             "1.0.0-alpha.1",
             "1.0.0+build.5",
         ] {
-            let text = format!("name = 'a'\nversion = '{version}'\nengine = 'lua'");
+            let text = format!("name = 'a'\nversion = '{version}'\nengine = 'wasm'");
             assert!(PluginManifest::parse(&text).is_ok(), "{version}");
         }
         for version in ["", "1", "1.0", "v1.0.0", "01.0.0", "1.0.0.0", "1.0.0-"] {
-            let text = format!("name = 'a'\nversion = '{version}'\nengine = 'lua'");
+            let text = format!("name = 'a'\nversion = '{version}'\nengine = 'wasm'");
             assert!(
                 matches!(
                     PluginManifest::parse(&text),
@@ -1306,14 +1187,14 @@ mod tests {
     #[test]
     fn manifest_entrypoint_must_stay_inside_the_plugin() {
         for entrypoint in [
-            "../main.lua",
-            "/etc/main.lua",
-            "lib/../main.lua",
-            "main.py",
+            "../plugin.wasm",
+            "/etc/plugin.wasm",
+            "lib/../plugin.wasm",
+            "main.lua",
             "",
         ] {
             let text = format!(
-                "name = 'a'\nversion = '1.0.0'\nengine = 'lua'\nentrypoint = '{entrypoint}'"
+                "name = 'a'\nversion = '1.0.0'\nengine = 'wasm'\nentrypoint = '{entrypoint}'"
             );
             assert!(
                 matches!(
@@ -1323,10 +1204,11 @@ mod tests {
                 "{entrypoint}"
             );
         }
-        let text = "name = 'a'\nversion = '1.0.0'\nengine = 'lua'\nentrypoint = 'src/init.lua'";
+        let text =
+            "name = 'a'\nversion = '1.0.0'\nengine = 'wasm'\nentrypoint = 'build/hello.wasm'";
         assert_eq!(
             PluginManifest::parse(text).unwrap().entrypoint(),
-            "src/init.lua"
+            "build/hello.wasm"
         );
     }
 
@@ -1335,7 +1217,7 @@ mod tests {
         let text = r#"
             name = "a"
             version = "1.0.0"
-            engine = "lua"
+            engine = "wasm"
 
             [config]
             count = 3
@@ -1361,7 +1243,7 @@ mod tests {
             })
         );
 
-        let text = "name = 'a'\nversion = '1.0.0'\nengine = 'lua'\n[config]\nx = nan";
+        let text = "name = 'a'\nversion = '1.0.0'\nengine = 'wasm'\n[config]\nx = nan";
         assert!(matches!(
             PluginManifest::parse(text),
             Err(PluginError::InvalidManifest(_))
@@ -1374,7 +1256,7 @@ mod tests {
         let mut m = manifest("a");
         m.description = Some("A plugin".to_string());
         m.config = serde_json::from_str(r#"{"x": 1, "nested": {"y": [1, 2]}, "z": "s"}"#).unwrap();
-        install(td.path(), &m, "").unwrap();
+        install(td.path(), &m, b"").unwrap();
 
         let plugin = Plugin::load(&td.path().join("a"), PluginSource::User).unwrap();
         assert_eq!(plugin.manifest, m);
@@ -1384,7 +1266,7 @@ mod tests {
     fn manifest_time_budget_is_milliseconds_or_unlimited() {
         let parse = |budget: &str| {
             PluginManifest::parse(&format!(
-                "name = 'a'\nversion = '1.0.0'\nengine = 'lua'\n{budget}"
+                "name = 'a'\nversion = '1.0.0'\nengine = 'wasm'\n{budget}"
             ))
         };
         assert_eq!(parse("").unwrap().time_budget(), TimeBudget::DEFAULT);
@@ -1419,7 +1301,7 @@ mod tests {
         ] {
             let mut m = manifest(name);
             m.time_budget_ms = budget;
-            install(td.path(), &m, "").unwrap();
+            install(td.path(), &m, b"").unwrap();
             let plugin = Plugin::load(&td.path().join(name), PluginSource::User).unwrap();
             assert_eq!(plugin.manifest.time_budget_ms, budget);
             assert_eq!(
@@ -1431,7 +1313,7 @@ mod tests {
 
     #[test]
     fn manifest_ignores_unknown_fields() {
-        let text = "name = 'a'\nversion = '1.0.0'\nengine = 'lua'\nkeywords = ['x']";
+        let text = "name = 'a'\nversion = '1.0.0'\nengine = 'wasm'\nkeywords = ['x']";
         assert!(PluginManifest::parse(text).is_ok());
     }
 
@@ -1458,7 +1340,7 @@ mod tests {
                 &parent.join(dir).join(MANIFEST_FILE_NAME),
                 &toml::to_string(&manifest(name)).unwrap(),
             );
-            write(&parent.join(dir).join("main.lua"), "");
+            write(&parent.join(dir).join("plugin.wasm"), "");
         }
         // Hidden directories and plain files are not plugins.
         write(&user.join(".hidden").join(MANIFEST_FILE_NAME), "{}");
@@ -1487,8 +1369,8 @@ mod tests {
     #[test]
     fn system_plugins_win_name_ties() {
         let td = TempDir::new().unwrap();
-        install(&PluginSource::User.dir(td.path()), &manifest("a"), "").unwrap();
-        install(&PluginSource::System.dir(td.path()), &manifest("a"), "").unwrap();
+        install(&PluginSource::User.dir(td.path()), &manifest("a"), b"").unwrap();
+        install(&PluginSource::System.dir(td.path()), &manifest("a"), b"").unwrap();
 
         let found = discover(td.path()).unwrap();
         assert_eq!(found.plugins.len(), 1);
@@ -1507,8 +1389,8 @@ mod tests {
     #[test]
     fn plugins_outside_the_system_and_user_directories_are_reported() {
         let td = TempDir::new().unwrap();
-        install(td.path(), &manifest("stray"), "").unwrap();
-        install(&PluginSource::User.dir(td.path()), &manifest("a"), "").unwrap();
+        install(td.path(), &manifest("stray"), b"").unwrap();
+        install(&PluginSource::User.dir(td.path()), &manifest("a"), b"").unwrap();
 
         let found = discover(td.path()).unwrap();
         assert_eq!(found.plugins.len(), 1);
@@ -1535,7 +1417,7 @@ mod tests {
                 &td.path().join(dir).join(MANIFEST_FILE_NAME),
                 &toml::to_string(&manifest("a")).unwrap(),
             );
-            write(&td.path().join(dir).join("main.lua"), "");
+            write(&td.path().join(dir).join("plugin.wasm"), "");
         }
 
         let found = discover(tmp.path()).unwrap();
@@ -1565,8 +1447,8 @@ mod tests {
         let td = Plugins(PluginSource::User.dir(tmp.path()));
         let mut m = manifest("a");
         m.config = serde_json::from_str(r#"{"x": 1, "y": 2}"#).unwrap();
-        install(td.path(), &m, "").unwrap();
-        install(td.path(), &manifest("b"), "").unwrap();
+        install(td.path(), &m, b"").unwrap();
+        install(td.path(), &manifest("b"), b"").unwrap();
 
         let mut found = discover(tmp.path()).unwrap();
         assert_eq!(found.plugins[0].config, m.config);
@@ -1587,43 +1469,25 @@ mod tests {
     }
 
     #[test]
-    fn source_includes_modules() {
+    fn source_is_the_component() {
         let td = TempDir::new().unwrap();
-        let dir = install(td.path(), &manifest("a"), "-- main").unwrap();
-        write(&dir.join("util.lua"), "-- util");
-        write(&dir.join("lib/rules.lua"), "-- rules");
-        write(&dir.join("lib/init.lua"), "-- lib");
-        write(&dir.join("notes.txt"), "not lua");
-        write(&dir.join(".hidden.lua"), "-- hidden");
+        let dir = install(td.path(), &manifest("a"), b"\0asm").unwrap();
 
         let source = Plugin::load(&dir, PluginSource::User)
             .unwrap()
             .load_source()
             .unwrap();
         assert_eq!(source.name, "a");
-        assert_eq!(source.text, "-- main");
         assert_eq!(source.config, "{}");
-        let modules: Vec<_> = source
-            .modules
-            .iter()
-            .map(|m| (m.name.as_str(), m.text.as_str()))
-            .collect();
-        assert_eq!(
-            modules,
-            [
-                ("lib", "-- lib"),
-                ("lib.rules", "-- rules"),
-                ("util", "-- util")
-            ]
-        );
+        assert_eq!(source.component.bytes, b"\0asm");
     }
 
     #[test]
     fn oversized_plugins_are_rejected() {
         let td = TempDir::new().unwrap();
-        let dir = install(td.path(), &manifest("a"), "").unwrap();
-        let big = "-".repeat(MAX_PLUGIN_SOURCE_BYTES as usize + 1);
-        write(&dir.join("big.lua"), &big);
+        let dir = install(td.path(), &manifest("a"), b"").unwrap();
+        let file = std::fs::File::create(dir.join("plugin.wasm")).unwrap();
+        file.set_len(MAX_WASM_COMPONENT_BYTES + 1).unwrap();
 
         let err = Plugin::load(&dir, PluginSource::User)
             .unwrap()
@@ -1636,12 +1500,12 @@ mod tests {
     fn load_sources_skips_disabled_plugins() {
         let tmp = TempDir::new().unwrap();
         let td = Plugins(PluginSource::User.dir(tmp.path()));
-        install(td.path(), &manifest("on"), "-- on").unwrap();
+        install(td.path(), &manifest("on"), b"on").unwrap();
         let mut off = manifest("off");
         off.enabled = false;
-        install(td.path(), &off, "-- off").unwrap();
+        install(td.path(), &off, b"off").unwrap();
 
-        let sources = load_sources(&discover(tmp.path()).unwrap(), PluginEngine::Lua);
+        let sources = load_sources(&discover(tmp.path()).unwrap());
         let names: Vec<_> = sources.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["on"]);
     }
@@ -1649,7 +1513,7 @@ mod tests {
     #[test]
     fn install_refuses_to_overwrite() {
         let td = TempDir::new().unwrap();
-        install(td.path(), &manifest("a"), "").unwrap();
-        assert!(install(td.path(), &manifest("a"), "").is_err());
+        install(td.path(), &manifest("a"), b"").unwrap();
+        assert!(install(td.path(), &manifest("a"), b"").is_err());
     }
 }

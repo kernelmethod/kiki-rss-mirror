@@ -1,0 +1,16 @@
+[package]
+name = "kiki-retention"
+version = "2.0.0"
+edition = "2021"
+publish = false
+description = "Kiki's retention plugin, installed as plugins/retention/plugin.wasm"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kiki-plugin = { path = "../../sdk/rust/kiki-plugin" }
+serde_json = "1"
+# For WASI's wall clock; the same version kiki-plugin uses.
+wit-bindgen = { version = "0.57", default-features = false, features = ["macros", "realloc"] }

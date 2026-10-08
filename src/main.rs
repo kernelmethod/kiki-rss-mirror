@@ -77,7 +77,7 @@ pub enum Commands {
     #[command(name = kiki_rss::process::feed_fetcher::RESOLVER_SUBCOMMAND, hide = true)]
     FeedResolver(cli::child::ChildArgs),
 
-    /// Internal: run the sandboxed Lua script host. Spawned by `serve`.
+    /// Internal: run the sandboxed script host. Spawned by `serve`.
     #[cfg(unix)]
     #[command(name = kiki_rss::process::script_host::SUBCOMMAND, hide = true)]
     ScriptHost(cli::child::ChildArgs),

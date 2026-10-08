@@ -57,7 +57,7 @@ CREATE TABLE plugins (
 );
 
 -- Each plugin's key-value store, read and written by its code with
--- `kiki.store.get` and `kiki.store.set`. `value` is JSON.
+-- `store-get` and `store-set`. `value` is JSON.
 CREATE TABLE plugin_store (
     plugin      VARCHAR NOT NULL,
     key         VARCHAR NOT NULL,

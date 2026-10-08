@@ -1,6 +1,6 @@
 [package]
 name = "kiki-rss"
-version = "0.35.0"
+version = "0.36.0"
 edition = "2021"
 description = "An RSS feed aggregator"
 license = "MIT"
@@ -23,7 +23,7 @@ systemd = []
 api-docs = ["utoipa-scalar"]
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 web-ui = ["cli"]
-# Bundle the plugins in plugins/ that `kiki init` installs (see build.rs)
+# Bundle the plugins in plugins/ that `kiki init` installs (see build.rs).
 default-plugins = ["dep:tar", "dep:zstd"]
 extra-tests = []
 
@@ -50,7 +50,6 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 serde_bytes = "0.11"
 metrics = { version = "0.24", optional = true }
 metrics-exporter-prometheus = { version = "0.17", default-features = false, optional = true }
-mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 regex = "1"
 thiserror = "2.0.18"
 utoipa = { version = "5", features = ["axum_extras"] }
@@ -70,6 +69,8 @@ sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.3"
 subtle = "2"
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime", "component-model", "std", "addr2line", "demangle"] }
+wit-component = { version = "0.248", default-features = false }
 
 [build-dependencies]
 tar = { version = "0.4", default-features = false, optional = true }
@@ -83,11 +84,13 @@ landlock = "0.4"
 seccompiler = "0.5"
 
 [dev-dependencies]
+wat = "1"
 flate2 = "1"
 http = "1"
 itertools = "0.14"
 serial_test = "3.4"
 tempfile = "3"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [profile.dev]
 incremental = true
@@ -116,49 +119,8 @@ inherits = "release"
 strip = false
 debug = "line-tables-only"
 
-[package.metadata.deb]
-maintainer = "kernelmethod"
-depends = "$auto"
-section = "net"
-priority = "optional"
-maintainer-scripts = "dist/scripts"
-assets = [
-    ["target/release/kiki", "usr/bin/", "755"],
-    ["dist/kiki.service", "usr/lib/systemd/system/", "644"],
-    ["README.md", "usr/share/doc/kiki-rss/", "644"],
-]
-
-[package.metadata.generate-rpm]
-assets = [
-    { source = "target/release/kiki", dest = "/usr/bin/kiki", mode = "755" },
-    { source = "dist/kiki.service", dest = "/usr/lib/systemd/system/kiki.service", mode = "644" },
-    { source = "README.md", dest = "/usr/share/doc/kiki-rss/README.md", mode = "644", doc = true },
-]
-
-pre_install_script = """
-# Create system group if it doesn't exist
-getent group kiki >/dev/null 2>&1 || groupadd --system kiki
-# Create system user if it doesn't exist
-getent passwd kiki >/dev/null 2>&1 || \
-    useradd --system --gid kiki --home-dir /var/lib/kiki \
-        --shell /usr/sbin/nologin --no-create-home kiki
-"""
-
-post_install_script = """
-# Create and set ownership on data directory
-install -d -m 0750 -o kiki -g kiki /var/lib/kiki
-# Initialize the database (idempotent)
-su -s /bin/sh kiki -c 'KIKI_HOME=/var/lib/kiki /usr/bin/kiki init --check'
-# Reload systemd and enable service
-systemctl daemon-reload
-"""
-
-pre_uninstall_script = """
-# Stop and disable service before removal
-systemctl is-active --quiet kiki.service 2>/dev/null && systemctl stop kiki.service
-systemctl is-enabled --quiet kiki.service 2>/dev/null && systemctl disable kiki.service
-true
-"""
-
-[package.metadata.generate-rpm.requires]
-systemd = "*"
+[[bench]]
+name = "sanitize"
+harness = false
+# The plugin is built only for the default plugins.
+required-features = ["default-plugins"]

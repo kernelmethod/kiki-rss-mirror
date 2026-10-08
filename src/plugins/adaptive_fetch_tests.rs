@@ -1,8 +1,9 @@
-//! Tests for the `adaptive-fetch` plugin shipped in `plugins/adaptive-fetch/`.
+//! Tests for the `adaptive-fetch` plugin shipped in `plugins/adaptive-fetch/`,
+//! built from the crate in that directory by `build.rs`.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
-use crate::scripting::lua::LuaScriptRunner;
+use crate::scripting::wasm::WasmScriptRunner;
 use crate::scripting::{
     ContentChange, Event, EventPayload, FeedInfo, FetchSchedule, ScriptRunner, ScriptServices,
     ScriptSource, ServiceCall, ServiceReply,
@@ -12,7 +13,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 const MANIFEST: &str = include_str!("../../plugins/adaptive-fetch/manifest.toml");
-const MAIN: &str = include_str!("../../plugins/adaptive-fetch/main.lua");
+const WASM: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/plugins-wasm/adaptive-fetch.wasm"
+));
 
 const MIN_CADENCE: u64 = 60;
 const DAY: u64 = 86_400;
@@ -70,15 +74,24 @@ impl ScriptServices for FakeServices {
 }
 
 /// The plugin, loaded with `config`, answering its calls with `services`.
-fn plugin(config: Value, services: Arc<FakeServices>) -> LuaScriptRunner {
-    let mut source = ScriptSource::new(MAIN);
-    source.name = "adaptive-fetch".to_string();
-    source.config = config.to_string();
-    LuaScriptRunner::from_sources_with(&[source], Some(services)).unwrap()
+fn plugin(config: Value, services: Arc<FakeServices>) -> WasmScriptRunner {
+    load(config, Some(services)).unwrap()
+}
+
+/// The plugin, loaded with `config`, answering its calls with `services`, if
+/// given.
+fn load(config: Value, services: Option<Arc<FakeServices>>) -> Result<WasmScriptRunner, String> {
+    let source = ScriptSource {
+        name: "adaptive-fetch".to_string(),
+        config: config.to_string(),
+        ..ScriptSource::new(WASM.to_vec())
+    };
+    let services = services.map(|s| s as Arc<dyn ScriptServices>);
+    WasmScriptRunner::from_sources_with(&[source], services).map_err(|e| e.to_string())
 }
 
 /// The plugin with its default config, and its services.
-fn default_plugin() -> (LuaScriptRunner, Arc<FakeServices>) {
+fn default_plugin() -> (WasmScriptRunner, Arc<FakeServices>) {
     let manifest = crate::plugins::PluginManifest::parse(MANIFEST).unwrap();
     let services = Arc::new(FakeServices::default());
     (
@@ -106,7 +119,7 @@ fn fetch_feed(feed_id: i64, change: ContentChange, hint: u64, interval: u64) -> 
 }
 
 /// The wait the plugin chose for `schedule`, if it chose one.
-fn wait(runner: &LuaScriptRunner, schedule: FetchSchedule) -> Option<u64> {
+fn wait(runner: &WasmScriptRunner, schedule: FetchSchedule) -> Option<u64> {
     runner.dispatch_schedule(schedule).unwrap().map(|d| {
         assert_eq!(d.plugin, "adaptive-fetch");
         d.wait_secs
@@ -116,7 +129,7 @@ fn wait(runner: &LuaScriptRunner, schedule: FetchSchedule) -> Option<u64> {
 /// `n` fetches of feed 1 finding it `change`d or not, with a 0s hint on a
 /// feed with `interval`, returning each wait chosen.
 fn waits(
-    runner: &LuaScriptRunner,
+    runner: &WasmScriptRunner,
     change: ContentChange,
     interval: u64,
     n: usize,
@@ -329,9 +342,6 @@ fn only_the_listed_feeds_are_backed_off_from() {
 
 #[test]
 fn invalid_feed_lists_fail_the_load() {
-    let mut source = ScriptSource::new(MAIN);
-    source.name = "adaptive-fetch".to_string();
-    source.config = json!({ "exclude": [1.5] }).to_string();
-    let err = LuaScriptRunner::from_sources(&[source]).err().unwrap();
-    assert!(err.to_string().contains("exclude[1]"), "{err}");
+    let err = load(json!({ "exclude": [1.5] }), None).err().unwrap();
+    assert!(err.contains("exclude[1]"), "{err}");
 }

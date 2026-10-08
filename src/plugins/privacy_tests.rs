@@ -1,8 +1,9 @@
-//! Tests for the `privacy` plugin shipped in `plugins/privacy/`.
+//! Tests for the `privacy` plugin shipped in `plugins/privacy/`, built from
+//! the crate in that directory by `build.rs`.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
-use crate::scripting::lua::LuaScriptRunner;
+use crate::scripting::wasm::WasmScriptRunner;
 use crate::scripting::{
     Event, EventPayload, FeedEntry, FeedInfo, ScriptRunner, ScriptServices, ScriptSource,
     ServiceCall, ServiceReply,
@@ -12,18 +13,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const MANIFEST: &str = include_str!("../../plugins/privacy/manifest.toml");
-const MAIN: &str = include_str!("../../plugins/privacy/main.lua");
+const WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/privacy.wasm"));
+
+/// The plugin, loaded with `config`, looking feeds up in `services`.
+fn load(
+    config: Value,
+    services: Option<Arc<dyn ScriptServices>>,
+) -> Result<WasmScriptRunner, String> {
+    let source = ScriptSource {
+        name: "privacy".to_string(),
+        config: config.to_string(),
+        ..ScriptSource::new(WASM.to_vec())
+    };
+    WasmScriptRunner::from_sources_with(&[source], services).map_err(|e| e.to_string())
+}
 
 /// The plugin, loaded with `config`.
-fn plugin(config: Value) -> Result<LuaScriptRunner, crate::scripting::lua::ScriptError> {
-    let mut source = ScriptSource::new(MAIN);
-    source.name = "privacy".to_string();
-    source.config = config.to_string();
-    LuaScriptRunner::from_sources(&[source])
+fn plugin(config: Value) -> Result<WasmScriptRunner, String> {
+    load(config, None)
 }
 
 /// The plugin, loaded with its default config.
-fn default_plugin() -> LuaScriptRunner {
+fn default_plugin() -> WasmScriptRunner {
     let manifest = crate::plugins::PluginManifest::parse(MANIFEST).unwrap();
     plugin(Value::Object(manifest.config)).unwrap()
 }
@@ -45,17 +56,17 @@ fn entry(url: Option<&str>, content: Option<&str>) -> FeedEntry {
     }
 }
 
-fn ingest(runner: &LuaScriptRunner, entry: FeedEntry) -> FeedEntry {
+fn ingest(runner: &WasmScriptRunner, entry: FeedEntry) -> FeedEntry {
     runner.dispatch_transform_entry(entry).unwrap().unwrap()
 }
 
 /// The entry URL `url` becomes, going through `runner`.
-fn clean_url(runner: &LuaScriptRunner, url: &str) -> String {
+fn clean_url(runner: &WasmScriptRunner, url: &str) -> String {
     ingest(runner, entry(Some(url), None)).url.unwrap()
 }
 
 /// The content `content` becomes, going through `runner`.
-fn clean_content(runner: &LuaScriptRunner, content: &str) -> String {
+fn clean_content(runner: &WasmScriptRunner, content: &str) -> String {
     ingest(runner, entry(None, Some(content))).content.unwrap()
 }
 
@@ -193,7 +204,7 @@ fn bad_params_fail_to_load() {
         json!({"params": ["*"]}),
         json!({"params": [3]}),
     ] {
-        let err = plugin(config.clone()).err().unwrap().to_string();
+        let err = plugin(config.clone()).err().unwrap();
         assert!(err.contains("privacy: "), "{config}: {err}");
     }
 }
@@ -318,14 +329,14 @@ fn bad_trackers_fail_to_load() {
         json!({"trackers": ["example.com/a b"]}),
         json!({"trackers": [3]}),
     ] {
-        let err = plugin(config.clone()).err().unwrap().to_string();
+        let err = plugin(config.clone()).err().unwrap();
         assert!(err.contains("privacy: "), "{config}: {err}");
     }
 }
 
 /// Whether `runner` lets Kiki cache the assets of an entry from feed
 /// `feed_id`.
-fn caches_assets(runner: &LuaScriptRunner, feed_id: i64) -> bool {
+fn caches_assets(runner: &WasmScriptRunner, feed_id: i64) -> bool {
     let mut e = entry(None, Some("<img src=\"https://example.com/photo.jpg\">"));
     e.feed_id = feed_id;
     let e = ingest(runner, e);
@@ -350,7 +361,7 @@ fn assets_are_not_cached_for_feeds_given_by_id() {
     assert!(!caches_assets(&runner, 3));
 }
 
-/// Answers `kiki.feeds.get` for feed `n` in 1..=3 with the URL
+/// Answers `get-feed` for feed `n` in 1..=3 with the URL
 /// `https://example.com/feed{n}`, counting the lookups.
 #[derive(Default)]
 struct Feeds {
@@ -378,11 +389,8 @@ impl ScriptServices for Feeds {
 #[test]
 fn assets_are_not_cached_for_feeds_given_by_url() {
     let feeds = Arc::new(Feeds::default());
-    let mut source = ScriptSource::new(MAIN);
-    source.name = "privacy".to_string();
-    source.config = json!({"skip_assets": ["https://example.com/feed2", 3]}).to_string();
-    let runner = LuaScriptRunner::from_sources_with(
-        &[source],
+    let runner = load(
+        json!({"skip_assets": ["https://example.com/feed2", 3]}),
         Some(feeds.clone() as Arc<dyn ScriptServices>),
     )
     .unwrap();
@@ -421,7 +429,7 @@ fn bad_skip_assets_fail_to_load() {
         json!({"skip_assets": [1.5]}),
         json!({"skip_assets": [true]}),
     ] {
-        let err = plugin(config.clone()).err().unwrap().to_string();
+        let err = plugin(config.clone()).err().unwrap();
         assert!(err.contains("privacy: "), "{config}: {err}");
     }
 }

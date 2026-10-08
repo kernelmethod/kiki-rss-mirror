@@ -1,9 +1,14 @@
 name = "retention"
-version = "1.0.0"
-engine = "lua"
+version = "2.0.0"
+engine = "wasm"
+entrypoint = "plugin.wasm"
 description = "Delete entries once their feed has stopped listing them for a number of days"
 license = "MIT"
 homepage = "https://github.com/kernelmethod/kiki-rss"
+
+# Written in Rust, as a WebAssembly component: its source is beside this
+# manifest in Kiki's repository. Versions before 2.0.0 were written in Lua,
+# and took the same config.
 
 # Deleting entries cannot be undone, so it takes a permission.
 permissions = ["entries.delete"]
@@ -15,7 +20,7 @@ time_budget_ms = "unlimited"
 
 # Entries are kept for as long as their feed lists them. Once it stops,
 # this plugin deletes them after `max_age_days` days, checking every hour.
-# Zero, the default, keeps every entry forever. See main.lua for how.
+# Zero, the default, keeps every entry forever. See src/lib.rs for how.
 [config]
 max_age_days = 0
 keep_tags = ["system:saved"]

@@ -1,8 +1,8 @@
-//! The server's answers to the calls plugins make through the `kiki` Lua
-//! API: their key-value stores (`kiki.store`), tagging stored entries
-//! (`kiki.entries.tag` and `untag`), scans of stored entries
-//! (`kiki.entries.scan`), deleting stored entries
-//! (`kiki.entries.delete_where`), and looking up feeds (`kiki.feeds.get`).
+//! The server's answers to the calls plugins make through the host
+//! interface: their key-value stores (`store-get` and `store-set`), tagging
+//! stored entries (`tag-entry` and `untag-entry`), scans of stored entries
+//! (`start-scan`), deleting stored entries (`delete-entries`), and looking
+//! up feeds (`get-feed`).
 //!
 //! # Permissions
 //!
@@ -14,7 +14,7 @@
 //!
 //! # Deleting entries
 //!
-//! `kiki.entries.delete_where` deletes only entries their feed has stopped
+//! `delete-entries` deletes only entries their feed has stopped
 //! listing (see [`crate::db::retention::mark_dropped`]): an entry still in
 //! its feed would come back, as a new and unread entry, on the feed's next
 //! refresh. Entries are deleted [`DELETE_BATCH`] at a time, each batch in a
@@ -28,7 +28,7 @@
 //! own so that feed refreshes carry on alongside it. Of what the handler
 //! returns, only the system tags it adds (such as `system:hidden`) are
 //! applied, just as they would be to a new entry; to change anything else
-//! the handler calls `kiki.entries.tag` or `untag` itself.
+//! the handler calls `tag-entry` or `untag-entry` itself.
 //!
 //! A plugin runs at most one scan at a time: starting another cancels the
 //! first. Reloading the plugins ends every scan, since the handlers they
@@ -57,14 +57,14 @@ const READ_BATCH: usize = 200;
 
 /// Most entries a scan hands to the plugin per dispatch. The runner hands
 /// back the ones it did not reach once a dispatch has taken
-/// [`SCAN_SLICE`](crate::scripting::lua::SCAN_SLICE), so events queued
+/// [`SCAN_SLICE`](crate::scripting::SCAN_SLICE), so events queued
 /// behind a scan wait for one slice at most, not a whole batch.
 const DISPATCH_BATCH: usize = 25;
 
 /// Longest user tag name a plugin may set.
 const MAX_TAG_NAME_BYTES: usize = 255;
 
-/// Most entries `kiki.entries.delete_where` deletes in one transaction.
+/// Most entries `delete-entries` deletes in one transaction.
 pub const DELETE_BATCH: u64 = 500;
 
 /// Most user tags there may be for a plugin to create another. Plugins can
@@ -655,8 +655,7 @@ fn strings(conn: &Connection, sql: &str, entry_id: i64) -> rusqlite::Result<Vec<
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::scripting::lua::LuaScriptRunner;
-    use crate::scripting::{Event, EventPayload, ScriptRunner, ScriptSource};
+    use crate::scripting::{Event, EventPayload, FetchSchedule, ScheduleDecision, ScriptRunner};
     use rusqlite::params;
     use std::time::{Duration, Instant};
 
@@ -700,16 +699,102 @@ mod tests {
         .unwrap()
     }
 
-    /// A plugin named `p`, running `text`, loaded into an in-process runner
-    /// whose calls `services` answers, as the server wires them up.
+    /// What a stand-in plugin does with each entry of one of its scans.
+    type ScanHandler = fn(&dyn ScriptServices, FeedEntry) -> Option<FeedEntry>;
+
+    /// What a stand-in plugin does on `plugin.load`: makes calls through its
+    /// services, and starts scans, keeping their handlers in the map.
+    type LoadHandler =
+        Box<dyn Fn(&dyn ScriptServices, &mut HashMap<u64, ScanHandler>) + Send + Sync>;
+
+    /// A runner standing in for one plugin, named `p`, whose calls go to
+    /// the server's services as a real plugin's would.
+    struct FakePlugin {
+        services: Arc<dyn ScriptServices>,
+        load: LoadHandler,
+        /// The handlers of the scans the plugin is running. Locked while
+        /// the plugin runs, as a real runner is.
+        scans: Mutex<HashMap<u64, ScanHandler>>,
+        /// The summaries of the plugin's scans that went through every
+        /// entry.
+        summaries: Mutex<Vec<ScanSummary>>,
+    }
+
+    /// Calls `call` as the plugin `p`.
+    fn call(services: &dyn ScriptServices, call: ServiceCall) -> Result<ServiceReply, String> {
+        services.call("p", call)
+    }
+
+    /// Starts a scan of every visible entry as the plugin `p`, handing each
+    /// entry to `handler`.
+    fn start_scan(
+        services: &dyn ScriptServices,
+        scans: &mut HashMap<u64, ScanHandler>,
+        handler: ScanHandler,
+    ) {
+        let options = ScanOptions::default();
+        match call(services, ServiceCall::StartScan { options }).unwrap() {
+            ServiceReply::ScanStarted(id) => scans.insert(id, handler),
+            other => panic!("expected ScanStarted, got {other:?}"),
+        };
+    }
+
+    impl ScriptRunner for FakePlugin {
+        fn dispatch_transform_entry(&self, entry: FeedEntry) -> anyhow::Result<Option<FeedEntry>> {
+            Ok(Some(entry))
+        }
+
+        fn dispatch_schedule(&self, _: FetchSchedule) -> anyhow::Result<Option<ScheduleDecision>> {
+            Ok(None)
+        }
+
+        fn dispatch_observe(&self, event: Event, _: EventPayload) {
+            if event == Event::PluginLoad {
+                let mut scans = self.scans.lock().unwrap();
+                (self.load)(&*self.services, &mut scans);
+            }
+        }
+
+        fn dispatch_scan(
+            &self,
+            scan_id: u64,
+            entries: Vec<FeedEntry>,
+        ) -> anyhow::Result<Option<Vec<Option<FeedEntry>>>> {
+            let scans = self.scans.lock().unwrap();
+            let Some(handler) = scans.get(&scan_id) else {
+                return Ok(None);
+            };
+            Ok(Some(
+                entries
+                    .into_iter()
+                    .map(|e| handler(&*self.services, e))
+                    .collect(),
+            ))
+        }
+
+        fn finish_scan(&self, scan_id: u64, summary: Option<ScanSummary>) {
+            let removed = self.scans.lock().unwrap().remove(&scan_id);
+            if let (Some(_), Some(summary)) = (removed, summary) {
+                self.summaries.lock().unwrap().push(summary);
+            }
+        }
+    }
+
+    /// A plugin named `p`, which does `load` on `plugin.load`, installed in
+    /// a runner handle whose calls `services` answers, as the server wires
+    /// them up.
     struct Harness {
         pool: Db,
         runner: ScriptRunnerHandle,
         services: Arc<ServerServices>,
+        plugin: Arc<FakePlugin>,
     }
 
     impl Harness {
-        fn new(pool: Db, text: &str) -> Self {
+        fn new(
+            pool: Db,
+            load: impl Fn(&dyn ScriptServices, &mut HashMap<u64, ScanHandler>) + Send + Sync + 'static,
+        ) -> Self {
             let runner = ScriptRunnerHandle::empty();
             let services = Arc::new(ServerServices::new(
                 pool.clone(),
@@ -720,19 +805,24 @@ mod tests {
                 "p".to_string(),
                 vec![Permission::EntriesDelete],
             )]));
-            let mut source = ScriptSource::new(text);
-            source.name = "p".to_string();
-            let lua = LuaScriptRunner::from_sources_with(
-                &[source],
-                Some(services.clone() as Arc<dyn ScriptServices>),
-            )
-            .unwrap();
-            runner.set(Some(Arc::new(lua) as Arc<dyn ScriptRunner>));
+            let plugin = Arc::new(FakePlugin {
+                services: services.clone(),
+                load: Box::new(load),
+                scans: Mutex::new(HashMap::new()),
+                summaries: Mutex::new(Vec::new()),
+            });
+            runner.set(Some(plugin.clone() as Arc<dyn ScriptRunner>));
             Self {
                 pool,
                 runner,
                 services,
+                plugin,
             }
+        }
+
+        /// A plugin that does nothing.
+        fn idle(pool: Db) -> Self {
+            Self::new(pool, |_, _| {})
         }
 
         fn load(&self) {
@@ -752,21 +842,23 @@ mod tests {
         }
     }
 
-    const HIDE_SPAM: &str = r#"
-        local function hide_spam(entry)
-            entry.title = "changed"
-            if entry.guid:find("spam") then
-                table.insert(entry.tags, "system:hidden")
-                table.insert(entry.tags, "user-tag")
-            end
-            if entry.guid == "drop" then return nil end
-            return entry
-        end
-        local options = ...
-        kiki.on("plugin.load", function()
-            kiki.entries.scan(options, hide_spam)
-        end)
-    "#;
+    /// Hides entries whose guid has `spam` in it, and tries, in vain, to
+    /// change their titles and add a user tag.
+    fn hide_spam(_: &dyn ScriptServices, mut entry: FeedEntry) -> Option<FeedEntry> {
+        entry.title = "changed".to_string();
+        if entry.guid.contains("spam") {
+            entry.tags.push("system:hidden".to_string());
+            entry.tags.push("user-tag".to_string());
+        }
+        (entry.guid != "drop").then_some(entry)
+    }
+
+    /// A plugin that scans every entry with [`hide_spam`] when it loads.
+    fn spam_hider(pool: Db) -> Harness {
+        Harness::new(pool, |services, scans| {
+            start_scan(services, scans, hide_spam)
+        })
+    }
 
     #[test]
     fn scans_apply_only_system_tags() {
@@ -777,7 +869,7 @@ mod tests {
         let spam = insert_entry(&conn, feed, "rss", "spam");
         let dropped = insert_entry(&conn, feed, "rss", "drop");
 
-        let h = Harness::new(pool.clone(), HIDE_SPAM);
+        let h = spam_hider(pool.clone());
         h.load();
         h.wait_for_scans();
         assert!(tags(&conn, ham).is_empty());
@@ -801,7 +893,7 @@ mod tests {
             insert_entry(&conn, feed, "rss", &format!("spam-{i}"));
         }
 
-        let h = Harness::new(pool.clone(), HIDE_SPAM);
+        let h = spam_hider(pool.clone());
         let hidden = SystemTag::Hidden.id(&conn).unwrap();
         let mut counts = (0, 0);
         scan(
@@ -903,20 +995,22 @@ mod tests {
         )
         .unwrap();
 
-        // Tags entries through kiki.entries.tag rather than by returning
-        // them, to cover that too.
-        let h = Harness::new(
-            pool.clone(),
-            r#"
-            kiki.on("plugin.load", function()
-                kiki.entries.scan(function(entry)
-                    if entry.authors[1] == "Ada" and entry.categories[1] == "ads" then
-                        kiki.entries.tag(entry.id, "ada-ads")
-                    end
-                end)
-            end)
-            "#,
-        );
+        // Tags entries through tag-entry rather than by returning them, to
+        // cover that too.
+        fn tag_ada_ads(services: &dyn ScriptServices, entry: FeedEntry) -> Option<FeedEntry> {
+            if entry.authors == ["Ada"] && entry.categories == ["ads"] {
+                let tag = ServiceCall::SetEntryTag {
+                    entry_id: entry.id.unwrap(),
+                    tag: "ada-ads".to_string(),
+                    present: true,
+                };
+                call(services, tag).unwrap();
+            }
+            None
+        }
+        let h = Harness::new(pool.clone(), |services, scans| {
+            start_scan(services, scans, tag_ada_ads)
+        });
         h.load();
         h.wait_for_scans();
         assert_eq!(tags(&conn, rss), ["ada-ads"]);
@@ -925,27 +1019,33 @@ mod tests {
 
     #[test]
     fn plugins_can_use_their_store() {
-        let pool = pool();
-        let h = Harness::new(
-            pool.clone(),
-            r#"
-            kiki.on("plugin.load", function()
-                assert(kiki.store.get("missing") == nil)
-                kiki.store.set("rules", { a = { 1, 2 }, b = "x" })
-                local rules = kiki.store.get("rules")
-                assert(rules.a[2] == 2 and rules.b == "x")
-                kiki.store.set("gone", true)
-                kiki.store.set("gone", nil)
-                assert(kiki.store.get("gone") == nil)
-                kiki.store.set("done", true)
-            end)
-            "#,
-        );
-        h.load();
-        let conn = pool.connect();
+        let h = Harness::idle(pool());
+        let get = |key: &str| call(&*h.services, ServiceCall::StoreGet { key: key.into() });
+        let set = |key: &str, value: Option<&str>| {
+            let call_ = ServiceCall::StoreSet {
+                key: key.into(),
+                value: value.map(str::to_string),
+            };
+            call(&*h.services, call_)
+        };
+
+        assert_eq!(get("missing").unwrap(), ServiceReply::Value(None));
         assert_eq!(
-            store_get(&conn, "p", "done").unwrap(),
-            Some(serde_json::json!(true))
+            set("rules", Some(r#"{"a":[1,2],"b":"x"}"#)).unwrap(),
+            ServiceReply::Done
+        );
+        assert_eq!(
+            get("rules").unwrap(),
+            ServiceReply::Value(Some(r#"{"a":[1,2],"b":"x"}"#.to_string()))
+        );
+        set("gone", Some("true")).unwrap();
+        set("gone", None).unwrap();
+        assert_eq!(get("gone").unwrap(), ServiceReply::Value(None));
+        assert!(set("bad", Some("{")).unwrap_err().contains("invalid value"));
+        let conn = h.pool.connect();
+        assert_eq!(
+            store_get(&conn, "p", "rules").unwrap(),
+            Some(serde_json::json!({"a": [1, 2], "b": "x"}))
         );
     }
 
@@ -976,28 +1076,24 @@ mod tests {
             [],
         )
         .unwrap();
-        let h = Harness::new(
-            pool.clone(),
-            r#"
-            kiki.on("plugin.load", function()
-                local feed = kiki.feeds.get(4)
-                assert(feed.id == 4 and feed.title == "Feed")
-                assert(feed.url == "https://example.com/f")
-                assert(kiki.feeds.get(5) == nil)
-                kiki.store.set("done", true)
-            end)
-            "#,
-        );
-        h.load();
+        let h = Harness::idle(pool.clone());
         assert_eq!(
-            store_get(&conn, "p", "done").unwrap(),
-            Some(serde_json::json!(true))
+            call(&*h.services, ServiceCall::GetFeed { feed_id: 4 }).unwrap(),
+            ServiceReply::Feed(Some(FeedInfo {
+                id: 4,
+                url: Some("https://example.com/f".to_string()),
+                title: "Feed".to_string(),
+            }))
+        );
+        assert_eq!(
+            call(&*h.services, ServiceCall::GetFeed { feed_id: 5 }).unwrap(),
+            ServiceReply::Feed(None)
         );
     }
 
     #[test]
     fn unknown_plugins_are_refused() {
-        let h = Harness::new(pool(), "");
+        let h = Harness::idle(pool());
         let err = h
             .services
             .call("other", ServiceCall::StoreGet { key: "k".into() })
@@ -1005,24 +1101,8 @@ mod tests {
         assert!(err.contains("no plugin"), "{err}");
     }
 
-    #[test]
-    fn scans_cannot_start_while_plugins_load() {
-        let pool = pool();
-        let services =
-            ServerServices::new(pool, ScriptRunnerHandle::empty(), CancellationToken::new());
-        services.set_loaded(HashMap::from([(ScriptSource::new("").name, vec![])]));
-        let services: Arc<dyn ScriptServices> = Arc::new(services);
-        let err = LuaScriptRunner::from_sources_with(
-            &[ScriptSource::new("kiki.entries.scan(function() end)")],
-            Some(services),
-        )
-        .err()
-        .unwrap();
-        assert!(err.to_string().contains("plugin.load"), "{err}");
-    }
-
-    /// A scan's `on_done` callback runs once it has gone through every
-    /// entry, with a summary; a scan replaced by another never calls it.
+    /// A scan is finished with a summary once it has gone through every
+    /// entry; a scan replaced by another is finished without one.
     #[test]
     fn on_done_runs_only_when_a_scan_completes() {
         let pool = pool();
@@ -1032,35 +1112,25 @@ mod tests {
             insert_entry(&conn, feed, "rss", &format!("spam-{i}"));
         }
 
-        let h = Harness::new(
-            pool.clone(),
-            r#"
-            local function hide(entry)
-                table.insert(entry.tags, "system:hidden")
-                return entry
-            end
-            kiki.on("plugin.load", function()
-                -- Replaced at once by the second scan, so never done.
-                kiki.entries.scan(hide, function() kiki.store.set("first", true) end)
-                kiki.entries.scan(hide, function(summary)
-                    kiki.store.set("summary", summary)
-                end)
-            end)
-            "#,
-        );
-        h.load();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while store_get(&conn, "p", "summary").unwrap().is_none() {
-            assert!(Instant::now() < deadline, "on_done never ran");
-            std::thread::sleep(Duration::from_millis(10));
+        fn hide(_: &dyn ScriptServices, mut entry: FeedEntry) -> Option<FeedEntry> {
+            entry.tags.push("system:hidden".to_string());
+            Some(entry)
         }
+        let h = Harness::new(pool.clone(), |services, scans| {
+            // Replaced at once by the second scan, so never done.
+            start_scan(services, scans, hide);
+            start_scan(services, scans, hide);
+        });
+        h.load();
         h.wait_for_scans();
         let total = (READ_BATCH + 3) as u64;
         assert_eq!(
-            store_get(&conn, "p", "summary").unwrap(),
-            Some(serde_json::json!({"scanned": total, "updated": total}))
+            *h.plugin.summaries.lock().unwrap(),
+            [ScanSummary {
+                scanned: total,
+                updated: total
+            }]
         );
-        assert_eq!(store_get(&conn, "p", "first").unwrap(), None);
     }
 
     #[test]
@@ -1182,60 +1252,33 @@ mod tests {
     }
 
     #[test]
-    fn plugins_delete_entries_through_delete_where() {
+    fn plugins_delete_entries() {
         let pool = pool();
         let conn = pool.connect();
         let feed = insert_feed(&conn);
         let old = insert_entry(&conn, feed, "rss", "old");
         let recent = insert_entry(&conn, feed, "rss", "recent");
+        let pinned = insert_entry(&conn, feed, "rss", "pinned");
         drop_entry(&conn, old, 10);
         drop_entry(&conn, recent, 1);
+        drop_entry(&conn, pinned, 10);
+        assert!(set_entry_tag(&conn, pinned, "pinned", true).unwrap());
 
-        let h = Harness::new(
-            pool.clone(),
-            r#"
-            kiki.on("plugin.load", function()
-                local week_ago = os.time() - 7 * 86400
-                local deleted = kiki.entries.delete_where { dropped_before = week_ago }
-                kiki.store.set("deleted", deleted)
-                local ok, err = pcall(kiki.entries.delete_where, {})
-                kiki.store.set("missing", not ok and tostring(err):find("dropped_before") ~= nil)
-                ok, err = pcall(kiki.entries.delete_where, { dropped_before = 1, nope = 2 })
-                kiki.store.set("unknown", not ok and tostring(err):find("unknown filter") ~= nil)
-                ok, err = pcall(kiki.entries.delete_where,
-                    { dropped_before = 1, keep_tagged = { "system:nope" } })
-                kiki.store.set("system", not ok and tostring(err):find("not a system tag") ~= nil)
-                local bad = 0
-                for _, tags in ipairs({ { tag = "x" }, { 1 }, true }) do
-                    ok, err = pcall(kiki.entries.delete_where,
-                        { dropped_before = 1, keep_tagged = tags })
-                    if not ok and tostring(err):find("list of them") then
-                        bad = bad + 1
-                    end
-                end
-                kiki.store.set("bad", bad)
-                kiki.store.set("one", kiki.entries.delete_where(
-                    { dropped_before = 1, keep_tagged = "pinned" }))
-            end)
-            "#,
-        );
-        h.load();
-        assert_eq!(entry_ids(&conn), [recent]);
-        for (key, value) in [
-            ("deleted", serde_json::json!(1)),
-            ("missing", serde_json::json!(true)),
-            ("unknown", serde_json::json!(true)),
-            ("system", serde_json::json!(true)),
-            ("bad", serde_json::json!(3)),
-            ("one", serde_json::json!(0)),
-        ] {
-            assert_eq!(store_get(&conn, "p", key).unwrap(), Some(value), "{key}");
-        }
+        let h = Harness::idle(pool.clone());
+        let delete = |filter| call(&*h.services, ServiceCall::DeleteEntries { filter });
+        let filter = DeleteFilter {
+            dropped_before: week_ago(),
+            keep_tagged: vec!["pinned".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(delete(filter.clone()).unwrap(), ServiceReply::Deleted(1));
+        assert_eq!(delete(filter).unwrap(), ServiceReply::Deleted(0));
+        assert_eq!(entry_ids(&conn), [recent, pinned]);
     }
 
     #[test]
     fn deleting_needs_the_permission() {
-        let h = Harness::new(pool(), "");
+        let h = Harness::idle(pool());
         h.services
             .set_loaded(HashMap::from([("p".to_string(), vec![])]));
         let call = ServiceCall::DeleteEntries {
@@ -1259,7 +1302,7 @@ mod tests {
 
     #[test]
     fn plugins_that_are_not_loaded_are_refused() {
-        let h = Harness::new(pool(), "");
+        let h = Harness::idle(pool());
         let previous = h.services.set_loaded(HashMap::new());
         assert!(previous.contains_key("p"));
         let err = h

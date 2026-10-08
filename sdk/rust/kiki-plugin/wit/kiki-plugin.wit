@@ -1,0 +1,297 @@
+// The interface between Kiki and plugins written as WebAssembly components.
+//
+// A plugin whose manifest says `engine = "wasm"` is a component targeting the
+// `plugin` world below, described in the guide's "Writing plugins" chapter.
+//
+// It lives in the kiki-plugin crate, which generates plugins' bindings from
+// it, so that it ships with the crate; Kiki's own bindings, in
+// src/scripting/wasm.rs, are generated from this same file.
+
+package kiki:plugin@0.1.0;
+
+interface types {
+    /// The levels `log` writes at.
+    enum level { debug, info, warn, error }
+
+    /// The events a plugin can handle. `init` returns the ones it does, and
+    /// only those are delivered to it.
+    enum event-kind {
+        entry-parsed,
+        entry-ingest,
+        fetch-success,
+        fetch-error,
+        feed-added,
+        feed-removed,
+        plugin-load,
+        fetch-schedule,
+    }
+
+    /// A feed entry. `id`, `feed-id`, `syndication-format`, `guid`, `authors`
+    /// and `categories` are read-only: changes a handler makes to them are
+    /// discarded.
+    record entry {
+        /// The stored entry's id; `none` for an entry being ingested.
+        id: option<s64>,
+        feed-id: s64,
+        /// `"rss"` or `"atom"`.
+        syndication-format: string,
+        guid: string,
+        /// Unix timestamp.
+        published-at: option<s64>,
+        title: string,
+        url: option<string>,
+        /// HTML.
+        content: option<string>,
+        authors: list<string>,
+        categories: list<string>,
+        tags: list<string>,
+        cache-assets: bool,
+    }
+
+    /// `fetch.success`: a feed was fetched.
+    record fetch-success {
+        feed-id: s64,
+        status: u16,
+        url: string,
+        content-length: option<u64>,
+    }
+
+    /// `fetch.error`: a feed could not be fetched.
+    record fetch-error {
+        feed-id: s64,
+        /// `"http"`, `"timeout"`, `"network"`, `"too_many_redirects"`,
+        /// `"body_too_large"`, `"parse"` or `"fetcher"`.
+        kind: string,
+        status: option<u16>,
+        message: string,
+        retry-after: option<s64>,
+    }
+
+    /// A feed, as `feed.added` and `feed.removed` describe it.
+    record feed-event {
+        id: s64,
+        url: string,
+        title: string,
+    }
+
+    /// A feed, as `get-feed` returns it.
+    record feed {
+        id: s64,
+        /// The URL it is fetched from, if any.
+        url: option<string>,
+        title: string,
+    }
+
+    enum content-change { changed, unchanged, unknown }
+
+    /// `fetch.schedule`: the wait before a feed's next fetch.
+    record fetch-schedule {
+        feed-id: s64,
+        status: u16,
+        change: content-change,
+        hint-secs: u64,
+        interval-secs: u64,
+        min-cadence-secs: u64,
+        wait-secs: u64,
+    }
+
+    /// Which stored entries a scan visits.
+    record scan-options {
+        feed-id: option<s64>,
+        since: option<s64>,
+        include-hidden: bool,
+    }
+
+    /// What a finished scan did.
+    record scan-summary {
+        scanned: u64,
+        updated: u64,
+    }
+
+    /// Which stored entries `delete-entries` deletes.
+    record delete-filter {
+        dropped-before: s64,
+        feed-id: option<s64>,
+        published-before: option<s64>,
+        /// Defaults to `["system:saved"]`; an empty list keeps nothing.
+        keep-tagged: option<list<string>>,
+    }
+}
+
+/// What the server does for plugins: logging, their stores, stored entries,
+/// feeds and timers.
+interface host {
+    use types.{level, feed, scan-options, delete-filter};
+
+    /// Write `message` to the server log.
+    log: func(level: level, message: string);
+
+    /// The value stored under `key`, as JSON text, or `none`.
+    store-get: func(key: string) -> result<option<string>, string>;
+    /// Store `value`, JSON text, under `key`, or remove the key if `none`.
+    store-set: func(key: string, value: option<string>) -> result<_, string>;
+
+    /// Add the tag `name` to the stored entry `id`; whether it was added.
+    tag-entry: func(id: s64, name: string) -> result<bool, string>;
+    /// Remove the tag `name` from the stored entry `id`; whether it had it.
+    untag-entry: func(id: s64, name: string) -> result<bool, string>;
+    /// Start a scan of the stored entries; returns its id. Its entries go
+    /// to `on-scan-entry`, and `on-scan-done` follows once it has gone
+    /// through them all. Not allowed from `init`.
+    start-scan: func(options: scan-options) -> result<u64, string>;
+    /// Delete stored entries their feed no longer lists; returns how many.
+    /// Needs the `entries.delete` permission.
+    delete-entries: func(filter: delete-filter) -> result<u64, string>;
+
+    /// The feed `id`, or `none`.
+    get-feed: func(id: s64) -> result<option<feed>, string>;
+
+    /// Call `on-timer` with the returned id every `secs` seconds (60 to a
+    /// year), starting `secs` seconds from now.
+    every: func(secs: u64) -> result<u32, string>;
+}
+
+/// Regular expressions, compiled and matched by the server. Matching runs natively, so it
+/// is faster than a regex library built into the plugin, and the plugin is smaller.
+///
+/// Flags are letters: `i` (case-insensitive), `m` (multi-line), `s` (`.` matches a
+/// newline), `x` (ignore whitespace) and `U` (swap greed). A plugin may have 128
+/// distinct patterns, with their flags, alive at once, alone or in sets: compiling one it
+/// has alive already shares it, and counts nothing more.
+interface regex {
+    /// A compiled regular expression.
+    resource regex {
+        /// Compile `pattern` with `flags`.
+        compile: static func(pattern: string, %flags: string) -> result<regex, string>;
+        /// Whether the regex matches anywhere in `haystack`.
+        is-match: func(haystack: string) -> bool;
+        /// The byte offsets of the start and end of the first match in `haystack` at or
+        /// after the byte offset `start`.
+        find: func(haystack: string, start: u32) -> option<tuple<u32, u32>>;
+    }
+
+    /// Patterns matched together, in one call. Each is matched alone, as `regex` would
+    /// match it: one pass over the haystack for all of them would be slower whenever one
+    /// pattern has no literal text to look for.
+    resource regex-set {
+        /// Compile `patterns`, each a pattern and its flags.
+        compile: static func(patterns: list<tuple<string, string>>) -> result<regex-set, string>;
+        /// The indices of the patterns that match `haystack`, in order.
+        matches: func(haystack: string) -> list<u32>;
+    }
+}
+
+/// HTML, parsed and rewritten by the server with `lol_html`, the streaming rewriter Kiki
+/// uses for its own HTML. Parsing runs natively, so it is faster than a parser built into
+/// the plugin, and the plugin is much smaller.
+///
+/// The server cannot call into a plugin while the plugin is calling it, so a rewrite takes
+/// two passes. `select` parses the HTML and returns the elements a CSS selector matches, in
+/// document order. The plugin decides what to do with them, and `rewrite` parses the same
+/// HTML with the same selector again, applying `edits` to the elements by their index in
+/// what `select` returned.
+///
+/// Calls that return text into the plugin's memory take `max-bytes`, the most memory the
+/// result may take there, and fail rather than return more: a plugin whose memory cannot
+/// hold a result would trap.
+interface html {
+    /// Where a piece of `elements.text` starts, in bytes, and how long it is; or, for an
+    /// element's attributes, which run of `elements.attributes` they are.
+    record span { start: u32, len: u32 }
+
+    enum namespace { html, svg, mathml }
+
+    /// An element `select` matched.
+    record element {
+        /// Its tag name, lowercase.
+        tag-name: span,
+        namespace: namespace,
+        /// Its attributes, in `elements.attributes`.
+        attributes: span,
+    }
+
+    /// An attribute: its name, lowercase, and its value, with character references
+    /// decoded as a browser decodes them.
+    record attribute { name: span, value: span }
+
+    /// The elements a selector matched, in document order, with all their text in one
+    /// string, so that the result reaches the plugin in three pieces however many
+    /// elements there are.
+    record elements {
+        text: string,
+        elements: list<element>,
+        attributes: list<attribute>,
+    }
+
+    /// Where an insertion puts its content: before or after the element, at the start or
+    /// end of its content, in place of its content, or in place of the element.
+    enum place { before, after, prepend, append, inner, replace }
+
+    variant edit-op {
+        /// Remove the element and its content.
+        remove,
+        /// Remove the element's tags, keeping its content.
+        unwrap,
+        /// Set an attribute to a value, which is escaped as needed: a value read from
+        /// `select` and set again is written out as what was read.
+        set-attribute(tuple<string, string>),
+        /// Remove an attribute, every one of the name if there are several.
+        remove-attribute(string),
+        set-tag-name(string),
+        /// Insert text, which is escaped.
+        insert-text(tuple<place, string>),
+        /// Insert HTML as it is.
+        insert-html(tuple<place, string>),
+    }
+
+    /// An edit to the element at index `element` of what `select` returned. An element's
+    /// edits are applied in the order given.
+    record edit { element: u32, op: edit-op }
+
+    /// The elements of `html` that `selector`, a CSS selector, matches.
+    select: func(html: string, selector: string, max-bytes: u32) -> result<elements, string>;
+
+    /// `html`, with `edits` applied to the elements `selector` matches, and its comments
+    /// removed if `remove-comments` is set.
+    rewrite: func(
+        html: string,
+        selector: string,
+        edits: list<edit>,
+        remove-comments: bool,
+        max-bytes: u32,
+    ) -> result<string, string>;
+
+    /// `s` with its character references decoded, as `select` decodes attribute values.
+    unescape: func(s: string, max-bytes: u32) -> result<string, string>;
+}
+
+world plugin {
+    use types.{
+        event-kind, entry, fetch-success, fetch-error, feed-event,
+        fetch-schedule, scan-summary,
+    };
+    import host;
+    import regex;
+    import html;
+
+    /// Called when plugins load, with the plugin's config as a JSON
+    /// object. Returns the events the plugin handles, or an error, which
+    /// fails the load.
+    export init: func(config: string) -> result<list<event-kind>, string>;
+
+    export on-entry-parsed: func(entry: entry);
+    /// Return the entry, possibly changed, to keep it, or `none` to drop it.
+    export on-entry-ingest: func(entry: entry) -> option<entry>;
+    export on-fetch-success: func(event: fetch-success);
+    export on-fetch-error: func(event: fetch-error);
+    export on-feed-added: func(feed: feed-event);
+    export on-feed-removed: func(feed: feed-event);
+    export on-plugin-load: func();
+    /// Return a longer wait in seconds, or `none` to leave it.
+    export on-fetch-schedule: func(schedule: fetch-schedule) -> option<u64>;
+    export on-timer: func(id: u32);
+    /// Like `on-entry-ingest`, for an entry a scan visits: only system
+    /// tags added to `tags` are kept, and `none` leaves the entry alone.
+    export on-scan-entry: func(scan: u64, entry: entry) -> option<entry>;
+    export on-scan-done: func(scan: u64, summary: scan-summary);
+}

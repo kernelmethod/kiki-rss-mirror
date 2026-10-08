@@ -1,0 +1,15 @@
+# The default plugins written in Rust, as WebAssembly components: each
+# member is a plugin's directory, holding its crate, whose package is named
+# `kiki-<name>`, beside its manifest.toml. Not part of kiki-rss's build:
+# kiki-rss's build.rs builds them all for wasm32-unknown-unknown and bundles
+# each as `<name>/plugin.wasm`, leaving the crate out.
+[workspace]
+resolver = "2"
+members = ["adaptive-fetch", "auto-tag", "filter", "privacy", "retention", "sanitize"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

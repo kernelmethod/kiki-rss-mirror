@@ -8,8 +8,11 @@
 use super::super::*;
 use crate::config::Settings;
 use crate::plugins::services::ServerServices;
-use crate::scripting::lua::LuaScriptRunner;
-use crate::scripting::{ScriptRunnerHandle, ScriptSource};
+use crate::scripting::wasm::WasmScriptRunner;
+use crate::scripting::{
+    Event, EventPayload, FeedEntry, FetchSchedule, ScanSummary, ScheduleDecision, ScriptRunner,
+    ScriptRunnerHandle, ScriptSource,
+};
 use crate::test::{FeedServerState, SharedFeedServerState, TestBuilder, TestConfig};
 use anyhow::Result;
 use chrono::Utc;
@@ -20,7 +23,10 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 const PLUGIN: &str = "adaptive-fetch";
-const MAIN: &str = include_str!("../../../plugins/adaptive-fetch/main.lua");
+const WASM: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/plugins-wasm/adaptive-fetch.wasm"
+));
 
 /// Slack for assertions on `next_fetch_at`, covering the time the test
 /// itself takes.
@@ -35,7 +41,7 @@ struct Setup {
     pool: crate::db::Db,
     /// The plugin, loaded with the config the test asked for, or `None` to
     /// refresh with no plugins at all.
-    runner: Option<LuaScriptRunner>,
+    runner: Option<WasmScriptRunner>,
 }
 
 /// Start a feed server in `state`, insert a feed pointing at it with the
@@ -64,10 +70,12 @@ async fn setup(state: FeedServerState, config: Option<Value>, interval: i64) -> 
                 CancellationToken::new(),
             );
             services.set_loaded(HashMap::from([(PLUGIN.to_string(), vec![])]));
-            let mut source = ScriptSource::new(MAIN);
-            source.name = PLUGIN.to_string();
-            source.config = config.to_string();
-            Some(LuaScriptRunner::from_sources_with(
+            let source = ScriptSource {
+                name: PLUGIN.to_string(),
+                config: config.to_string(),
+                ..ScriptSource::new(WASM.to_vec())
+            };
+            Some(WasmScriptRunner::from_sources_with(
                 &[source],
                 Some(Arc::new(services)),
             )?)
@@ -267,6 +275,38 @@ async fn test_starts_from_the_polling_floor() -> Result<()> {
     Ok(())
 }
 
+/// A runner whose `fetch.schedule` handler asks for `Some` wait, or fails
+/// with `None`.
+struct FixedWait(Option<u64>);
+
+impl ScriptRunner for FixedWait {
+    fn dispatch_transform_entry(&self, entry: FeedEntry) -> anyhow::Result<Option<FeedEntry>> {
+        Ok(Some(entry))
+    }
+
+    fn dispatch_schedule(&self, _: FetchSchedule) -> anyhow::Result<Option<ScheduleDecision>> {
+        match self.0 {
+            Some(wait_secs) => Ok(Some(ScheduleDecision {
+                wait_secs,
+                plugin: "fixed".to_string(),
+            })),
+            None => anyhow::bail!("boom"),
+        }
+    }
+
+    fn dispatch_observe(&self, _: Event, _: EventPayload) {}
+
+    fn dispatch_scan(
+        &self,
+        _: u64,
+        _: Vec<FeedEntry>,
+    ) -> anyhow::Result<Option<Vec<Option<FeedEntry>>>> {
+        Ok(None)
+    }
+
+    fn finish_scan(&self, _: u64, _: Option<ScanSummary>) {}
+}
+
 /// The wait a plugin asks for is held between the one planned and the
 /// feed's interval: a plugin can have a feed fetched less often than its
 /// server asks, never more often, and never less often than its interval.
@@ -275,11 +315,7 @@ async fn test_plugin_waits_are_bounded() -> Result<()> {
     let s = setup(max_age_zero(), None, 3600).await?;
     let settings = Settings::default();
     for (asked, expected) in [(5, 60), (900, 900), (100_000, 3600)] {
-        let mut source = ScriptSource::new(format!(
-            "kiki.on('fetch.schedule', function() return {asked} end)"
-        ));
-        source.name = "fixed".to_string();
-        let runner = LuaScriptRunner::from_sources(&[source])?;
+        let runner = FixedWait(Some(asked));
         s.tc.database_conn()?.execute(
             "UPDATE feeds SET next_fetch_at = NULL WHERE id = ?1",
             [s.feed_id],
@@ -309,9 +345,7 @@ async fn test_plugin_waits_are_bounded() -> Result<()> {
 #[tokio::test]
 async fn test_failing_plugin_keeps_the_planned_wait() -> Result<()> {
     let s = setup(max_age_zero(), None, 3600).await?;
-    let mut source = ScriptSource::new("kiki.on('fetch.schedule', function() error('boom') end)");
-    source.name = "broken".to_string();
-    let runner = LuaScriptRunner::from_sources(&[source])?;
+    let runner = FixedWait(None);
     let now = Utc::now().timestamp();
     refresh_feed_with_settings(
         &s.client,

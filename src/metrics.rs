@@ -467,7 +467,7 @@ mod imp {
                 KeyName::from_const_str("kiki_entries_deleted_total"),
                 None,
                 SharedString::const_str(
-                    "Total entries deleted by plugins with kiki.entries.delete_where, labeled by plugin.",
+                    "Total entries deleted by plugins with delete-entries, labeled by plugin.",
                 ),
             );
 

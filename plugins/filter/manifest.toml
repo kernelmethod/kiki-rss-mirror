@@ -1,14 +1,19 @@
 name = "filter"
-version = "3.0.0"
-engine = "lua"
+version = "3.1.0"
+engine = "wasm"
+entrypoint = "plugin.wasm"
 description = "Hide entries whose fields match, or fail to match, regular expressions"
 license = "MIT"
 homepage = "https://github.com/kernelmethod/kiki-rss"
 
+# Written in Rust, as a WebAssembly component: its source is beside this
+# manifest in Kiki's repository. Versions before 3.1.0 were
+# written in Lua, and took the same config.
+#
 # Entries matching an `exclude` rule are hidden. When an entry's feed has
 # `include` rules, entries matching none of them are hidden too. A rule's
 # `feeds` names feeds by id, or by the URL they are fetched from. See
-# main.lua for every setting. To tag entries, use the auto-tag plugin.
+# src/lib.rs for every setting. To tag entries, use the auto-tag plugin.
 #
 # The rules are empty by default. Set them in the web UI or with, for
 # example, `kiki plugin config set filter rules.toml`, where rules.toml

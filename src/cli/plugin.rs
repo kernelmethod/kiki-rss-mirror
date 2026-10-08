@@ -156,13 +156,7 @@ fn list(home: &Path, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
         .iter()
         .map(|p| {
             let m = &p.manifest;
-            let status = if !m.engine.is_supported() {
-                "unsupported"
-            } else if m.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            };
+            let status = if m.enabled { "enabled" } else { "disabled" };
             [
                 m.name.clone(),
                 m.version.clone(),
@@ -430,12 +424,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(plugins::MANIFEST_FILE_NAME),
-            "name = 'hello'\nversion = '1.0.0'\nengine = 'lua'\n\
+            "name = 'hello'\nversion = '1.0.0'\nengine = 'wasm'\n\
              description = 'Says hello'\n[config]\na = 1\nb = [1, 2]\n\
              [[settings]]\nname = 'a'\ntype = 'integer'\n",
         )
         .unwrap();
-        std::fs::write(dir.join("main.lua"), "").unwrap();
+        std::fs::write(dir.join("plugin.wasm"), "").unwrap();
         home
     }
 
@@ -490,7 +484,7 @@ mod tests {
         );
         assert_eq!(
             lines.next().unwrap(),
-            ["hello", "1.0.0", "lua", "user", "enabled", "-", "Says", "hello"]
+            ["hello", "1.0.0", "wasm", "user", "enabled", "-", "Says", "hello"]
         );
         assert!(lines.next().is_none());
         assert!(String::from_utf8(err).unwrap().contains("broken"));

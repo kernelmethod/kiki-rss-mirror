@@ -1,13 +1,12 @@
-//! Tests for the `retention` plugin shipped in `plugins/retention/`, and for
-//! moving the config file's retired `[retention]` setting into its config.
+//! Tests for the `retention` plugin shipped in `plugins/retention/`, built from
+//! the crate in that directory by `build.rs`.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use super::runtime::PluginRuntime;
-use super::{migrate_retention_setting, Permission, PluginManifest, PluginSource};
-use crate::config::ConfigStore;
+use super::{Permission, PluginManifest, PluginSource};
 use crate::db::Db;
-use crate::scripting::lua::LuaScriptRunner;
+use crate::scripting::wasm::WasmScriptRunner;
 use crate::scripting::{
     DeleteFilter, Event, EventPayload, ScriptRunner, ScriptRunnerHandle, ScriptSource, ServiceCall,
     ServiceReply,
@@ -18,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 const MANIFEST: &str = include_str!("../../plugins/retention/manifest.toml");
-const MAIN: &str = include_str!("../../plugins/retention/main.lua");
+const WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/retention.wasm"));
 
 const DAY: i64 = 86_400;
 
@@ -49,14 +48,13 @@ fn config(overrides: Value) -> Value {
 }
 
 /// The plugin, loaded with `overrides`, answering its calls with `services`.
-fn plugin(
-    overrides: Value,
-    services: Arc<FakeServices>,
-) -> Result<LuaScriptRunner, crate::scripting::lua::ScriptError> {
-    let mut source = ScriptSource::new(MAIN);
-    source.name = "retention".to_string();
-    source.config = config(overrides).to_string();
-    LuaScriptRunner::from_sources_with(&[source], Some(services))
+fn plugin(overrides: Value, services: Arc<FakeServices>) -> Result<WasmScriptRunner, String> {
+    let source = ScriptSource {
+        name: "retention".to_string(),
+        config: config(overrides).to_string(),
+        ..ScriptSource::new(WASM.to_vec())
+    };
+    WasmScriptRunner::from_sources_with(&[source], Some(services)).map_err(|e| e.to_string())
 }
 
 #[test]
@@ -163,7 +161,7 @@ fn install_retention(plugins_dir: &Path) {
     let dir = PluginSource::System.dir(plugins_dir).join("retention");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("manifest.toml"), MANIFEST).unwrap();
-    std::fs::write(dir.join("main.lua"), MAIN).unwrap();
+    std::fs::write(dir.join("plugin.wasm"), WASM).unwrap();
 }
 
 /// Stores an entry of feed `feed_id`, dropped from it `days` days ago, or
@@ -204,14 +202,15 @@ fn the_installed_plugin_deletes_old_entries() {
     install_retention(&plugins_dir);
     let sneaky = PluginManifest {
         permissions: vec![],
-        ..PluginManifest::parse("name = 'sneaky'\nversion = '1.0.0'\nengine = 'lua'\n").unwrap()
+        ..PluginManifest::parse("name = 'sneaky'\nversion = '1.0.0'\nengine = 'wasm'\n").unwrap()
     };
     super::install(
         &PluginSource::User.dir(&plugins_dir),
-        &sneaky,
-        r#"kiki.on("plugin.load", function()
-            kiki.entries.delete_where { dropped_before = os.time() + 86400 }
-        end)"#,
+        &PluginManifest {
+            config: json!({"delete": i64::MAX}).as_object().unwrap().clone(),
+            ..sneaky
+        },
+        &crate::test::WASM_FIXTURE,
     )
     .unwrap();
 
@@ -244,75 +243,4 @@ fn the_installed_plugin_deletes_old_entries() {
     assert_eq!(runtime.current().plugins.len(), 2);
     // `sneaky` was refused, or "recent" would be gone too.
     assert_eq!(guids(&db), ["current", "recent"]);
-}
-
-/// A config file in a temporary directory holding `text`, and a database.
-fn config_and_db(text: &str) -> (ConfigStore, Db) {
-    let (db, dir) = db();
-    let path = dir.join("kiki.toml");
-    std::fs::write(&path, text).unwrap();
-    (ConfigStore::open(&path).unwrap(), db)
-}
-
-fn retention_overrides(db: &Db) -> serde_json::Map<String, Value> {
-    db.read_blocking(|conn| crate::db::plugins::get_config_overrides(conn, "retention"))
-        .unwrap()
-        .unwrap()
-}
-
-#[test]
-fn the_retired_setting_moves_to_the_plugin() {
-    let (config, db) =
-        config_and_db("[retention]\nmax_age_days = 30\n\n[asset_cache]\nenabled = false\n");
-    assert!(migrate_retention_setting(&config, &db).unwrap());
-    assert_eq!(
-        retention_overrides(&db),
-        *json!({"max_age_days": 30}).as_object().unwrap()
-    );
-
-    let text = std::fs::read_to_string(config.path()).unwrap();
-    assert!(!text.contains("retention"), "{text}");
-    assert!(!config.current().asset_cache.enabled);
-    // There is nothing left to move.
-    assert!(!migrate_retention_setting(&config, &db).unwrap());
-}
-
-#[test]
-fn the_plugins_own_setting_is_kept() {
-    let (config, db) = config_and_db("[retention]\nmax_age_days = 30\n");
-    db.write_blocking(|conn| {
-        let overrides = json!({"max_age_days": 7, "keep_tags": []});
-        crate::db::plugins::set_config_overrides(conn, "retention", overrides.as_object().unwrap())
-    })
-    .unwrap()
-    .unwrap();
-    assert!(migrate_retention_setting(&config, &db).unwrap());
-    assert_eq!(retention_overrides(&db)["max_age_days"], 7);
-    assert!(!std::fs::read_to_string(config.path())
-        .unwrap()
-        .contains("retention"));
-}
-
-#[test]
-fn invalid_retired_settings_are_dropped() {
-    for text in [
-        "[retention]\nmax_age_days = 0\n",
-        "[retention]\nmax_age_days = \"30\"\n",
-    ] {
-        let (config, db) = config_and_db(text);
-        assert!(migrate_retention_setting(&config, &db).unwrap(), "{text}");
-        assert!(retention_overrides(&db).is_empty(), "{text}");
-        assert!(!std::fs::read_to_string(config.path())
-            .unwrap()
-            .contains("retention"));
-    }
-}
-
-#[test]
-fn nothing_is_moved_without_the_setting() {
-    let (config, db) = config_and_db("[asset_cache]\nenabled = false\n");
-    let before = std::fs::read_to_string(config.path()).unwrap();
-    assert!(!migrate_retention_setting(&config, &db).unwrap());
-    assert!(retention_overrides(&db).is_empty());
-    assert_eq!(std::fs::read_to_string(config.path()).unwrap(), before);
 }

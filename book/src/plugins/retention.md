@@ -46,6 +46,8 @@ gone: set the plugin's config with `/v1/plugins/name/retention/config`
 instead.
 
 The plugin uses [timers](../writing-plugins.md#timers) and
-[`kiki.entries.delete_where`](../writing-plugins.md#deleting-entries); see
-[`plugins/retention/main.lua`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/retention/main.lua)
-for the details.
+[deletes entries](../writing-plugins.md#deleting-entries). It is written in
+Rust, as a [WebAssembly plugin](../writing-plugins.md); see
+[`plugins/retention/src/lib.rs`](https://github.com/kernelmethod/kiki-rss/blob/main/plugins/retention/src/lib.rs)
+for the details. Versions before 2.0.0 were written in Lua, and took the same
+configuration.

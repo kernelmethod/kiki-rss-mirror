@@ -9,7 +9,7 @@ Kiki ships with:
   headers and backs off from misbehaving servers, caches images and
   enclosures, and runs plugins over new entries. This functionality is
   exposed over an HTTP API.
-- **Plugins** written in Lua, four of which are installed by default: one
+- **Plugins** compiled to WebAssembly, four of which are installed by default: one
   [hides entries](plugins/filter.md) matching rules you set, one
   [tags entries](plugins/auto-tag.md) automatically, one
   [sanitizes entries' HTML](plugins/sanitize.md), and one

@@ -51,8 +51,8 @@ pub(super) fn fire_fetch_success(
 /// Error returned when plugins could not be loaded into a script runner.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadPluginsError {
-    /// A plugin's code failed to compile or its top-level chunk failed to run. The
-    /// plugins that were running before, if any, keep running.
+    /// A plugin failed to compile, or its `init` failed. The plugins that were running
+    /// before, if any, keep running.
     #[error("failed to load plugins: {0}")]
     Compile(String),
 
@@ -62,7 +62,7 @@ pub enum LoadPluginsError {
     HostDead(String),
 }
 
-/// Build a [`ScriptRunner`] from the Lua plugins in `discovery` and install it in
+/// Build a [`ScriptRunner`] from the plugins in `discovery` and install it in
 /// `handle`, replacing the runner it held.
 ///
 /// Called when the server starts, and again whenever plugins are reloaded (see
@@ -71,8 +71,8 @@ pub enum LoadPluginsError {
 ///
 /// When `host` carries a sandboxed script host, the sources are shipped to that child
 /// process and `handle` receives a [`SubprocessScriptRunner`] that forwards to it.
-/// Otherwise the VM is built in this process, which is the path the library tests and
-/// `--no-script-isolation` take, and the calls plugins make through the `kiki` API are
+/// Otherwise the plugins are loaded in this process, which is the path the library tests
+/// and `--no-script-isolation` take, and the calls plugins make to the server are
 /// answered by `services`. (The host answers them with the services set on it.)
 ///
 /// Plugins that cannot be loaded are logged and skipped (see
@@ -93,7 +93,7 @@ pub fn load_script_runner(
     host: &crate::process::ScriptHostHandle,
     services: Arc<dyn crate::scripting::ScriptServices>,
 ) -> Result<usize, LoadPluginsError> {
-    let sources = load_lua_sources(discovery);
+    let sources = load_plugin_sources(discovery);
     let count = sources.len();
 
     // A runner with no handlers behaves exactly like no runner at all —
@@ -123,7 +123,7 @@ pub fn load_script_runner(
             Err(e) if host.is_alive() => {
                 // The host answered, it just could not compile what we
                 // sent, and kept running what it had.
-                warn!("script host failed to compile Lua scripts: {}", e);
+                warn!("script host failed to load plugins: {}", e);
                 metrics.record_plugin_load_error();
                 Err(LoadPluginsError::Compile(e.to_string()))
             }
@@ -141,9 +141,9 @@ pub fn load_script_runner(
         };
     }
 
-    // No isolated host: compile into a VM in this process.
+    // No isolated host: load the plugins in this process.
     let _ = host;
-    match crate::scripting::lua::LuaScriptRunner::from_sources_with(&sources, Some(services)) {
+    match crate::scripting::wasm::WasmScriptRunner::from_sources_with(&sources, Some(services)) {
         Ok(runner) => {
             handle.set(if empty {
                 None
@@ -156,7 +156,7 @@ pub fn load_script_runner(
             Ok(count)
         }
         Err(e) => {
-            warn!("failed to compile Lua scripts: {}", e);
+            warn!("failed to load plugins: {}", e);
             metrics.record_plugin_load_error();
             Err(LoadPluginsError::Compile(e.to_string()))
         }
@@ -173,7 +173,7 @@ fn fire_plugin_load(handle: &ScriptRunnerHandle) {
     }
 }
 
-/// Read the source of every enabled Lua plugin in `discovery`.
-pub(super) fn load_lua_sources(discovery: &crate::plugins::Discovery) -> Vec<ScriptSource> {
-    crate::plugins::load_sources(discovery, crate::plugins::PluginEngine::Lua)
+/// Read the code of every enabled plugin in `discovery`.
+pub(super) fn load_plugin_sources(discovery: &crate::plugins::Discovery) -> Vec<ScriptSource> {
+    crate::plugins::load_sources(discovery)
 }
