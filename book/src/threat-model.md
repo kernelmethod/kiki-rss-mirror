@@ -223,8 +223,12 @@ every process it starts:
 - **seccomp** kills the process if it makes a system call none of Kiki's
   processes need, such as `ptrace`, `mount`, `bpf`, `io_uring` or
   namespace creation, and refuses the socket calls that process has no
-  use for. Only the supervisor may `execve`, and then only the kiki
-  executable.
+  use for. The processes Landlock gives no files at all (the script host,
+  the fetcher's parser and the web UI) are also refused every system call
+  that reaches a file by its path. This holds even where the kernel lacks
+  Landlock, and it covers what Landlock does not restrict, such as changing
+  a file's permissions or owner. Only the supervisor may `execve`, and then
+  only the kiki executable.
 - **`PR_SET_MDWE`** refuses memory that is both writable and executable,
   so injected code can't be written into memory and then run. Every
   process gets it but the script host, which compiles WebAssembly plugins

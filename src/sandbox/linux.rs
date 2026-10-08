@@ -727,6 +727,142 @@ const DENIED_FEED_WORKER: &[i64] = &[libc::SYS_bind, libc::SYS_listen, libc::SYS
 /// only ever accepts on that one, so `accept4` stays allowed.
 const DENIED_WEB_UI: &[i64] = &[libc::SYS_bind, libc::SYS_listen];
 
+/// Syscalls that reach the filesystem by path, refused with `EACCES` to
+/// the profiles Landlock grants no paths at all (see
+/// [`refuses_filesystem`]), on every architecture.
+///
+/// Landlock already denies those profiles every file, so on a kernel that
+/// enforces it this changes nothing a working process notices: the calls
+/// fail with the same error. It is defence in depth for kernels that do
+/// not enforce Landlock, or enforce an older ABI, and it covers what
+/// Landlock has no say over at all: changing a file's mode, owner,
+/// extended attributes or times, reading a symlink's target, and checking
+/// whether a path exists or is accessible. Calls that work on a
+/// descriptor the process already has (`read`, `write`, `fstat`,
+/// `fchmod`) stay allowed: these processes hold sockets and their
+/// standard streams, and with no way to open a file, nothing more.
+///
+/// `newfstatat` and `statx` stay allowed too: the C library and std
+/// implement `fstat` with them, passing `AT_EMPTY_PATH` and an empty path,
+/// and seccomp cannot read the path to tell that from a lookup by name.
+/// So does `utimensat`, which `futimens` calls with no path, but only
+/// then: see [`apply_seccomp`].
+const DENIED_FILESYSTEM: &[i64] = &[
+    // Opening: with `O_PATH` too, which Landlock does not check.
+    libc::SYS_openat,
+    libc::SYS_openat2,
+    libc::SYS_open_tree,
+    // Creating, removing and renaming.
+    libc::SYS_mkdirat,
+    libc::SYS_mknodat,
+    libc::SYS_unlinkat,
+    libc::SYS_renameat2,
+    libc::SYS_linkat,
+    libc::SYS_symlinkat,
+    libc::SYS_truncate,
+    // Changing a file's metadata, which Landlock does not restrict.
+    libc::SYS_fchmodat,
+    libc::SYS_fchownat,
+    libc::SYS_setxattr,
+    libc::SYS_lsetxattr,
+    libc::SYS_removexattr,
+    libc::SYS_lremovexattr,
+    // Learning about a path, which Landlock does not restrict either.
+    libc::SYS_readlinkat,
+    libc::SYS_faccessat,
+    libc::SYS_faccessat2,
+    libc::SYS_getxattr,
+    libc::SYS_lgetxattr,
+    libc::SYS_listxattr,
+    libc::SYS_llistxattr,
+    libc::SYS_statfs,
+    libc::SYS_inotify_add_watch,
+    libc::SYS_chdir,
+    // Syscalls newer than the libc crate's tables, numbered alike on every
+    // architecture Kiki filters: `fchmodat2` (Linux 6.6), `setxattrat`,
+    // `getxattrat`, `listxattrat` and `removexattrat` (6.13),
+    // `open_tree_attr` (6.15), and `file_getattr` and `file_setattr`
+    // (6.17). On an older kernel they fail with `EACCES` rather than
+    // `ENOSYS`, which no caller can tell apart from Landlock's refusal.
+    452,
+    463,
+    464,
+    465,
+    466,
+    467,
+    468,
+    469,
+];
+
+/// The legacy path-based syscalls in [`DENIED_FILESYSTEM`]'s spirit that
+/// only x86_64 has; aarch64 and riscv64 have only their `*at` forms.
+#[cfg(target_arch = "x86_64")]
+const DENIED_FILESYSTEM_X86_64: &[i64] = &[
+    libc::SYS_open,
+    libc::SYS_creat,
+    libc::SYS_mkdir,
+    libc::SYS_mknod,
+    libc::SYS_rmdir,
+    libc::SYS_unlink,
+    libc::SYS_rename,
+    libc::SYS_renameat,
+    libc::SYS_link,
+    libc::SYS_symlink,
+    libc::SYS_chmod,
+    libc::SYS_chown,
+    libc::SYS_lchown,
+    libc::SYS_utime,
+    libc::SYS_utimes,
+    libc::SYS_futimesat,
+    libc::SYS_readlink,
+    libc::SYS_access,
+];
+
+/// Whether a profile is refused the syscalls in [`DENIED_FILESYSTEM`]: the
+/// profiles whose Landlock ruleset grants no path at all, and so need no
+/// filesystem syscall that the denial could break.
+fn refuses_filesystem(profile: &SandboxProfile) -> bool {
+    match profile {
+        SandboxProfile::ScriptHost | SandboxProfile::FeedParser | SandboxProfile::WebUi => true,
+        SandboxProfile::Server { .. }
+        | SandboxProfile::FeedFetcher
+        | SandboxProfile::FeedWorker
+        | SandboxProfile::FeedResolver => false,
+    }
+}
+
+/// The syscalls in [`DENIED_FILESYSTEM`], and its x86_64 and aarch64
+/// additions, for this architecture.
+fn filesystem_syscalls() -> Vec<i64> {
+    // `renameat` is gone from riscv64, which has `renameat2` alone.
+    #[cfg(target_arch = "x86_64")]
+    let extra: &[i64] = DENIED_FILESYSTEM_X86_64;
+    #[cfg(target_arch = "aarch64")]
+    let extra: &[i64] = &[libc::SYS_renameat];
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let extra: &[i64] = &[];
+    DENIED_FILESYSTEM.iter().chain(extra).copied().collect()
+}
+
+/// The rules of the filter that refuses filesystem syscalls (see
+/// [`DENIED_FILESYSTEM`]): every one outright but `utimensat`, which is
+/// refused only with a path, as `futimens` passes none.
+fn filesystem_rules() -> Result<std::collections::BTreeMap<i64, Vec<seccompiler::SeccompRule>>> {
+    use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
+
+    let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> = filesystem_syscalls()
+        .into_iter()
+        .map(|nr| (nr, Vec::new()))
+        .collect();
+    let with_path = SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Ne, 0)
+        .context("building a seccomp condition")?;
+    rules.insert(
+        libc::SYS_utimensat,
+        vec![SeccompRule::new(vec![with_path]).context("building a seccomp rule")?],
+    );
+    Ok(rules)
+}
+
 /// The `ioctl` requests every profile is refused, with `ENOTTY`, as on a
 /// descriptor that does not support them: `TIOCSTI`, which would let a
 /// compromised process type commands into a terminal it inherited, and
@@ -843,6 +979,10 @@ fn socket_domains(profile: &SandboxProfile) -> Option<&'static [i32]> {
 ///   not use (see [`socket_domains`]); a library that probes for a local
 ///   service, as glibc's resolver does for nscd, sees it as absent rather
 ///   than bringing the process down.
+/// * the syscalls that reach the filesystem by path fail with `EACCES`,
+///   as Landlock would have them, in the profiles it grants no path (see
+///   [`DENIED_FILESYSTEM`]); a library that looks for a configuration
+///   file, as the C library does for time zones, finds none.
 ///
 /// The default action for unmatched syscalls is `Allow` — this is a
 /// defence-in-depth layer that eliminates the most dangerous escape
@@ -937,6 +1077,10 @@ fn apply_seccomp(config: &SandboxConfig) -> Result<()> {
                 .collect(),
             refuse(libc::EACCES),
         )?;
+    }
+
+    if refuses_filesystem(&config.profile) {
+        compile("filesystem", filesystem_rules()?, refuse(libc::EACCES))?;
     }
 
     // The denylist itself, with `clone` denied only with namespace flags:
@@ -1531,6 +1675,174 @@ mod tests {
             .unwrap();
             let _: seccompiler::BpfProgram = filter.try_into().unwrap();
         }
+    }
+
+    /// Exactly the profiles Landlock grants no path are refused the
+    /// filesystem, so the refusal can break nothing Landlock allows.
+    #[test]
+    fn only_profiles_without_paths_refuse_the_filesystem() {
+        for profile in every_profile() {
+            let (rw, ro) = landlock_paths(&profile);
+            assert_eq!(
+                refuses_filesystem(&profile),
+                rw.is_empty() && ro.is_empty() && !matches!(profile, SandboxProfile::Server { .. }),
+            );
+        }
+        assert!(refuses_filesystem(&SandboxProfile::ScriptHost));
+        assert!(refuses_filesystem(&SandboxProfile::FeedParser));
+        assert!(refuses_filesystem(&SandboxProfile::WebUi));
+    }
+
+    /// Once the filesystem filter is installed, nothing can be opened,
+    /// created, changed or looked up by path, but descriptors the process
+    /// already holds still work. Runs in a forked child, since a filter
+    /// cannot be removed.
+    #[test]
+    fn the_filesystem_filter_refuses_paths_but_not_descriptors() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStringExt;
+
+        // Exit codes from the child, one per check that failed.
+        const INSTALL_FAILED: i32 = 10;
+        const OPENED: i32 = 11;
+        const OPENED_O_PATH: i32 = 12;
+        const MADE_DIR: i32 = 13;
+        const CHMODDED: i32 = 14;
+        const READ_LINK: i32 = 15;
+        const ACCESSED: i32 = 16;
+        const TOUCHED_BY_PATH: i32 = 17;
+        const NEW_SYSCALL: i32 = 18;
+        const LEGACY_OPENED: i32 = 19;
+        const FSTAT_REFUSED: i32 = 20;
+        const WRITE_REFUSED: i32 = 21;
+        const FUTIMENS_REFUSED: i32 = 22;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("file")).unwrap();
+        let path =
+            std::ffi::CString::new(dir.path().join("file").into_os_string().into_vec()).unwrap();
+        let new_dir =
+            std::ffi::CString::new(dir.path().join("new").into_os_string().into_vec()).unwrap();
+        let fd = file.as_raw_fd();
+
+        let filter = seccompiler::SeccompFilter::new(
+            filesystem_rules().unwrap(),
+            seccompiler::SeccompAction::Allow,
+            seccompiler::SeccompAction::Errno(libc::EACCES as u32),
+            detect_arch().expect("a supported architecture"),
+        )
+        .unwrap();
+        let program: seccompiler::BpfProgram = filter.try_into().unwrap();
+
+        // SAFETY: the child only makes raw syscalls and calls `_exit`, so
+        // it takes no lock another thread of the test harness could hold.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let code = (|| {
+                if seccompiler::apply_filter(&program).is_err() {
+                    return INSTALL_FAILED;
+                }
+                let refused = |ret: libc::c_long| {
+                    ret == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
+                };
+                // SAFETY: every pointer below is a NUL-terminated string
+                // or a buffer that outlives the call, of the length given.
+                unsafe {
+                    let at = libc::AT_FDCWD as libc::c_long;
+                    if !refused(libc::syscall(
+                        libc::SYS_openat,
+                        at,
+                        path.as_ptr(),
+                        libc::O_RDONLY,
+                    )) {
+                        return OPENED;
+                    }
+                    if !refused(libc::syscall(
+                        libc::SYS_openat,
+                        at,
+                        c"/".as_ptr(),
+                        libc::O_PATH,
+                    )) {
+                        return OPENED_O_PATH;
+                    }
+                    if !refused(libc::syscall(
+                        libc::SYS_mkdirat,
+                        at,
+                        new_dir.as_ptr(),
+                        0o700,
+                    )) {
+                        return MADE_DIR;
+                    }
+                    if !refused(libc::syscall(libc::SYS_fchmodat, at, path.as_ptr(), 0o777)) {
+                        return CHMODDED;
+                    }
+                    let mut buf = [0u8; 64];
+                    if !refused(libc::syscall(
+                        libc::SYS_readlinkat,
+                        at,
+                        c"/proc/self/exe".as_ptr(),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )) {
+                        return READ_LINK;
+                    }
+                    if !refused(libc::syscall(
+                        libc::SYS_faccessat,
+                        at,
+                        path.as_ptr(),
+                        libc::F_OK,
+                    )) {
+                        return ACCESSED;
+                    }
+                    let null: *const libc::timespec = std::ptr::null();
+                    if !refused(libc::syscall(
+                        libc::SYS_utimensat,
+                        at,
+                        path.as_ptr(),
+                        null,
+                        0,
+                    )) {
+                        return TOUCHED_BY_PATH;
+                    }
+                    // `getxattrat`, which the libc crate does not name.
+                    if !refused(libc::syscall(464, at, path.as_ptr(), 0, 0, 0)) {
+                        return NEW_SYSCALL;
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    if !refused(libc::syscall(libc::SYS_open, path.as_ptr(), libc::O_RDONLY)) {
+                        return LEGACY_OPENED;
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let _ = LEGACY_OPENED;
+
+                    let mut stat: libc::stat = std::mem::zeroed();
+                    if libc::fstat(fd, &mut stat) != 0 {
+                        return FSTAT_REFUSED;
+                    }
+                    if libc::write(fd, b"x".as_ptr().cast(), 1) != 1 {
+                        return WRITE_REFUSED;
+                    }
+                    if libc::syscall(libc::SYS_utimensat, fd, null, null, 0) != 0 {
+                        return FUTIMENS_REFUSED;
+                    }
+                }
+                0
+            })();
+            // SAFETY: `_exit` skips the harness's atexit handlers and
+            // destructors, which belong to the parent.
+            unsafe { libc::_exit(code) };
+        }
+
+        let mut status = 0;
+        // SAFETY: `pid` is the child forked above, and `status` is a valid
+        // pointer for the call.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "waitpid: {}", std::io::Error::last_os_error());
+        assert!(libc::WIFEXITED(status), "child did not exit: {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0, "child failed a check");
+        assert!(!dir.path().join("new").exists());
     }
 
     /// Forbidden `clone` flags are exactly the namespace ones, none of

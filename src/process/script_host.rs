@@ -11,8 +11,9 @@
 //! Kiki has.
 //!
 //! This module moves them into a child process that holds nothing: no
-//! database, no filesystem (Landlock with an empty ruleset), and no way
-//! to open a socket (seccomp). Its entire view of the world is one
+//! database, no filesystem (Landlock with an empty ruleset, and seccomp
+//! refusing every syscall that takes a path), and no way to open a socket
+//! (seccomp). Its entire view of the world is one
 //! inherited socket pair and whatever the server chooses to send down it.
 //! What plugins ask of the server (the store, stored entries, feeds) goes
 //! back up that socket as a [`FromHost::Call`], and
