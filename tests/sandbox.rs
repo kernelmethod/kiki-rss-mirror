@@ -549,7 +549,7 @@ const SECCOMP_PROBE_PASSED: &str = "seccomp probe: allowed calls passed";
 /// Not a test of its own: [`the_syscall_denylist_is_enforced`] runs it in
 /// a process of its own. It installs the script host's sandbox, the
 /// strictest there is, and checks what the seccomp filters' argument
-/// rules let through, then tries to create a user namespace, which must
+/// rules let through and refuse, then tries to create a user namespace, which must
 /// kill it.
 #[test]
 fn seccomp_probe() {
@@ -557,7 +557,27 @@ fn seccomp_probe() {
     if std::env::var_os(SECCOMP_PROBE_ENV).is_none() {
         return;
     }
+    let exe = std::env::current_exe().expect("test binary");
+    let permissions = std::fs::metadata(&exe)
+        .expect("test binary's metadata")
+        .permissions();
     apply(&SandboxConfig::script_host(false)).expect("install the script host sandbox");
+
+    // Paths are refused, rather than killing: opening, which Landlock
+    // refuses too, and changing a file's mode, which only seccomp does.
+    // The mode is the one the file already has, in case neither refuses.
+    let opened = std::fs::File::open(&exe).map(drop);
+    assert_eq!(
+        opened.map_err(|e| e.raw_os_error()),
+        Err(Some(libc::EACCES)),
+        "opening a file was not refused"
+    );
+    let chmodded = std::fs::set_permissions(&exe, permissions);
+    assert_eq!(
+        chmodded.map_err(|e| e.raw_os_error()),
+        Err(Some(libc::EACCES)),
+        "changing a file's mode was not refused"
+    );
 
     // `clone3` is refused, and the C library falls back to `clone`.
     thread::spawn(|| 42)
@@ -590,7 +610,7 @@ fn seccomp_probe() {
     println!("seccomp probe: a user namespace was created");
 }
 
-/// The filters refuse denied ioctls, kill for namespaces, and let
+/// The filters refuse denied ioctls and paths, kill for namespaces, and let
 /// threads start: run [`seccomp_probe`] in a fresh process, and
 /// check that it got past the allowed calls and was then killed.
 #[test]
