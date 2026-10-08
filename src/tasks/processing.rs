@@ -8,7 +8,6 @@ use crate::tasks::parsing::{insert_atom_entry_data, insert_rss_entry_data, upser
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeSet;
-use std::time::Instant;
 use tracing::{debug, error, warn};
 
 /// The entries a refresh wrote.
@@ -244,19 +243,23 @@ fn run_scripts(
     }
     let format = feed_entry.syndication_format.clone();
     let original = feed_entry.clone();
-    let script_start = Instant::now();
-    match runner.dispatch_transform_entry(feed_entry) {
+    let mut runs = Vec::new();
+    let result = runner.dispatch_transform_entry_timed(feed_entry, &mut runs);
+    for run in &runs {
+        metrics.record_plugin_run(&run.plugin, run.seconds);
+    }
+    match result {
         Ok(Some(e)) => {
-            metrics.record_plugin_execution(script_start.elapsed().as_secs_f64(), "ok");
+            metrics.record_plugin_execution("ok");
             Some(e)
         }
         Ok(None) => {
-            metrics.record_plugin_execution(script_start.elapsed().as_secs_f64(), "filtered");
+            metrics.record_plugin_execution("filtered");
             debug!("{} entry filtered by script for feed {}", format, feed_id);
             None
         }
         Err(e) => {
-            metrics.record_plugin_execution(script_start.elapsed().as_secs_f64(), "error");
+            metrics.record_plugin_execution("error");
             warn!(
                 "script error processing {} entry for feed {}: {}; inserting unmodified",
                 format, feed_id, e

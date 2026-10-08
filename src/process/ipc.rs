@@ -32,8 +32,8 @@
 //! multiplexed instead; see [`crate::process::feed_fetcher`].
 
 use crate::scripting::{
-    Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary, ScheduleDecision,
-    ScriptSource, ServiceCall, ServiceReply, WasmComponent,
+    Event, EventPayload, EventSet, FeedEntry, FetchSchedule, PluginRun, ScanSummary,
+    ScheduleDecision, ScriptSource, ServiceCall, ServiceReply, WasmComponent,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, IoSlice, Read, Write};
@@ -112,8 +112,12 @@ pub enum HostResponse {
     Reloaded { loaded: usize },
 
     /// The handler chain ran. `None` means a handler filtered the entry
-    /// out and it should not be inserted.
-    Entry { entry: Option<FeedEntry> },
+    /// out and it should not be inserted. `runs` is how long each plugin's
+    /// handler took.
+    Entry {
+        entry: Option<FeedEntry>,
+        runs: Vec<PluginRun>,
+    },
 
     /// An observe event was dispatched.
     Ack,
@@ -528,10 +532,16 @@ mod tests {
             other => panic!("wrong variant: {other:?}"),
         }
 
-        let resp = HostResponse::Entry { entry: Some(entry) };
+        let resp = HostResponse::Entry {
+            entry: Some(entry),
+            runs: Vec::new(),
+        };
         let encoded = encode(&resp).unwrap();
         let decoded: HostResponse = decode(&encoded).unwrap();
-        assert!(matches!(decoded, HostResponse::Entry { entry: Some(_) }));
+        assert!(matches!(
+            decoded,
+            HostResponse::Entry { entry: Some(_), .. }
+        ));
     }
 
     /// `EventPayload::FetchError` carries a `Cow<'static, str>`; it must

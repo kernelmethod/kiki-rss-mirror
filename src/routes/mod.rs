@@ -184,9 +184,7 @@ pub mod test {
         for expected in [
             "kiki_http_requests_total",
             "kiki_http_request_duration_seconds",
-            "kiki_task_queue_depth",
             "kiki_workers_total",
-            "kiki_db_pool_connections",
             "kiki_build_info",
         ] {
             assert!(

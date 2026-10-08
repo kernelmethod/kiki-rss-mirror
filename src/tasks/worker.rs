@@ -52,13 +52,6 @@ impl Drop for InProgressGuard {
     }
 }
 
-/// Snapshot the current size of an `InProgressSet` for the
-/// `kiki_feeds_refresh_in_progress` gauge. Takes the lock briefly.
-fn in_progress_len(set: &InProgressSet) -> f64 {
-    let locked = set.lock().unwrap_or_else(|e| e.into_inner());
-    locked.len() as f64
-}
-
 /// Shared state for a pool of workers that process [`TaskManagerCommand`]s.
 ///
 /// Workers pull commands from a shared channel and dispatch events through a
@@ -224,10 +217,6 @@ fn recover_from_failed_command(
         .record_task_processed(command.name(), "panic", task_start.elapsed().as_secs_f64());
 
     if let TaskManagerCommand::RefreshFeed { feed_id, .. } = command {
-        // The unwind released the feed's claim, but skipped the update of
-        // the gauge that follows a refresh.
-        w.metrics
-            .set_feeds_refresh_in_progress(in_progress_len(&w.refresh_in_progress));
         let settings = w.config.current();
         let schedule = w.db.write_blocking(|conn| {
             set_feed_error(
@@ -271,11 +260,7 @@ async fn handle_command(
     match command {
         TaskManagerCommand::RefreshFeed { feed_id, manual } => {
             let guard = match InProgressGuard::try_claim(&w.refresh_in_progress, feed_id) {
-                Some(g) => {
-                    w.metrics
-                        .set_feeds_refresh_in_progress(in_progress_len(&w.refresh_in_progress));
-                    g
-                }
+                Some(g) => g,
                 None => {
                     debug!(
                         "Worker {}: feed {} already in progress, skipping refresh",
@@ -331,8 +316,6 @@ async fn handle_command(
             };
 
             drop(guard);
-            w.metrics
-                .set_feeds_refresh_in_progress(in_progress_len(&w.refresh_in_progress));
 
             w.metrics.record_task_processed(
                 "refresh_feed",
