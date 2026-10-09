@@ -353,15 +353,17 @@ pub struct PluginManifest {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
-    /// How long, in milliseconds, each call of one of the plugin's handlers
-    /// may run before it is stopped: a positive integer, or `"unlimited"`
-    /// for no limit. Defaults to [`TimeBudget::DEFAULT`], 100 ms.
+    /// How much CPU time, in milliseconds, each call of one of the plugin's
+    /// handlers may use before it is stopped: a positive integer, or
+    /// `"unlimited"` for no limit. Defaults to [`TimeBudget::DEFAULT`],
+    /// 100 ms. A call is also stopped once it has taken longer by the clock
+    /// than [`crate::scripting::wasm::wall_limit`] allows.
     ///
-    /// Time a handler spends waiting on the server, in calls to its store,
+    /// Time a handler spends on the server's behalf, in calls to its store,
     /// stored entries and feeds, does not count, up to
     /// a second per call of the handler. An unlimited handler is still
     /// stopped, together with every other plugin, if it keeps the script
-    /// host from answering for 10 seconds; see [`TimeBudget::Unlimited`].
+    /// host from answering; see [`TimeBudget::Unlimited`].
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

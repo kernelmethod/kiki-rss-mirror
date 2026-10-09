@@ -224,36 +224,33 @@ fn store_entries<D>(
 /// entry whose scripts fail is stored unmodified.
 fn run_scripts(
     feed_id: i64,
-    feed_entry: FeedEntry,
+    mut feed_entry: FeedEntry,
     script_runner: Option<&dyn ScriptRunner>,
     metrics: &Metrics,
 ) -> Option<FeedEntry> {
     let Some(runner) = script_runner else {
         return Some(feed_entry);
     };
-    // Checked first to spare cloning the entry for events nothing handles.
+    // Checked first to spare sending the entry for events nothing handles.
     if runner.handles(crate::scripting::Event::EntryParsed) {
-        runner.dispatch_observe(
-            crate::scripting::Event::EntryParsed,
-            crate::scripting::EventPayload::Entry(feed_entry.clone()),
-        );
+        runner.dispatch_parsed(&feed_entry);
     }
     if !runner.handles(crate::scripting::Event::EntryIngest) {
         return Some(feed_entry);
     }
-    let format = feed_entry.syndication_format.clone();
-    let original = feed_entry.clone();
     let mut runs = Vec::new();
-    let result = runner.dispatch_transform_entry_timed(feed_entry, &mut runs);
+    // The runner leaves the entry as it was if it fails.
+    let result = runner.dispatch_transform_entry_timed(&mut feed_entry, &mut runs);
     for run in &runs {
         metrics.record_plugin_run(&run.plugin, run.seconds);
     }
+    let format = &feed_entry.syndication_format;
     match result {
-        Ok(Some(e)) => {
+        Ok(true) => {
             metrics.record_plugin_execution("ok");
-            Some(e)
+            Some(feed_entry)
         }
-        Ok(None) => {
+        Ok(false) => {
             metrics.record_plugin_execution("filtered");
             debug!("{} entry filtered by script for feed {}", format, feed_id);
             None
@@ -264,7 +261,7 @@ fn run_scripts(
                 "script error processing {} entry for feed {}: {}; inserting unmodified",
                 format, feed_id, e
             );
-            Some(original)
+            Some(feed_entry)
         }
     }
 }

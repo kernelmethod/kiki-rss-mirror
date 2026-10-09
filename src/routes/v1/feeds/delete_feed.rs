@@ -79,11 +79,14 @@ pub async fn delete_feed(
     match result {
         Ok(Ok((0, _))) => Ok((StatusCode::NOT_FOUND, "Feed not found").into_response()),
         Ok(Ok((_, identity))) => {
-            if let (Some(runner), Some((url, title))) = (state.script_runner.current(), identity) {
-                runner.dispatch_observe(
-                    crate::scripting::Event::FeedRemoved,
-                    crate::scripting::EventPayload::Feed { id, url, title },
-                );
+            if let Some((url, title)) = identity {
+                state
+                    .script_runner
+                    .observe(
+                        crate::scripting::Event::FeedRemoved,
+                        crate::scripting::EventPayload::Feed { id, url, title },
+                    )
+                    .await;
             }
             Ok((StatusCode::NO_CONTENT, "").into_response())
         }
