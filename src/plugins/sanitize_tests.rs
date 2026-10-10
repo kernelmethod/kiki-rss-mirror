@@ -346,6 +346,36 @@ fn kept_attributes_are_written_out_again() {
     }
 }
 
+/// Start tags are written back as Kiki's HTML rewriter writes them: with a space before
+/// a `/>` after attributes, and as they were if they have none.
+#[test]
+fn start_tags_are_written_back_whole() {
+    let runner = default_plugin();
+    let cases = [
+        (r#"<img src="/a.png"/>"#, r#"<img src="/a.png" />"#),
+        (r#"<img src=/a.png class="c" />"#, r#"<img src="/a.png" />"#),
+        ("<p >a<br/>b<br >c</p >", "<p >a<br/>b<br >c</p >"),
+        (r#"<p class="c">a<br class="c"/></p>"#, "<p>a<br/></p>"),
+    ];
+    for (html, expected) in cases {
+        assert_eq!(sanitize(&runner, html), expected, "{html}");
+    }
+}
+
+/// Kiki marks the start tags it hands the plugin with NULs, which content can't forge.
+#[test]
+fn nuls_in_content_are_not_taken_for_start_tags() {
+    let runner = default_plugin();
+    assert_eq!(
+        sanitize(&runner, "<p>\x000\x00<script>x()</script></p>"),
+        "<p>\u{FFFD}0\u{FFFD}</p>"
+    );
+    assert_eq!(
+        sanitize(&runner, "<p title=\"\x000\x00\">x</p>"),
+        "<p title=\"\u{FFFD}0\u{FFFD}\">x</p>"
+    );
+}
+
 #[test]
 fn comments_are_removed() {
     let runner = default_plugin();

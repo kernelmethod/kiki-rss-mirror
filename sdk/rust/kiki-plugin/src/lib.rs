@@ -163,10 +163,11 @@ pub mod regex {
 /// [`MAX_RESULT_BYTES`](html::MAX_RESULT_BYTES).
 pub mod html {
     use crate::bindings::kiki::plugin::html as wit;
-    pub use wit::{Namespace, Place};
+    pub use wit::{Namespace, Place, StripRules};
 
     /// Most memory the result of a call may take in the plugin's memory: the elements
-    /// [`select`] returns, the HTML [`rewrite`] returns or the text [`unescape`] returns.
+    /// [`select`] returns, the HTML [`rewrite`] returns, what [`strip`] returns or the text
+    /// [`unescape`] returns.
     pub const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 
     /// Memory kept free, beyond a result's own size, for the allocations that hold it.
@@ -235,7 +236,7 @@ pub mod html {
         }
     }
 
-    /// An element [`select`] matched.
+    /// An element [`select`] matched, or [`strip`] kept.
     #[derive(Clone, Copy)]
     pub struct Element<'a> {
         elements: &'a Elements,
@@ -399,6 +400,129 @@ pub mod html {
             edits.remove_comments,
             max_bytes,
         )
+    }
+
+    /// `html` rewritten in one pass by `rules`: elements removed with their content, kept
+    /// without their attributes, or unwrapped, by their tag names, and comments removed if
+    /// the rules say so. The attributes taken off the elements kept are returned with them,
+    /// for the plugin to check and write back as it goes through [`Stripped::pieces`].
+    ///
+    /// Where [`select`] and [`rewrite`] parse the HTML twice, this parses it once, and no
+    /// edits cross back to Kiki: use it when what to do with an element depends on its tag
+    /// name alone, and with an attribute on its value.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the HTML needs more memory than the server allows to parse, or what is
+    /// returned needs more room than the plugin's memory has.
+    pub fn strip(html: &str, rules: &StripRules) -> Result<Stripped, String> {
+        // As for `select`, and the HTML besides, which grows by a marker of at most 12
+        // bytes for each start tag of at least 3.
+        let max_bytes = room(html.len().saturating_mul(13).saturating_add(64));
+        let stripped = wit::strip(html, rules, max_bytes)?;
+        Ok(Stripped {
+            html: stripped.html,
+            elements: Elements(stripped.elements),
+        })
+    }
+
+    /// HTML [`strip`] rewrote, and the elements it kept, with the attributes it took off
+    /// them.
+    pub struct Stripped {
+        html: String,
+        elements: Elements,
+    }
+
+    /// A piece of the HTML [`strip`] returned, in order: what to write out to rebuild it.
+    pub enum Piece<'a> {
+        /// HTML to write out as it is.
+        Html(&'a str),
+        /// A kept element's start tag, without attributes, split where they go. Write
+        /// `open`, the attributes to keep, each after a space, and `close`; or nothing, to
+        /// remove a void element such as `<img>`.
+        StartTag {
+            /// The element, with the attributes taken off it.
+            element: Element<'a>,
+            /// The `<` and the tag name.
+            open: &'a str,
+            /// The rest of the tag: `>` or `/>`, or as it was written if the element had
+            /// no attributes. After attributes, `/>` needs a space before it.
+            close: &'a str,
+        },
+    }
+
+    impl Stripped {
+        /// The elements kept, with the attributes taken off them, in document order.
+        pub fn elements(&self) -> &Elements {
+            &self.elements
+        }
+
+        /// The stripped HTML's length, which rebuilding it from [`Self::pieces`] adds the
+        /// attributes kept to.
+        pub fn len(&self) -> usize {
+            self.html.len()
+        }
+
+        /// Whether the stripped HTML is empty.
+        pub fn is_empty(&self) -> bool {
+            self.html.is_empty()
+        }
+
+        /// The stripped HTML, in pieces, in order.
+        pub fn pieces(&self) -> impl Iterator<Item = Piece<'_>> + '_ {
+            let mut rest = self.html.as_str();
+            let mut tag: Option<Piece<'_>> = None;
+            std::iter::from_fn(move || {
+                if let Some(tag) = tag.take() {
+                    return Some(tag);
+                }
+                if rest.is_empty() {
+                    return None;
+                }
+                let Some((before, after)) = rest.split_once('\0') else {
+                    return Some(Piece::Html(std::mem::take(&mut rest)));
+                };
+                match self.start_tag(after) {
+                    Some((piece, after_tag)) => {
+                        tag = Some(piece);
+                        rest = after_tag;
+                    }
+                    // Not a marker, which Kiki never writes: kept as text.
+                    None => {
+                        let (text, after) = rest.split_at(before.len() + 1);
+                        rest = after;
+                        return Some(Piece::Html(text));
+                    }
+                }
+                if before.is_empty() {
+                    return tag.take();
+                }
+                Some(Piece::Html(before))
+            })
+        }
+
+        /// The start tag marked by `marked`, the HTML after a marker's first NUL, and the
+        /// HTML after it.
+        fn start_tag<'a>(&'a self, marked: &'a str) -> Option<(Piece<'a>, &'a str)> {
+            let (index, tag) = marked.split_once('\0')?;
+            let element = self.elements.get(index.parse().ok()?)?;
+            let name_len = tag
+                .bytes()
+                .skip(1)
+                .position(|b| b.is_ascii_whitespace() || b == b'/' || b == b'>')?
+                + 1;
+            let close_len = tag.get(name_len..)?.find('>')? + 1;
+            let (open, after) = tag.split_at(name_len);
+            let (close, after) = after.split_at(close_len);
+            Some((
+                Piece::StartTag {
+                    element,
+                    open,
+                    close,
+                },
+                after,
+            ))
+        }
     }
 
     /// `s` with its character references decoded, as [`select`] decodes attribute values.

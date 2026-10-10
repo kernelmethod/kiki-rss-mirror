@@ -730,7 +730,7 @@ to a plugin. Don't edit HTML with string searches or regexes: they see
 sanitizers built on them get bypassed.
 
 Kiki can't call into a plugin while the plugin is calling Kiki, so a
-rewrite takes two passes:
+general rewrite takes two passes:
 
 1. `html::select(html, selector)` returns the elements a CSS selector, such
    as `"a[href], img"` or `"*"`, matches, in document order. Each has a tag
@@ -778,6 +778,60 @@ most 8 MiB. Each call also checks how much room the plugin's memory has for
 what it returns, and fails rather than return more than that, since a
 plugin with no room for a result would trap. Parsing counts against the
 handler's [time budget](#resource-limits).
+
+### Rewriting in one pass
+
+When what to do with an element depends on its tag name alone, and with an
+attribute on its value, as in a sanitizer, `html::strip(html, &rules)` does
+the work in one pass, and sends no edits back to Kiki. `StripRules` name
+the elements to remove with their content (`drop`), and the ones to keep
+(`keep`); every other element is unwrapped. `drop_foreign` also removes
+elements inside an `<svg>` or a `<math>`, and `remove_comments` removes
+comments. Kiki takes every attribute off the elements kept, and returns
+them, decoded, for the plugin to check and write back as it goes through
+the HTML's `pieces()`:
+
+```rust,ignore
+use kiki_plugin::html::{self, Piece, StripRules};
+
+fn keep_https_links(content: &str) -> Result<String, String> {
+    let rules = StripRules {
+        drop: vec!["script".to_string(), "style".to_string()],
+        keep: vec!["p".to_string(), "a".to_string()],
+        drop_foreign: true,
+        remove_comments: true,
+    };
+    let stripped = html::strip(content, &rules)?;
+    let mut out = String::with_capacity(stripped.len());
+    for piece in stripped.pieces() {
+        match piece {
+            Piece::Html(html) => out.push_str(html),
+            Piece::StartTag { element, open, close } => {
+                out.push_str(open);
+                let href = element.attribute("href").filter(|h| h.starts_with("https:"));
+                if let Some(href) = href {
+                    out.push_str(" href=\"");
+                    out.push_str(&html::escape(href));
+                    out.push('"');
+                    if close.starts_with('/') {
+                        out.push(' ');
+                    }
+                }
+                out.push_str(close);
+            }
+        }
+    }
+    Ok(out)
+}
+```
+
+Each kept element's start tag comes as `open`, the `<` and the tag name,
+and `close`, the rest of the tag; write the attributes to keep between
+them, each after a space, and put a space before a `close` of `/>` after
+them. Leaving out both removes the tag, which removes a void element such
+as `<img>` whole. Kiki marks the start tags in what it returns with NUL
+characters, so it replaces any NULs in the HTML it is given with U+FFFD, as
+browsers do.
 
 ## What a plugin can reach
 

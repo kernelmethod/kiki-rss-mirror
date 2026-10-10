@@ -11,4 +11,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 kiki-plugin = { path = "../../sdk/rust/kiki-plugin" }
+memchr = "2"
 serde_json = "1"

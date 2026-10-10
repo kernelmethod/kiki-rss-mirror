@@ -113,6 +113,7 @@ name = "kiki-privacy"
 version = "2.0.0"
 dependencies = [
  "kiki-plugin",
+ "memchr",
  "serde_json",
 ]
 
