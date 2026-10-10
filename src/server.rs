@@ -726,18 +726,7 @@ async fn timer_loop(script_runner: ScriptRunnerHandle, cancel_token: Cancellatio
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let Some(runner) = script_runner.current() else {
-                    continue;
-                };
-                if !runner.handles(Event::Timer) {
-                    continue;
-                }
-                let run = tokio::task::spawn_blocking(move || {
-                    runner.dispatch_observe(Event::Timer, EventPayload::Timer);
-                });
-                if let Err(e) = run.await {
-                    tracing::warn!("plugin timers failed: {e}");
-                }
+                script_runner.observe(Event::Timer, EventPayload::Timer).await;
             }
             _ = cancel_token.cancelled() => {
                 break;

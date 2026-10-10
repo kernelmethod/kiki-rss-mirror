@@ -345,7 +345,8 @@ Each handler has a time and a memory budget (see
 [Resource limits](writing-plugins.md#resource-limits)). A plugin's manifest
 may lift its time budget, as the bundled `sanitize` plugin does so that no
 entry is stored unsanitized; the server still stops a script host that
-doesn't answer for 10 seconds. A script host that
+goes silent for 10 seconds while requests wait on it, or keeps one waiting
+for 40. A script host that
 crashes or stops answering is not replaced; plugins stay disabled until
 Kiki is restarted, rather than handing a fresh script host to whatever
 broke the last one. Entries keep flowing in either way. A plugin that

@@ -803,16 +803,24 @@ Every call into a plugin runs under hard limits:
 
 - **Time**: 100 ms per call, unless the plugin's manifest sets
   `time_budget_ms` to another number of milliseconds or to `"unlimited"`.
-  Time spent waiting on the server, in [calls to it](#calls-to-the-server),
-  is not counted, up to one second per call; past that, waiting counts like
-  anything else. Loading a plugin, which runs its `init`, may take up to 5
-  seconds.
+  The budget is of CPU time, so a handler isn't stopped because the machine
+  is busy with other work. A call is also stopped once it has taken five
+  times its budget by the clock, or its budget plus a second, whichever is
+  less, however little CPU time it used. Time spent on
+  [calls to the server](#calls-to-the-server) is not counted, up to one
+  second per call; past that, it counts like anything else. Loading a
+  plugin, which runs its `init`, may take up to 5 seconds of CPU time.
 
-  An unlimited handler still has a backstop: plugins run one handler at a
-  time in a separate process, and if that process doesn't answer the server
-  for 10 seconds, the server stops it, and with it every plugin, until Kiki
-  restarts. Keep `"unlimited"` for plugins you trust to finish, such as the
-  bundled `sanitize`, which every new entry passes through.
+  Each plugin's handlers run one call at a time, but different plugins run
+  at the same time: while one plugin works on an entry, the next entry can
+  already be in the plugin before it.
+
+  An unlimited handler still has a backstop: plugins run in a separate
+  process, and if that process sends the server nothing for 10 seconds while
+  it waits on it, or keeps a request waiting for 40, the server stops it,
+  and with it every plugin, until Kiki restarts. Keep `"unlimited"` for
+  plugins you trust to finish, such as the bundled `sanitize`, which every
+  new entry passes through.
 - **Memory**: 16 MiB for each plugin, and 512 KiB of stack.
 - **Regexes**: compiled regexes live outside the plugin's memory, and have
   limits of their own; see [Regular expressions](#regular-expressions).

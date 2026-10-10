@@ -142,20 +142,23 @@ pub const SCAN_SLICE: Duration = Duration::from_millis(50);
 /// server, since timers start over whenever plugins reload.
 pub const MAX_TIMER_INTERVAL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
-/// How long each call of a plugin's handlers may run before it is stopped.
+/// How much CPU time each call of a plugin's handlers may use before it is stopped.
 ///
 /// The budget covers one call of a handler, whether for an event, a timer or an entry of a
-/// scan, not the plugin's handlers taken together. A plugin's manifest sets
-/// it with `time_budget_ms`; see [`crate::plugins::PluginManifest::time_budget_ms`].
+/// scan, not the plugin's handlers taken together. It is of the CPU time of the thread
+/// running the call, with a ceiling in wall-clock time; see [`wasm::wall_limit`]. A
+/// plugin's manifest sets it with `time_budget_ms`; see
+/// [`crate::plugins::PluginManifest::time_budget_ms`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TimeBudget {
     /// Each call may run for this many milliseconds.
     Millis(u64),
     /// Calls run until they finish.
     ///
-    /// The script host is still declared dead if it does not answer within
-    /// [`crate::process::script_host::IPC_TIMEOUT`], which disables scripting until the
-    /// server restarts, so this is only for plugins trusted to finish.
+    /// The script host is still declared dead if it goes silent for
+    /// [`crate::process::script_host::IPC_TIMEOUT`] while a request waits on it, which
+    /// disables scripting until the server restarts, so this is only for plugins trusted
+    /// to finish.
     Unlimited,
 }
 
@@ -230,17 +233,6 @@ impl ScriptSource {
             component: WasmComponent::new(bytes),
         }
     }
-}
-
-/// Copies the fields scripts may not change from `original` onto `modified`, the entry a
-/// handler returned.
-pub(crate) fn restore_read_only(modified: &mut FeedEntry, original: &FeedEntry) {
-    modified.id = original.id;
-    modified.feed_id = original.feed_id;
-    modified.syndication_format = original.syndication_format.clone();
-    modified.guid = original.guid.clone();
-    modified.authors = original.authors.clone();
-    modified.categories = original.categories.clone();
 }
 
 /// Error returned when a script's config is not a JSON object.
@@ -323,6 +315,122 @@ pub struct FeedEntry {
     pub cache_assets: bool,
 }
 
+/// Which of the fields plugins may change an `entry.ingest` chain changed. See
+/// [`EntryPatch::take`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EntryChanges(u8);
+
+impl EntryChanges {
+    pub(crate) const PUBLISHED_AT: Self = Self(1);
+    pub(crate) const TITLE: Self = Self(1 << 1);
+    pub(crate) const URL: Self = Self(1 << 2);
+    pub(crate) const CONTENT: Self = Self(1 << 3);
+    pub(crate) const TAGS: Self = Self(1 << 4);
+    pub(crate) const CACHE_ASSETS: Self = Self(1 << 5);
+
+    /// Whether every change in `other` is in `self`.
+    pub(crate) fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Add the changes in `other`.
+    pub(crate) fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
+/// The fields of an entry an `entry.ingest` chain changed, with their new values: what
+/// the script host sends back for an entry, rather than the whole entry, most of which
+/// plugins usually leave alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryPatch {
+    /// The new `published_at`, if it changed.
+    pub published_at: Option<Option<i64>>,
+    /// The new `title`, if it changed.
+    pub title: Option<String>,
+    /// The new `url`, if it changed.
+    pub url: Option<Option<String>>,
+    /// The new `content`, if it changed.
+    pub content: Option<Option<String>>,
+    /// The new `tags`, if they changed.
+    pub tags: Option<Vec<String>>,
+    /// The new `cache_assets`, if it changed.
+    pub cache_assets: Option<bool>,
+}
+
+impl EntryPatch {
+    /// Move the fields of `entry` named by `changes` into a patch, leaving them empty in
+    /// `entry`.
+    pub(crate) fn take(entry: &mut FeedEntry, changes: EntryChanges) -> Self {
+        let mut patch = Self::default();
+        if changes.contains(EntryChanges::PUBLISHED_AT) {
+            patch.published_at = Some(entry.published_at);
+        }
+        if changes.contains(EntryChanges::TITLE) {
+            patch.title = Some(std::mem::take(&mut entry.title));
+        }
+        if changes.contains(EntryChanges::URL) {
+            patch.url = Some(entry.url.take());
+        }
+        if changes.contains(EntryChanges::CONTENT) {
+            patch.content = Some(entry.content.take());
+        }
+        if changes.contains(EntryChanges::TAGS) {
+            patch.tags = Some(std::mem::take(&mut entry.tags));
+        }
+        if changes.contains(EntryChanges::CACHE_ASSETS) {
+            patch.cache_assets = Some(entry.cache_assets);
+        }
+        patch
+    }
+
+    /// Apply the patch to `entry`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::scripting::{EntryPatch, FeedEntry};
+    ///
+    /// let mut entry = FeedEntry {
+    ///     id: None,
+    ///     feed_id: 1,
+    ///     syndication_format: "rss".to_string(),
+    ///     guid: "1".to_string(),
+    ///     published_at: None,
+    ///     title: "Old".to_string(),
+    ///     url: None,
+    ///     content: Some("<p>body</p>".to_string()),
+    ///     authors: vec![],
+    ///     categories: vec![],
+    ///     tags: vec![],
+    ///     cache_assets: true,
+    /// };
+    /// EntryPatch { title: Some("New".to_string()), ..EntryPatch::default() }.apply(&mut entry);
+    /// assert_eq!(entry.title, "New");
+    /// assert_eq!(entry.content.as_deref(), Some("<p>body</p>"));
+    /// ```
+    pub fn apply(self, entry: &mut FeedEntry) {
+        if let Some(published_at) = self.published_at {
+            entry.published_at = published_at;
+        }
+        if let Some(title) = self.title {
+            entry.title = title;
+        }
+        if let Some(url) = self.url {
+            entry.url = url;
+        }
+        if let Some(content) = self.content {
+            entry.content = content;
+        }
+        if let Some(tags) = self.tags {
+            entry.tags = tags;
+        }
+        if let Some(cache_assets) = self.cache_assets {
+            entry.cache_assets = cache_assets;
+        }
+    }
+}
+
 /// The set of server events that plugins may handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Event {
@@ -369,6 +477,22 @@ impl Event {
             Self::PluginLoad => "plugin.load",
             Self::FetchSchedule => "fetch.schedule",
             Self::Timer => "timer",
+        }
+    }
+
+    /// What a handler of the event is called in log messages (e.g. `"entry.ingest
+    /// handler"`).
+    pub fn handler_name(self) -> &'static str {
+        match self {
+            Self::EntryIngest => "entry.ingest handler",
+            Self::EntryParsed => "entry.parsed handler",
+            Self::FetchSuccess => "fetch.success handler",
+            Self::FetchError => "fetch.error handler",
+            Self::FeedAdded => "feed.added handler",
+            Self::FeedRemoved => "feed.removed handler",
+            Self::PluginLoad => "plugin.load handler",
+            Self::FetchSchedule => "fetch.schedule handler",
+            Self::Timer => "timer handler",
         }
     }
 
@@ -557,10 +681,10 @@ pub struct ScheduleDecision {
 
 /// How long one plugin's handler ran, from
 /// [`ScriptRunner::dispatch_transform_entry_timed`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PluginRun {
     /// The plugin whose handler ran.
-    pub plugin: String,
+    pub plugin: Arc<str>,
     /// How long the handler took, in seconds.
     pub seconds: f64,
 }
@@ -717,17 +841,35 @@ pub trait ScriptRunner: Send + Sync {
     /// - `Err(_)` — an unrecoverable failure; the caller decides how to proceed.
     fn dispatch_transform_entry(&self, entry: FeedEntry) -> anyhow::Result<Option<FeedEntry>>;
 
-    /// As [`Self::dispatch_transform_entry`], also appending to `runs` how long each plugin's
-    /// handler took.
+    /// As [`Self::dispatch_transform_entry`], changing `entry` in place, and also appending
+    /// to `runs` how long each plugin's handler took.
     ///
-    /// The default runs the handlers without timing them, leaving `runs` as it was.
+    /// Returns whether the entry should be kept. On an error `entry` is left as it was.
+    ///
+    /// The default copies the entry for [`Self::dispatch_transform_entry`], and does not
+    /// time the handlers, leaving `runs` as it was. Runners that can avoid the copy
+    /// override it.
     fn dispatch_transform_entry_timed(
         &self,
-        entry: FeedEntry,
+        entry: &mut FeedEntry,
         runs: &mut Vec<PluginRun>,
-    ) -> anyhow::Result<Option<FeedEntry>> {
+    ) -> anyhow::Result<bool> {
         let _ = runs;
-        self.dispatch_transform_entry(entry)
+        match self.dispatch_transform_entry(entry.clone())? {
+            Some(transformed) => {
+                *entry = transformed;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Fire [`Event::EntryParsed`] for `entry`.
+    ///
+    /// The default copies the entry for [`Self::dispatch_observe`]; runners that can send
+    /// it on without copying override it.
+    fn dispatch_parsed(&self, entry: &FeedEntry) {
+        self.dispatch_observe(Event::EntryParsed, EventPayload::Entry(entry.clone()));
     }
 
     /// Pass `schedule` through each `fetch.schedule` handler in registration order.
@@ -803,6 +945,22 @@ impl ScriptRunnerHandle {
         match self.inner.read() {
             Ok(g) => g.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Fire an observe-only event from async code, if the runner has a handler for it.
+    ///
+    /// Dispatching blocks while plugins run, and on the script host's channel, so it runs
+    /// on the blocking thread pool rather than holding up one of the runtime's threads.
+    /// Waits for it, so that events reach plugins in the order the caller fires them.
+    pub async fn observe(&self, event: Event, payload: EventPayload) {
+        let Some(runner) = self.current().filter(|r| r.handles(event)) else {
+            return;
+        };
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || runner.dispatch_observe(event, payload)).await
+        {
+            tracing::warn!(event = event.name(), "dispatching to plugins failed: {e}");
         }
     }
 
