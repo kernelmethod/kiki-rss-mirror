@@ -386,3 +386,80 @@ async fn re_ingest_does_not_duplicate() -> Result<()> {
     tc.assert_db_integrity();
     Ok(())
 }
+
+/// A runner whose `entry.ingest` handler replaces the entry's content.
+struct ReplaceContent;
+
+impl crate::scripting::ScriptRunner for ReplaceContent {
+    fn dispatch_transform_entry(
+        &self,
+        mut entry: crate::scripting::FeedEntry,
+    ) -> anyhow::Result<Option<crate::scripting::FeedEntry>> {
+        entry.content = Some("<p>rewritten</p>".to_string());
+        Ok(Some(entry))
+    }
+
+    fn dispatch_schedule(
+        &self,
+        _: crate::scripting::FetchSchedule,
+    ) -> anyhow::Result<Option<crate::scripting::ScheduleDecision>> {
+        Ok(None)
+    }
+
+    fn dispatch_observe(&self, _: crate::scripting::Event, _: crate::scripting::EventPayload) {}
+
+    fn dispatch_scan(
+        &self,
+        _: u64,
+        _: Vec<crate::scripting::FeedEntry>,
+    ) -> anyhow::Result<Option<Vec<Option<crate::scripting::FeedEntry>>>> {
+        Ok(None)
+    }
+
+    fn finish_scan(&self, _: u64, _: Option<crate::scripting::ScanSummary>) {}
+}
+
+/// The parser sends an item's description only as its content; when a script
+/// changes the content, the description as parsed is still stored.
+#[tokio::test]
+async fn ingest_rss_keeps_description_a_script_replaced() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let conn = tc.database_conn()?;
+    conn.execute(
+        "INSERT INTO feeds (title, url) VALUES ('test feed', 'http://example.com/feed')",
+        [],
+    )?;
+    let feed_id = conn.last_insert_rowid();
+
+    let body = br#"<rss version="2.0"><channel><title>t</title>
+        <link>http://example.com/</link><description>d</description>
+        <item><title>hi</title><link>http://example.com/1</link><guid>g1</guid><description>&lt;p&gt;original&lt;/p&gt;</description></item>
+        </channel></rss>"#;
+    let Some(crate::fetcher::ParsedFeed::Rss { entries, .. }) =
+        crate::fetcher::parse::parse_feed(feed_id, body)
+    else {
+        panic!("the feed parses as RSS");
+    };
+    assert_eq!(entries[0].data.description, None);
+
+    let db = make_pool(&tc.database_path())?;
+    super::super::processing::process_rss_feed(
+        feed_id,
+        None,
+        entries,
+        &db,
+        Some(&ReplaceContent),
+        &super::test_metrics(),
+    )?;
+
+    let (content, description): (Option<String>, Option<String>) = conn.query_row(
+        "SELECT e.content, red.description FROM entries e
+         JOIN rss_entry_data red ON red.entry_id = e.id
+         WHERE e.feed_id = ?1 AND e.guid = 'g1'",
+        [feed_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(content.as_deref(), Some("<p>rewritten</p>"));
+    assert_eq!(description.as_deref(), Some("<p>original</p>"));
+    Ok(())
+}

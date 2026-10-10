@@ -170,7 +170,7 @@ fn dispatch(c: &mut Criterion) {
             group.measurement_time(Duration::from_secs(4));
             group.warm_up_time(Duration::from_secs(1));
             group.throughput(Throughput::Elements(1));
-            for bytes in [2 * 1024, 64 * 1024] {
+            for bytes in [2 * 1024, 64 * 1024, 1024 * 1024] {
                 let entry = entry(&html(bytes));
                 for threads in [1, 4] {
                     group.bench_with_input(
