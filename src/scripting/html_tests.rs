@@ -1,4 +1,4 @@
-//! Tests of the `html` interface's two passes.
+//! Tests of the `html` interface: `select` and `rewrite`'s two passes, and `strip`'s one.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
@@ -10,9 +10,10 @@ fn never() -> bool {
 
 const MAX: u32 = HTML_OUTPUT_LIMIT_BYTES as u32;
 
-/// The elements `selector` matches in `html`, as tag names and their attributes.
-fn elements(html: &str, selector: &str) -> Vec<(String, Vec<(String, String)>)> {
-    let selected = select(html, selector, MAX, &never).unwrap();
+/// Elements, as tag names and their attributes.
+type Found = Vec<(String, Vec<(String, String)>)>;
+
+fn found(selected: &Selected) -> Found {
     selected
         .elements
         .iter()
@@ -30,6 +31,11 @@ fn elements(html: &str, selector: &str) -> Vec<(String, Vec<(String, String)>)> 
             (selected.text(el.tag_name).to_string(), attributes)
         })
         .collect()
+}
+
+/// The elements `selector` matches in `html`.
+fn elements(html: &str, selector: &str) -> Found {
+    found(&select(html, selector, MAX, &never).unwrap())
 }
 
 fn edit(element: u32, op: EditOp) -> Edit {
@@ -262,6 +268,123 @@ fn passes_stop_once_the_budget_runs_out() {
     );
     assert_eq!(
         rewrite(&html, "p", vec![], false, MAX, &|| true).unwrap_err(),
+        HtmlError::Expired
+    );
+}
+
+fn rules(drop: &[&str], keep: &[&str]) -> StripRules {
+    StripRules {
+        drop: drop.iter().map(|s| s.to_string()).collect(),
+        keep: keep.iter().map(|s| s.to_string()).collect(),
+        drop_foreign: true,
+        remove_comments: true,
+    }
+}
+
+/// `html` stripped by `rules`, with its markers written as `[i]`, and the elements kept.
+fn stripped(html: &str, rules: &StripRules) -> (String, Found) {
+    let stripped = strip(html, rules, MAX, &never).unwrap();
+    let mut marked = String::new();
+    for (i, piece) in stripped.html.split(STRIP_MARKER).enumerate() {
+        if i % 2 == 1 {
+            marked.push_str(&format!("[{piece}]"));
+        } else {
+            marked.push_str(piece);
+        }
+    }
+    (marked, found(&stripped.elements))
+}
+
+#[test]
+fn strip_drops_keeps_and_unwraps_in_one_pass() {
+    let (html, elements) = stripped(
+        r#"<div class="d"><P Class="x" onclick="f()">a <A HREF="/a?x=1&amp;y=2">b</A></p><!-- c --><script>x()</script><br></div>"#,
+        &rules(&["script"], &["p", "a", "br"]),
+    );
+    assert_eq!(html, "[0]<P>a [1]<A>b</A></p>[2]<br>");
+    assert_eq!(
+        elements,
+        [
+            (
+                "p".to_string(),
+                vec![
+                    ("class".to_string(), "x".to_string()),
+                    ("onclick".to_string(), "f()".to_string())
+                ]
+            ),
+            (
+                "a".to_string(),
+                vec![("href".to_string(), "/a?x=1&y=2".to_string())]
+            ),
+            ("br".to_string(), vec![]),
+        ]
+    );
+}
+
+/// Elements inside a removed one are still returned, but their markers go with it, so
+/// the markers' indices skip them.
+#[test]
+fn strip_markers_skip_elements_removed_with_their_parents() {
+    let (html, elements) = stripped(
+        "<object><p>x</p></object><p>y</p><svg><a>z</a></svg>",
+        &rules(&["object"], &["p", "a", "svg"]),
+    );
+    assert_eq!(html, "[1]<p>y</p>");
+    assert_eq!(elements.len(), 2);
+}
+
+#[test]
+fn strip_leaves_start_tags_without_attributes_as_they_were() {
+    let (html, _) = stripped(
+        r#"<img src="a.png"/><img src=b.png /><br ><br/><hr>"#,
+        &rules(&[], &["img", "br", "hr"]),
+    );
+    assert_eq!(html, "[0]<img/>[1]<img/>[2]<br >[3]<br/>[4]<hr>");
+}
+
+#[test]
+fn strip_keeps_comments_and_foreign_elements_if_asked() {
+    let rules = StripRules {
+        drop_foreign: false,
+        remove_comments: false,
+        ..rules(&[], &["svg", "p"])
+    };
+    let (html, _) = stripped("<!-- c --><svg><p>x</p></svg>", &rules);
+    assert_eq!(html, "<!-- c -->[0]<svg>[1]<p>x</p></svg>");
+}
+
+/// Only markers are NULs, so a NUL in the HTML can't pass for one.
+#[test]
+fn strip_replaces_nuls_in_the_html() {
+    let (html, elements) = stripped("<p title=\"\x000\x00\">\x000\x00</p>", &rules(&[], &["p"]));
+    assert_eq!(html, "[0]<p>\u{FFFD}0\u{FFFD}</p>");
+    assert_eq!(elements[0].1[0].1, "\u{FFFD}0\u{FFFD}");
+}
+
+#[test]
+fn strip_is_capped_and_stops_once_the_budget_runs_out() {
+    let html = r#"<p title="abcdefgh">x</p>"#.repeat(64);
+    let rules = rules(&[], &["p"]);
+    // Each element takes 1 + 5 + 8 bytes of text, an element and an attribute, and
+    // `\0i\0<p>x</p>`, 11 or 12 bytes, of HTML.
+    let elements = 64 * (14 + ELEMENT_BYTES + ATTRIBUTE_BYTES);
+    let html_bytes = 10 * 11 + 54 * 12;
+    let max = (elements + html_bytes) as u32;
+    assert_eq!(
+        strip(&html, &rules, max, &never)
+            .unwrap()
+            .elements
+            .elements
+            .len(),
+        64
+    );
+    let err = strip(&html, &rules, max - 1, &never).unwrap_err();
+    assert!(
+        matches!(&err, HtmlError::Failed(m) if m.contains("more than")),
+        "{err:?}"
+    );
+    assert_eq!(
+        strip(&html, &rules, MAX, &|| true).unwrap_err(),
         HtmlError::Expired
     );
 }

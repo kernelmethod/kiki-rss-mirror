@@ -26,7 +26,12 @@
 //!
 //! Comments are removed. The attributes that are kept are written out again from their
 //! decoded values, so a value is stored as it was checked: however a URL hides its scheme
-//! behind character references, what is stored is what was checked. Text is kept as it is.
+//! behind character references, what is stored is what was checked. Text is kept as it is,
+//! but for NUL characters, which become U+FFFD, as browsers show them.
+//!
+//! The HTML is parsed once: Kiki removes and unwraps elements by their names, as the
+//! config says, and takes the attributes off the elements kept (`html::strip`). Which
+//! attributes to keep, and which URLs, the plugin decides as it writes the HTML out again.
 //!
 //! If the HTML cannot be rewritten (its elements or the rewritten HTML need more memory than
 //! the plugin has, say), the entry's content is replaced with its text, escaped, so that
@@ -38,10 +43,11 @@
 //! entries already stored. Plugins that run after this one (those whose directory names
 //! sort after "sanitize") see the sanitized content, and can add markup back.
 
-use kiki_plugin::html::{self, Edits, Element, Namespace};
+use kiki_plugin::html::{self, Piece, StripRules};
 use kiki_plugin::{log, plugin, Entry, Level, Plugin};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 
 /// Longest content the plugin writes as text.
 const OUTPUT_LIMIT_BYTES: usize = html::MAX_RESULT_BYTES;
@@ -96,29 +102,55 @@ const URL_ATTRIBUTES: &[&str] = &[
     "usemap",
 ];
 
+/// FNV-1a. The sets of names the plugin looks every attribute up in hold a few short
+/// names, which the default hasher, SipHash, is slow to hash in WebAssembly. Content only
+/// looks names up, and never adds any, so it can't make the sets slow to search.
+struct Fnv(u64);
+
+impl Default for Fnv {
+    fn default() -> Self {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+}
+
+type Set = HashSet<String, BuildHasherDefault<Fnv>>;
+type Map<V> = HashMap<String, V, BuildHasherDefault<Fnv>>;
+
 struct Sanitize {
-    /// The elements kept.
-    allowed: HashSet<String>,
-    /// The elements removed with their content: [`ALWAYS_DROPPED`] and the config's `drop`.
-    dropped: HashSet<String>,
+    /// What to do with each element: keep the config's `elements`, remove
+    /// [`ALWAYS_DROPPED`] and the config's `drop` with their content, and SVG and MathML
+    /// too, and unwrap the rest.
+    rules: StripRules,
     /// The URL schemes allowed, lowercase.
-    schemes: HashSet<String>,
+    schemes: Set,
     /// The attributes allowed on every element.
-    global_attributes: HashSet<String>,
+    global_attributes: Set,
     /// The attributes allowed on given elements, by element.
-    element_attributes: HashMap<String, HashSet<String>>,
+    element_attributes: Map<Set>,
 }
 
 /// Reads config key `key` as a list of non-empty strings, lowercased, as a set.
-fn string_set(config: &Map<String, Value>, key: &str) -> Result<HashSet<String>, String> {
+fn string_set(config: &serde_json::Map<String, Value>, key: &str) -> Result<Set, String> {
     let list = match config.get(key) {
-        None | Some(Value::Null) => return Ok(HashSet::new()),
+        None | Some(Value::Null) => return Ok(Set::default()),
         // An empty Lua table, as configs written for the Lua plugin could hold.
-        Some(Value::Object(map)) if map.is_empty() => return Ok(HashSet::new()),
+        Some(Value::Object(map)) if map.is_empty() => return Ok(Set::default()),
         Some(Value::Array(list)) => list,
         Some(_) => return Err(format!("sanitize: '{key}' must be a list of strings")),
     };
-    let mut set = HashSet::with_capacity(list.len());
+    let mut set = Set::with_capacity_and_hasher(list.len(), Default::default());
     for (i, value) in list.iter().enumerate() {
         match value.as_str() {
             Some(s) if !s.is_empty() => set.insert(s.to_ascii_lowercase()),
@@ -134,14 +166,14 @@ fn string_set(config: &Map<String, Value>, key: &str) -> Result<HashSet<String>,
 }
 
 impl Sanitize {
-    fn from_config(config: &Map<String, Value>) -> Result<Self, String> {
+    fn from_config(config: &serde_json::Map<String, Value>) -> Result<Self, String> {
         let allowed = string_set(config, "elements")?;
         let mut dropped = string_set(config, "drop")?;
         dropped.extend(ALWAYS_DROPPED.iter().map(|s| s.to_string()));
         let schemes = string_set(config, "url_schemes")?;
 
-        let mut global_attributes = HashSet::new();
-        let mut element_attributes: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut global_attributes = Set::default();
+        let mut element_attributes: Map<Set> = Map::default();
         for value in string_set(config, "attributes")? {
             // "element:name", with neither part empty; anything else is a bare name.
             match value.split_once(':') {
@@ -158,8 +190,13 @@ impl Sanitize {
         }
 
         Ok(Sanitize {
-            allowed,
-            dropped,
+            rules: StripRules {
+                // Dropping wins over keeping.
+                keep: allowed.difference(&dropped).cloned().collect(),
+                drop: dropped.into_iter().collect(),
+                drop_foreign: true,
+                remove_comments: true,
+            },
             schemes,
             global_attributes,
             element_attributes,
@@ -181,6 +218,36 @@ impl Sanitize {
     /// characters and spaces at the start of a URL, and tabs and newlines anywhere in it,
     /// so they are ignored here too: otherwise `" java\tscript:"` would look relative.
     fn url_allowed(&self, url: &str) -> bool {
+        // The scheme is what comes before the first `:`, if that is a letter followed by
+        // letters, digits, `+`, `.` and `-`. Read without copying the URL, as this runs for
+        // every link and image.
+        let mut chars = url
+            .chars()
+            .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+            .skip_while(|c| c.is_ascii_control() || *c == ' ');
+        let mut scheme = [0; 32];
+        let mut len = 0;
+        loop {
+            match chars.next() {
+                Some(':') if len > 0 => break,
+                Some(c) if c.is_ascii_alphabetic() || (len > 0 && is_scheme_char(c)) => {
+                    let Some(byte) = scheme.get_mut(len) else {
+                        return self.long_url_allowed(url);
+                    };
+                    *byte = c.to_ascii_lowercase() as u8;
+                    len += 1;
+                }
+                // No scheme: the URL is relative.
+                _ => return true,
+            }
+        }
+        let scheme = std::str::from_utf8(scheme.get(..len).unwrap_or_default()).unwrap_or_default();
+        self.schemes.contains(scheme)
+    }
+
+    /// [`Self::url_allowed`], for a URL that may have a scheme too long to read without
+    /// copying it.
+    fn long_url_allowed(&self, url: &str) -> bool {
         let cleaned: String = url
             .chars()
             .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
@@ -190,9 +257,7 @@ impl Sanitize {
             return true;
         };
         let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'));
+            && scheme.chars().all(is_scheme_char);
         !is_scheme || self.schemes.contains(&scheme.to_ascii_lowercase())
     }
 
@@ -212,50 +277,96 @@ impl Sanitize {
         !URL_ATTRIBUTES.contains(&name) || self.url_allowed(value)
     }
 
-    /// Record in `edits` what to do with `el`.
-    fn sanitize_element(&self, el: &Element<'_>, edits: &mut Edits) {
-        let index = el.index();
-        let name = el.tag_name();
-        let foreign = matches!(el.namespace(), Namespace::Svg | Namespace::Mathml);
-        if foreign || self.dropped.contains(name) {
-            edits.remove(index);
-            return;
-        }
-        if !self.allowed.contains(name) {
-            edits.remove_and_keep_content(index);
-            return;
-        }
-
-        // Remove every attribute, then set the ones that are allowed again from their
-        // decoded values, which Kiki escapes as it writes them.
-        for (attribute, _) in el.attributes() {
-            edits.remove_attribute(index, attribute);
-        }
-        let mut has_src = false;
-        for (attribute, value) in el.attributes() {
-            if self.attribute_allowed(name, attribute) && self.value_allowed(attribute, value) {
-                edits.set_attribute(index, attribute, value);
-                has_src |= attribute == "src";
+    /// `content`, sanitized, or why it could not be.
+    ///
+    /// Kiki parses it once, removing and unwrapping elements as [`Self::rules`] say, and
+    /// taking every attribute off the elements kept. The plugin then writes the HTML out
+    /// again, with the attributes it allows written back from their decoded values: the
+    /// value stored is the value checked.
+    fn rewrite(&self, content: &str) -> Result<String, String> {
+        let stripped = html::strip(content, &self.rules)?;
+        let mut out = Bounded::with_capacity(stripped.len() + stripped.len() / 4);
+        // The attributes kept on an element, by name, each where it first was.
+        let mut kept: Vec<(&str, &str)> = Vec::new();
+        for piece in stripped.pieces() {
+            let written = match piece {
+                Piece::Html(html) => out.push(html.as_bytes()),
+                Piece::StartTag {
+                    element,
+                    open,
+                    close,
+                } => {
+                    let name = element.tag_name();
+                    kept.clear();
+                    for (attribute, value) in element.attributes() {
+                        if !self.attribute_allowed(name, attribute)
+                            || !self.value_allowed(attribute, value)
+                        {
+                            continue;
+                        }
+                        // A repeated attribute's last value wins.
+                        match kept.iter_mut().find(|(n, _)| *n == attribute) {
+                            Some(same) => same.1 = value,
+                            None => kept.push((attribute, value)),
+                        }
+                    }
+                    if name == "img" && !kept.iter().any(|(attribute, _)| *attribute == "src") {
+                        continue;
+                    }
+                    write_start_tag(&mut out, open, &kept, close)
+                }
+            };
+            if !written {
+                return Err("the sanitized HTML does not fit in the plugin's memory".to_string());
             }
         }
-
-        if name == "img" && !has_src {
-            edits.remove(index);
-        }
+        Ok(out.into_string())
     }
+}
 
-    /// `html`, sanitized, or why it could not be.
-    fn rewrite(&self, content: &str) -> Result<String, String> {
-        let mut edits = Edits::new();
-        edits.remove_comments();
-        // Dropped before the rewrite, which needs the memory.
-        let elements = html::select(content, "*")?;
-        for el in elements.iter() {
-            self.sanitize_element(&el, &mut edits);
+/// Write a start tag: `open`, the `<` and the tag name; ` name="value"` for each of
+/// `attributes`, with `&` and `"` in the value escaped; and `close`, the rest of the tag,
+/// after a space if it is `/>` and follows an attribute, whose value it would otherwise
+/// end if unquoted. Returns whether it all fit.
+fn write_start_tag(
+    out: &mut Bounded,
+    open: &str,
+    attributes: &[(&str, &str)],
+    close: &str,
+) -> bool {
+    let mut fits = out.push(open.as_bytes());
+    for &(name, value) in attributes {
+        // Written only with a name that can't end the tag or start a value.
+        if !is_attribute_name(name) {
+            continue;
         }
-        drop(elements);
-        html::rewrite(content, "*", &edits)
+        fits &= out.push(b" ") && out.push(name.as_bytes()) && out.push(b"=\"");
+        let mut rest = value;
+        while let Some(i) = rest.find(['&', '"']) {
+            let (text, after) = rest.split_at(i);
+            let escaped: &[u8] = if after.starts_with('&') {
+                b"&amp;"
+            } else {
+                b"&quot;"
+            };
+            fits &= out.push(text.as_bytes()) && out.push(escaped);
+            rest = after.get(1..).unwrap_or_default();
+        }
+        fits &= out.push(rest.as_bytes()) && out.push(b"\"");
     }
+    if !attributes.is_empty() && close.starts_with('/') {
+        fits &= out.push(b" ");
+    }
+    fits && out.push(close.as_bytes())
+}
+
+/// Whether `name` can be written as an attribute's name: it is not empty, and has no
+/// whitespace, control characters, quotes, `/`, `=` or `>`.
+fn is_attribute_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '/' | '=' | '>' | '<')
+        })
 }
 
 /// Bytes written up to [`OUTPUT_LIMIT_BYTES`], or as many as the plugin's memory holds,
@@ -301,6 +412,11 @@ impl Bounded {
     fn into_string(self) -> String {
         String::from_utf8(self.bytes).unwrap_or_default()
     }
+}
+
+/// Whether `c` may follow a URL scheme's first letter.
+fn is_scheme_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')
 }
 
 /// Whether `c` is whitespace as the Lua plugin's patterns had it (`%s`): ASCII
@@ -387,7 +503,7 @@ fn unescape_split(text: &str) -> usize {
 
 impl Plugin for Sanitize {
     fn new(config: &str) -> Result<Self, String> {
-        let config: Map<String, Value> =
+        let config: serde_json::Map<String, Value> =
             serde_json::from_str(config).map_err(|e| format!("sanitize: invalid config: {e}"))?;
         Sanitize::from_config(&config)
     }

@@ -204,8 +204,22 @@ impl Privacy {
     }
 
     fn is_tracking(&self, name: &str) -> bool {
-        let name = name.to_ascii_lowercase();
-        self.names.contains(&name) || self.prefixes.iter().any(|p| name.starts_with(p.as_str()))
+        // Lowercased on the stack, as most names are short: this runs for every parameter
+        // of every URL in the content.
+        let mut buf = [0; 64];
+        let lower = match buf.get_mut(..name.len()) {
+            Some(lower) => {
+                lower.copy_from_slice(name.as_bytes());
+                lower.make_ascii_lowercase();
+                // ASCII lowercasing keeps UTF-8 valid.
+                std::str::from_utf8(lower)
+                    .map(Cow::Borrowed)
+                    .unwrap_or_default()
+            }
+            None => Cow::Owned(name.to_ascii_lowercase()),
+        };
+        self.names.contains(lower.as_ref())
+            || self.prefixes.iter().any(|p| lower.starts_with(p.as_str()))
     }
 
     /// Removes the tracking parameters from `s`, a query string or a fragment, without its
@@ -284,42 +298,59 @@ impl Privacy {
         Some(out)
     }
 
-    /// `html` with the tracking parameters removed from the URLs in its `href` and `src`
-    /// attributes, or `None` if they have none.
-    fn clean_content(&self, html: &str) -> Option<String> {
-        let mut html = Cow::Borrowed(html);
-        for name in ["href", "src"] {
-            for quoted in [true, false] {
-                if let Some(cleaned) = self.clean_attribute(&html, name, quoted) {
-                    html = Cow::Owned(cleaned);
-                }
-            }
-        }
-        match html {
-            Cow::Owned(html) => Some(html),
-            Cow::Borrowed(_) => None,
-        }
-    }
-
-    /// `html` with the tracking parameters removed from the values of the attributes named
-    /// `name`, quoted or not as `quoted` says, or `None` if they have none.
+    /// `html` cleaned in one pass from start to end: with the tracking parameters removed
+    /// from the URLs in its `href` and `src` attributes if `content` is set, and its
+    /// tracking pixels' `<img>` elements removed if `pixels` is; or `None` if it has
+    /// nothing to clean.
     ///
     /// Attributes are found by their text alone, without parsing the HTML: an attribute's
-    /// name must follow whitespace, so that `data-src`, say, is left alone. The HTML is
-    /// read from left to right, and carried on after each attribute found.
-    fn clean_attribute(&self, html: &str, name: &str, quoted: bool) -> Option<String> {
+    /// name must follow whitespace, so that `data-src`, say, is left alone. Each one found
+    /// is skipped over once its value is cleaned. An `<img>` tag is read whole to tell
+    /// whether it is a tracking pixel, and then, if it is not, from its name on like the
+    /// rest of the HTML.
+    ///
+    /// The pass stops only at `<`, where a tag may start, and at `=`, which every
+    /// attribute has: an attribute is found by looking back from its `=` for its name.
+    fn clean_html(&self, html: &str) -> Option<String> {
         let bytes = html.as_bytes();
         let mut out: Option<String> = None;
         // How much of `html` is in `out`.
         let mut copied = 0;
+        // Where to look from next. Attributes are looked for only after it: what is
+        // before it was skipped over.
         let mut pos = 0;
-        while let Some(start) = find(bytes, pos, is_space) {
-            pos = start + 1;
-            let Some((value_start, value_end, end)) = attribute_value(bytes, start, name, quoted)
-            else {
+        let next = |from: usize| -> Option<usize> {
+            let rest = bytes.get(from..)?;
+            let found = match (self.pixels, self.content) {
+                (true, true) => memchr::memchr2(b'<', b'=', rest),
+                (true, false) => memchr::memchr(b'<', rest),
+                (false, true) => memchr::memchr(b'=', rest),
+                (false, false) => None,
+            };
+            Some(from + found?)
+        };
+        let mut at = pos;
+        while let Some(found) = next(at) {
+            at = found + 1;
+            if bytes.get(found) == Some(&b'<') {
+                let Some((close, pixel)) = self.read_img(html, found) else {
+                    continue;
+                };
+                if pixel {
+                    let out = out.get_or_insert_with(|| String::with_capacity(html.len()));
+                    out.push_str(html.get(copied..found).unwrap_or_default());
+                    copied = close + 1;
+                    pos = close + 1;
+                    at = pos;
+                }
+                // Otherwise its attributes are cleaned as the pass goes on.
+                continue;
+            }
+            let Some((value_start, value_end, end)) = attribute_at(bytes, pos, found) else {
                 continue;
             };
             pos = end;
+            at = end;
             let (Some(value), Some(before)) = (
                 html.get(value_start..value_end),
                 html.get(copied..value_start),
@@ -338,6 +369,25 @@ impl Privacy {
         Some(out)
     }
 
+    /// If an `<img>` tag starts at `start` in `html`, and is closed: the position of the
+    /// `>` closing it, and whether it is a tracking pixel.
+    fn read_img(&self, html: &str, start: usize) -> Option<(usize, bool)> {
+        let bytes = html.as_bytes();
+        let name_end = start + 4;
+        let is_img = bytes
+            .get(start + 1..name_end)
+            .is_some_and(|name| name.eq_ignore_ascii_case(b"img"))
+            // Not, say, <imgx>.
+            && bytes
+                .get(name_end)
+                .is_some_and(|&b| is_space(b) || b == b'/' || b == b'>');
+        if !is_img {
+            return None;
+        }
+        let (attrs, close) = read_tag(html, name_end)?;
+        Some((close, self.is_pixel(&attrs)))
+    }
+
     /// Whether `src`, an image's source, is from one of the `trackers`.
     fn is_tracker(&self, src: &str) -> bool {
         url_host(src)
@@ -348,46 +398,6 @@ impl Privacy {
     fn is_pixel(&self, attrs: &ImageAttributes) -> bool {
         (is_tiny(attrs.width) && is_tiny(attrs.height))
             || attrs.src.is_some_and(|src| self.is_tracker(src))
-    }
-
-    /// `html` with its tracking pixels' `<img>` elements removed, or `None` if it has none.
-    fn remove_pixels(&self, html: &str) -> Option<String> {
-        let bytes = html.as_bytes();
-        let mut out: Option<String> = None;
-        // How much of `html` is in `out`.
-        let mut copied = 0;
-        let mut pos = 0;
-        while let Some(start) = find(bytes, pos, |b| b == b'<') {
-            let name_end = start + 4;
-            let is_img = bytes
-                .get(start + 1..name_end)
-                .is_some_and(|name| name.eq_ignore_ascii_case(b"img"));
-            if !is_img {
-                pos = start + 1;
-                continue;
-            }
-            // Not an <img> tag (say, <imgx>), one to keep, or one left unclosed: carry on
-            // after its name.
-            pos = name_end;
-            if !bytes
-                .get(name_end)
-                .is_some_and(|&b| is_space(b) || b == b'/' || b == b'>')
-            {
-                continue;
-            }
-            let Some((attrs, close)) = read_tag(html, name_end) else {
-                continue;
-            };
-            if self.is_pixel(&attrs) {
-                let out = out.get_or_insert_with(|| String::with_capacity(html.len()));
-                out.push_str(html.get(copied..start).unwrap_or_default());
-                copied = close + 1;
-                pos = close + 1;
-            }
-        }
-        let mut out = out?;
-        out.push_str(html.get(copied..).unwrap_or_default());
-        Some(out)
     }
 
     /// Whether feed `feed_id` is in `skip_assets`, by id or by URL.
@@ -436,6 +446,24 @@ fn trim_space_start(s: &str) -> &str {
 fn find(bytes: &[u8], from: usize, pred: impl Fn(u8) -> bool) -> Option<usize> {
     let i = bytes.get(from..)?.iter().position(|&b| pred(b))?;
     Some(from + i)
+}
+
+/// If the `=` at `equals` in `bytes` is an `href` or `src` attribute's, written after
+/// whitespace at or after `from`: where its value starts and ends, and where the attribute
+/// ends, as [`attribute_value`] has them.
+fn attribute_at(bytes: &[u8], from: usize, equals: usize) -> Option<(usize, usize, usize)> {
+    let mut name_end = equals;
+    while name_end > from && bytes.get(name_end - 1).is_some_and(|&b| is_space(b)) {
+        name_end -= 1;
+    }
+    ["href", "src"].into_iter().find_map(|name| {
+        let start = name_end.checked_sub(name.len() + 1)?;
+        if start < from || !bytes.get(start).is_some_and(|&b| is_space(b)) {
+            return None;
+        }
+        attribute_value(bytes, start, name, true)
+            .or_else(|| attribute_value(bytes, start, name, false))
+    })
 }
 
 /// If the whitespace at `start` in `bytes` is followed by the attribute `name` (in any
@@ -601,15 +629,8 @@ impl Privacy {
         if let Some(cleaned) = entry.url.as_deref().and_then(|url| self.clean_url(url)) {
             entry.url = Some(cleaned);
         }
-        if self.pixels {
-            if let Some(cleaned) = entry.content.as_deref().and_then(|c| self.remove_pixels(c)) {
-                entry.content = Some(cleaned);
-            }
-        }
-        if self.content {
-            if let Some(cleaned) = entry.content.as_deref().and_then(|c| self.clean_content(c)) {
-                entry.content = Some(cleaned);
-            }
+        if let Some(cleaned) = entry.content.as_deref().and_then(|c| self.clean_html(c)) {
+            entry.content = Some(cleaned);
         }
         if self.skips_assets(entry.feed_id) {
             entry.cache_assets = false;

@@ -415,6 +415,9 @@ pub struct AtomCategory {
 /// RSS-specific per-entry data captured from a parsed item.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RssEntryIngestData {
+    /// The item's `<description>`, if it differs from the entry's content. It is
+    /// `None` as parsed, since the description is also the content; the server fills
+    /// it in from the content only before scripts that may change the content run.
     pub description: Option<String>,
     pub comments: Option<String>,
     pub author: Option<String>,

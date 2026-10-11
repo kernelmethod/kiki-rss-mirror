@@ -613,6 +613,35 @@ fn span_to_wit(span: super::html::Span) -> html_host::Span {
     }
 }
 
+/// What `select` returns, as plugins see it; also the elements `strip` returns.
+fn elements_to_wit(selected: super::html::Selected) -> html_host::Elements {
+    use super::html::Namespace;
+    html_host::Elements {
+        elements: selected
+            .elements
+            .iter()
+            .map(|el| html_host::Element {
+                tag_name: span_to_wit(el.tag_name),
+                namespace: match el.namespace {
+                    Namespace::Html => html_host::Namespace::Html,
+                    Namespace::Svg => html_host::Namespace::Svg,
+                    Namespace::MathMl => html_host::Namespace::Mathml,
+                },
+                attributes: span_to_wit(el.attributes),
+            })
+            .collect(),
+        attributes: selected
+            .attributes
+            .iter()
+            .map(|a| html_host::Attribute {
+                name: span_to_wit(a.name),
+                value: span_to_wit(a.value),
+            })
+            .collect(),
+        text: selected.text,
+    }
+}
+
 impl html_host::Host for State {
     fn select(
         &mut self,
@@ -620,35 +649,32 @@ impl html_host::Host for State {
         selector: String,
         max_bytes: u32,
     ) -> wasmtime::Result<Result<html_host::Elements, String>> {
-        use super::html::Namespace;
         self.check_budget("html.select")?;
         let budget = &self.budget;
         let selected = super::html::select(&html, &selector, max_bytes, &|| budget.expired());
+        Self::html_result("html.select", selected.map(elements_to_wit))
+    }
+
+    fn strip(
+        &mut self,
+        html: String,
+        rules: html_host::StripRules,
+        max_bytes: u32,
+    ) -> wasmtime::Result<Result<html_host::Stripped, String>> {
+        self.check_budget("html.strip")?;
+        let rules = super::html::StripRules {
+            drop: rules.drop.into_iter().collect(),
+            keep: rules.keep.into_iter().collect(),
+            drop_foreign: rules.drop_foreign,
+            remove_comments: rules.remove_comments,
+        };
+        let budget = &self.budget;
+        let stripped = super::html::strip(&html, &rules, max_bytes, &|| budget.expired());
         Self::html_result(
-            "html.select",
-            selected.map(|selected| html_host::Elements {
-                elements: selected
-                    .elements
-                    .iter()
-                    .map(|el| html_host::Element {
-                        tag_name: span_to_wit(el.tag_name),
-                        namespace: match el.namespace {
-                            Namespace::Html => html_host::Namespace::Html,
-                            Namespace::Svg => html_host::Namespace::Svg,
-                            Namespace::MathMl => html_host::Namespace::Mathml,
-                        },
-                        attributes: span_to_wit(el.attributes),
-                    })
-                    .collect(),
-                attributes: selected
-                    .attributes
-                    .iter()
-                    .map(|a| html_host::Attribute {
-                        name: span_to_wit(a.name),
-                        value: span_to_wit(a.value),
-                    })
-                    .collect(),
-                text: selected.text,
+            "html.strip",
+            stripped.map(|stripped| html_host::Stripped {
+                html: stripped.html,
+                elements: elements_to_wit(stripped.elements),
             }),
         )
     }

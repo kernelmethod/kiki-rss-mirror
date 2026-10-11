@@ -261,6 +261,37 @@ interface html {
         max-bytes: u32,
     ) -> result<string, string>;
 
+    /// What `strip` does with each element, by its tag name, lowercase.
+    record strip-rules {
+        /// Elements removed with their content.
+        drop: list<string>,
+        /// Elements kept, without their attributes. Every other element is unwrapped: its
+        /// tags are removed and its content kept.
+        keep: list<string>,
+        /// Whether elements in the SVG and MathML namespaces are removed with their content,
+        /// whatever their names.
+        drop-foreign: bool,
+        remove-comments: bool,
+    }
+
+    /// What `strip` returns.
+    record stripped {
+        /// The stripped HTML. Just before each kept element's start tag is a marker: a NUL,
+        /// the element's index in `elements`, in decimal, and a NUL. NULs in the HTML given
+        /// are replaced with U+FFFD, so markers are the only NULs. The start tag follows
+        /// without attributes, as `<name>` or `<name/>`, or as it was written if it had
+        /// none.
+        html: string,
+        /// The elements kept, with the attributes taken off them, as `select` returns
+        /// them. An element inside one removed with its content is listed, but its marker
+        /// is removed with it.
+        elements: elements,
+    }
+
+    /// `html` rewritten in one pass by `rules`, keeping each kept element's attributes
+    /// aside for the plugin to check and write back.
+    strip: func(html: string, rules: strip-rules, max-bytes: u32) -> result<stripped, string>;
+
     /// `s` with its character references decoded, as `select` decodes attribute values.
     unescape: func(s: string, max-bytes: u32) -> result<string, string>;
 }
