@@ -113,8 +113,10 @@ const SYMLINK_SEARCH_DEPTH: usize = 4;
 /// themselves are unaffected — Landlock opens them following symlinks —
 /// so only symlinks *inside* a granted directory need this.
 ///
-/// Symlinked directories are granted whole and not descended into.
-/// Dangling symlinks, and anything that cannot be read, are skipped.
+/// Symlinked directories are granted whole, and searched in turn for
+/// symlinks that lead further: on NixOS a symlinked directory in `/etc`
+/// often lands in one store path whose files link on into others. Dangling
+/// symlinks, and anything that cannot be read, are skipped.
 fn symlink_targets(paths: &[PathBuf]) -> Vec<PathBuf> {
     let roots: Vec<PathBuf> = paths
         .iter()
@@ -140,8 +142,18 @@ fn collect_symlink_targets(dir: &Path, depth: usize, roots: &[PathBuf], out: &mu
             let Ok(target) = std::fs::canonicalize(&path) else {
                 continue; // dangling
             };
-            if !roots.iter().any(|r| target.starts_with(r)) && !out.contains(&target) {
-                out.push(target);
+            // `out` holds the targets granted so far, so a symlinked
+            // directory is searched only once, and a cycle ends there.
+            if roots
+                .iter()
+                .chain(out.iter())
+                .any(|r| target.starts_with(r))
+            {
+                continue;
+            }
+            out.push(target.clone());
+            if target.is_dir() && depth > 0 {
+                collect_symlink_targets(&target, depth - 1, roots, out);
             }
         } else if file_type.is_dir() && depth > 0 {
             collect_symlink_targets(&path, depth - 1, roots, out);
@@ -1296,6 +1308,44 @@ mod tests {
         assert_eq!(
             targets,
             vec![store.join("ca-bundle.crt"), store.join("certs-dir")]
+        );
+    }
+
+    /// A symlinked directory is searched in turn, so files in it that link
+    /// on elsewhere — `/etc/ssl/certs` linking to one store path whose
+    /// bundles link into another — have their targets granted too, and a
+    /// cycle of directory links ends.
+    #[test]
+    fn symlinks_inside_symlinked_dirs_are_followed() {
+        let td = tempfile::TempDir::with_prefix("kiki_sandbox").unwrap();
+        let etc_store = td.path().join("store/etc");
+        let cacert = td.path().join("store/cacert");
+        let etc_ssl = td.path().join("etc/ssl");
+        std::fs::create_dir_all(etc_store.join("certs")).unwrap();
+        std::fs::create_dir_all(&cacert).unwrap();
+        std::fs::create_dir_all(&etc_ssl).unwrap();
+        std::fs::write(cacert.join("ca-bundle.crt"), "").unwrap();
+
+        let symlink = |target: &Path, link: PathBuf| {
+            std::os::unix::fs::symlink(target, link).unwrap();
+        };
+        symlink(&etc_store.join("certs"), etc_ssl.join("certs"));
+        symlink(
+            &cacert.join("ca-bundle.crt"),
+            etc_store.join("certs/ca-certificates.crt"),
+        );
+        symlink(&etc_store, etc_store.join("certs/loop"));
+
+        let mut targets = symlink_targets(&[etc_ssl]);
+        targets.sort();
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap();
+        assert_eq!(
+            targets,
+            vec![
+                canonical(&cacert).join("ca-bundle.crt"),
+                canonical(&etc_store),
+                canonical(&etc_store).join("certs"),
+            ]
         );
     }
 
