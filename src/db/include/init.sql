@@ -281,6 +281,15 @@ CREATE INDEX idx_entry_unread_visible ON entries(published_at)
 CREATE INDEX idx_entry_feed_unread_visible ON entries(feed_id, published_at)
     WHERE unread_visible = 1;
 
+-- The entry columns that full-text searches sort and filter by, looked up
+-- by id for each entry matching the query: reading them from here rather
+-- than the entries table skips each entry's title and content, and makes
+-- searches for common words several times faster. SQLite does not choose
+-- it on its own, so searches name it with INDEXED BY; see
+-- src/routes/v1/entries/search_entries.rs.
+CREATE INDEX idx_entry_search
+    ON entries(id, published_at, feed_id, ingested_at, unread_visible);
+
 -- Keep `entries.unread_visible` in step with the entry's system:read and
 -- system:hidden tags, however entry_tags rows are added, removed or changed.
 CREATE TRIGGER entry_tags_unread_visible_ai AFTER INSERT ON entry_tags

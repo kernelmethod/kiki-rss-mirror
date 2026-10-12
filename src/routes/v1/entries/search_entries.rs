@@ -491,6 +491,9 @@ fn validate_request(payload: &SearchEntriesRequest) -> Result<(), Response> {
 /// parameters 1 through `next_idx - 1`.
 struct CompiledSearch {
     from_clause: &'static str,
+    /// The tables to count the matching entries from with `where_clause`:
+    /// `entries_fts` alone when the full-text query is the only condition.
+    count_from_clause: &'static str,
     /// The conditions, for counting the matching entries.
     where_clause: String,
     /// The same conditions, written to find one page of them; see
@@ -623,10 +626,23 @@ impl CompiledSearch {
             }
         }
 
+        // Each entry the full-text query matches is looked up by id, for
+        // the columns it is sorted and filtered by. idx_entry_search holds
+        // them without each entry's title and content, which a common word
+        // would otherwise have read for most entries, but SQLite does not
+        // choose it on its own.
         let from_clause = if use_fts {
-            "entries e JOIN entries_fts ON e.id = entries_fts.rowid"
+            "entries e INDEXED BY idx_entry_search \
+             JOIN entries_fts ON e.id = entries_fts.rowid"
         } else {
             "entries e"
+        };
+        // With no other condition, every entry in the full-text index is
+        // one of the entries, and counting needs nothing else.
+        let count_from_clause = if use_fts && conditions.len() == 1 {
+            "entries_fts"
+        } else {
+            from_clause
         };
 
         let where_of = |conditions: &[String]| {
@@ -648,6 +664,7 @@ impl CompiledSearch {
 
         Ok(CompiledSearch {
             from_clause,
+            count_from_clause,
             where_clause,
             page_where_clause,
             params,
@@ -661,7 +678,7 @@ impl CompiledSearch {
     fn count(&self, conn: &rusqlite::Connection) -> Result<usize, SearchEntriesError> {
         let count_sql = format!(
             "SELECT COUNT(*) FROM {}{}",
-            self.from_clause, self.where_clause
+            self.count_from_clause, self.where_clause
         );
         Ok(conn
             .prepare(&count_sql)
@@ -942,6 +959,72 @@ mod tests {
         ] {
             assert!(walked(json.clone(), 25, 0).is_empty(), "{json}");
         }
+        Ok(())
+    }
+
+    /// The query plan SQLite chooses for `sql`, with `params` bound.
+    fn plan(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[SqlParam],
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| row.get(3))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// A full-text search looks its matches up in idx_entry_search, rather
+    /// than reading each one's row of the entries table, and counts them
+    /// from the full-text index alone when nothing else narrows them.
+    #[test]
+    fn test_full_text_search_plans() -> anyhow::Result<()> {
+        let conn = crate::db::ConnectionBuilder::default()
+            .in_memory()
+            .create()
+            .build()?;
+        let search = |json: serde_json::Value| -> anyhow::Result<CompiledSearch> {
+            let payload: SearchEntriesRequest = serde_json::from_value(json)?;
+            Ok(CompiledSearch::new(&payload, &HashSet::new())?)
+        };
+        let count_plan = |search: &CompiledSearch| {
+            plan(
+                &conn,
+                &format!(
+                    "SELECT COUNT(*) FROM {}{}",
+                    search.count_from_clause, search.where_clause
+                ),
+                &search.params,
+            )
+        };
+        let uses_index = |plan: &[String]| {
+            plan.iter()
+                .any(|step| step.contains("COVERING INDEX idx_entry_search"))
+        };
+        let reads_entries = |plan: &[String]| plan.iter().any(|step| step.contains(" e "));
+
+        for sort in ["published_at", "relevance", "id", "id_desc"] {
+            let (sql, params) = search(serde_json::json!({"query": "news", "sort": sort}))?.page(
+                "e.id, bm25(entries_fts)",
+                25,
+                0,
+            );
+            let page = plan(&conn, &sql, &params)?;
+            assert!(uses_index(&page), "{sort}: {page:?}");
+        }
+
+        let only_query = search(serde_json::json!({"query": "news"}))?;
+        let count = count_plan(&only_query)?;
+        assert!(!reads_entries(&count), "{count:?}");
+
+        let narrowed = search(serde_json::json!({
+            "query": "news",
+            "feed_id": 1,
+            "published_after": "2024-01-01T00:00:00Z",
+            "tags": {"not": {"or": ["system:read", "system:hidden"]}},
+        }))?;
+        let count = count_plan(&narrowed)?;
+        assert!(uses_index(&count), "{count:?}");
         Ok(())
     }
 }
