@@ -113,6 +113,22 @@ fn ingest_handlers_run_in_order() {
     assert_eq!(out.content, entry("").content);
 }
 
+/// Every plugin's `entry.transform` handler runs before any plugin's `entry.ingest`
+/// handler, whatever order the plugins load in.
+#[test]
+fn transform_handlers_run_before_ingest_handlers() {
+    let (runner, _) = runner(&[
+        source("a", json!({ "suffix": " a-ingest" })),
+        source("b", json!({ "transform_suffix": " b-transform" })),
+    ]);
+    assert!(runner.handles(Event::EntryTransform));
+    let out = runner
+        .dispatch_transform_entry(entry("title"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.title, "title b-transform a-ingest");
+}
+
 #[test]
 fn ingest_handlers_can_drop_entries() {
     let (runner, _) = runner(&[

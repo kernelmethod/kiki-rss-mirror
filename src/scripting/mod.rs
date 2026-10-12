@@ -19,16 +19,16 @@
 //!
 //! # Handler chaining and return values
 //!
-//! `entry.ingest` handlers run in plugin order; the output of one becomes the input of the
-//! next. A handler may return nothing to drop the entry; subsequent handlers are not
-//! called. `fetch.schedule` handlers also run in order, each seeing the wait the one before
+//! `entry.transform` handlers run in plugin order, and then `entry.ingest` handlers do;
+//! the output of one becomes the input of the next. A handler may return nothing to drop
+//! the entry; subsequent handlers are not called. `fetch.schedule` handlers also run in order, each seeing the wait the one before
 //! it chose (see [`FetchSchedule`]). Handlers for observe-only events (everything else) are
 //! called for their side effects.
 //!
 //! # Error handling
 //!
-//! If a handler times out or traps, the error is logged as a warning. For `entry.ingest`
-//! the entry passes through the failing handler **unmodified**, and for `fetch.schedule`
+//! If a handler times out or traps, the error is logged as a warning. For `entry.transform`
+//! and `entry.ingest` the entry passes through the failing handler **unmodified**, and for `fetch.schedule`
 //! the wait is left as it was; for observe events the failure is simply dropped. A broken
 //! plugin never silently drops entries.
 //!
@@ -437,6 +437,10 @@ pub enum Event {
     /// Fires per-entry during feed refresh, after parsing and before insertion. Handlers
     /// may transform or filter the entry by returning a modified entry or nothing.
     EntryIngest,
+    /// Like `EntryIngest`, and run before it: every plugin's handler runs before any
+    /// `EntryIngest` handler, so those see the entry as it will be stored. For plugins
+    /// that rewrite entries, such as by sanitizing their content.
+    EntryTransform,
     /// Fires per-entry during feed refresh, immediately before `EntryIngest`. Observe-only;
     /// sees the entry exactly as parsed from the feed source.
     EntryParsed,
@@ -469,6 +473,7 @@ impl Event {
     pub fn name(self) -> &'static str {
         match self {
             Self::EntryIngest => "entry.ingest",
+            Self::EntryTransform => "entry.transform",
             Self::EntryParsed => "entry.parsed",
             Self::FetchSuccess => "fetch.success",
             Self::FetchError => "fetch.error",
@@ -485,6 +490,7 @@ impl Event {
     pub fn handler_name(self) -> &'static str {
         match self {
             Self::EntryIngest => "entry.ingest handler",
+            Self::EntryTransform => "entry.transform handler",
             Self::EntryParsed => "entry.parsed handler",
             Self::FetchSuccess => "fetch.success handler",
             Self::FetchError => "fetch.error handler",
@@ -506,7 +512,7 @@ impl Event {
 ///
 /// Packed into two bytes, so the script host can report its subscriptions
 /// on every response for next to nothing. That holds sixteen events;
-/// [`Event`] has nine.
+/// [`Event`] has ten.
 ///
 /// # Examples
 ///
@@ -568,7 +574,7 @@ impl EventSet {
 /// Payload variants carried alongside an [`Event`] when dispatched to scripts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventPayload {
-    /// Used for [`Event::EntryIngest`] and [`Event::EntryParsed`].
+    /// Used for [`Event::EntryTransform`], [`Event::EntryIngest`] and [`Event::EntryParsed`].
     Entry(FeedEntry),
     /// Used for [`Event::FetchSuccess`].
     FetchSuccess {
@@ -817,8 +823,8 @@ pub trait ScriptServices: Send + Sync {
 /// Implementations hold a live scripting VM plus the handlers registered by scripts at load
 /// time, and route [`Event`]s to the appropriate handlers.
 ///
-/// Transform events use methods of their own: [`Event::EntryIngest`] uses
-/// [`Self::dispatch_transform_entry`], which may return `Ok(None)` to filter the entry out,
+/// Transform events use methods of their own: [`Event::EntryTransform`] and
+/// [`Event::EntryIngest`] use [`Self::dispatch_transform_entry`], which may return `Ok(None)` to filter the entry out,
 /// and [`Event::FetchSchedule`] uses [`Self::dispatch_schedule`]. All other events are
 /// observe-only and dispatched via [`Self::dispatch_observe`].
 pub trait ScriptRunner: Send + Sync {
@@ -832,7 +838,15 @@ pub trait ScriptRunner: Send + Sync {
         true
     }
 
-    /// Pass `entry` through each `entry.ingest` handler in registration order.
+    /// Whether any handler may be registered for [`Event::EntryTransform`] or
+    /// [`Event::EntryIngest`], the events [`Self::dispatch_transform_entry`] runs. Like
+    /// [`Self::handles`], a `false` is a promise and a `true` is not.
+    fn transforms_entries(&self) -> bool {
+        self.handles(Event::EntryTransform) || self.handles(Event::EntryIngest)
+    }
+
+    /// Pass `entry` through each `entry.transform` handler, then each `entry.ingest`
+    /// handler, each in registration order.
     ///
     /// # Return values
     ///

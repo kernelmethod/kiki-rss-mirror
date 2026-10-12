@@ -848,7 +848,7 @@ impl ScriptRunner for SubprocessScriptRunner {
         entry: &mut FeedEntry,
         runs: &mut Vec<PluginRun>,
     ) -> Result<bool> {
-        if !self.handles(Event::EntryIngest) {
+        if !self.transforms_entries() {
             return Ok(true);
         }
         let request = HostRequest::TransformEntry {
@@ -880,7 +880,7 @@ impl ScriptRunner for SubprocessScriptRunner {
             }
             Err(e) => {
                 // Never drop an entry because the scripting layer broke.
-                warn!(error = %e, "script host: entry.ingest dispatch failed; passing the entry through unmodified");
+                warn!(error = %e, "script host: entry dispatch failed; passing the entry through unmodified");
                 Ok(true)
             }
         }

@@ -38,6 +38,14 @@ const EVENTS: &[Event] = &[
         default: "",
     },
     Event {
+        name: "entry.transform",
+        kind: Some("EntryTransform"),
+        export: "on_entry_transform",
+        params: &[("entry", "::kiki_plugin::Entry")],
+        returns: Some("::std::option::Option<::kiki_plugin::Entry>"),
+        default: "Some(entry)",
+    },
+    Event {
         name: "entry.ingest",
         kind: Some("EntryIngest"),
         export: "on_entry_ingest",
@@ -129,22 +137,25 @@ const EVENTS: &[Event] = &[
 ///
 /// A handler takes `&mut self` or `&self`, then the event's arguments:
 ///
-/// | `#[on(...)]`     | arguments                         | returns         |
-/// |------------------|-----------------------------------|-----------------|
-/// | `entry.parsed`   | `entry: Entry`                    |                 |
-/// | `entry.ingest`   | `entry: Entry`                    | `Option<Entry>` |
-/// | `fetch.success`  | `event: FetchSuccess`             |                 |
-/// | `fetch.error`    | `event: FetchError`               |                 |
-/// | `feed.added`     | `feed: FeedEvent`                 |                 |
-/// | `feed.removed`   | `feed: FeedEvent`                 |                 |
-/// | `plugin.load`    |                                   |                 |
-/// | `fetch.schedule` | `schedule: FetchSchedule`         | `Option<u64>`   |
-/// | `timer`          | `id: u32`                         |                 |
-/// | `scan.entry`     | `scan: u64, entry: Entry`         | `Option<Entry>` |
-/// | `scan.done`      | `scan: u64, summary: ScanSummary` |                 |
+/// | `#[on(...)]`      | arguments                         | returns         |
+/// |-------------------|-----------------------------------|-----------------|
+/// | `entry.parsed`    | `entry: Entry`                    |                 |
+/// | `entry.transform` | `entry: Entry`                    | `Option<Entry>` |
+/// | `entry.ingest`    | `entry: Entry`                    | `Option<Entry>` |
+/// | `fetch.success`   | `event: FetchSuccess`             |                 |
+/// | `fetch.error`     | `event: FetchError`               |                 |
+/// | `feed.added`      | `feed: FeedEvent`                 |                 |
+/// | `feed.removed`    | `feed: FeedEvent`                 |                 |
+/// | `plugin.load`     |                                   |                 |
+/// | `fetch.schedule`  | `schedule: FetchSchedule`         | `Option<u64>`   |
+/// | `timer`           | `id: u32`                         |                 |
+/// | `scan.entry`      | `scan: u64, entry: Entry`         | `Option<Entry>` |
+/// | `scan.done`       | `scan: u64, summary: ScanSummary` |                 |
 ///
-/// The first eight are the server's events; see the guide's "Writing plugins" chapter.
-/// `entry.ingest` returns the entry, possibly changed, to keep it, or `None` to drop it;
+/// The first nine are the server's events; see the guide's "Writing plugins" chapter.
+/// `entry.transform` and `entry.ingest` return the entry, possibly changed, to keep it,
+/// or `None` to drop it: every plugin's `entry.transform` runs before any
+/// `entry.ingest`, so `entry.ingest` sees the entry as it will be stored;
 /// `fetch.schedule` returns a longer wait before the feed's next fetch, in seconds, or
 /// `None` to leave it. `timer` is called when a timer started with `host::every` is due,
 /// and `scan.entry` and `scan.done` for a scan started with `host::start_scan`: only

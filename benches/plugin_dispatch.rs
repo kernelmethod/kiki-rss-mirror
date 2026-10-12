@@ -1,4 +1,4 @@
-//! Benchmarks of dispatching `entry.ingest` to plugins: how many entries a second go
+//! Benchmarks of dispatching new entries to plugins: how many entries a second go
 //! through a chain of plugins, run in this process or in the sandboxed script host as
 //! `kiki serve` runs them, from one thread or from several at once.
 //!
@@ -11,8 +11,8 @@
 //! * `fixture`: the test fixture four times over, each appending to the entry's title,
 //!   so that what is measured is mostly the cost of getting the entry to each plugin and
 //!   back;
-//! * `defaults`: the default plugins that handle `entry.ingest` (`filter`, `auto-tag`,
-//!   `privacy` and `sanitize`), each with a rule or two, as a server runs them.
+//! * `defaults`: the default plugins that handle `entry.transform` (`privacy` and
+//!   `sanitize`) and `entry.ingest` (`filter` and `auto-tag`), each with a rule or two, as a server runs them.
 //!
 //! Needs the `default-plugins` feature (on by default), which builds the plugins, and the
 //! `kiki` binary, which runs the script host.
@@ -52,7 +52,7 @@ fn fixture_chain() -> Vec<ScriptSource> {
         .collect()
 }
 
-/// The default plugins that handle `entry.ingest`, each with its default config and a
+/// The default plugins that handle `entry.transform` and `entry.ingest`, each with its default config and a
 /// rule or two.
 fn default_chain() -> Vec<ScriptSource> {
     let plugins = [

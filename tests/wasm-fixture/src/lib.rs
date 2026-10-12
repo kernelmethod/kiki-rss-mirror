@@ -7,8 +7,8 @@
 use kiki_plugin::html::{self, Edits, Place};
 use kiki_plugin::regex::{Regex, RegexSet};
 use kiki_plugin::{
-    host, parse_config, plugin, DeleteFilter, Entry, FeedEvent, FetchError, FetchSchedule,
-    FetchSuccess, Level, Plugin, ScanOptions, ScanSummary,
+    host, parse_config, plugin, DeleteFilter, Entry, EventKind, FeedEvent, FetchError,
+    FetchSchedule, FetchSuccess, Level, Plugin, ScanOptions, ScanSummary,
 };
 use serde::Deserialize;
 
@@ -19,6 +19,8 @@ use serde::Deserialize;
 struct Config {
     /// Append this to the title of each ingested entry.
     suffix: Option<String>,
+    /// Append this to the title of each entry in `entry.transform`.
+    transform_suffix: Option<String>,
     /// Add this tag to each ingested entry.
     tag: Option<String>,
     /// Drop ingested entries with this title.
@@ -102,6 +104,10 @@ impl Plugin for Fixture {
         kiki_plugin::log(Level::Info, "fixture loaded");
         Ok(Fixture { config, made: 0 })
     }
+
+    fn wants(&self, event: EventKind) -> bool {
+        event != EventKind::EntryTransform || self.config.transform_suffix.is_some()
+    }
 }
 
 #[plugin]
@@ -109,6 +115,14 @@ impl Fixture {
     #[on(entry.parsed)]
     fn entry_parsed(&mut self, entry: Entry) {
         seen("entry.parsed", entry.title);
+    }
+
+    #[on(entry.transform)]
+    fn entry_transform(&mut self, mut entry: Entry) -> Option<Entry> {
+        if let Some(suffix) = &self.config.transform_suffix {
+            entry.title.push_str(suffix);
+        }
+        Some(entry)
     }
 
     #[on(entry.ingest)]
