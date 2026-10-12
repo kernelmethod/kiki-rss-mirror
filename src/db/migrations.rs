@@ -32,6 +32,10 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0002_adaptive_fetch_plugin",
         sql: include_str!("include/migrations/0002_adaptive_fetch_plugin.sql"),
     },
+    Migration {
+        name: "0003_entry_search_index",
+        sql: include_str!("include/migrations/0003_entry_search_index.sql"),
+    },
 ];
 
 /// SQL to create the migrations table. Safe to run on databases that already
@@ -401,6 +405,26 @@ pub(crate) mod tests {
         // Deleting an entry takes its tags with it, leaving the rest alone.
         conn.execute("DELETE FROM entries WHERE id = 1", [])?;
         check(2000)?;
+        Ok(())
+    }
+
+    /// `0003_entry_search_index` adds the index that full-text searches
+    /// name with INDEXED BY, without which they would fail.
+    #[test]
+    fn test_0003_entry_search_index() -> Result<()> {
+        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute_batch(
+            "DROP INDEX idx_entry_search;
+             DELETE FROM migrations WHERE name = '0003_entry_search_index';",
+        )?;
+        assert_eq!(run_pending_migrations(&mut conn)?, 1);
+        conn.query_row(
+            "SELECT COUNT(*) FROM entries e INDEXED BY idx_entry_search
+             JOIN entries_fts ON e.id = entries_fts.rowid
+             WHERE entries_fts MATCH 'news'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
         Ok(())
     }
 }
