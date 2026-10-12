@@ -123,8 +123,7 @@ pub(super) fn process_rss_feed(
     let parsed_count = entries.len();
     // The description arrives as the content alone. It is kept apart only if a script
     // may change the content, as `insert_rss_entry_data` stores it only then.
-    let keep_description =
-        script_runner.is_some_and(|r| r.handles(crate::scripting::Event::EntryIngest));
+    let keep_description = script_runner.is_some_and(|r| r.transforms_entries());
     let entries: Vec<_> = entries
         .into_iter()
         .filter_map(
@@ -242,7 +241,7 @@ fn run_scripts(
     if runner.handles(crate::scripting::Event::EntryParsed) {
         runner.dispatch_parsed(&feed_entry);
     }
-    if !runner.handles(crate::scripting::Event::EntryIngest) {
+    if !runner.transforms_entries() {
         return Some(feed_entry);
     }
     let mut runs = Vec::new();

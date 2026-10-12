@@ -624,7 +624,7 @@ impl Plugin for Privacy {
 
 #[plugin]
 impl Privacy {
-    #[on(entry.ingest)]
+    #[on(entry.transform)]
     fn clean_ingested(&mut self, mut entry: Entry) -> Option<Entry> {
         if let Some(cleaned) = entry.url.as_deref().and_then(|url| self.clean_url(url)) {
             entry.url = Some(cleaned);

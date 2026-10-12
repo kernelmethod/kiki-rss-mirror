@@ -511,7 +511,7 @@ impl Plugin for Sanitize {
 
 #[plugin]
 impl Sanitize {
-    #[on(entry.ingest)]
+    #[on(entry.transform)]
     fn sanitize_ingested(&mut self, mut entry: Entry) -> Option<Entry> {
         if let Some(content) = entry.content.take() {
             entry.content = Some(match self.rewrite(&content) {
