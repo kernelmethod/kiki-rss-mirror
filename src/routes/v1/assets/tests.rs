@@ -23,8 +23,6 @@ fn seed_asset(tc: &crate::test::TestConfig, bytes: &[u8], original_url: &str) ->
         original_url,
         Some("image/png"),
         bytes.len() as i64,
-        None,
-        None,
     )?;
 
     Ok(hash)

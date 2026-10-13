@@ -84,23 +84,14 @@ pub fn insert_asset(
     original_url: &str,
     content_type: Option<&str>,
     size_bytes: i64,
-    etag: Option<&str>,
-    last_modified: Option<&str>,
 ) -> Result<i64> {
     let inserted = conn
         .execute(
             "INSERT INTO feed_assets
-            (blake3, original_url, content_type, size_bytes, etag, last_modified)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            (blake3, original_url, content_type, size_bytes)
+         VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(blake3) DO NOTHING",
-            params![
-                blake3,
-                original_url,
-                content_type,
-                size_bytes,
-                etag,
-                last_modified
-            ],
+            params![blake3, original_url, content_type, size_bytes],
         )
         .with_context(|| format!("failed to insert feed_assets row for {}", blake3))?;
     if inserted > 0 {
@@ -218,6 +209,33 @@ pub fn evict_to(conn: &mut Connection, target_bytes: i64) -> Result<Vec<String>>
     Ok(deleted)
 }
 
+/// Delete every asset nothing uses: no entry links to it and no feed has
+/// it as its favicon. Returns the blake3 hashes of the deleted rows; the
+/// caller is responsible for unlinking the corresponding files from disk,
+/// before letting go of `conn`, so that a task storing the same bytes again
+/// meanwhile does not have its file removed.
+///
+/// Assets lose their last user when the entries linking to them are
+/// deleted, such as by the `retention` plugin, or when a feed using one as
+/// its favicon is deleted. Their `http_cache` rows go with them.
+///
+/// # Errors
+///
+/// Returns an error if the delete fails.
+pub fn delete_unused(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "DELETE FROM feed_assets AS fa
+         WHERE NOT EXISTS (SELECT 1 FROM entry_assets WHERE asset_id = fa.id)
+           AND NOT EXISTS (SELECT 1 FROM feed_favicons WHERE asset_id = fa.id)
+         RETURNING blake3",
+    )?;
+    let deleted = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()
+        .with_context(|| "failed to delete unused assets")?;
+    Ok(deleted)
+}
+
 /// Delete a single asset row by blake3 hash. Returns the row if it existed.
 pub fn delete_by_hash(conn: &Connection, blake3: &str) -> Result<Option<AssetRow>> {
     let row = lookup_by_hash(conn, blake3)?;
@@ -244,16 +262,7 @@ mod tests {
     #[test]
     fn insert_lookup_touch_delete() {
         let conn = mem_conn();
-        let id = insert_asset(
-            &conn,
-            "abc",
-            "http://x/y.png",
-            Some("image/png"),
-            10,
-            None,
-            None,
-        )
-        .unwrap();
+        let id = insert_asset(&conn, "abc", "http://x/y.png", Some("image/png"), 10).unwrap();
         let row = lookup_by_hash(&conn, "abc").unwrap().unwrap();
         assert_eq!(row.id, id);
         assert_eq!(row.original_url, "http://x/y.png");
@@ -268,8 +277,8 @@ mod tests {
     #[test]
     fn insert_existing_hash_returns_existing_id() {
         let conn = mem_conn();
-        let first = insert_asset(&conn, "abc", "http://x/a.png", None, 10, None, None).unwrap();
-        let second = insert_asset(&conn, "abc", "http://y/b.png", None, 10, None, None).unwrap();
+        let first = insert_asset(&conn, "abc", "http://x/a.png", None, 10).unwrap();
+        let second = insert_asset(&conn, "abc", "http://y/b.png", None, 10).unwrap();
         assert_eq!(first, second);
         let row = lookup_by_hash(&conn, "abc").unwrap().unwrap();
         assert_eq!(row.original_url, "http://x/a.png");
@@ -279,8 +288,8 @@ mod tests {
     #[test]
     fn total_cache_size_sums() {
         let conn = mem_conn();
-        insert_asset(&conn, "a", "http://x/a", None, 100, None, None).unwrap();
-        insert_asset(&conn, "b", "http://x/b", None, 250, None, None).unwrap();
+        insert_asset(&conn, "a", "http://x/a", None, 100).unwrap();
+        insert_asset(&conn, "b", "http://x/b", None, 250).unwrap();
         assert_eq!(total_cache_size(&conn).unwrap(), 350);
     }
 
@@ -289,9 +298,9 @@ mod tests {
         let mut conn = mem_conn();
         // Insert three rows with explicit last_accessed_at values so the
         // order is deterministic.
-        insert_asset(&conn, "a", "http://x/a", None, 100, None, None).unwrap();
-        insert_asset(&conn, "b", "http://x/b", None, 200, None, None).unwrap();
-        insert_asset(&conn, "c", "http://x/c", None, 300, None, None).unwrap();
+        insert_asset(&conn, "a", "http://x/a", None, 100).unwrap();
+        insert_asset(&conn, "b", "http://x/b", None, 200).unwrap();
+        insert_asset(&conn, "c", "http://x/c", None, 300).unwrap();
         conn.execute(
             "UPDATE feed_assets SET last_accessed_at = 100 WHERE blake3 = 'a'",
             [],
@@ -318,7 +327,7 @@ mod tests {
     #[test]
     fn evict_to_noop_when_under_cap() {
         let mut conn = mem_conn();
-        insert_asset(&conn, "a", "http://x/a", None, 10, None, None).unwrap();
+        insert_asset(&conn, "a", "http://x/a", None, 10).unwrap();
         let deleted = evict_to(&mut conn, 100).unwrap();
         assert!(deleted.is_empty());
     }
@@ -338,26 +347,8 @@ mod tests {
             rusqlite::params![1i64, "rss", "g", 1i64, "t", "http://example.com/e"],
         )
         .unwrap();
-        let a = insert_asset(
-            &conn,
-            "a",
-            "http://x/a.png",
-            Some("image/png"),
-            10,
-            None,
-            None,
-        )
-        .unwrap();
-        let b = insert_asset(
-            &conn,
-            "b",
-            "http://x/b.mp3",
-            Some("audio/mpeg"),
-            20,
-            None,
-            None,
-        )
-        .unwrap();
+        let a = insert_asset(&conn, "a", "http://x/a.png", Some("image/png"), 10).unwrap();
+        let b = insert_asset(&conn, "b", "http://x/b.mp3", Some("audio/mpeg"), 20).unwrap();
         link_entry_asset(&conn, 1, a, "inline_img").unwrap();
         link_entry_asset(&conn, 1, b, "enclosure").unwrap();
         // Duplicate link is a no-op.
@@ -369,5 +360,41 @@ mod tests {
         assert_eq!(rows[0].kind, "inline_img");
         assert_eq!(rows[1].asset.blake3, "b");
         assert_eq!(rows[1].kind, "enclosure");
+    }
+
+    #[test]
+    fn delete_unused_keeps_linked_assets_and_favicons() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO feeds (title, url, syndication_format) VALUES ('F', 'http://f/', 'rss')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entries (feed_id, syndication_format, guid, published_at, title, url)
+             VALUES (1, 'rss', 'g', 1, 't', 'http://f/e')",
+            [],
+        )
+        .unwrap();
+        let linked = insert_asset(&conn, "linked", "http://x/a", None, 1).unwrap();
+        let icon = insert_asset(&conn, "icon", "http://x/i", None, 1).unwrap();
+        insert_asset(&conn, "unused", "http://x/u", None, 1).unwrap();
+        link_entry_asset(&conn, 1, linked, "inline_img").unwrap();
+        conn.execute(
+            "INSERT INTO feed_favicons (feed_id, asset_id) VALUES (1, ?1)",
+            [icon],
+        )
+        .unwrap();
+
+        assert_eq!(delete_unused(&conn).unwrap(), ["unused"]);
+        assert!(delete_unused(&conn).unwrap().is_empty());
+
+        // Deleting the entry leaves its asset unused; deleting the feed
+        // takes its favicon with it.
+        conn.execute("DELETE FROM entries", []).unwrap();
+        assert_eq!(delete_unused(&conn).unwrap(), ["linked"]);
+        conn.execute("DELETE FROM feeds", []).unwrap();
+        assert_eq!(delete_unused(&conn).unwrap(), ["icon"]);
+        assert_eq!(total_cache_size(&conn).unwrap(), 0);
     }
 }

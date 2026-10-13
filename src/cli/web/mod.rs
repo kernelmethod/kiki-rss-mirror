@@ -33,8 +33,9 @@ use tokio_util::sync::CancellationToken;
 
 /// Base URL for requests to the Kiki API. The client sends every request
 /// over the server's Unix socket, so the host is never resolved and only
-/// fills the `Host` header.
-const API_BASE: &str = "http://kiki";
+/// fills the `Host` header. `localhost` is one the API always answers to,
+/// whatever `api.allowed_hosts` lists.
+const API_BASE: &str = "http://localhost";
 
 /// Arguments for the `kiki web` subcommand.
 ///
@@ -62,7 +63,8 @@ pub struct WebArgs {
     listen: SocketAddr,
 
     /// Also answer requests for HOST, besides `localhost`, `127.0.0.1` and
-    /// `::1`, and any listed in `kiki.toml`'s `web_ui.allowed_hosts`. May
+    /// `::1`, and any listed in `kiki.toml`'s `http.allowed_hosts` (or
+    /// `web_ui.allowed_hosts`, which replaces it for the web UI). May
     /// be given more than once. `*.example.com` allows every
     /// subdomain of `example.com`, and `*` allows any host at all.
     ///
@@ -116,7 +118,7 @@ impl WebArgs {
         listener.set_nonblocking(true)?;
         tracing::info!("web UI listening on http://{}", listener.local_addr()?);
         let settings = configured_settings()?;
-        let allowed_hosts = self.allowed_hosts(&settings.web_ui.allowed_hosts);
+        let allowed_hosts = self.allowed_hosts(settings.web_ui_allowed_hosts());
         let anonymous = settings.api.anonymous_access;
         let gate = if self.require_login || settings.web_ui.require_login {
             tracing::info!("the web UI requires logging in with an API token");
@@ -158,7 +160,8 @@ impl WebArgs {
     }
 
     /// The hosts the web UI answers to: those given to `--allowed-host`,
-    /// and `configured`, from the config file's `web_ui.allowed_hosts`.
+    /// and `configured`, from the config file's `http.allowed_hosts` or
+    /// `web_ui.allowed_hosts`.
     /// Warns when that leaves the web UI open to DNS rebinding, or when it
     /// listens beyond loopback but can only be reached as `localhost`.
     fn allowed_hosts(&self, configured: &[HostPattern]) -> AllowedHosts {
@@ -168,12 +171,12 @@ impl WebArgs {
         if allowed.allows_any() {
             tracing::warn!(
                 "the web UI answers to any host name ('*' in --allowed-host or \
-                 web_ui.allowed_hosts), so other sites may reach it through DNS rebinding"
+                 http.allowed_hosts), so other sites may reach it through DNS rebinding"
             );
         } else if allowed.only_localhost() && !self.listen.ip().is_loopback() {
             tracing::warn!(
                 "the web UI listens on {} but only answers to localhost; add the name or \
-                 address it is reached at with --allowed-host or web_ui.allowed_hosts",
+                 address it is reached at with --allowed-host or http.allowed_hosts",
                 self.listen
             );
         }
@@ -258,7 +261,7 @@ impl WebArgs {
 
 /// The settings in `kiki.toml` in the data directory, where the `kiki
 /// serve` child reads its own settings. Read once, before the sandbox
-/// hides the file, for the `web_ui` settings and `api.anonymous_access`.
+/// hides the file, for the `http` and `web_ui` settings and `api.anonymous_access`.
 ///
 /// # Errors
 ///

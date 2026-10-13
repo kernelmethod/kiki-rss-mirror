@@ -65,7 +65,7 @@ async fn test_etag_stored_and_sent() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let stored_etag: Option<String> = conn.query_row(
-        "SELECT header_etag FROM feeds WHERE id = ?1",
+        "SELECT c.etag FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| row.get(0),
     )?;
@@ -121,7 +121,7 @@ async fn test_last_modified_stored_and_sent() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let stored_lm: Option<String> = conn.query_row(
-        "SELECT header_last_modified FROM feeds WHERE id = ?1",
+        "SELECT c.last_modified FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| row.get(0),
     )?;
@@ -176,7 +176,7 @@ async fn test_expires_skips_fetch() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let stored_expires: Option<i64> = conn.query_row(
-        "SELECT header_expires FROM feeds WHERE id = ?1",
+        "SELECT c.expires_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| row.get(0),
     )?;
@@ -353,7 +353,7 @@ async fn test_etag_and_last_modified_both_sent() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let (stored_etag, stored_lm): (Option<String>, Option<String>) = conn.query_row(
-        "SELECT header_etag, header_last_modified FROM feeds WHERE id = ?1",
+        "SELECT c.etag, c.last_modified FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -381,7 +381,7 @@ async fn test_etag_and_last_modified_both_sent() -> Result<()> {
     Ok(())
 }
 
-/// Cache-Control: max-age=3600 stores header_expires ≈ now+3600 and skips
+/// Cache-Control: max-age=3600 stores expires_at ≈ now+3600 and skips
 /// the second fetch.
 #[tokio::test]
 async fn test_max_age_sets_expires() -> Result<()> {
@@ -407,17 +407,17 @@ async fn test_max_age_sets_expires() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let stored_expires: Option<i64> = conn.query_row(
-        "SELECT header_expires FROM feeds WHERE id = ?1",
+        "SELECT c.expires_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| row.get(0),
     )?;
-    let expires = stored_expires.expect("header_expires should be set");
+    let expires = stored_expires.expect("expires_at should be set");
     // Allow a small slack below the lower bound: corrected_max_age (RFC 9111
     // §4.2.3) may subtract up to one second based on the response's auto-
     // generated Date header rounding to the previous second.
     assert!(
         expires >= before + 3595 && expires <= before + 3600 + 5,
-        "header_expires should be approximately now + 3600, got offset {}",
+        "expires_at should be approximately now + 3600, got offset {}",
         expires - before
     );
 
@@ -472,11 +472,11 @@ async fn test_max_age_overrides_expires() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let stored_expires: Option<i64> = conn.query_row(
-        "SELECT header_expires FROM feeds WHERE id = ?1",
+        "SELECT c.expires_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| row.get(0),
     )?;
-    let expires = stored_expires.expect("header_expires should be set");
+    let expires = stored_expires.expect("expires_at should be set");
     // max-age should win over the past Expires header
     assert!(
         expires >= before + 3600,
@@ -488,7 +488,7 @@ async fn test_max_age_overrides_expires() -> Result<()> {
     Ok(())
 }
 
-/// Cache-Control: no-cache clears header_expires but preserves ETag for
+/// Cache-Control: no-cache clears expires_at but preserves ETag for
 /// conditional requests.
 #[tokio::test]
 async fn test_no_cache_clears_expires() -> Result<()> {
@@ -514,7 +514,7 @@ async fn test_no_cache_clears_expires() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let (stored_etag, stored_expires): (Option<String>, Option<i64>) = conn.query_row(
-        "SELECT header_etag, header_expires FROM feeds WHERE id = ?1",
+        "SELECT c.etag, c.expires_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -525,7 +525,7 @@ async fn test_no_cache_clears_expires() -> Result<()> {
     );
     assert!(
         stored_expires.is_none(),
-        "header_expires should be NULL with no-cache"
+        "expires_at should be NULL with no-cache"
     );
 
     reset_last_checked(&conn, feed_id);
@@ -578,7 +578,7 @@ async fn test_no_store_clears_all_cache_headers() -> Result<()> {
     let conn = tc.database_conn()?;
     let (stored_etag, stored_lm, stored_expires): (Option<String>, Option<String>, Option<i64>) =
         conn.query_row(
-            "SELECT header_etag, header_last_modified, header_expires FROM feeds WHERE id = ?1",
+            "SELECT c.etag, c.last_modified, c.expires_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
             [feed_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
@@ -989,7 +989,7 @@ async fn test_multiple_cache_control_headers_combine() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let (stored_etag, stored_expires): (Option<String>, Option<i64>) = conn.query_row(
-        "SELECT header_etag, header_expires FROM feeds WHERE id = ?1",
+        "SELECT c.etag, c.expires_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1031,11 +1031,11 @@ async fn test_age_header_reduces_max_age() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let stored_expires: Option<i64> = conn.query_row(
-        "SELECT header_expires FROM feeds WHERE id = ?1",
+        "SELECT c.expires_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| row.get(0),
     )?;
-    let expires = stored_expires.expect("header_expires should be set");
+    let expires = stored_expires.expect("expires_at should be set");
     // 600 - 300 = 300 seconds of remaining freshness.
     assert!(
         expires >= before + 290 && expires <= before + 310,
@@ -1075,11 +1075,11 @@ async fn test_date_skew_reduces_max_age() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let stored_expires: Option<i64> = conn.query_row(
-        "SELECT header_expires FROM feeds WHERE id = ?1",
+        "SELECT c.expires_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| row.get(0),
     )?;
-    let expires = stored_expires.expect("header_expires should be set");
+    let expires = stored_expires.expect("expires_at should be set");
     // 600 - 60 = 540 seconds of remaining freshness (±10s slack for test jitter).
     assert!(
         expires >= before + 530 && expires <= before + 550,
@@ -1163,11 +1163,11 @@ async fn test_pragma_ignored_when_cache_control_present() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let stored_expires: Option<i64> = conn.query_row(
-        "SELECT header_expires FROM feeds WHERE id = ?1",
+        "SELECT c.expires_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| row.get(0),
     )?;
-    let expires = stored_expires.expect("header_expires should be set from max-age");
+    let expires = stored_expires.expect("expires_at should be set from max-age");
     assert!(
         expires >= before + 3500 && expires <= before + 3700,
         "Cache-Control max-age should win over Pragma; got offset {}",
@@ -1177,7 +1177,7 @@ async fn test_pragma_ignored_when_cache_control_present() -> Result<()> {
 }
 
 /// `Cache-Control: immutable, max-age=3600` stores a future
-/// `header_immutable_until`, and the next refresh omits conditional
+/// `immutable_until`, and the next refresh omits conditional
 /// request headers (RFC 8246).
 #[tokio::test]
 async fn test_immutable_skips_conditional_headers() -> Result<()> {
@@ -1205,14 +1205,14 @@ async fn test_immutable_skips_conditional_headers() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let stored_until: Option<i64> = conn.query_row(
-        "SELECT header_immutable_until FROM feeds WHERE id = ?1",
+        "SELECT c.immutable_until FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| row.get(0),
     )?;
-    let until = stored_until.expect("header_immutable_until should be set");
+    let until = stored_until.expect("immutable_until should be set");
     assert!(
         until >= before + 3500 && until <= before + 3700,
-        "header_immutable_until should be ~now+3600"
+        "immutable_until should be ~now+3600"
     );
 
     // Force a second fetch (the scheduler would otherwise gate us).
@@ -1322,11 +1322,11 @@ async fn test_expires_rfc850_format_is_parsed() -> Result<()> {
 
     let conn = tc.database_conn()?;
     let stored: Option<i64> = conn.query_row(
-        "SELECT header_expires FROM feeds WHERE id = ?1",
+        "SELECT c.expires_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| row.get(0),
     )?;
-    let stored = stored.expect("header_expires should parse from RFC 850 format");
+    let stored = stored.expect("expires_at should parse from RFC 850 format");
     assert!(
         stored >= before + 25 * 60 && stored <= before + 35 * 60,
         "RFC 850 Expires should parse into a ~30min-future timestamp"
@@ -1378,7 +1378,7 @@ async fn test_forced_refresh_detects_validator_lie() -> Result<()> {
     let expected_hash_a = blake3::hash(&body_a).to_hex().to_string();
     let conn = tc.database_conn()?;
     let (stored_hash, stored_refresh_at): (Option<String>, Option<i64>) = conn.query_row(
-        "SELECT header_body_hash, last_full_refresh_at FROM feeds WHERE id = ?1",
+        "SELECT c.body_hash, c.last_full_refresh_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1408,7 +1408,7 @@ async fn test_forced_refresh_detects_validator_lie() -> Result<()> {
 
     let expected_hash_b = blake3::hash(&body_b).to_hex().to_string();
     let stored_hash_after: Option<String> = conn.query_row(
-        "SELECT header_body_hash FROM feeds WHERE id = ?1",
+        "SELECT c.body_hash FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| row.get(0),
     )?;
@@ -1498,13 +1498,13 @@ async fn test_forced_refresh_match_does_not_fire_lie() -> Result<()> {
     Ok(())
 }
 
-/// Read the stored `(header_etag, header_last_modified)` for a feed.
+/// Read the stored `(etag, last_modified)` for a feed.
 fn stored_validators(
     conn: &rusqlite::Connection,
     feed_id: i64,
 ) -> (Option<String>, Option<String>) {
     conn.query_row(
-        "SELECT header_etag, header_last_modified FROM feeds WHERE id = ?1",
+        "SELECT c.etag, c.last_modified FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
@@ -1674,7 +1674,7 @@ async fn test_304_immutable_opens_window() -> Result<()> {
     assert_eq!(state.lock().unwrap().not_modified_count, 1);
 
     let (immutable_until, expires): (Option<i64>, Option<i64>) = tc.database_conn()?.query_row(
-        "SELECT header_immutable_until, header_expires FROM feeds WHERE id = ?1",
+        "SELECT c.immutable_until, c.expires_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
         [feed_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1708,7 +1708,7 @@ async fn test_304_without_freshness_keeps_stored_expires() -> Result<()> {
         tc.database_conn()
             .unwrap()
             .query_row(
-                "SELECT header_expires FROM feeds WHERE id = ?1",
+                "SELECT c.expires_at FROM feeds f LEFT JOIN http_cache c ON c.url = f.url WHERE f.id = ?1",
                 [feed_id],
                 |row| row.get(0),
             )
@@ -1737,12 +1737,16 @@ async fn refresh_once(client: &reqwest::Client, feed_id: i64, pool: &crate::db::
     .await
 }
 
-/// Read one nullable integer column from a feed row.
+/// Read one nullable integer column from a feed's row or its `http_cache`
+/// row.
 fn feed_column(tc: &crate::test::TestConfig, feed_id: i64, column: &str) -> Option<i64> {
     tc.database_conn()
         .unwrap()
         .query_row(
-            &format!("SELECT {column} FROM feeds WHERE id = ?1"),
+            &format!(
+                "SELECT {column} FROM feeds f LEFT JOIN http_cache c ON c.url = f.url
+                 WHERE f.id = ?1"
+            ),
             [feed_id],
             |row| row.get(0),
         )
@@ -1763,7 +1767,7 @@ async fn test_immutable_without_max_age_still_revalidates() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     refresh_once(&client, feed_id, &pool).await?;
-    assert_eq!(feed_column(&tc, feed_id, "header_immutable_until"), None);
+    assert_eq!(feed_column(&tc, feed_id, "immutable_until"), None);
 
     reset_last_checked(&tc.database_conn()?, feed_id);
     refresh_once(&client, feed_id, &pool).await?;
@@ -1789,12 +1793,13 @@ async fn test_expired_immutable_window_resumes_revalidation() -> Result<()> {
     let (feed_id, client, pool) = setup_feed_for_cache_test(&tc).await?;
 
     refresh_once(&client, feed_id, &pool).await?;
-    assert!(feed_column(&tc, feed_id, "header_immutable_until").is_some());
+    assert!(feed_column(&tc, feed_id, "immutable_until").is_some());
 
     // Move the window into the past and make the feed eligible.
     let conn = tc.database_conn()?;
     conn.execute(
-        "UPDATE feeds SET header_immutable_until = ?1 WHERE id = ?2",
+        "UPDATE http_cache SET immutable_until = ?1
+         WHERE url = (SELECT url FROM feeds WHERE id = ?2)",
         rusqlite::params![Utc::now().timestamp() - 1, feed_id],
     )?;
     reset_last_checked(&conn, feed_id);
@@ -1825,9 +1830,9 @@ async fn test_future_date_does_not_extend_max_age() -> Result<()> {
     let before = Utc::now().timestamp();
     refresh_once(&client, feed_id, &pool).await?;
 
-    let expires = feed_column(&tc, feed_id, "header_expires").expect("header_expires set");
+    let expires = feed_column(&tc, feed_id, "expires_at").expect("expires_at set");
     let next = feed_column(&tc, feed_id, "next_fetch_at").expect("next_fetch_at set");
-    for (what, ts) in [("header_expires", expires), ("next_fetch_at", next)] {
+    for (what, ts) in [("expires_at", expires), ("next_fetch_at", next)] {
         assert!(
             (before + 595..=before + 610).contains(&ts),
             "{what} should be ~now+600 despite the future Date; got offset {}",
@@ -1854,8 +1859,8 @@ async fn test_expires_asctime_format_is_parsed() -> Result<()> {
     let before = Utc::now().timestamp();
     refresh_once(&client, feed_id, &pool).await?;
 
-    let stored = feed_column(&tc, feed_id, "header_expires")
-        .expect("header_expires should parse from asctime format");
+    let stored = feed_column(&tc, feed_id, "expires_at")
+        .expect("expires_at should parse from asctime format");
     assert!(
         (before + 25 * 60..=before + 35 * 60).contains(&stored),
         "asctime Expires should parse into a ~30min-future timestamp"
@@ -1877,7 +1882,7 @@ async fn next_fetch_offset_with_expires(expires: String) -> Result<(i64, Option<
     let before = Utc::now().timestamp();
     refresh_once(&client, feed_id, &pool).await?;
     let next = feed_column(&tc, feed_id, "next_fetch_at").expect("next_fetch_at set");
-    Ok((next - before, feed_column(&tc, feed_id, "header_expires")))
+    Ok((next - before, feed_column(&tc, feed_id, "expires_at")))
 }
 
 /// An `Expires` already in the past gives no freshness, so the feed stays

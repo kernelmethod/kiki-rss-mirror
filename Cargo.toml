@@ -1,6 +1,6 @@
 [package]
 name = "kiki-rss"
-version = "0.36.4"
+version = "0.37.0"
 edition = "2021"
 description = "An RSS feed aggregator"
 license = "MIT"
@@ -125,3 +125,10 @@ name = "sanitize"
 harness = false
 # The plugin is built only for the default plugins.
 required-features = ["default-plugins"]
+
+[[bench]]
+name = "plugin_dispatch"
+harness = false
+# The default plugins are built only with the feature, and the script host is
+# the `kiki` binary, which needs `cli`.
+required-features = ["default-plugins", "cli"]

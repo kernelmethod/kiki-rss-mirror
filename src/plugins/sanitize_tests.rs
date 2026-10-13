@@ -346,6 +346,36 @@ fn kept_attributes_are_written_out_again() {
     }
 }
 
+/// Start tags are written back as Kiki's HTML rewriter writes them: with a space before
+/// a `/>` after attributes, and as they were if they have none.
+#[test]
+fn start_tags_are_written_back_whole() {
+    let runner = default_plugin();
+    let cases = [
+        (r#"<img src="/a.png"/>"#, r#"<img src="/a.png" />"#),
+        (r#"<img src=/a.png class="c" />"#, r#"<img src="/a.png" />"#),
+        ("<p >a<br/>b<br >c</p >", "<p >a<br/>b<br >c</p >"),
+        (r#"<p class="c">a<br class="c"/></p>"#, "<p>a<br/></p>"),
+    ];
+    for (html, expected) in cases {
+        assert_eq!(sanitize(&runner, html), expected, "{html}");
+    }
+}
+
+/// Kiki marks the start tags it hands the plugin with NULs, which content can't forge.
+#[test]
+fn nuls_in_content_are_not_taken_for_start_tags() {
+    let runner = default_plugin();
+    assert_eq!(
+        sanitize(&runner, "<p>\x000\x00<script>x()</script></p>"),
+        "<p>\u{FFFD}0\u{FFFD}</p>"
+    );
+    assert_eq!(
+        sanitize(&runner, "<p title=\"\x000\x00\">x</p>"),
+        "<p title=\"\u{FFFD}0\u{FFFD}\">x</p>"
+    );
+}
+
 #[test]
 fn comments_are_removed() {
     let runner = default_plugin();
@@ -444,8 +474,8 @@ fn invalid_configs_fail_to_load() {
     }
 }
 
-/// `privacy` runs before `sanitize`, in directory order, and `sanitize`
-/// still cleans up what it leaves behind.
+/// `privacy` runs before `sanitize`, both handling `entry.transform`, in directory order,
+/// and `sanitize` still cleans up what it leaves behind.
 #[test]
 fn sanitize_still_works_on_privacy_cleaned_content() {
     let manifest =
@@ -466,4 +496,36 @@ fn sanitize_still_works_on_privacy_cleaned_content() {
         ),
         r#"<p><a href="https://example.com/a?id=1">a</a></p>"#
     );
+}
+
+/// `sanitize` handles `entry.transform`, so the `entry.ingest` handlers of plugins that load
+/// before it, as `filter` does, see the content as it will be stored: here, without the
+/// script it removes.
+#[test]
+fn filter_sees_sanitized_content_though_it_loads_first() {
+    let filter = ScriptSource {
+        name: "filter".to_string(),
+        config: json!({
+            "exclude": [{ "pattern": "sponsored", "fields": ["content"] }],
+            "rescan": false,
+        })
+        .to_string(),
+        ..ScriptSource::new(
+            include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/filter.wasm")).to_vec(),
+        )
+    };
+    let runner = WasmScriptRunner::from_sources_with(&[filter, source(json!({}))], None).unwrap();
+
+    let kept = runner
+        .dispatch_transform_entry(entry(Some("<p>news</p><script>sponsored()</script>")))
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.content.as_deref(), Some("<p>news</p>"));
+    assert!(kept.tags.is_empty(), "{:?}", kept.tags);
+
+    let hidden = runner
+        .dispatch_transform_entry(entry(Some("<p>sponsored news</p>")))
+        .unwrap()
+        .unwrap();
+    assert_eq!(hidden.tags, ["system:hidden"]);
 }

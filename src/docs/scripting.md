@@ -183,21 +183,22 @@ called on the value it returns, so a plugin keeps what it needs, such as
 compiled regexes, in its own fields. An error from `Plugin::new` fails the
 load. A handler takes `&mut self` or `&self`, then the event's arguments:
 
-| `#[on(...)]`     | Arguments                         | Returns         |
-|------------------|-----------------------------------|-----------------|
-| `entry.parsed`   | `entry: Entry`                    |                 |
-| `entry.ingest`   | `entry: Entry`                    | `Option<Entry>` |
-| `fetch.success`  | `event: FetchSuccess`             |                 |
-| `fetch.error`    | `event: FetchError`               |                 |
-| `feed.added`     | `feed: FeedEvent`                 |                 |
-| `feed.removed`   | `feed: FeedEvent`                 |                 |
-| `plugin.load`    |                                   |                 |
-| `fetch.schedule` | `schedule: FetchSchedule`         | `Option<u64>`   |
-| `timer`          | `id: u32`                         |                 |
-| `scan.entry`     | `scan: u64, entry: Entry`         | `Option<Entry>` |
-| `scan.done`      | `scan: u64, summary: ScanSummary` |                 |
+| `#[on(...)]`      | Arguments                         | Returns         |
+|-------------------|-----------------------------------|-----------------|
+| `entry.parsed`    | `entry: Entry`                    |                 |
+| `entry.transform` | `entry: Entry`                    | `Option<Entry>` |
+| `entry.ingest`    | `entry: Entry`                    | `Option<Entry>` |
+| `fetch.success`   | `event: FetchSuccess`             |                 |
+| `fetch.error`     | `event: FetchError`               |                 |
+| `feed.added`      | `feed: FeedEvent`                 |                 |
+| `feed.removed`    | `feed: FeedEvent`                 |                 |
+| `plugin.load`     |                                   |                 |
+| `fetch.schedule`  | `schedule: FetchSchedule`         | `Option<u64>`   |
+| `timer`           | `id: u32`                         |                 |
+| `scan.entry`      | `scan: u64, entry: Entry`         | `Option<Entry>` |
+| `scan.done`       | `scan: u64, summary: ScanSummary` |                 |
 
-The first eight are the server's [events](#events); `timer` is for
+The first nine are the server's [events](#events); `timer` is for
 [timers](#timers), and `scan.entry` and `scan.done` for
 [scans](#stored-entries). A plugin handles the events it has handlers for,
 and only those are delivered to it. One that needs some of them only for
@@ -227,8 +228,8 @@ for `wasm32-unknown-unknown`, which Kiki turns into one), which:
 - exports `init`, which Kiki calls with the plugin's config, as a JSON
   object, when the plugin loads. It returns the events the plugin handles,
   and only those are delivered to it; an error fails the load;
-- exports a function for each event: `on-entry-ingest`, `on-fetch-schedule`,
-  `on-plugin-load` and so on, and `on-timer`, `on-scan-entry` and
+- exports a function for each event: `on-entry-transform`, `on-entry-ingest`,
+  `on-fetch-schedule`, `on-plugin-load` and so on, and `on-timer`, `on-scan-entry` and
   `on-scan-done` for timers and scans.
 
 `every(secs)` returns a timer's id, which is passed to `on-timer` each time
@@ -347,23 +348,25 @@ again must give a value that matches.
 
 ## Events
 
-| Event            | Payload                                    | Purpose |
-|------------------|--------------------------------------------|---------|
-| `entry.parsed`   | `Entry` (see below)                        | Observe a newly-parsed entry, before any transformations. |
-| `entry.ingest`   | `Entry` (see below)                        | **Transform or filter** a parsed entry. Return the (possibly modified) entry to keep it, or `None` to drop it. |
-| `fetch.success`  | `FetchSuccess`: `feed_id`, `status`, `url`, `content_length` | Fires after a successful (2xx) feed fetch, once the response body has been read. |
-| `fetch.error`    | `FetchError`: `feed_id`, `kind`, `status`, `message`, `retry_after` | Fires when a feed fetch fails. `kind` is one of `"http"`, `"timeout"`, `"network"`, `"too_many_redirects"`, `"body_too_large"`, `"parse"`, or `"fetcher"` (the isolated feed fetcher itself failed, e.g. its worker crashed while handling this feed). `status` and `retry_after` are set only when available. |
-| `feed.added`     | `FeedEvent`: `id`, `url`, `title`          | Fires after a feed is created via the HTTP API. |
-| `feed.removed`   | `FeedEvent`: `id`, `url`, `title`          | Fires after a feed is deleted via the HTTP API, or merged into another feed because it permanently redirected to that feed's URL (its entries then belong to the other feed). `id`, `url`, `title` reflect the feed's state immediately before deletion. |
-| `plugin.load`    | none                                       | Fires once plugins have loaded: when the server starts, and after every reload. Where to start a [scan](#stored-entries) of stored entries. |
-| `fetch.schedule` | `FetchSchedule` (see below)                | **Lengthen the wait** before a feed's next fetch. Return a number of seconds, or `None` to leave it. See [Scheduling fetches](#scheduling-fetches). |
+| Event             | Payload                                    | Purpose |
+|-------------------|--------------------------------------------|---------|
+| `entry.parsed`    | `Entry` (see below)                        | Observe a newly-parsed entry, before any transformations. |
+| `entry.transform` | `Entry` (see below)                        | **Rewrite** a parsed entry, such as by sanitizing its content, before any plugin's `entry.ingest` handler sees it. Return the (possibly modified) entry to keep it, or `None` to drop it. |
+| `entry.ingest`    | `Entry` (see below)                        | **Filter or tag** an entry, as it will be stored. Return the (possibly modified) entry to keep it, or `None` to drop it. |
+| `fetch.success`   | `FetchSuccess`: `feed_id`, `status`, `url`, `content_length` | Fires after a successful (2xx) feed fetch, once the response body has been read. |
+| `fetch.error`     | `FetchError`: `feed_id`, `kind`, `status`, `message`, `retry_after` | Fires when a feed fetch fails. `kind` is one of `"http"`, `"timeout"`, `"network"`, `"too_many_redirects"`, `"body_too_large"`, `"parse"`, or `"fetcher"` (the isolated feed fetcher itself failed, e.g. its worker crashed while handling this feed). `status` and `retry_after` are set only when available. |
+| `feed.added`      | `FeedEvent`: `id`, `url`, `title`          | Fires after a feed is created via the HTTP API. |
+| `feed.removed`    | `FeedEvent`: `id`, `url`, `title`          | Fires after a feed is deleted via the HTTP API, or merged into another feed because it permanently redirected to that feed's URL (its entries then belong to the other feed). `id`, `url`, `title` reflect the feed's state immediately before deletion. |
+| `plugin.load`     | none                                       | Fires once plugins have loaded: when the server starts, and after every reload. Where to start a [scan](#stored-entries) of stored entries. |
+| `fetch.schedule`  | `FetchSchedule` (see below)                | **Lengthen the wait** before a feed's next fetch. Return a number of seconds, or `None` to leave it. See [Scheduling fetches](#scheduling-fetches). |
 
-`entry.ingest` and `fetch.schedule` are **transform** events: their handlers
-can change what happens. All other events are observe-only.
+`entry.transform`, `entry.ingest` and `fetch.schedule` are **transform**
+events: their handlers can change what happens. All other events are observe-only.
 
 ### The entry
 
-The payload of `entry.parsed` and `entry.ingest` is an entry with the
+The payload of `entry.parsed`, `entry.transform` and `entry.ingest` is an
+entry with the
 following fields:
 
 | Field               | Type              | Mutable |
@@ -409,9 +412,17 @@ Handlers may read them, but any modifications are discarded.
 ### Handler chaining
 
 Handlers for the same event run in the order of their plugins' directory
-names. For `entry.ingest`, the output of one handler becomes the input to
-the next — if any handler returns `None`, the entry is dropped immediately
-and subsequent handlers do not run.
+names. A new entry goes through every `entry.transform` handler, then every
+`entry.ingest` handler, the output of one handler becoming the input to the
+next — if any handler returns `None`, the entry is dropped immediately and
+subsequent handlers do not run.
+
+So `entry.ingest` handlers see an entry as it will be stored, whatever order
+plugins load in, just as a [scan](#stored-entries) of stored entries does. A
+plugin that rewrites entries, such as the default `privacy` and `sanitize`
+plugins, should handle `entry.transform`; one that decides about entries
+from what they say, such as `filter` and `auto-tag`, should handle
+`entry.ingest`, so that it decides the same way at ingest and on a scan.
 
 ## Scheduling fetches
 
@@ -471,7 +482,7 @@ values with `serde`. Keys are 1 to 256 bytes long, a value may take up
 
 ## Stored entries
 
-`entry.ingest` sees each entry once, as it arrives. These calls reach the
+`entry.transform` and `entry.ingest` see each entry once, as it arrives. These calls reach the
 entries already stored, such as those fetched before a plugin was installed
 or its config changed:
 
@@ -495,8 +506,8 @@ or its config changed:
   saw, and `updated`, how many gained a system tag. It is not called for a
   scan that ends early.
 
-User tags added with `tag-entry` last only until an `entry.ingest`
-handler next sets the entry's user tags: when an entry is fetched again and a
+User tags added with `tag-entry` last only until an `entry.transform` or
+`entry.ingest` handler next sets the entry's user tags: when an entry is fetched again and a
 handler returns any user tag for it, its user tags are replaced with the ones
 returned, as they would be for tags added by hand. Tags that must last are best
 set by the same plugin, on ingest as well as on stored entries.
@@ -730,7 +741,7 @@ to a plugin. Don't edit HTML with string searches or regexes: they see
 sanitizers built on them get bypassed.
 
 Kiki can't call into a plugin while the plugin is calling Kiki, so a
-rewrite takes two passes:
+general rewrite takes two passes:
 
 1. `html::select(html, selector)` returns the elements a CSS selector, such
    as `"a[href], img"` or `"*"`, matches, in document order. Each has a tag
@@ -779,6 +790,60 @@ what it returns, and fails rather than return more than that, since a
 plugin with no room for a result would trap. Parsing counts against the
 handler's [time budget](#resource-limits).
 
+### Rewriting in one pass
+
+When what to do with an element depends on its tag name alone, and with an
+attribute on its value, as in a sanitizer, `html::strip(html, &rules)` does
+the work in one pass, and sends no edits back to Kiki. `StripRules` name
+the elements to remove with their content (`drop`), and the ones to keep
+(`keep`); every other element is unwrapped. `drop_foreign` also removes
+elements inside an `<svg>` or a `<math>`, and `remove_comments` removes
+comments. Kiki takes every attribute off the elements kept, and returns
+them, decoded, for the plugin to check and write back as it goes through
+the HTML's `pieces()`:
+
+```rust,ignore
+use kiki_plugin::html::{self, Piece, StripRules};
+
+fn keep_https_links(content: &str) -> Result<String, String> {
+    let rules = StripRules {
+        drop: vec!["script".to_string(), "style".to_string()],
+        keep: vec!["p".to_string(), "a".to_string()],
+        drop_foreign: true,
+        remove_comments: true,
+    };
+    let stripped = html::strip(content, &rules)?;
+    let mut out = String::with_capacity(stripped.len());
+    for piece in stripped.pieces() {
+        match piece {
+            Piece::Html(html) => out.push_str(html),
+            Piece::StartTag { element, open, close } => {
+                out.push_str(open);
+                let href = element.attribute("href").filter(|h| h.starts_with("https:"));
+                if let Some(href) = href {
+                    out.push_str(" href=\"");
+                    out.push_str(&html::escape(href));
+                    out.push('"');
+                    if close.starts_with('/') {
+                        out.push(' ');
+                    }
+                }
+                out.push_str(close);
+            }
+        }
+    }
+    Ok(out)
+}
+```
+
+Each kept element's start tag comes as `open`, the `<` and the tag name,
+and `close`, the rest of the tag; write the attributes to keep between
+them, each after a space, and put a space before a `close` of `/>` after
+them. Leaving out both removes the tag, which removes a void element such
+as `<img>` whole. Kiki marks the start tags in what it returns with NUL
+characters, so it replaces any NULs in the HTML it is given with U+FFFD, as
+browsers do.
+
 ## What a plugin can reach
 
 A plugin runs in a sandbox of its own: it shares no memory with Kiki or with
@@ -803,16 +868,24 @@ Every call into a plugin runs under hard limits:
 
 - **Time**: 100 ms per call, unless the plugin's manifest sets
   `time_budget_ms` to another number of milliseconds or to `"unlimited"`.
-  Time spent waiting on the server, in [calls to it](#calls-to-the-server),
-  is not counted, up to one second per call; past that, waiting counts like
-  anything else. Loading a plugin, which runs its `init`, may take up to 5
-  seconds.
+  The budget is of CPU time, so a handler isn't stopped because the machine
+  is busy with other work. A call is also stopped once it has taken five
+  times its budget by the clock, or its budget plus a second, whichever is
+  less, however little CPU time it used. Time spent on
+  [calls to the server](#calls-to-the-server) is not counted, up to one
+  second per call; past that, it counts like anything else. Loading a
+  plugin, which runs its `init`, may take up to 5 seconds of CPU time.
 
-  An unlimited handler still has a backstop: plugins run one handler at a
-  time in a separate process, and if that process doesn't answer the server
-  for 10 seconds, the server stops it, and with it every plugin, until Kiki
-  restarts. Keep `"unlimited"` for plugins you trust to finish, such as the
-  bundled `sanitize`, which every new entry passes through.
+  Each plugin's handlers run one call at a time, but different plugins run
+  at the same time: while one plugin works on an entry, the next entry can
+  already be in the plugin before it.
+
+  An unlimited handler still has a backstop: plugins run in a separate
+  process, and if that process sends the server nothing for 10 seconds while
+  it waits on it, or keeps a request waiting for 40, the server stops it,
+  and with it every plugin, until Kiki restarts. Keep `"unlimited"` for
+  plugins you trust to finish, such as the bundled `sanitize`, which every
+  new entry passes through.
 - **Memory**: 16 MiB for each plugin, and 512 KiB of stack.
 - **Regexes**: compiled regexes live outside the plugin's memory, and have
   limits of their own; see [Regular expressions](#regular-expressions).
@@ -826,7 +899,7 @@ compiling it again.
 When a handler traps, whether it ran out of time or memory, panicked, or
 called into WASI that Kiki doesn't provide, it fails:
 
-- For `entry.ingest`, the entry passes through that handler **unmodified** —
+- For `entry.transform` and `entry.ingest`, the entry passes through that handler **unmodified** —
   a broken plugin will never silently drop entries.
 - For `fetch.schedule`, the wait is left as it was, and the next handler runs.
 - For other events, the failure is logged and dropped.

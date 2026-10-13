@@ -136,16 +136,19 @@ pub async fn add_feed(
     event!(Level::INFO, "created new feed");
     let result = AddFeedResponse { id };
 
-    if let Some(runner) = state.script_runner.current() {
-        runner.dispatch_observe(
+    // Before the refresh is queued, so that plugins hear of the feed before
+    // they see its entries.
+    state
+        .script_runner
+        .observe(
             crate::scripting::Event::FeedAdded,
             crate::scripting::EventPayload::Feed {
                 id,
                 url: url_for_event,
                 title: title_for_event,
             },
-        );
-    }
+        )
+        .await;
 
     // Issue a command to the feed-fetch workers to make them fetch
     // the latest version of the feed.

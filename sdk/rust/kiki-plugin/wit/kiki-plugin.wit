@@ -7,7 +7,7 @@
 // it, so that it ships with the crate; Kiki's own bindings, in
 // src/scripting/wasm.rs, are generated from this same file.
 
-package kiki:plugin@0.1.0;
+package kiki:plugin@0.2.0;
 
 interface types {
     /// The levels `log` writes at.
@@ -17,6 +17,7 @@ interface types {
     /// only those are delivered to it.
     enum event-kind {
         entry-parsed,
+        entry-transform,
         entry-ingest,
         fetch-success,
         fetch-error,
@@ -261,6 +262,37 @@ interface html {
         max-bytes: u32,
     ) -> result<string, string>;
 
+    /// What `strip` does with each element, by its tag name, lowercase.
+    record strip-rules {
+        /// Elements removed with their content.
+        drop: list<string>,
+        /// Elements kept, without their attributes. Every other element is unwrapped: its
+        /// tags are removed and its content kept.
+        keep: list<string>,
+        /// Whether elements in the SVG and MathML namespaces are removed with their content,
+        /// whatever their names.
+        drop-foreign: bool,
+        remove-comments: bool,
+    }
+
+    /// What `strip` returns.
+    record stripped {
+        /// The stripped HTML. Just before each kept element's start tag is a marker: a NUL,
+        /// the element's index in `elements`, in decimal, and a NUL. NULs in the HTML given
+        /// are replaced with U+FFFD, so markers are the only NULs. The start tag follows
+        /// without attributes, as `<name>` or `<name/>`, or as it was written if it had
+        /// none.
+        html: string,
+        /// The elements kept, with the attributes taken off them, as `select` returns
+        /// them. An element inside one removed with its content is listed, but its marker
+        /// is removed with it.
+        elements: elements,
+    }
+
+    /// `html` rewritten in one pass by `rules`, keeping each kept element's attributes
+    /// aside for the plugin to check and write back.
+    strip: func(html: string, rules: strip-rules, max-bytes: u32) -> result<stripped, string>;
+
     /// `s` with its character references decoded, as `select` decodes attribute values.
     unescape: func(s: string, max-bytes: u32) -> result<string, string>;
 }
@@ -280,6 +312,10 @@ world plugin {
     export init: func(config: string) -> result<list<event-kind>, string>;
 
     export on-entry-parsed: func(entry: entry);
+    /// Return the entry, possibly changed, to keep it, or `none` to drop it.
+    /// Every plugin's `on-entry-transform` runs before any `on-entry-ingest`,
+    /// so `on-entry-ingest` sees the entry as it will be stored.
+    export on-entry-transform: func(entry: entry) -> option<entry>;
     /// Return the entry, possibly changed, to keep it, or `none` to drop it.
     export on-entry-ingest: func(entry: entry) -> option<entry>;
     export on-fetch-success: func(event: fetch-success);

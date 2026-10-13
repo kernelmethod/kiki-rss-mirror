@@ -37,16 +37,11 @@ pub async fn retrieve(
 
     let resp = 'redirect: {
         for _ in 0..=MAX_REDIRECTS {
-            // Only send conditional headers on the first request, and only
-            // when the caller allows them.
+            // The validators belong to the feed's URL, so they are only
+            // sent on the first request.
             let mut request = client.get(&current_url).timeout(timeout);
-            if current_url == feed_url && spec.send_conditionals {
-                if let Some(etag) = &spec.etag {
-                    request = request.header("If-None-Match", etag);
-                }
-                if let Some(last_modified) = &spec.last_modified {
-                    request = request.header("If-Modified-Since", last_modified);
-                }
+            if current_url == feed_url {
+                request = spec.validators.apply(request);
             }
             // Only forward credentials to the feed's configured origin. If a
             // redirect took us cross-origin we intentionally drop them to

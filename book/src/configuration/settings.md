@@ -58,6 +58,12 @@ The on-disk cache of entries' images and enclosures.
 | `enabled` | `true` | Whether to download and cache entries' assets at all. |
 | `max_bytes` | `1073741824` (1 GiB) | The size, in bytes, the cache is trimmed down to. |
 
+Once the cache grows past `max_bytes`, the assets used least recently are
+deleted until it is back under. Separately, every minute Kiki deletes the
+assets nothing uses any more: those of entries that have been deleted, such
+as by the [`retention`](../plugins/retention.md) plugin, and the favicons of
+feeds that have been removed.
+
 ## `[retention]`
 
 Retired. Deleting old entries is now up to the
@@ -84,13 +90,22 @@ whoever can see them which sites Kiki fetches from. To keep Kiki from
 downloading images and enclosures at all for some feeds, see `skip_assets`
 in the [privacy plugin](../plugins/privacy.md).
 
+## `[http]`
+
+Shared by the web UI and the API. `kiki web` reads it as it starts; the API
+applies changes to the next request.
+
+| Key | Default | Description |
+| --- | ------- | ----------- |
+| `allowed_hosts` | `[]` | Hosts the web UI and the API answer to besides `localhost`, `127.0.0.1` and `::1`: exact names or addresses, `*.example.com` for every subdomain of `example.com`, or `*` for any host. Requests naming another host in their `Host` header are refused, so that a site cannot reach Kiki through DNS rebinding. Empty, the web UI answers only to the localhost names, and the API to any host. `allowed_hosts` under `[web_ui]` or `[api]` replaces this list for one of them. See [The web UI](../web-ui.md#reaching-it-by-another-name) and [Exposing Kiki over the network](../deployment.md#exposing-kiki-over-the-network). |
+
 ## `[web_ui]`
 
 Read by `kiki web` as it starts, so restart it after a change.
 
 | Key | Default | Description |
 | --- | ------- | ----------- |
-| `allowed_hosts` | `[]` | Hosts the web UI answers to besides `localhost`, `127.0.0.1` and `::1`: exact names or addresses, `*.example.com` for every subdomain of `example.com`, or `*` for any host. See [The web UI](../web-ui.md). |
+| `allowed_hosts` | unset | Hosts the web UI answers to besides `localhost`, `127.0.0.1` and `::1`, in place of `http.allowed_hosts`. Unset, the web UI uses the `[http]` list. See [The web UI](../web-ui.md#reaching-it-by-another-name). |
 | `require_login` | `false` | Whether the web UI asks for an [API token](../tokens.md) before showing anything, as `kiki web --require-login` does. See [Logging in](../web-ui.md#logging-in). |
 
 ## `[api]`
@@ -100,6 +115,7 @@ Changes apply to the next request, with no restart.
 | Key | Default | Description |
 | --- | ------- | ----------- |
 | `anonymous_access` | `"full"` | What a request without an [API token](../tokens.md) may do: `"full"` (anything, administration included), `"read-only"` (as with a token holding only the `read` scope), or `"token-required"` (nothing but `GET /v1/health`, `GET /v1/`, `GET /v1/access`, `GET /v1/tokens/current` and `/docs`). Requests with a token are held to its scopes either way. `GET /v1/access` reports the setting to anyone. See [Anonymous access](../tokens.md#anonymous-access). |
+| `allowed_hosts` | unset | Hosts the API answers to besides `localhost`, `127.0.0.1` and `::1`, in place of `http.allowed_hosts`. Unset, the API uses the `[http]` list. An empty list, set here or inherited, turns the check off, and the API answers any host. Otherwise a request naming another host in its `Host` header is refused with `400 Bad Request`. See [Exposing Kiki over the network](../deployment.md#exposing-kiki-over-the-network). |
 
 ## Per-feed settings
 

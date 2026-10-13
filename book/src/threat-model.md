@@ -223,8 +223,12 @@ every process it starts:
 - **seccomp** kills the process if it makes a system call none of Kiki's
   processes need, such as `ptrace`, `mount`, `bpf`, `io_uring` or
   namespace creation, and refuses the socket calls that process has no
-  use for. Only the supervisor may `execve`, and then only the kiki
-  executable.
+  use for. The processes Landlock gives no files at all (the script host,
+  the fetcher's parser and the web UI) are also refused every system call
+  that reaches a file by its path. This holds even where the kernel lacks
+  Landlock, and it covers what Landlock does not restrict, such as changing
+  a file's permissions or owner. Only the supervisor may `execve`, and then
+  only the kiki executable.
 - **`PR_SET_MDWE`** refuses memory that is both writable and executable,
   so injected code can't be written into memory and then run. Every
   process gets it but the script host, which compiles WebAssembly plugins
@@ -313,7 +317,8 @@ and nor do their credentials.
 A plugin, or a feed that subverts one, runs in the script host, which has
 no files and no sockets. What it can do is what the plugin API allows:
 
-- change or drop the entries passed to its `entry.ingest` handlers;
+- change or drop the entries passed to its `entry.transform` and
+  `entry.ingest` handlers;
 - delay a feed's next fetch, through `fetch.schedule`, but never past the
   feed's own interval, and never to fetch it sooner than its server asks;
 - tag and untag any stored entry;
@@ -341,7 +346,8 @@ Each handler has a time and a memory budget (see
 [Resource limits](writing-plugins.md#resource-limits)). A plugin's manifest
 may lift its time budget, as the bundled `sanitize` plugin does so that no
 entry is stored unsanitized; the server still stops a script host that
-doesn't answer for 10 seconds. A script host that
+goes silent for 10 seconds while requests wait on it, or keeps one waiting
+for 40. A script host that
 crashes or stops answering is not replaced; plugins stay disabled until
 Kiki is restarted, rather than handing a fresh script host to whatever
 broke the last one. Entries keep flowing in either way. A plugin that

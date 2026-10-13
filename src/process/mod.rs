@@ -312,11 +312,27 @@ pub(crate) fn spawn_child(
     log_only: bool,
     no_sandbox: bool,
 ) -> anyhow::Result<(std::os::unix::net::UnixStream, std::process::Child)> {
+    let exe = std::env::current_exe().context("locating the kiki executable")?;
+    spawn_child_exe(&exe, subcommand, fd_env, log_only, no_sandbox)
+}
+
+/// [`spawn_child`], running `exe` rather than the current binary.
+///
+/// # Errors
+///
+/// As for [`spawn_child`].
+#[cfg(unix)]
+pub(crate) fn spawn_child_exe(
+    exe: &std::path::Path,
+    subcommand: &str,
+    fd_env: &str,
+    log_only: bool,
+    no_sandbox: bool,
+) -> anyhow::Result<(std::os::unix::net::UnixStream, std::process::Child)> {
     use std::process::Stdio;
 
-    let exe = std::env::current_exe().context("locating the kiki executable")?;
     let mut cmd = child_command(
-        &exe,
+        exe,
         subcommand,
         fd_env,
         ChildEnv::Inherit,

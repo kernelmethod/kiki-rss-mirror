@@ -16,26 +16,28 @@
 //! [`MAX_FRAME_BYTES`]; the feed fetcher channel, which carries whole
 //! parsed feeds, passes its own larger limit to the `_limited` variants.
 //!
-//! The script host protocol is strictly request/response — every request
-//! written by the server is answered by exactly one response from the
-//! script host, including for observe-only events whose result is
-//! discarded. Each response travels as a [`FromHost::Done`], which also
-//! names the events the host has handlers for, so the server can skip
-//! sending events nothing would see. While it works on a request, the
-//! script host may ask the server for something on a plugin's behalf with
-//! [`FromHost::Call`];
-//! the server answers with [`HostRequest::CallResult`] and goes back to
-//! waiting for the response, so calls nest inside a request without the
-//! two sides ever getting out of step. Keeping them in lockstep means a
-//! dropped or malformed frame shows up immediately as an error rather
-//! than as a silently desynchronised stream. The feed fetcher's protocol is
-//! multiplexed instead; see [`crate::process::feed_fetcher`].
+//! The script host protocol is request/response, with many requests in
+//! flight at once: every request the server writes carries an id
+//! ([`ToHost`]), and is answered by exactly one response with the same id
+//! ([`FromHost`]), including for observe-only events whose result is
+//! discarded. Responses come back in whatever order the script host
+//! finishes them. Each travels as a [`HostMessage::Done`], which also names
+//! the events the host has handlers for ([`Subscriptions`]), so the server
+//! can skip sending events nothing would see. While it works on a request,
+//! the script host may ask the server for something on a plugin's behalf
+//! with [`HostMessage::Call`], under the request's id; the server answers
+//! with [`HostRequest::CallResult`] under the same id, so calls nest inside
+//! their request. A frame with an id the other side is not waiting on means
+//! the two have fallen out of step, and is treated as corruption. The feed
+//! fetcher's protocol is multiplexed too; see
+//! [`crate::process::feed_fetcher`].
 
 use crate::scripting::{
-    Event, EventPayload, EventSet, FeedEntry, FetchSchedule, PluginRun, ScanSummary,
+    EntryPatch, Event, EventPayload, EventSet, FeedEntry, FetchSchedule, ScanSummary,
     ScheduleDecision, ScriptSource, ServiceCall, ServiceReply, WasmComponent,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::borrow::Cow;
 use std::io::{self, IoSlice, Read, Write};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -47,9 +49,49 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// peer's memory.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
-/// A message from the server to the script host.
+/// Identifies a request to the script host, and everything sent about it.
+pub type RequestId = u64;
+
+/// A frame from the server to the script host: a request, or the answer to a
+/// call made while the request `id` is served.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum HostRequest {
+pub struct ToHost<'a> {
+    /// The request this is, or is about.
+    pub id: RequestId,
+    /// Whether other requests were in flight when this one was sent. The
+    /// script host then has another thread take over reading at once, so
+    /// that a request arriving while this one is served is read and served
+    /// alongside it. Otherwise the thread that read this one serves it, and
+    /// reads the next itself, so that requests sent one after another are
+    /// served on one thread, whose caches are warm with the plugins.
+    pub busy: bool,
+    /// What the server sends.
+    pub request: HostRequest<'a>,
+}
+
+/// A [`ToHost`] that borrows its request, to send one without copying it.
+/// Encodes exactly as the [`ToHost`] it stands for.
+#[derive(Debug, Serialize)]
+pub struct ToHostRef<'r, 'a> {
+    /// The request this is, or is about.
+    pub id: RequestId,
+    /// Whether other requests were in flight when this one was sent. The
+    /// script host then has another thread take over reading at once, so
+    /// that a request arriving while this one is served is read and served
+    /// alongside it. Otherwise the thread that read this one serves it, and
+    /// reads the next itself, so that requests sent one after another are
+    /// served on one thread, whose caches are warm with the plugins.
+    pub busy: bool,
+    /// What the server sends.
+    pub request: &'r HostRequest<'a>,
+}
+
+/// A message from the server to the script host.
+///
+/// Entries are [`Cow`]s so that the server can send one it holds without
+/// copying it. They arrive owned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HostRequest<'a> {
     /// Discard the current plugins, if any, and load `sources` in their
     /// place, each plugin with its config.
     ///
@@ -59,7 +101,10 @@ pub enum HostRequest {
     Reload { sources: Vec<ScriptSource> },
 
     /// Run `entry` through the `entry.ingest` handler chain.
-    TransformEntry { entry: FeedEntry },
+    TransformEntry { entry: Cow<'a, FeedEntry> },
+
+    /// Fire `entry.parsed` for `entry`. Answered with [`HostResponse::Ack`].
+    EntryParsed { entry: Cow<'a, FeedEntry> },
 
     /// Fire an observe-only event. The response carries no data, but is
     /// still awaited to keep the stream in lockstep.
@@ -111,12 +156,13 @@ pub enum HostResponse {
     /// The plugins were reloaded; `loaded` is the number of plugins loaded.
     Reloaded { loaded: usize },
 
-    /// The handler chain ran. `None` means a handler filtered the entry
-    /// out and it should not be inserted. `runs` is how long each plugin's
-    /// handler took.
+    /// The handler chain ran. `patch` holds the fields the handlers
+    /// changed, or is `None` if a handler filtered the entry out and it
+    /// should not be inserted. `runs` is how long each plugin's handler
+    /// took.
     Entry {
-        entry: Option<FeedEntry>,
-        runs: Vec<PluginRun>,
+        patch: Option<EntryPatch>,
+        runs: Vec<PluginTime>,
     },
 
     /// An observe event was dispatched.
@@ -139,21 +185,55 @@ pub enum HostResponse {
     Schedule { decision: Option<ScheduleDecision> },
 }
 
+/// How long the handler of the plugin `plugin`, by its index in the order
+/// plugins were loaded in, took, in seconds. See [`HostResponse::Entry`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PluginTime {
+    /// The plugin's index among the sources of the last [`HostRequest::Reload`].
+    pub plugin: u32,
+    /// How long its handler took, in seconds.
+    pub seconds: f64,
+}
+
+/// The events the script host's plugins have at least one handler for, as
+/// of a response.
+///
+/// Responses to requests served at the same time can arrive in any order,
+/// so each carries a sequence number, taken before the events were read: of
+/// two reports, the one with the higher number is the more recent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subscriptions {
+    /// Grows with each report.
+    pub seq: u64,
+    /// The events.
+    pub events: EventSet,
+}
+
 /// A frame from the script host to the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FromHost {
-    /// The answer to the request being served, which ends it.
+pub struct FromHost {
+    /// The request the message is about.
+    pub id: RequestId,
+    /// The message.
+    pub message: HostMessage,
+}
+
+/// A message from the script host to the server, about a request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HostMessage {
+    /// The answer to the request, which ends it.
     Done {
         response: HostResponse,
         /// The events the host's plugins have at least one handler for once the
         /// request has been served. Plugins may register handlers at any
         /// time, so this is reported with every response.
-        subscribed: EventSet,
+        subscribed: Subscriptions,
     },
 
     /// Not a response: a plugin asks the server for something while the
     /// request is being served. The server answers with
-    /// [`HostRequest::CallResult`] and keeps waiting for the response.
+    /// [`HostRequest::CallResult`], under the request's id, and keeps waiting
+    /// for the response.
     Call { plugin: String, call: ServiceCall },
 }
 
@@ -191,6 +271,19 @@ pub enum CodecError {
 /// enforce it.
 pub fn encode<T: Serialize + ?Sized>(msg: &T) -> Result<Vec<u8>, CodecError> {
     Ok(postcard::to_stdvec(msg)?)
+}
+
+/// Encode `msg` as a frame body into `buf`, replacing what it held, so that
+/// a buffer kept for the purpose saves allocating one per message.
+///
+/// # Errors
+///
+/// As for [`encode`].
+pub fn encode_into<T: Serialize + ?Sized>(msg: &T, buf: &mut Vec<u8>) -> Result<(), CodecError> {
+    buf.clear();
+    let taken = std::mem::take(buf);
+    *buf = postcard::to_extend(msg, taken)?;
+    Ok(())
 }
 
 /// Decode a frame body written by [`encode`].
@@ -327,6 +420,38 @@ pub fn read_frame_limited<R: Read>(r: &mut R, max: usize) -> io::Result<Vec<u8>>
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
     Ok(payload)
+}
+
+/// Most bytes a buffer passed to [`read_frame_into`] keeps between frames,
+/// as do the buffers the script host's messages are encoded into.
+/// One that grew past this for a large frame is shrunk back, so that one
+/// large entry does not pin megabytes for the life of the channel.
+pub(crate) const KEPT_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// [`read_frame`] into `buf`, which is kept between frames so that most
+/// frames need no allocation, rather than into a new vector. Returns the
+/// frame, which is the start of `buf`.
+///
+/// # Errors
+///
+/// As for [`read_frame`].
+pub fn read_frame_into<'b, R: Read>(r: &mut R, buf: &'b mut Vec<u8>) -> io::Result<&'b [u8]> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)?;
+    let len = checked_len(len_buf, MAX_FRAME_BYTES)?;
+    if buf.capacity() > KEPT_BUFFER_BYTES && len <= KEPT_BUFFER_BYTES {
+        buf.truncate(KEPT_BUFFER_BYTES);
+        buf.shrink_to(KEPT_BUFFER_BYTES);
+    }
+    // Zeroed only where it grows: what a previous frame left is overwritten.
+    if buf.len() < len {
+        buf.resize(len, 0);
+    }
+    let frame = buf
+        .get_mut(..len)
+        .ok_or_else(|| io::Error::other("frame buffer too short"))?;
+    r.read_exact(frame)?;
+    Ok(frame)
 }
 
 /// Async counterpart of [`read_frame_limited`].
@@ -519,12 +644,17 @@ mod tests {
             cache_assets: true,
         };
 
-        let req = HostRequest::TransformEntry {
-            entry: entry.clone(),
+        let req = ToHost {
+            id: 7,
+            busy: false,
+            request: HostRequest::TransformEntry {
+                entry: Cow::Borrowed(&entry),
+            },
         };
         let encoded = encode(&req).unwrap();
-        let decoded: HostRequest = decode(&encoded).unwrap();
-        match decoded {
+        let decoded: ToHost<'static> = decode(&encoded).unwrap();
+        assert_eq!(decoded.id, 7);
+        match decoded.request {
             HostRequest::TransformEntry { entry: e } => {
                 assert_eq!(e.guid, entry.guid);
                 assert_eq!(e.tags, entry.tags);
@@ -532,16 +662,92 @@ mod tests {
             other => panic!("wrong variant: {other:?}"),
         }
 
-        let resp = HostResponse::Entry {
-            entry: Some(entry),
-            runs: Vec::new(),
+        let patch = EntryPatch {
+            title: Some("new".to_string()),
+            ..EntryPatch::default()
+        };
+        let resp = FromHost {
+            id: 7,
+            message: HostMessage::Done {
+                response: HostResponse::Entry {
+                    patch: Some(patch.clone()),
+                    runs: vec![PluginTime {
+                        plugin: 1,
+                        seconds: 0.5,
+                    }],
+                },
+                subscribed: Subscriptions {
+                    seq: 3,
+                    events: EventSet::ALL,
+                },
+            },
         };
         let encoded = encode(&resp).unwrap();
-        let decoded: HostResponse = decode(&encoded).unwrap();
-        assert!(matches!(
-            decoded,
-            HostResponse::Entry { entry: Some(_), .. }
-        ));
+        let decoded: FromHost = decode(&encoded).unwrap();
+        assert_eq!(decoded.id, 7);
+        match decoded.message {
+            HostMessage::Done {
+                response: HostResponse::Entry { patch: p, runs },
+                subscribed,
+            } => {
+                assert_eq!(p, Some(patch));
+                assert_eq!(runs[0].plugin, 1);
+                assert_eq!(subscribed.seq, 3);
+            }
+            other => panic!("wrong message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_borrowed_request_encodes_as_an_owned_one() {
+        let request = HostRequest::FinishScan {
+            scan_id: 3,
+            summary: None,
+        };
+        assert_eq!(
+            encode(&ToHostRef {
+                id: 9,
+                busy: true,
+                request: &request
+            })
+            .unwrap(),
+            encode(&ToHost {
+                id: 9,
+                busy: true,
+                request
+            })
+            .unwrap()
+        );
+    }
+
+    /// A buffer kept between frames holds each in turn, larger or smaller.
+    #[test]
+    fn frames_can_be_read_into_a_kept_buffer() {
+        let mut framed = Vec::new();
+        write_frame(&mut framed, b"a longer frame").unwrap();
+        write_frame(&mut framed, b"short").unwrap();
+        write_frame(&mut framed, &vec![1u8; KEPT_BUFFER_BYTES + 1]).unwrap();
+        write_frame(&mut framed, b"after").unwrap();
+        let mut cursor = std::io::Cursor::new(framed);
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_frame_into(&mut cursor, &mut buf).unwrap(),
+            b"a longer frame"
+        );
+        assert_eq!(read_frame_into(&mut cursor, &mut buf).unwrap(), b"short");
+        assert_eq!(
+            read_frame_into(&mut cursor, &mut buf).unwrap().len(),
+            KEPT_BUFFER_BYTES + 1
+        );
+        assert_eq!(read_frame_into(&mut cursor, &mut buf).unwrap(), b"after");
+        assert!(buf.capacity() <= KEPT_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn messages_can_be_encoded_into_a_kept_buffer() {
+        let mut buf = vec![9; 100];
+        encode_into(&HostResponse::Reloaded { loaded: 2 }, &mut buf).unwrap();
+        assert_eq!(buf, encode(&HostResponse::Reloaded { loaded: 2 }).unwrap());
     }
 
     /// `EventPayload::FetchError` carries a `Cow<'static, str>`; it must
@@ -560,7 +766,7 @@ mod tests {
             payload,
         };
         let encoded = encode(&req).unwrap();
-        let decoded: HostRequest = decode(&encoded).unwrap();
+        let decoded: HostRequest<'static> = decode(&encoded).unwrap();
         match decoded {
             HostRequest::Observe {
                 event,
@@ -585,7 +791,7 @@ mod tests {
     fn garbage_is_refused() {
         assert!(decode::<HostResponse>(b"").is_err());
         assert!(decode::<HostResponse>(&[0xff]).is_err());
-        assert!(decode::<HostRequest>(b"{\"Reload\":{\"sources\":[]}}").is_err());
+        assert!(decode::<HostRequest<'static>>(b"{\"Reload\":{\"sources\":[]}}").is_err());
     }
 
     #[test]

@@ -11,6 +11,12 @@
 //! The second pass matches the same elements in the same order as the first, since nothing
 //! a rewrite inserts is parsed, and a removed element's descendants are still matched.
 //!
+//! [`strip`] instead rewrites the HTML in one pass, for plugins whose edits depend on what
+//! they find in attribute values only: it removes or unwraps elements by their tag names
+//! alone, as rules the plugin gives say, and takes every attribute off the elements it
+//! keeps, returning them for the plugin to check. The plugin writes back the ones it keeps
+//! itself, into the HTML [`strip`] returns, where markers show it the start tags.
+//!
 //! # Packing
 //!
 //! What [`select`] returns crosses into the plugin's memory, where every string and list
@@ -44,6 +50,8 @@ use lol_html::{
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+use std::fmt::Write;
 
 /// Most memory the rewriter may use for its buffers during one pass.
 pub const HTML_MEMORY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
@@ -152,6 +160,36 @@ pub struct Edit {
     pub element: u32,
     pub op: EditOp,
 }
+
+/// What [`strip`] does with each element, by its tag name, lowercase.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StripRules {
+    /// Elements removed with their content.
+    pub drop: HashSet<String>,
+    /// Elements kept, without their attributes. Every other element is unwrapped: its tags
+    /// are removed and its content kept.
+    pub keep: HashSet<String>,
+    /// Whether elements in the SVG and MathML namespaces are removed with their content,
+    /// whatever their names.
+    pub drop_foreign: bool,
+    /// Whether comments are removed.
+    pub remove_comments: bool,
+}
+
+/// What [`strip`] returns.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Stripped {
+    /// The stripped HTML, with [`STRIP_MARKER`] and the element's index in `elements`, in
+    /// decimal, and [`STRIP_MARKER`] again, just before each kept element's start tag.
+    pub html: String,
+    /// The elements kept, with the attributes taken off them, in document order.
+    pub elements: Selected,
+}
+
+/// The character around the index of an element [`strip`] kept, in front of its start tag.
+/// [`strip`] replaces it with U+FFFD wherever the HTML holds it, as browsers do, so that it
+/// marks start tags alone.
+pub const STRIP_MARKER: char = '\0';
 
 /// The error a content handler returns to stop the rewriter. What went wrong is kept
 /// aside, in [`Pass::failure`].
@@ -281,32 +319,8 @@ pub fn select(
     let handler = ElementContentHandlers::default().element(|el: &mut Element| {
         pass.next_element()?;
         let mut selected = selected.borrow_mut();
-        let Selected {
-            text,
-            elements,
-            attributes,
-        } = &mut *selected;
-        let tag_name = push_text(text, &el.tag_name());
-        let first = attributes.len();
-        for attribute in el.attributes() {
-            let name = push_text(text, &attribute.name());
-            let value = push_text(text, &decode(&attribute.value()));
-            attributes.push(Attribute { name, value });
-        }
-        elements.push(SelectedElement {
-            tag_name,
-            namespace: match el.namespace_uri() {
-                "http://www.w3.org/2000/svg" => Namespace::Svg,
-                "http://www.w3.org/1998/Math/MathML" => Namespace::MathMl,
-                _ => Namespace::Html,
-            },
-            attributes: Span {
-                start: first as u32,
-                len: (attributes.len() - first) as u32,
-            },
-        });
-        if text.len() + elements.len() * ELEMENT_BYTES + attributes.len() * ATTRIBUTE_BYTES > limit
-        {
+        selected.push(el, &el.tag_name(), namespace(el));
+        if selected.bytes() > limit {
             return pass.fail(HtmlError::failed(format!(
                 "the elements selected take more than {limit} bytes"
             )));
@@ -322,6 +336,15 @@ pub fn select(
     Ok(selected.into_inner())
 }
 
+/// The namespace `el` is in.
+fn namespace(el: &Element) -> Namespace {
+    match el.namespace_uri() {
+        "http://www.w3.org/2000/svg" => Namespace::Svg,
+        "http://www.w3.org/1998/Math/MathML" => Namespace::MathMl,
+        _ => Namespace::Html,
+    }
+}
+
 /// Append `s` to `text`, returning where it went. `text` is kept below
 /// [`HTML_OUTPUT_LIMIT_BYTES`], so offsets fit in a `u32`.
 fn push_text(text: &mut String, s: &str) -> Span {
@@ -334,6 +357,38 @@ fn push_text(text: &mut String, s: &str) -> Span {
 }
 
 impl Selected {
+    /// Add `el`, whose tag name and namespace are `tag_name` and `namespace`, with its
+    /// attributes, their values decoded.
+    fn push(&mut self, el: &Element, tag_name: &str, namespace: Namespace) {
+        let Selected {
+            text,
+            elements,
+            attributes,
+        } = self;
+        let tag_name = push_text(text, tag_name);
+        let first = attributes.len();
+        for attribute in el.attributes() {
+            let name = push_text(text, &attribute.name());
+            let value = push_text(text, &decode(&attribute.value()));
+            attributes.push(Attribute { name, value });
+        }
+        elements.push(SelectedElement {
+            tag_name,
+            namespace,
+            attributes: Span {
+                start: first as u32,
+                len: (attributes.len() - first) as u32,
+            },
+        });
+    }
+
+    /// How many bytes these take in the plugin's memory.
+    fn bytes(&self) -> usize {
+        self.text.len()
+            + self.elements.len() * ELEMENT_BYTES
+            + self.attributes.len() * ATTRIBUTE_BYTES
+    }
+
     /// The piece of [`Selected::text`] at `span`.
     pub fn text(&self, span: Span) -> &str {
         let start = span.start as usize;
@@ -430,6 +485,127 @@ pub fn rewrite(
     // The output is the input's UTF-8, with the plugin's UTF-8 inserted.
     String::from_utf8(out)
         .map_err(|e| HtmlError::failed(format!("the rewritten HTML is not UTF-8: {e}")))
+}
+
+/// `html` rewritten in one pass by `rules`: elements removed with their content, kept
+/// without their attributes, or unwrapped, and comments removed if the rules say so. The
+/// elements kept are returned with the attributes taken off them, values decoded, and the
+/// HTML marks each one's start tag with its index, as [`Stripped::html`] describes.
+///
+/// What is returned may take at most `max_bytes` (and at most
+/// [`HTML_OUTPUT_LIMIT_BYTES`]) of the plugin's memory, and `expired` says whether the
+/// plugin's time budget has run out.
+///
+/// # Errors
+///
+/// Fails if the HTML cannot be parsed within the rewriter's memory limit, or what is
+/// returned would take more than the bytes allowed; or with [`HtmlError::Expired`] once
+/// `expired` says so.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::scripting::html::{strip, StripRules};
+///
+/// let rules = StripRules {
+///     drop: ["script".to_string()].into(),
+///     keep: ["a".to_string()].into(),
+///     ..StripRules::default()
+/// };
+/// let html = r#"<div><a href="/a">a</a><script>x()</script></div>"#;
+/// let stripped = strip(html, &rules, 1024, &|| false).unwrap();
+/// assert_eq!(stripped.html, "\x000\x00<a>a</a>");
+/// let a = stripped.elements.elements[0];
+/// assert_eq!(stripped.elements.text(a.tag_name), "a");
+/// ```
+pub fn strip(
+    html: &str,
+    rules: &StripRules,
+    max_bytes: u32,
+    expired: &dyn Fn() -> bool,
+) -> Result<Stripped, HtmlError> {
+    let limit = (max_bytes as usize).min(HTML_OUTPUT_LIMIT_BYTES);
+    let html: Cow<str> = if html.contains(STRIP_MARKER) {
+        Cow::Owned(html.replace(STRIP_MARKER, "\u{FFFD}"))
+    } else {
+        Cow::Borrowed(html)
+    };
+    let pass = Pass::new(expired);
+    let selected = RefCell::new(Selected::default());
+    // How many bytes `selected` takes, for the output sink, which can't borrow it.
+    let selected_bytes = Cell::new(0);
+    let written = Cell::new(0);
+    let marker = RefCell::new(String::new());
+
+    let handler = ElementContentHandlers::default().element(|el: &mut Element| {
+        pass.next_element()?;
+        let tag_name = el.tag_name();
+        let namespace = namespace(el);
+        if (rules.drop_foreign && namespace != Namespace::Html) || rules.drop.contains(&tag_name) {
+            el.remove();
+            return Ok(());
+        }
+        if !rules.keep.contains(&tag_name) {
+            el.remove_and_keep_content();
+            return Ok(());
+        }
+        let mut selected = selected.borrow_mut();
+        let index = selected.elements.len();
+        selected.push(el, &tag_name, namespace);
+        selected_bytes.set(selected.bytes());
+        if selected_bytes.get() + written.get() > limit {
+            return pass.fail(HtmlError::failed(format!(
+                "the stripped HTML takes more than {limit} bytes"
+            )));
+        }
+        let first = selected.attributes.len() - el.attributes().len();
+        for attribute in selected.attributes.get(first..).unwrap_or_default() {
+            el.remove_attribute(selected.text(attribute.name));
+        }
+        let mut marker = marker.borrow_mut();
+        marker.clear();
+        // Writing to a `String` can't fail.
+        let _ = write!(marker, "{STRIP_MARKER}{index}{STRIP_MARKER}");
+        el.before(&marker, ContentType::Html);
+        Ok(())
+    });
+    let mut document = DocumentContentHandlers::default();
+    if rules.remove_comments {
+        document = document.comments(|c: &mut Comment| {
+            c.remove();
+            Ok(())
+        });
+    }
+
+    let mut out = Vec::new();
+    let overflowed = Cell::new(false);
+    let rewriter = HtmlRewriter::new(
+        settings(
+            vec![(Cow::Owned(parse_selector("*")?), handler)],
+            vec![document],
+        ),
+        |chunk: &[u8]| {
+            if overflowed.get() || out.len() + chunk.len() + selected_bytes.get() > limit {
+                overflowed.set(true);
+            } else {
+                out.extend_from_slice(chunk);
+                written.set(out.len());
+            }
+        },
+    );
+    pass.run(rewriter, &html)?;
+    if overflowed.get() {
+        return Err(HtmlError::failed(format!(
+            "the stripped HTML takes more than {limit} bytes"
+        )));
+    }
+    // The output is the input's UTF-8, with the markers inserted.
+    let html = String::from_utf8(out)
+        .map_err(|e| HtmlError::failed(format!("the stripped HTML is not UTF-8: {e}")))?;
+    Ok(Stripped {
+        html,
+        elements: selected.into_inner(),
+    })
 }
 
 fn apply(el: &mut Element, op: EditOp) -> Result<(), HtmlError> {

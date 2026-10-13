@@ -21,7 +21,7 @@
 //! url = "http://proxy.example:3128"   # or "socks5h://127.0.0.1:9050" for Tor
 //! no_proxy = "localhost, .internal.example"
 //!
-//! [web_ui]
+//! [http]
 //! allowed_hosts = ["kiki.lan", "*.home.example"]
 //!
 //! [api]
@@ -95,6 +95,8 @@ pub struct Settings {
     pub asset_cache: AssetCacheSettings,
     #[serde(default)]
     pub proxy: ProxySettings,
+    #[serde(default)]
+    pub http: HttpSettings,
     #[serde(default)]
     pub web_ui: WebUiSettings,
     #[serde(default)]
@@ -178,6 +180,41 @@ pub struct ProxySettings {
     pub no_proxy: Option<String>,
 }
 
+/// Settings shared by Kiki's HTTP listeners: the web UI that `kiki web`
+/// serves, and the API, with any reverse proxy in front of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpSettings {
+    /// Hosts the web UI and the API answer to besides `localhost`,
+    /// `127.0.0.1` and `::1`: exact host names or IP addresses,
+    /// `*.example.com` for every subdomain of `example.com`, or `*` for any
+    /// host at all. Requests naming any other host in their `Host` header
+    /// are refused, so that a site cannot reach Kiki by pointing its own
+    /// domain at this machine or at a reverse proxy in front of it (DNS
+    /// rebinding).
+    ///
+    /// The two are usually reached at the same name, so they share this
+    /// list. [`WebUiSettings::allowed_hosts`] and
+    /// [`ApiSettings::allowed_hosts`] replace it for one of them. Empty, the
+    /// default, the web UI answers only to the localhost names, and the API
+    /// to any host, since it listens only on a Unix socket unless a proxy
+    /// is put in front of it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::{HostPattern, Overrides};
+    ///
+    /// let o = Overrides::parse("[http]\nallowed_hosts = [\"kiki.lan\", \"*\"]\n").unwrap();
+    /// assert_eq!(
+    ///     o.resolve().unwrap().http.allowed_hosts,
+    ///     [HostPattern::Exact("kiki.lan".into()), HostPattern::Any]
+    /// );
+    /// ```
+    #[serde(default)]
+    pub allowed_hosts: Vec<HostPattern>,
+}
+
 /// Settings for the web UI that `kiki web` serves.
 ///
 /// `kiki web` reads these once, as it starts, so a change takes effect
@@ -186,12 +223,10 @@ pub struct ProxySettings {
 #[serde(deny_unknown_fields)]
 pub struct WebUiSettings {
     /// Hosts the web UI answers to besides `localhost`, `127.0.0.1` and
-    /// `::1`, on top of any given to `kiki web --allowed-host`: exact
-    /// host names or IP addresses, `*.example.com` for every subdomain of
-    /// `example.com`, or `*` for any host at all. Requests naming any
-    /// other host in their `Host` header are refused, so that a site
-    /// cannot reach the web UI by pointing its own domain at this machine
-    /// (DNS rebinding).
+    /// `::1`, on top of any given to `kiki web --allowed-host`, in the
+    /// forms [`HttpSettings::allowed_hosts`] takes. Unset, the default,
+    /// the web UI answers to `http.allowed_hosts`; set, to these instead.
+    /// See [`Settings::web_ui_allowed_hosts`].
     ///
     /// # Examples
     ///
@@ -201,11 +236,11 @@ pub struct WebUiSettings {
     /// let o = Overrides::parse("[web_ui]\nallowed_hosts = [\"kiki.lan\", \"*\"]\n").unwrap();
     /// assert_eq!(
     ///     o.resolve().unwrap().web_ui.allowed_hosts,
-    ///     [HostPattern::Exact("kiki.lan".into()), HostPattern::Any]
+    ///     Some(vec![HostPattern::Exact("kiki.lan".into()), HostPattern::Any])
     /// );
     /// ```
-    #[serde(default)]
-    pub allowed_hosts: Vec<HostPattern>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<HostPattern>>,
 
     /// Whether the web UI requires logging in with an API token, created
     /// with `kiki token create`, as `kiki web --require-login` does. Each
@@ -241,6 +276,31 @@ pub struct ApiSettings {
     /// ```
     #[serde(default)]
     pub anonymous_access: AnonymousAccess,
+
+    /// Hosts the API answers to besides `localhost`, `127.0.0.1` and
+    /// `::1`, in the forms [`HttpSettings::allowed_hosts`] takes. Unset,
+    /// the default, the API answers to `http.allowed_hosts`; set, to these
+    /// instead. See [`Settings::api_allowed_hosts`]. With an empty list,
+    /// here or inherited, the check is off and the API answers whatever
+    /// host a request names. Otherwise requests naming any other host in
+    /// their `Host` header are refused, so that a site cannot reach a
+    /// reverse proxy in front of the API by pointing its own domain at the
+    /// proxy (DNS rebinding). The proxy has to pass the client's `Host`
+    /// through. A change takes effect with the next request.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::{HostPattern, Overrides};
+    ///
+    /// let o = Overrides::parse("[api]\nallowed_hosts = [\"kiki.example.com\"]\n").unwrap();
+    /// assert_eq!(
+    ///     o.resolve().unwrap().api.allowed_hosts,
+    ///     Some(vec![HostPattern::Exact("kiki.example.com".into())])
+    /// );
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<HostPattern>>,
 }
 
 /// What a request without an API token may do; see
@@ -381,6 +441,7 @@ impl Default for Settings {
                 max_bytes: DEFAULT_ASSET_CACHE_MAX_BYTES,
             },
             proxy: ProxySettings::default(),
+            http: HttpSettings::default(),
             web_ui: WebUiSettings::default(),
             api: ApiSettings::default(),
         }
@@ -388,6 +449,56 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The hosts the web UI answers to besides the localhost names and
+    /// those given to `kiki web --allowed-host`:
+    /// [`WebUiSettings::allowed_hosts`] if it is set, and otherwise the
+    /// shared [`HttpSettings::allowed_hosts`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::{HostPattern, Overrides};
+    ///
+    /// let o = Overrides::parse("[http]\nallowed_hosts = [\"kiki.lan\"]\n").unwrap();
+    /// assert_eq!(
+    ///     o.resolve().unwrap().web_ui_allowed_hosts(),
+    ///     [HostPattern::Exact("kiki.lan".into())]
+    /// );
+    /// ```
+    pub fn web_ui_allowed_hosts(&self) -> &[HostPattern] {
+        self.web_ui
+            .allowed_hosts
+            .as_deref()
+            .unwrap_or(&self.http.allowed_hosts)
+    }
+
+    /// The hosts the API answers to besides the localhost names:
+    /// [`ApiSettings::allowed_hosts`] if it is set, and otherwise the
+    /// shared [`HttpSettings::allowed_hosts`]. Empty means the API answers
+    /// any host.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::{HostPattern, Overrides};
+    ///
+    /// let lan = [HostPattern::Exact("kiki.lan".into())];
+    /// let o = Overrides::parse("[http]\nallowed_hosts = [\"kiki.lan\"]\n").unwrap();
+    /// assert_eq!(o.resolve().unwrap().api_allowed_hosts(), lan);
+    ///
+    /// let o = Overrides::parse(
+    ///     "[http]\nallowed_hosts = [\"kiki.lan\"]\n[api]\nallowed_hosts = []\n",
+    /// )
+    /// .unwrap();
+    /// assert!(o.resolve().unwrap().api_allowed_hosts().is_empty());
+    /// ```
+    pub fn api_allowed_hosts(&self) -> &[HostPattern] {
+        self.api
+            .allowed_hosts
+            .as_deref()
+            .unwrap_or(&self.http.allowed_hosts)
+    }
+
     /// Checks the values that serde's types alone cannot rule out.
     ///
     /// # Errors
@@ -780,41 +891,81 @@ mod tests {
     }
 
     #[test]
-    fn web_ui_allowed_hosts_are_read_from_the_file() {
-        assert!(Settings::default().web_ui.allowed_hosts.is_empty());
+    fn allowed_hosts_are_read_from_the_file() {
+        let defaults = Settings::default();
+        assert!(defaults.http.allowed_hosts.is_empty());
+        assert_eq!(defaults.web_ui.allowed_hosts, None);
+        assert_eq!(defaults.api.allowed_hosts, None);
 
-        let o = Overrides::parse(
-            "[web_ui]\nallowed_hosts = [\"Kiki.LAN\", \"*.example.com\", \"[::1]\", \"*\"]\n",
-        )
+        let all = [
+            HostPattern::Exact("kiki.lan".into()),
+            HostPattern::Subdomains("example.com".into()),
+            HostPattern::Exact("::1".into()),
+            HostPattern::Any,
+        ];
+        for section in ["http", "web_ui", "api"] {
+            let o = Overrides::parse(&format!(
+                "[{section}]\nallowed_hosts = [\"Kiki.LAN\", \"*.example.com\", \"[::1]\", \"*\"]\n"
+            ))
+            .unwrap();
+            let settings = o.resolve().unwrap();
+            let shared = section == "http";
+            assert_eq!(
+                settings.web_ui_allowed_hosts() == all,
+                shared || section == "web_ui",
+                "{section}"
+            );
+            assert_eq!(
+                settings.api_allowed_hosts() == all,
+                shared || section == "api",
+                "{section}"
+            );
+
+            // Each survives being written back out, an empty list too.
+            for hosts in [vec!["kiki.lan", "*.example.com"], vec![]] {
+                let mut o = Overrides::default();
+                o.set(section, "allowed_hosts", hosts).unwrap();
+                let reparsed = Overrides::parse(&o.to_toml_string().unwrap()).unwrap();
+                assert_eq!(reparsed.resolve().unwrap(), o.resolve().unwrap());
+            }
+
+            for text in [
+                "allowed_hosts = [\"kiki.lan:8080\"]\n",
+                "allowed_hosts = [\"\"]\n",
+                "allowed_hosts = \"kiki.lan\"\n",
+                "allowed_host = [\"kiki.lan\"]\n",
+            ] {
+                let o = Overrides::parse(&format!("[{section}]\n{text}")).unwrap();
+                assert!(
+                    matches!(o.resolve(), Err(ConfigError::Invalid(_))),
+                    "{section} {text:?} should be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn web_ui_and_api_hosts_replace_the_shared_ones() {
+        let shared = "[http]\nallowed_hosts = [\"kiki.lan\"]\n";
+        let lan = [HostPattern::Exact("kiki.lan".into())];
+
+        let settings = Overrides::parse(shared).unwrap().resolve().unwrap();
+        assert_eq!(settings.web_ui_allowed_hosts(), lan);
+        assert_eq!(settings.api_allowed_hosts(), lan);
+
+        // An override replaces the shared list rather than adding to it,
+        // and an empty one turns the check off.
+        let settings = Overrides::parse(&format!(
+            "{shared}[web_ui]\nallowed_hosts = [\"*.lan\"]\n[api]\nallowed_hosts = []\n"
+        ))
+        .unwrap()
+        .resolve()
         .unwrap();
         assert_eq!(
-            o.resolve().unwrap().web_ui.allowed_hosts,
-            [
-                HostPattern::Exact("kiki.lan".into()),
-                HostPattern::Subdomains("example.com".into()),
-                HostPattern::Exact("::1".into()),
-                HostPattern::Any,
-            ]
+            settings.web_ui_allowed_hosts(),
+            [HostPattern::Subdomains("lan".into())]
         );
-
-        let mut o = Overrides::default();
-        o.set("web_ui", "allowed_hosts", ["kiki.lan", "*.example.com"])
-            .unwrap();
-        let reparsed = Overrides::parse(&o.to_toml_string().unwrap()).unwrap();
-        assert_eq!(reparsed.resolve().unwrap(), o.resolve().unwrap());
-
-        for text in [
-            "[web_ui]\nallowed_hosts = [\"kiki.lan:8080\"]\n",
-            "[web_ui]\nallowed_hosts = [\"\"]\n",
-            "[web_ui]\nallowed_hosts = \"kiki.lan\"\n",
-            "[web_ui]\nallowed_host = [\"kiki.lan\"]\n",
-        ] {
-            let o = Overrides::parse(text).unwrap();
-            assert!(
-                matches!(o.resolve(), Err(ConfigError::Invalid(_))),
-                "{text:?} should be rejected"
-            );
-        }
+        assert!(settings.api_allowed_hosts().is_empty());
     }
 
     #[test]

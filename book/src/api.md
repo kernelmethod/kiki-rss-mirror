@@ -69,4 +69,7 @@ without a token; `GET /v1/access` reports the setting to anyone. See
 By default only your own user can reach the socket. If you widen that, or
 put Kiki behind a reverse proxy (see
 [Exposing Kiki over the network](deployment.md#exposing-kiki-over-the-network)),
-it is up to you to make sure only the people you trust can reach it.
+it is up to you to make sure only the people you trust can reach it. Set
+`allowed_hosts` under `[http]` (shared with the web UI) or `[api]` to the
+names the proxy is reached at, so that other sites can't
+reach it through DNS rebinding.

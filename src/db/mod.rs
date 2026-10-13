@@ -7,6 +7,7 @@ pub mod assets;
 pub mod favicons;
 pub mod feeds;
 mod handle;
+pub mod http_cache;
 pub mod integrity;
 pub mod log;
 pub mod migrations;
@@ -226,6 +227,7 @@ mod tests {
             "feed_favicons",
             "feed_tags",
             "feeds",
+            "http_cache",
             "migrations",
             "pending_entry_assets",
             "plugin_store",

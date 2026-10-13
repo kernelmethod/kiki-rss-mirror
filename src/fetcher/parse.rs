@@ -265,7 +265,9 @@ fn rss_item_to_parts(feed_id: i64, item: rss::Item) -> RssEntry {
     };
 
     let data = RssEntryIngestData {
-        description: description.clone(),
+        // The description is the entry's content until a script changes it, so it is
+        // sent once, as the content; see `RssEntryIngestData::description`.
+        description: None,
         comments,
         author,
         enclosure_url,

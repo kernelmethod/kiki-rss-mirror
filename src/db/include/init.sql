@@ -87,30 +87,9 @@ CREATE TABLE feeds (
     -- Favicons are looked for here (see `feed_favicons`).
     site_url                VARCHAR,
     last_checked            DATETIME,
-    header_etag             VARCHAR,
-    header_last_modified    VARCHAR,
 
-    -- Blake3 hex digest of the body returned by the most recent successful
-    -- 200 response. Paired with `last_full_refresh_at` to detect servers
-    -- that keep returning unchanged `ETag`/`Last-Modified` validators while
-    -- the body has actually changed.
-    header_body_hash        VARCHAR,
-
-    -- Unix timestamp of the most recent successful 200 response (forced or
-    -- conditional). Used to decide when to force another non-conditional
-    -- fetch for validator-lie detection.
-    last_full_refresh_at    INTEGER,
-
-    -- Unix timestamp parsed from the HTTP Expires response header.
-    -- When set, the fetcher will skip refreshing the feed until this
-    -- time has passed.
-    header_expires          INTEGER,
-
-    -- Unix timestamp until which the feed's last response is treated as
-    -- immutable per RFC 8246 (Cache-Control: immutable). While set and in
-    -- the future, conditional request headers (If-None-Match,
-    -- If-Modified-Since) are omitted and the feed is not refetched.
-    header_immutable_until  INTEGER,
+    -- The feed's HTTP cache state (validators, freshness, body hash) is
+    -- kept in `http_cache` under `url`.
 
     -- Refresh hints the feed declares in its own markup, captured from the
     -- most recent successfully parsed 200 response:
@@ -280,6 +259,15 @@ CREATE INDEX idx_entry_unread_visible ON entries(published_at)
     WHERE unread_visible = 1;
 CREATE INDEX idx_entry_feed_unread_visible ON entries(feed_id, published_at)
     WHERE unread_visible = 1;
+
+-- The entry columns that full-text searches sort and filter by, looked up
+-- by id for each entry matching the query: reading them from here rather
+-- than the entries table skips each entry's title and content, and makes
+-- searches for common words several times faster. SQLite does not choose
+-- it on its own, so searches name it with INDEXED BY; see
+-- src/routes/v1/entries/search_entries.rs.
+CREATE INDEX idx_entry_search
+    ON entries(id, published_at, feed_id, ingested_at, unread_visible);
 
 -- Keep `entries.unread_visible` in step with the entry's system:read and
 -- system:hidden tags, however entry_tags rows are added, removed or changed.
@@ -542,9 +530,7 @@ CREATE TABLE feed_assets (
     content_type     TEXT,
     size_bytes       INTEGER NOT NULL,
     cached_at        INTEGER NOT NULL DEFAULT (unixepoch()),
-    last_accessed_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    etag             TEXT,
-    last_modified    TEXT
+    last_accessed_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 CREATE INDEX idx_feed_assets_last_accessed ON feed_assets(last_accessed_at);
 CREATE INDEX idx_feed_assets_original_url  ON feed_assets(original_url);
@@ -586,6 +572,65 @@ CREATE TABLE pending_entry_assets (
     FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_pending_entry_assets_next ON pending_entry_assets(next_attempt_at);
+
+---------------------------------------------------------------------------------
+-- HTTP cache state, one row per URL Kiki fetches: the validators to
+-- revalidate it with and how long its last response stays fresh. Shared by
+-- feeds (`feeds.url`) and cached assets (`feed_assets.original_url`); a row
+-- is removed once no feed or asset has its URL. See src/db/http_cache.rs.
+---------------------------------------------------------------------------------
+
+CREATE TABLE http_cache (
+    url                     TEXT PRIMARY KEY,
+
+    -- Validators from the last response, sent as If-None-Match and
+    -- If-Modified-Since.
+    etag                    TEXT,
+    last_modified           TEXT,
+
+    -- Unix timestamp the last response is fresh until: `max-age` (age-
+    -- corrected) or else the `Expires` header.
+    expires_at              INTEGER,
+
+    -- Unix timestamp until which the last response is treated as immutable
+    -- per RFC 8246 (Cache-Control: immutable). While set and in the future,
+    -- conditional request headers are omitted.
+    immutable_until         INTEGER,
+
+    -- Blake3 hex digest of the body of the most recent 200 response.
+    -- Paired with `last_full_refresh_at` to detect servers that keep
+    -- returning unchanged `ETag`/`Last-Modified` validators while the body
+    -- has actually changed. NULL after `Cache-Control: no-store`.
+    body_hash               TEXT,
+
+    -- Unix timestamp of the most recent 200 response (forced or
+    -- conditional). Used to decide when to force another non-conditional
+    -- fetch for validator-lie detection.
+    last_full_refresh_at    INTEGER
+);
+
+CREATE TRIGGER http_cache_feed_ad AFTER DELETE ON feeds
+WHEN OLD.url IS NOT NULL
+BEGIN
+    DELETE FROM http_cache WHERE url = OLD.url
+      AND NOT EXISTS (SELECT 1 FROM feed_assets WHERE original_url = OLD.url);
+END;
+
+-- A feed's cache state belongs to the URL it was fetched from, so it goes
+-- when the feed moves.
+CREATE TRIGGER http_cache_feed_au AFTER UPDATE OF url ON feeds
+WHEN OLD.url IS NOT NULL AND OLD.url IS NOT NEW.url
+BEGIN
+    DELETE FROM http_cache WHERE url = OLD.url
+      AND NOT EXISTS (SELECT 1 FROM feed_assets WHERE original_url = OLD.url);
+END;
+
+CREATE TRIGGER http_cache_asset_ad AFTER DELETE ON feed_assets
+BEGIN
+    DELETE FROM http_cache WHERE url = OLD.original_url
+      AND NOT EXISTS (SELECT 1 FROM feeds WHERE url = OLD.original_url)
+      AND NOT EXISTS (SELECT 1 FROM feed_assets WHERE original_url = OLD.original_url);
+END;
 
 ---------------------------------------------------------------------------------
 -- Full-text search index over entries (FTS5, external content)

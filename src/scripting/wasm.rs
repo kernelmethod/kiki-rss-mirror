@@ -39,9 +39,11 @@
 //!
 //! * The plugin's [`TimeBudget`], enforced with Wasmtime's epoch interruption: a thread
 //!   advances the engine's epoch every [`EPOCH_TICK`], and at each tick a running plugin
-//!   checks its deadline. Time spent waiting on the server is given back, up to
-//!   [`MAX_CALL_ALLOWANCE`] per call. Instantiating a plugin and calling its `init` run
-//!   under [`LOAD_BUDGET`], together.
+//!   checks its deadline. The budget is of CPU time, so that a busy machine does not make
+//!   plugins run out of time, with a ceiling in wall-clock time (see [`wall_limit`]).
+//!   Time spent on the server's behalf is given back, up to [`MAX_CALL_ALLOWANCE`] per
+//!   call. Instantiating a plugin and calling its `init` run under [`LOAD_BUDGET`],
+//!   together.
 //! * [`WASM_MEMORY_LIMIT_BYTES`] of linear memory per plugin, and limits on tables and
 //!   instances, enforced with [`StoreLimits`].
 //! * [`MAX_WASM_STACK`] bytes of stack.
@@ -58,14 +60,15 @@
 
 use super::regex::MAX_LIVE_REGEXES;
 use super::{
-    parse_script_config, restore_read_only, ContentChange, DeleteFilter, Event, EventPayload,
-    EventSet, FeedEntry, FetchSchedule, PluginRun, ScanOptions, ScanSummary, ScheduleDecision,
-    ScriptRunner, ScriptServices, ScriptSource, ServiceCall, ServiceReply, TimeBudget,
-    WasmComponent, MAX_TIMER_INTERVAL, SCAN_SLICE, TIMER_TICK,
+    parse_script_config, ContentChange, DeleteFilter, EntryChanges, Event, EventPayload, EventSet,
+    FeedEntry, FetchSchedule, PluginRun, ScanOptions, ScanSummary, ScheduleDecision, ScriptRunner,
+    ScriptServices, ScriptSource, ServiceCall, ServiceReply, TimeBudget, WasmComponent,
+    MAX_TIMER_INTERVAL, SCAN_SLICE, TIMER_TICK,
 };
 use crate::db::tags::{is_reserved_tag_name, SystemTag};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, error, warn};
@@ -301,34 +304,114 @@ struct Timer {
     next: Instant,
 }
 
-/// The time budget of the call into a plugin in progress, if any. Time the call spends
-/// waiting on the server is given back to it, up to [`MAX_CALL_ALLOWANCE`].
+/// How much CPU time the calling thread has used, from the clock that measures plugins'
+/// time budgets.
+///
+/// Where the platform has no clock of a thread's CPU time, this is the time since the
+/// first call, so that budgets are measured in wall-clock time.
+fn thread_cpu_time() -> Duration {
+    #[cfg(unix)]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec, and the clock id is a constant
+        // every Unix Kiki builds for defines.
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0 {
+            return Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+        }
+    }
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
+/// The time budget of the call into a plugin in progress, if any.
+///
+/// The budget is charged in CPU time of the thread running the call, so that a plugin is
+/// not stopped because the machine is busy and its thread waits for a CPU. So that a call
+/// still cannot run for ever, it is also stopped once it has taken [`wall_limit`] in
+/// wall-clock time. Time the call spends on the server's behalf, waiting on it or doing
+/// its work on this thread, is given back to it, up to [`MAX_CALL_ALLOWANCE`].
+///
+/// Reading the CPU time is a system call, which in the sandboxed script host also runs
+/// through its seccomp filter, and a plugin checks its budget on every call to the host,
+/// such as for each regex it matches. A thread cannot use CPU time faster than the clock
+/// runs, though, so a call that has run for less than its budget by the clock cannot have
+/// used it up: the CPU time is not read at all for calls that take less than
+/// [`CPU_BASELINE_AFTER`], as most do. A call that takes longer reads it once at its
+/// first check after that, and takes as its start the reading less the time since it
+/// started, as though it had been on a CPU all along: time it spent waiting for one
+/// before then counts, and none after.
 #[derive(Default)]
 struct CallBudget {
-    deadline: Option<Instant>,
+    /// The call's budget, and when it started, while a call with a budget runs.
+    running: Option<(Duration, Instant)>,
+    /// The reading of [`thread_cpu_time`] taken as the call's start, once there is one.
+    cpu_start: std::cell::Cell<Option<Duration>>,
+    /// The time given back to the call, which neither its budget nor its ceiling counts.
+    credit: Duration,
     allowance: Duration,
+}
+
+/// How long a call with a CPU time budget runs before it first reads the CPU time; see
+/// [`CallBudget`].
+pub const CPU_BASELINE_AFTER: Duration = Duration::from_millis(1);
+
+/// How many times its budget a call may take in wall-clock time.
+pub const WALL_CLOCK_FACTOR: u32 = 5;
+
+/// The most more than its budget a call may take in wall-clock time.
+pub const MAX_WALL_CLOCK_SLACK: Duration = Duration::from_secs(1);
+
+/// How long, in wall-clock time, a call with a CPU time budget of `limit` may take:
+/// [`WALL_CLOCK_FACTOR`] times its budget, but no more than [`MAX_WALL_CLOCK_SLACK`] more
+/// than it.
+pub fn wall_limit(limit: Duration) -> Duration {
+    (limit * WALL_CLOCK_FACTOR).min(limit + MAX_WALL_CLOCK_SLACK)
 }
 
 impl CallBudget {
     fn start(&mut self, limit: Option<Duration>) {
-        self.deadline = limit.map(|l| Instant::now() + l);
+        self.running = limit.map(|l| (l, Instant::now()));
+        self.cpu_start.set(None);
+        self.credit = Duration::ZERO;
         self.allowance = MAX_CALL_ALLOWANCE;
     }
 
     fn stop(&mut self) {
-        self.deadline = None;
+        self.running = None;
     }
 
     fn expired(&self) -> bool {
-        self.deadline.is_some_and(|d| Instant::now() >= d)
+        let Some((limit, started)) = self.running else {
+            return false;
+        };
+        let elapsed = started.elapsed();
+        if elapsed >= wall_limit(limit) + self.credit {
+            return true;
+        }
+        let budget = limit + self.credit;
+        let cpu_start = match self.cpu_start.get() {
+            Some(cpu_start) => cpu_start,
+            // Too soon to have used the budget, or to be worth reading the CPU time.
+            None if elapsed < CPU_BASELINE_AFTER.min(budget) => return false,
+            None => {
+                let cpu_start = thread_cpu_time().saturating_sub(elapsed);
+                self.cpu_start.set(Some(cpu_start));
+                cpu_start
+            }
+        };
+        // The thread's CPU time grows no faster than the clock.
+        elapsed >= budget && thread_cpu_time().saturating_sub(cpu_start) >= budget
     }
 
+    /// Give back `waited`, time the call spent on the server's behalf, up to what is left
+    /// of [`MAX_CALL_ALLOWANCE`].
     fn give_back(&mut self, waited: Duration) {
-        if let Some(deadline) = self.deadline.as_mut() {
-            let credit = waited.min(self.allowance);
-            self.allowance -= credit;
-            *deadline += credit;
-        }
+        let credit = waited.min(self.allowance);
+        self.allowance -= credit;
+        self.credit += credit;
     }
 }
 
@@ -530,6 +613,35 @@ fn span_to_wit(span: super::html::Span) -> html_host::Span {
     }
 }
 
+/// What `select` returns, as plugins see it; also the elements `strip` returns.
+fn elements_to_wit(selected: super::html::Selected) -> html_host::Elements {
+    use super::html::Namespace;
+    html_host::Elements {
+        elements: selected
+            .elements
+            .iter()
+            .map(|el| html_host::Element {
+                tag_name: span_to_wit(el.tag_name),
+                namespace: match el.namespace {
+                    Namespace::Html => html_host::Namespace::Html,
+                    Namespace::Svg => html_host::Namespace::Svg,
+                    Namespace::MathMl => html_host::Namespace::Mathml,
+                },
+                attributes: span_to_wit(el.attributes),
+            })
+            .collect(),
+        attributes: selected
+            .attributes
+            .iter()
+            .map(|a| html_host::Attribute {
+                name: span_to_wit(a.name),
+                value: span_to_wit(a.value),
+            })
+            .collect(),
+        text: selected.text,
+    }
+}
+
 impl html_host::Host for State {
     fn select(
         &mut self,
@@ -537,35 +649,32 @@ impl html_host::Host for State {
         selector: String,
         max_bytes: u32,
     ) -> wasmtime::Result<Result<html_host::Elements, String>> {
-        use super::html::Namespace;
         self.check_budget("html.select")?;
         let budget = &self.budget;
         let selected = super::html::select(&html, &selector, max_bytes, &|| budget.expired());
+        Self::html_result("html.select", selected.map(elements_to_wit))
+    }
+
+    fn strip(
+        &mut self,
+        html: String,
+        rules: html_host::StripRules,
+        max_bytes: u32,
+    ) -> wasmtime::Result<Result<html_host::Stripped, String>> {
+        self.check_budget("html.strip")?;
+        let rules = super::html::StripRules {
+            drop: rules.drop.into_iter().collect(),
+            keep: rules.keep.into_iter().collect(),
+            drop_foreign: rules.drop_foreign,
+            remove_comments: rules.remove_comments,
+        };
+        let budget = &self.budget;
+        let stripped = super::html::strip(&html, &rules, max_bytes, &|| budget.expired());
         Self::html_result(
-            "html.select",
-            selected.map(|selected| html_host::Elements {
-                elements: selected
-                    .elements
-                    .iter()
-                    .map(|el| html_host::Element {
-                        tag_name: span_to_wit(el.tag_name),
-                        namespace: match el.namespace {
-                            Namespace::Html => html_host::Namespace::Html,
-                            Namespace::Svg => html_host::Namespace::Svg,
-                            Namespace::MathMl => html_host::Namespace::Mathml,
-                        },
-                        attributes: span_to_wit(el.attributes),
-                    })
-                    .collect(),
-                attributes: selected
-                    .attributes
-                    .iter()
-                    .map(|a| html_host::Attribute {
-                        name: span_to_wit(a.name),
-                        value: span_to_wit(a.value),
-                    })
-                    .collect(),
-                text: selected.text,
+            "html.strip",
+            stripped.map(|stripped| html_host::Stripped {
+                html: stripped.html,
+                elements: elements_to_wit(stripped.elements),
             }),
         )
     }
@@ -684,8 +793,8 @@ impl Host for State {
         };
         match self.service("start-scan", ServiceCall::StartScan { options })? {
             Ok(ServiceReply::ScanStarted(id)) => {
-                // The scan cannot reach the plugin before this: its batches are dispatched
-                // through the runner, which is busy until this call returns.
+                // The scan cannot reach the plugin before this: its batches are handed to
+                // the plugin, which is locked until this call returns.
                 self.scans.insert(id);
                 Ok(Ok(id))
             }
@@ -902,6 +1011,7 @@ fn finish_call<R>(
 fn event_from_kind(kind: wit::EventKind) -> Event {
     match kind {
         wit::EventKind::EntryParsed => Event::EntryParsed,
+        wit::EventKind::EntryTransform => Event::EntryTransform,
         wit::EventKind::EntryIngest => Event::EntryIngest,
         wit::EventKind::FetchSuccess => Event::FetchSuccess,
         wit::EventKind::FetchError => Event::FetchError,
@@ -912,41 +1022,69 @@ fn event_from_kind(kind: wit::EventKind) -> Event {
     }
 }
 
-fn entry_to_wit(entry: FeedEntry) -> wit::Entry {
+/// Move `entry` into the WIT type plugins are called with, leaving its strings and lists
+/// empty, to be put back with [`entry_from_wit`].
+fn entry_to_wit(entry: &mut FeedEntry) -> wit::Entry {
     wit::Entry {
         id: entry.id,
         feed_id: entry.feed_id,
-        syndication_format: entry.syndication_format,
-        guid: entry.guid,
+        syndication_format: std::mem::take(&mut entry.syndication_format),
+        guid: std::mem::take(&mut entry.guid),
         published_at: entry.published_at,
-        title: entry.title,
-        url: entry.url,
-        content: entry.content,
-        authors: entry.authors,
-        categories: entry.categories,
-        tags: entry.tags,
+        title: std::mem::take(&mut entry.title),
+        url: entry.url.take(),
+        content: entry.content.take(),
+        authors: std::mem::take(&mut entry.authors),
+        categories: std::mem::take(&mut entry.categories),
+        tags: std::mem::take(&mut entry.tags),
         cache_assets: entry.cache_assets,
     }
 }
 
-/// The entry a handler returned, with the fields it may not change taken from `original`.
-fn entry_from_wit(entry: wit::Entry, original: &FeedEntry) -> FeedEntry {
-    let mut modified = FeedEntry {
-        id: entry.id,
-        feed_id: entry.feed_id,
-        syndication_format: entry.syndication_format,
-        guid: entry.guid,
-        published_at: entry.published_at,
-        title: entry.title,
-        url: entry.url,
-        content: entry.content,
-        authors: entry.authors,
-        categories: entry.categories,
-        tags: entry.tags,
-        cache_assets: entry.cache_assets,
-    };
-    restore_read_only(&mut modified, original);
-    modified
+/// Move `wit` back into `entry`, undoing [`entry_to_wit`].
+fn entry_from_wit(entry: &mut FeedEntry, wit: wit::Entry) {
+    entry.syndication_format = wit.syndication_format;
+    entry.guid = wit.guid;
+    entry.published_at = wit.published_at;
+    entry.title = wit.title;
+    entry.url = wit.url;
+    entry.content = wit.content;
+    entry.authors = wit.authors;
+    entry.categories = wit.categories;
+    entry.tags = wit.tags;
+    entry.cache_assets = wit.cache_assets;
+}
+
+/// Take into `current` the fields of `returned`, the entry a handler returned, that
+/// plugins may change, and return which of them differ. The rest of `returned` is
+/// ignored: those fields are read-only.
+fn merge_returned(current: &mut wit::Entry, returned: wit::Entry) -> EntryChanges {
+    let mut changes = EntryChanges::default();
+    if current.published_at != returned.published_at {
+        current.published_at = returned.published_at;
+        changes.insert(EntryChanges::PUBLISHED_AT);
+    }
+    if current.title != returned.title {
+        current.title = returned.title;
+        changes.insert(EntryChanges::TITLE);
+    }
+    if current.url != returned.url {
+        current.url = returned.url;
+        changes.insert(EntryChanges::URL);
+    }
+    if current.content != returned.content {
+        current.content = returned.content;
+        changes.insert(EntryChanges::CONTENT);
+    }
+    if current.tags != returned.tags {
+        current.tags = returned.tags;
+        changes.insert(EntryChanges::TAGS);
+    }
+    if current.cache_assets != returned.cache_assets {
+        current.cache_assets = returned.cache_assets;
+        changes.insert(EntryChanges::CACHE_ASSETS);
+    }
+    changes
 }
 
 fn schedule_to_wit(schedule: &FetchSchedule) -> wit::FetchSchedule {
@@ -962,6 +1100,62 @@ fn schedule_to_wit(schedule: &FetchSchedule) -> wit::FetchSchedule {
         interval_secs: schedule.interval_secs,
         min_cadence_secs: schedule.min_cadence_secs,
         wait_secs: schedule.wait_secs,
+    }
+}
+
+/// An observe-only event's payload, as plugins are called with it.
+enum WitPayload {
+    Entry(wit::Entry),
+    FetchSuccess(wit::FetchSuccess),
+    FetchError(wit::FetchError),
+    Feed(wit::FeedEvent),
+    None,
+}
+
+impl WitPayload {
+    /// `payload`, the payload of `event`, as plugins are called with it, or `None` if it
+    /// is not a payload of `event`.
+    fn new(event: Event, payload: EventPayload) -> Option<Self> {
+        Some(match (event, payload) {
+            (Event::EntryParsed, EventPayload::Entry(mut entry)) => {
+                WitPayload::Entry(entry_to_wit(&mut entry))
+            }
+            (
+                Event::FetchSuccess,
+                EventPayload::FetchSuccess {
+                    feed_id,
+                    status,
+                    url,
+                    content_length,
+                },
+            ) => WitPayload::FetchSuccess(wit::FetchSuccess {
+                feed_id,
+                status,
+                url,
+                content_length,
+            }),
+            (
+                Event::FetchError,
+                EventPayload::FetchError {
+                    feed_id,
+                    kind,
+                    status,
+                    message,
+                    retry_after,
+                },
+            ) => WitPayload::FetchError(wit::FetchError {
+                feed_id,
+                kind: kind.into_owned(),
+                status,
+                message,
+                retry_after,
+            }),
+            (Event::FeedAdded | Event::FeedRemoved, EventPayload::Feed { id, url, title }) => {
+                WitPayload::Feed(wit::FeedEvent { id, url, title })
+            }
+            (Event::PluginLoad, EventPayload::PluginLoad) => WitPayload::None,
+            _ => return None,
+        })
     }
 }
 
@@ -1059,26 +1253,110 @@ impl WasmPlugin {
         }
     }
 
-    /// Whether the plugin handles `event`: it is running, or will be restarted to handle
-    /// it.
-    fn handles(&self, event: Event) -> bool {
-        (self.live.is_some() || self.restart_pending) && self.events.contains(event)
-    }
-
     fn has_scan(&self, scan_id: u64) -> bool {
         self.live
             .as_ref()
             .is_some_and(|l| l.store.data().scans.contains(&scan_id))
     }
+
+    /// The events the plugin handles, and [`Event::Timer`] if it has started a timer.
+    fn subscriptions(&self) -> EventSet {
+        match &self.live {
+            Some(live) => {
+                let mut set = self.events;
+                if !live.store.data().timers.is_empty() {
+                    set.insert(Event::Timer);
+                }
+                set
+            }
+            // A plugin that is to be restarted may start timers again, so the timer tick,
+            // like its events, restarts it.
+            None if self.restart_pending => {
+                let mut set = self.events;
+                set.insert(Event::Timer);
+                set
+            }
+            None => EventSet::default(),
+        }
+    }
+}
+
+/// A plugin, behind a lock of its own, so that different plugins run at the same time.
+struct PluginSlot {
+    plugin: Mutex<WasmPlugin>,
+    /// The [`EventSet::to_bits`] of [`WasmPlugin::subscriptions`], as of when the plugin
+    /// was last unlocked, so that what plugins handle can be told without waiting for them.
+    subscribed: AtomicU16,
+}
+
+/// A locked plugin. Unlocking it records what it handles now in its slot.
+struct PluginGuard<'a> {
+    slot: &'a PluginSlot,
+    plugin: MutexGuard<'a, WasmPlugin>,
+}
+
+impl PluginSlot {
+    fn new(plugin: WasmPlugin) -> Self {
+        let subscribed = AtomicU16::new(plugin.subscriptions().to_bits());
+        PluginSlot {
+            plugin: Mutex::new(plugin),
+            subscribed,
+        }
+    }
+
+    fn lock(&self) -> PluginGuard<'_> {
+        PluginGuard {
+            slot: self,
+            plugin: self.plugin.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
+    /// As [`Self::lock`], unless another call holds the plugin.
+    fn try_lock(&self) -> Option<PluginGuard<'_>> {
+        let plugin = match self.plugin.try_lock() {
+            Ok(plugin) => plugin,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(PluginGuard { slot: self, plugin })
+    }
+
+    /// What the plugin handled when it was last unlocked.
+    fn subscriptions(&self) -> EventSet {
+        EventSet::from_bits(self.subscribed.load(Ordering::SeqCst))
+    }
+}
+
+impl std::ops::Deref for PluginGuard<'_> {
+    type Target = WasmPlugin;
+    fn deref(&self) -> &WasmPlugin {
+        &self.plugin
+    }
+}
+
+impl std::ops::DerefMut for PluginGuard<'_> {
+    fn deref_mut(&mut self) -> &mut WasmPlugin {
+        &mut self.plugin
+    }
+}
+
+impl Drop for PluginGuard<'_> {
+    fn drop(&mut self) {
+        self.slot
+            .subscribed
+            .store(self.plugin.subscriptions().to_bits(), Ordering::SeqCst);
+    }
 }
 
 /// Runs WebAssembly plugins in response to server events.
 ///
-/// See the [module documentation](self).
+/// Each plugin is behind a lock of its own, so that one plugin's handler runs one call at
+/// a time, while different plugins' handlers run at the same time: an entry can be in one
+/// plugin of the `entry.ingest` chain while another entry is in the next. See the
+/// [module documentation](self).
 pub struct WasmScriptRunner {
-    /// The plugins, in the order they load in. Behind a mutex since a store is used by one
-    /// call at a time, and to run one call at a time.
-    plugins: Mutex<Vec<WasmPlugin>>,
+    /// The plugins, in the order they load in.
+    plugins: Vec<PluginSlot>,
     linker: Linker<State>,
     services: Option<Arc<dyn ScriptServices>>,
 }
@@ -1119,7 +1397,7 @@ impl WasmScriptRunner {
             })?;
             let (live, events) =
                 instantiate(&linker, &component, &name, &source.config, services.clone())?;
-            plugins.push(WasmPlugin {
+            plugins.push(PluginSlot::new(WasmPlugin {
                 name,
                 budget: source.time_budget,
                 config: source.config.clone(),
@@ -1128,17 +1406,13 @@ impl WasmScriptRunner {
                 live: Some(live),
                 restart_pending: false,
                 traps: VecDeque::new(),
-            });
+            }));
         }
         Ok(Self {
-            plugins: Mutex::new(plugins),
+            plugins,
             linker,
             services,
         })
-    }
-
-    fn plugins(&self) -> std::sync::MutexGuard<'_, Vec<WasmPlugin>> {
-        self.plugins.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn dispatch(&self) -> Dispatch<'_> {
@@ -1149,37 +1423,55 @@ impl WasmScriptRunner {
         }
     }
 
+    /// The plugins that handled `event` when they were last unlocked, with their indexes
+    /// in load order, locked in turn. Each is checked again once locked, since it may have
+    /// changed while it was busy. (For [`Event::Timer`], a plugin handles the event if it
+    /// has timers; see [`WasmPlugin::subscriptions`].)
+    fn locked_for(&self, event: Event) -> impl Iterator<Item = (usize, PluginGuard<'_>)> {
+        self.plugins
+            .iter()
+            .enumerate()
+            .filter(move |(_, slot)| slot.subscriptions().contains(event))
+            .map(|(i, slot)| (i, slot.lock()))
+            .filter(move |(_, plugin)| plugin.subscriptions().contains(event))
+    }
+
     /// The events at least one plugin handles, and [`Event::Timer`] if a plugin has
     /// started a timer.
+    ///
+    /// Answered without waiting for plugins that are busy, from what they handled when
+    /// they were last unlocked.
     pub fn subscriptions(&self) -> EventSet {
-        let mut set = EventSet::default();
-        for plugin in self.plugins().iter() {
-            match &plugin.live {
-                Some(live) => {
-                    if !live.store.data().timers.is_empty() {
-                        set.insert(Event::Timer);
-                    }
-                }
-                // A plugin that is to be restarted may start timers again, so the timer
-                // tick, like its events, restarts it.
-                None if plugin.restart_pending => set.insert(Event::Timer),
-                None => continue,
-            }
-            set = set.union(plugin.events);
-        }
-        set
+        self.plugins.iter().fold(EventSet::default(), |set, slot| {
+            set.union(slot.subscriptions())
+        })
     }
 
     /// Whether a plugin in this runner started the scan `scan_id`, which has not finished.
     pub fn has_scan(&self, scan_id: u64) -> bool {
-        self.plugins().iter().any(|p| p.has_scan(scan_id))
+        self.scan_owner(scan_id).is_some()
+    }
+
+    /// The plugin that started the scan `scan_id`, locked. Plugins that are free are looked
+    /// at first, so that a busy plugin holds up only its own scans.
+    fn scan_owner(&self, scan_id: u64) -> Option<PluginGuard<'_>> {
+        let mut busy = Vec::new();
+        for slot in &self.plugins {
+            match slot.try_lock() {
+                Some(plugin) if plugin.has_scan(scan_id) => return Some(plugin),
+                Some(_) => {}
+                None => busy.push(slot),
+            }
+        }
+        busy.into_iter()
+            .map(PluginSlot::lock)
+            .find(|plugin| plugin.has_scan(scan_id))
     }
 
     /// Calls `on-timer` for each timer due by `now`, and schedules its next call.
     fn run_timers(&self, now: Instant) {
         let mut dispatch = self.dispatch();
-        let mut plugins = self.plugins();
-        for plugin in plugins.iter_mut() {
+        for (_, mut plugin) in self.locked_for(Event::Timer) {
             // A restarted plugin starts its timers afresh, so none is due yet.
             plugin.ensure_live(&mut dispatch);
             let due: Vec<u32> = match plugin.live.as_mut() {
@@ -1205,11 +1497,54 @@ impl WasmScriptRunner {
                 if plugin.live.is_none() {
                     break;
                 }
-                plugin.call(&mut dispatch, "timer handler", |b, s| {
+                plugin.call(&mut dispatch, Event::Timer.handler_name(), |b, s| {
                     b.call_on_timer(s, id)
                 });
             }
         }
+    }
+
+    /// Pass `entry` through each `entry.transform` handler and then each `entry.ingest`
+    /// handler, each in registration order, changing it in place, and calling `on_run` with the index in load order and the name of each
+    /// plugin whose handler ran, and how long it took, in seconds.
+    ///
+    /// Returns which fields the handlers changed, or `None` if a handler dropped the entry.
+    /// A handler that fails leaves the entry as it was.
+    pub(crate) fn transform_entry(
+        &self,
+        entry: &mut FeedEntry,
+        mut on_run: impl FnMut(usize, &Arc<str>, f64),
+    ) -> Option<EntryChanges> {
+        let mut dispatch = self.dispatch();
+        let mut changes = EntryChanges::default();
+        // Moved into the WIT type once, and back at the end, rather than copied for each
+        // plugin.
+        let mut current = entry_to_wit(entry);
+        let chain = [Event::EntryTransform, Event::EntryIngest]
+            .into_iter()
+            .flat_map(|event| self.locked_for(event).map(move |(i, p)| (event, i, p)));
+        for (event, index, mut plugin) in chain {
+            let start = Instant::now();
+            let returned = plugin.call(&mut dispatch, event.handler_name(), |b, s| {
+                if event == Event::EntryTransform {
+                    b.call_on_entry_transform(s, &current)
+                } else {
+                    b.call_on_entry_ingest(s, &current)
+                }
+            });
+            on_run(index, &plugin.name, start.elapsed().as_secs_f64());
+            match returned {
+                // A failed handler passes the entry through unmodified.
+                None => {}
+                Some(None) => {
+                    entry_from_wit(entry, current);
+                    return None;
+                }
+                Some(Some(returned)) => changes.insert(merge_returned(&mut current, returned)),
+            }
+        }
+        entry_from_wit(entry, current);
+        Some(changes)
     }
 }
 
@@ -1218,38 +1553,29 @@ impl ScriptRunner for WasmScriptRunner {
         self.subscriptions().contains(event)
     }
 
-    fn dispatch_transform_entry(&self, entry: FeedEntry) -> anyhow::Result<Option<FeedEntry>> {
-        self.dispatch_transform_entry_timed(entry, &mut Vec::new())
+    fn dispatch_transform_entry(&self, mut entry: FeedEntry) -> anyhow::Result<Option<FeedEntry>> {
+        let keep = self.dispatch_transform_entry_timed(&mut entry, &mut Vec::new())?;
+        Ok(keep.then_some(entry))
     }
 
     fn dispatch_transform_entry_timed(
         &self,
-        entry: FeedEntry,
+        entry: &mut FeedEntry,
         runs: &mut Vec<PluginRun>,
-    ) -> anyhow::Result<Option<FeedEntry>> {
-        let mut current = entry;
-        let mut dispatch = self.dispatch();
-        for plugin in self.plugins().iter_mut() {
-            if !plugin.handles(Event::EntryIngest) {
-                continue;
-            }
-            let input = entry_to_wit(current.clone());
-            let start = Instant::now();
-            let returned = plugin.call(&mut dispatch, "entry.ingest handler", |b, s| {
-                b.call_on_entry_ingest(s, &input)
-            });
+    ) -> anyhow::Result<bool> {
+        let changes = self.transform_entry(entry, |_, plugin, seconds| {
             runs.push(PluginRun {
-                plugin: plugin.name.to_string(),
-                seconds: start.elapsed().as_secs_f64(),
-            });
-            match returned {
-                // A failed handler passes the entry through unmodified.
-                None => {}
-                Some(None) => return Ok(None),
-                Some(Some(entry)) => current = entry_from_wit(entry, &current),
-            }
+                plugin: plugin.clone(),
+                seconds,
+            })
+        });
+        Ok(changes.is_some())
+    }
+
+    fn dispatch_parsed(&self, entry: &FeedEntry) {
+        if self.handles(Event::EntryParsed) {
+            self.dispatch_observe(Event::EntryParsed, EventPayload::Entry(entry.clone()));
         }
-        Ok(Some(current))
     }
 
     fn dispatch_schedule(
@@ -1258,14 +1584,13 @@ impl ScriptRunner for WasmScriptRunner {
     ) -> anyhow::Result<Option<ScheduleDecision>> {
         let mut decision = None;
         let mut dispatch = self.dispatch();
-        for plugin in self.plugins().iter_mut() {
-            if !plugin.handles(Event::FetchSchedule) {
-                continue;
-            }
+        for (_, mut plugin) in self.locked_for(Event::FetchSchedule) {
             let input = schedule_to_wit(&schedule);
-            let returned = plugin.call(&mut dispatch, "fetch.schedule handler", |b, s| {
-                b.call_on_fetch_schedule(s, input)
-            });
+            let returned = plugin.call(
+                &mut dispatch,
+                Event::FetchSchedule.handler_name(),
+                |b, s| b.call_on_fetch_schedule(s, input),
+            );
             if let Some(Some(wait_secs)) = returned {
                 schedule.wait_secs = wait_secs;
                 decision = Some(ScheduleDecision {
@@ -1282,75 +1607,43 @@ impl ScriptRunner for WasmScriptRunner {
             self.run_timers(Instant::now());
             return;
         }
-        let what = format!("{} handler", event.name());
+        if !self.handles(event) {
+            return;
+        }
+        // Converted once, for every plugin.
+        let Some(payload) = WitPayload::new(event, payload) else {
+            warn!(
+                event = event.name(),
+                "event payload does not match the event; dropping it"
+            );
+            return;
+        };
+        let what = event.handler_name();
         let mut dispatch = self.dispatch();
-        for plugin in self.plugins().iter_mut() {
-            if !plugin.handles(event) {
-                continue;
-            }
+        for (_, mut plugin) in self.locked_for(event) {
             let d = &mut dispatch;
-            match (&payload, event) {
-                (EventPayload::Entry(entry), Event::EntryParsed) => {
-                    let entry = entry_to_wit(entry.clone());
-                    plugin.call(d, &what, |b, s| b.call_on_entry_parsed(s, &entry));
+            match &payload {
+                WitPayload::Entry(entry) => {
+                    plugin.call(d, what, |b, s| b.call_on_entry_parsed(s, entry));
                 }
-                (
-                    EventPayload::FetchSuccess {
-                        feed_id,
-                        status,
-                        url,
-                        content_length,
-                    },
-                    _,
-                ) => {
-                    let event = wit::FetchSuccess {
-                        feed_id: *feed_id,
-                        status: *status,
-                        url: url.clone(),
-                        content_length: *content_length,
-                    };
-                    plugin.call(d, &what, |b, s| b.call_on_fetch_success(s, &event));
+                WitPayload::FetchSuccess(success) => {
+                    plugin.call(d, what, |b, s| b.call_on_fetch_success(s, success));
                 }
-                (
-                    EventPayload::FetchError {
-                        feed_id,
-                        kind,
-                        status,
-                        message,
-                        retry_after,
-                    },
-                    _,
-                ) => {
-                    let event = wit::FetchError {
-                        feed_id: *feed_id,
-                        kind: kind.to_string(),
-                        status: *status,
-                        message: message.clone(),
-                        retry_after: *retry_after,
-                    };
-                    plugin.call(d, &what, |b, s| b.call_on_fetch_error(s, &event));
+                WitPayload::FetchError(error) => {
+                    plugin.call(d, what, |b, s| b.call_on_fetch_error(s, error));
                 }
-                (EventPayload::Feed { id, url, title }, Event::FeedAdded | Event::FeedRemoved) => {
-                    let feed = wit::FeedEvent {
-                        id: *id,
-                        url: url.clone(),
-                        title: title.clone(),
-                    };
-                    plugin.call(d, &what, |b, s| {
+                WitPayload::Feed(feed) => {
+                    plugin.call(d, what, |b, s| {
                         if event == Event::FeedAdded {
-                            b.call_on_feed_added(s, &feed)
+                            b.call_on_feed_added(s, feed)
                         } else {
-                            b.call_on_feed_removed(s, &feed)
+                            b.call_on_feed_removed(s, feed)
                         }
                     });
                 }
-                (EventPayload::PluginLoad, Event::PluginLoad) => {
-                    plugin.call(d, &what, |b, s| b.call_on_plugin_load(s));
+                WitPayload::None => {
+                    plugin.call(d, what, |b, s| b.call_on_plugin_load(s));
                 }
-                _ => warn!(
-                    event = event.name(),
-                    "event payload does not match the event; dropping it"
-                ),
             }
         }
     }
@@ -1360,14 +1653,13 @@ impl ScriptRunner for WasmScriptRunner {
         scan_id: u64,
         entries: Vec<FeedEntry>,
     ) -> anyhow::Result<Option<Vec<Option<FeedEntry>>>> {
-        let mut plugins = self.plugins();
-        let Some(plugin) = plugins.iter_mut().find(|p| p.has_scan(scan_id)) else {
+        let Some(mut plugin) = self.scan_owner(scan_id) else {
             return Ok(None);
         };
         let mut dispatch = self.dispatch();
         let start = Instant::now();
         let mut results = Vec::with_capacity(entries.len());
-        for entry in entries {
+        for mut entry in entries {
             // At least one entry is always handled, so the scan makes progress.
             if !results.is_empty() && start.elapsed() >= SCAN_SLICE {
                 break;
@@ -1376,18 +1668,21 @@ impl ScriptRunner for WasmScriptRunner {
                 // The plugin was restarted, which ended its scans.
                 return Ok(None);
             }
-            let input = entry_to_wit(entry.clone());
+            let mut input = entry_to_wit(&mut entry);
             let returned = plugin.call(&mut dispatch, "scan handler", |b, s| {
                 b.call_on_scan_entry(s, scan_id, &input)
             });
-            results.push(returned.flatten().map(|e| entry_from_wit(e, &entry)));
+            results.push(returned.flatten().map(|returned| {
+                merge_returned(&mut input, returned);
+                entry_from_wit(&mut entry, input);
+                entry
+            }));
         }
         Ok(Some(results))
     }
 
     fn finish_scan(&self, scan_id: u64, summary: Option<ScanSummary>) {
-        let mut plugins = self.plugins();
-        let Some(plugin) = plugins.iter_mut().find(|p| p.has_scan(scan_id)) else {
+        let Some(mut plugin) = self.scan_owner(scan_id) else {
             return;
         };
         if let Some(live) = plugin.live.as_mut() {

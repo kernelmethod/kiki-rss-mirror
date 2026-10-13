@@ -14,9 +14,12 @@
 //! cache size exceeds the configured cap, the least-recently-accessed rows
 //! are dropped via [`crate::db::assets::evict_to`] and their files unlinked.
 use crate::config::ProxySettings;
+use crate::db::http_cache::{self, CacheEntry};
 use crate::fetcher::assets::{AssetReply, AssetSpec};
 use crate::fetcher::Fetcher;
+use crate::tasks::cache::{record_response, request_validators, Response};
 use anyhow::{Context, Result};
+use chrono::Utc;
 use reqwest::Url;
 use std::fs;
 use std::io::Write;
@@ -99,6 +102,25 @@ pub fn unlink_asset_file(data_dir: &Path, blake3: &str) {
     }
 }
 
+/// Delete the assets nothing uses any more, rows and files, and return
+/// how many there were. See [`crate::db::assets::delete_unused`].
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be reached or the delete fails.
+/// Files that cannot be removed are logged and left behind.
+pub async fn sweep_unused_assets(db: &crate::db::Db, data_dir: &Path) -> Result<usize> {
+    let data_dir = data_dir.to_path_buf();
+    db.write(move |conn| -> Result<usize> {
+        let deleted = crate::db::assets::delete_unused(conn)?;
+        for hash in &deleted {
+            unlink_asset_file(&data_dir, hash);
+        }
+        Ok(deleted.len())
+    })
+    .await?
+}
+
 /// Fetch, hash, store, and index a single asset, and link it to entry
 /// `entry_id` as an asset of kind `kind`.
 ///
@@ -152,15 +174,16 @@ where
 {
     // Fast path: we've already fetched this exact URL before. Just link the
     // existing asset row.
-    // `link` is taken only if it is called.
+    // `link` is taken only if it is called. Otherwise the download is made
+    // conditional on what the HTTP cache holds for the URL.
     let mut link = Some(link);
-    cache.db.write_blocking(|conn| -> Result<()> {
+    let prev = cache.db.write_blocking(|conn| -> Result<CacheEntry> {
         if let Some(existing) = crate::db::assets::lookup_by_url(conn, asset_url.as_str())? {
             if let Some(link) = link.take() {
                 link(conn, existing.id)?;
             }
         }
-        Ok(())
+        Ok(http_cache::lookup(conn, asset_url.as_str())?.unwrap_or_default())
     })??;
     let Some(link) = link else {
         return Ok(true);
@@ -171,12 +194,37 @@ where
         .fetch_asset(AssetSpec {
             url: asset_url.to_string(),
             kind,
+            validators: request_validators(&prev, Utc::now().timestamp(), false),
             proxy: cache.proxy.clone(),
         })
         .await
         .with_context(|| format!("fetching asset {asset_url}"))?;
     let asset = match reply {
         AssetReply::Fetched(asset) => asset,
+        // The validators came from a copy of the URL that is no longer an
+        // asset of its own (its row only lives on while a feed has the
+        // same URL), so there is nothing to link; the next try fetches it
+        // in full.
+        AssetReply::NotModified { headers } => {
+            let url = asset_url.as_str().to_string();
+            let headers = headers.to_header_map();
+            cache
+                .db
+                .write(move |conn| -> Result<()> {
+                    record_response(
+                        conn,
+                        &url,
+                        &prev,
+                        Response::NotModified,
+                        &headers,
+                        Utc::now().timestamp(),
+                    )?;
+                    Ok(())
+                })
+                .await??;
+            debug!("asset {} not modified, but no copy is stored", asset_url);
+            return Ok(false);
+        }
         AssetReply::Network { message } => {
             warn!("asset fetch failed for {}: {}", asset_url, message);
             return Ok(false);
@@ -250,8 +298,7 @@ where
     } else {
         asset.bytes
     };
-    let etag = asset.etag;
-    let last_modified = asset.last_modified;
+    let headers = asset.headers.to_header_map();
 
     let hash = blake3::hash(&bytes).to_hex().to_string();
     let size = bytes.len() as i64;
@@ -274,11 +321,19 @@ where
                     &url_str,
                     Some(content_type.as_str()),
                     size,
-                    etag.as_deref(),
-                    last_modified.as_deref(),
                 )?
             };
             link(conn, asset_id)?;
+            // Stored only if the URL has an asset row: one whose bytes were
+            // already stored under another URL has none.
+            record_response(
+                conn,
+                &url_str,
+                &prev,
+                Response::Full { body_hash: &hash },
+                &headers,
+                Utc::now().timestamp(),
+            )?;
 
             // Enforce cache cap inline. Cheap: one SUM and, in the common case
             // where we're under the cap, no deletes.

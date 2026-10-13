@@ -2193,9 +2193,7 @@ mod tests {
         FetchSpec {
             feed_id: 1,
             url: url.to_string(),
-            etag: None,
-            last_modified: None,
-            send_conditionals: true,
+            validators: Default::default(),
             auth: FeedAuth::default(),
             timeout_secs: 5,
             max_feed_bytes: 1024 * 1024,
@@ -2714,6 +2712,7 @@ mod tests {
         let asset = |path: &str, kind| AssetSpec {
             url: format!("{base}{path}"),
             kind,
+            validators: Default::default(),
             proxy: Default::default(),
         };
 

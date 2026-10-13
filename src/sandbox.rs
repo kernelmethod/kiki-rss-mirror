@@ -38,7 +38,12 @@
 //!   UI binding and listening. `socket` is refused, with `EACCES`, for any
 //!   address family but IPv4 and IPv6 in the feed fetcher's processes and
 //!   any but Unix in the web UI, and `ioctl` for `TIOCSTI` and
-//!   `TIOCLINUX`, with `ENOTTY`, in every profile.
+//!   `TIOCLINUX`, with `ENOTTY`, in every profile. The profiles Landlock
+//!   grants no path — the script host, the feed fetcher's parser and the
+//!   web UI — are also refused, with `EACCES`, every syscall that reaches
+//!   the filesystem by path: Landlock's refusal again, for kernels that
+//!   lack it, and also for what it does not cover, such as `chmod`,
+//!   `chown`, extended attributes and `readlink`.
 //!   The default action for unmatched syscalls is `Allow` — this is a
 //!   defence-in-depth layer that eliminates the most dangerous escape
 //!   primitives without risking that a benign syscall we forgot about
@@ -109,9 +114,10 @@ pub enum SandboxProfile {
     /// The script host: runs user-supplied plugins and talks to
     /// the server over an inherited socket pair, nothing else.
     ///
-    /// This profile grants **no filesystem access whatsoever**, denies
-    /// every syscall that could open a socket, and may signal no process
-    /// but itself. The host's inherited IPC
+    /// This profile grants **no filesystem access whatsoever** — seccomp
+    /// refuses every syscall that takes a path, as well as Landlock
+    /// granting none — denies every syscall that could open a socket, and
+    /// may signal no process but itself. The host's inherited IPC
     /// file descriptor already exists by the time the sandbox is applied,
     /// and is used through plain `read`/`write`.
     ScriptHost,

@@ -113,6 +113,22 @@ fn ingest_handlers_run_in_order() {
     assert_eq!(out.content, entry("").content);
 }
 
+/// Every plugin's `entry.transform` handler runs before any plugin's `entry.ingest`
+/// handler, whatever order the plugins load in.
+#[test]
+fn transform_handlers_run_before_ingest_handlers() {
+    let (runner, _) = runner(&[
+        source("a", json!({ "suffix": " a-ingest" })),
+        source("b", json!({ "transform_suffix": " b-transform" })),
+    ]);
+    assert!(runner.handles(Event::EntryTransform));
+    let out = runner
+        .dispatch_transform_entry(entry("title"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.title, "title b-transform a-ingest");
+}
+
 #[test]
 fn ingest_handlers_can_drop_entries() {
     let (runner, _) = runner(&[
@@ -665,4 +681,109 @@ fn plugins_rewrite_html_with_the_servers_parser() {
         .seen("html-select")
         .unwrap()
         .starts_with("html.select: invalid selector \"a[\""));
+}
+
+/// Plugins are locked one at a time, so an entry another plugin is done with is not held
+/// up by a plugin busy with a different entry.
+#[test]
+fn a_busy_plugin_holds_up_only_the_entries_that_reach_it() {
+    let dropper = source("dropper", json!({ "drop_title": "x" }));
+    let mut slow = source("slow", json!({ "spin_title": "spin" }));
+    slow.time_budget = TimeBudget::Millis(600);
+    let (runner, _) = runner(&[dropper, slow]);
+    std::thread::scope(|s| {
+        let spinning = s.spawn(|| runner.dispatch_transform_entry(entry("spin")));
+        // Let the spinning entry reach the slow plugin.
+        std::thread::sleep(Duration::from_millis(150));
+        let start = Instant::now();
+        // Dropped by the first plugin, so it never needs the second.
+        assert!(runner
+            .dispatch_transform_entry(entry("x"))
+            .unwrap()
+            .is_none());
+        assert!(
+            start.elapsed() < Duration::from_millis(300),
+            "waited {:?} for the busy plugin",
+            start.elapsed()
+        );
+        assert!(spinning.join().unwrap().unwrap().is_some());
+    });
+}
+
+/// Working on an entry in place reports which fields changed, and the patch made of
+/// them carries those and no others.
+#[test]
+fn changed_fields_are_reported() {
+    let (runner, _) = runner(&[source("a", json!({ "suffix": "!", "tag": "t" }))]);
+    let mut changed = entry("title");
+    let mut ran = Vec::new();
+    let changes = runner
+        .transform_entry(&mut changed, |index, name, _| {
+            ran.push((index, name.to_string()))
+        })
+        .unwrap();
+    assert_eq!(ran, [(0, "a".to_string())]);
+    assert!(changes.contains(EntryChanges::TITLE));
+    assert!(changes.contains(EntryChanges::TAGS));
+    assert!(!changes.contains(EntryChanges::CONTENT));
+    // The read-only fields are put back.
+    assert_eq!(changed.guid, "guid");
+    assert_eq!(changed.authors, ["Ada"]);
+
+    let mut patched = entry("title");
+    crate::scripting::EntryPatch::take(&mut changed, changes).apply(&mut patched);
+    assert_eq!(patched.title, "title!");
+    assert_eq!(patched.tags, ["t"]);
+    assert_eq!(patched.content.as_deref(), Some("<p>hi</p>"));
+}
+
+/// Budgets are of the CPU time of the thread running the call: time spent off the CPU
+/// does not count, once the call has read the CPU time, up to the ceiling in wall-clock
+/// time.
+#[test]
+fn budgets_count_cpu_time() {
+    // Reads the CPU time, as a call's first check after `CPU_BASELINE_AFTER`, from the
+    // epoch ticker or a call to the host, would. (On a busy machine the sleep may outlast
+    // a short budget, so what it says is not asserted.)
+    let first_check = |budget: &CallBudget| {
+        std::thread::sleep(CPU_BASELINE_AFTER * 2);
+        budget.expired();
+    };
+
+    let mut budget = CallBudget::default();
+    budget.start(Some(Duration::from_millis(100)));
+    first_check(&budget);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!budget.expired(), "sleeping used up the budget");
+    let start = thread_cpu_time();
+    while thread_cpu_time() - start < Duration::from_millis(110) {
+        std::hint::black_box(0);
+    }
+    assert!(budget.expired(), "running did not use up the budget");
+
+    // However little CPU time a call uses, it is stopped at the ceiling.
+    budget.start(Some(Duration::from_millis(10)));
+    assert_eq!(
+        wall_limit(Duration::from_millis(10)),
+        Duration::from_millis(50)
+    );
+    first_check(&budget);
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(budget.expired(), "the wall-clock ceiling did not apply");
+
+    // Time given back extends both.
+    budget.start(Some(Duration::from_millis(10)));
+    first_check(&budget);
+    std::thread::sleep(Duration::from_millis(60));
+    budget.give_back(Duration::from_millis(100));
+    assert!(!budget.expired());
+
+    // A call that has not run for its budget by the clock has not used it up.
+    budget.start(Some(Duration::from_millis(100)));
+    assert!(!budget.expired());
+
+    assert_eq!(
+        wall_limit(Duration::from_secs(5)),
+        Duration::from_secs(5) + MAX_WALL_CLOCK_SLACK
+    );
 }

@@ -72,16 +72,9 @@ pub struct FetchSpec {
     /// The feed's stored URL.
     pub url: String,
 
-    /// Stored `ETag`, sent as `If-None-Match` when conditionals are on.
-    pub etag: Option<String>,
-
-    /// Stored `Last-Modified`, sent as `If-Modified-Since` when
-    /// conditionals are on.
-    pub last_modified: Option<String>,
-
-    /// Whether conditional headers may be sent on the first request.
-    /// Off inside an `immutable` window and on a forced full refresh.
-    pub send_conditionals: bool,
+    /// What the HTTP cache holds for `url`, sent on the first request.
+    /// Empty inside an `immutable` window and on a forced full refresh.
+    pub validators: Validators,
 
     /// Credentials for the feed's own origin. Dropped on a cross-origin
     /// redirect.
@@ -97,6 +90,56 @@ pub struct FetchSpec {
     /// applied by the server ([`crate::config::Settings::effective_proxy`]).
     #[serde(with = "proxy_wire")]
     pub proxy: ProxySettings,
+}
+
+/// The validators a request is made conditional on, read out of the HTTP
+/// cache ([`crate::db::http_cache`]) by the server.
+///
+/// Every request whose response the server records in the HTTP cache
+/// carries one, the way it carries its [`ProxySettings`], and builds its
+/// request with [`Validators::apply`]. The fetcher only sends them; it is
+/// the server that decides whether there are any to send, and that records
+/// the response afterwards, by the same rules for every kind of request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Validators {
+    /// Sent as `If-None-Match`.
+    pub etag: Option<String>,
+    /// Sent as `If-Modified-Since`.
+    pub last_modified: Option<String>,
+}
+
+impl Validators {
+    /// Make `request` conditional on these validators. With none, it is
+    /// returned unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::fetcher::{client_builder, ProxiedClient, Validators};
+    ///
+    /// let client = ProxiedClient::new(client_builder)
+    ///     .unwrap()
+    ///     .get(&Default::default())
+    ///     .unwrap();
+    /// let validators = Validators {
+    ///     etag: Some("\"v1\"".into()),
+    ///     last_modified: None,
+    /// };
+    /// let request = validators
+    ///     .apply(client.get("https://example.com/feed.xml"))
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq!(request.headers()["if-none-match"], "\"v1\"");
+    /// ```
+    pub fn apply(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(etag) = &self.etag {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(last_modified) = &self.last_modified {
+            request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+        }
+        request
+    }
 }
 
 /// [`ProxySettings`] as it crosses the process boundary. Its own serde
@@ -415,6 +458,9 @@ pub struct AtomCategory {
 /// RSS-specific per-entry data captured from a parsed item.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RssEntryIngestData {
+    /// The item's `<description>`, if it differs from the entry's content. It is
+    /// `None` as parsed, since the description is also the content; the server fills
+    /// it in from the content only before scripts that may change the content run.
     pub description: Option<String>,
     pub comments: Option<String>,
     pub author: Option<String>,
@@ -800,9 +846,7 @@ pub(crate) mod tests {
         FetchSpec {
             feed_id: 1,
             url: "http://feed.invalid/feed".to_string(),
-            etag: None,
-            last_modified: None,
-            send_conditionals: false,
+            validators: Validators::default(),
             auth: FeedAuth::default(),
             timeout_secs: 5,
             max_feed_bytes: 1024 * 1024,
