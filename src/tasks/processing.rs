@@ -279,12 +279,8 @@ fn run_scripts(
 /// Updating in place keeps the entry's id stable across refreshes, and
 /// with it everything keyed on that id (tags, cached assets, the search
 /// index). The entry is in the feed again, so `dropped_at` is cleared.
-///
-/// A new entry takes the id after the highest ever used, recorded in
-/// `entry_id_high_water`, rather than SQLite's default of one past the
-/// highest in use, so that ids only ever increase even after the newest
-/// entries are deleted. It is stamped with the current time as its
-/// `ingested_at`, which an update leaves alone.
+/// A new entry is stamped with the current time as its `ingested_at`,
+/// which an update leaves alone.
 fn upsert_entry(
     tx: &rusqlite::Transaction,
     feed_id: i64,
@@ -298,20 +294,14 @@ fn upsert_entry(
     )?;
     let entry_id = tx.query_row(
         "INSERT INTO entries (
-            id,
             feed_id,
             syndication_format,
             guid,
             published_at,
             title,
             url,
-            content,
-            ingested_at
-        ) VALUES (
-            (SELECT MAX(hw.id, COALESCE((SELECT MAX(id) FROM entries), 0)) + 1
-             FROM entry_id_high_water hw),
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch()
-        )
+            content
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ON CONFLICT(feed_id, guid) DO UPDATE SET
             syndication_format = excluded.syndication_format,
             published_at = excluded.published_at,

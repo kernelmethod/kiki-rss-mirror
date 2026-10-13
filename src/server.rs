@@ -321,10 +321,14 @@ impl Server {
         )
         .with_context(|| format!("Unable to open the database at {:?}", self.db_path))?;
 
-        // Check for pending migrations before starting the server
+        // Check that the database is one this version can use, and has no
+        // pending migrations, before starting the server
         {
             let pending = db
-                .read(|conn| migrations::pending_migrations(conn))
+                .read(|conn| {
+                    migrations::check_generation(conn)?;
+                    migrations::pending_migrations(conn)
+                })
                 .await
                 .with_context(|| "failed to get connection for migration check")??;
             if !pending.is_empty() {
