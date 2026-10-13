@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "kiki-full-content"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "kiki-plugin",
  "serde_json",
