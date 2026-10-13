@@ -187,6 +187,7 @@ load. A handler takes `&mut self` or `&self`, then the event's arguments:
 | `#[on(...)]`      | Arguments                         | Returns         |
 |-------------------|-----------------------------------|-----------------|
 | `entry.parsed`    | `entry: Entry`                    |                 |
+| `entry.enrich`    | `entry: Entry`                    | `Option<Entry>` |
 | `entry.transform` | `entry: Entry`                    | `Option<Entry>` |
 | `entry.ingest`    | `entry: Entry`                    | `Option<Entry>` |
 | `fetch.success`   | `event: FetchSuccess`             |                 |
@@ -199,7 +200,7 @@ load. A handler takes `&mut self` or `&self`, then the event's arguments:
 | `scan.entry`      | `scan: u64, entry: Entry`         | `Option<Entry>` |
 | `scan.done`       | `scan: u64, summary: ScanSummary` |                 |
 
-The first nine are the server's [events](#events); `timer` is for
+The first ten are the server's [events](#events); `timer` is for
 [timers](#timers), and `scan.entry` and `scan.done` for
 [scans](#stored-entries). A plugin handles the events it has handlers for,
 and only those are delivered to it. One that needs some of them only for
@@ -229,7 +230,7 @@ for `wasm32-unknown-unknown`, which Kiki turns into one), which:
 - exports `init`, which Kiki calls with the plugin's config, as a JSON
   object, when the plugin loads. It returns the events the plugin handles,
   and only those are delivered to it; an error fails the load;
-- exports a function for each event: `on-entry-transform`, `on-entry-ingest`,
+- exports a function for each event: `on-entry-enrich`, `on-entry-transform`, `on-entry-ingest`,
   `on-fetch-schedule`, `on-plugin-load` and so on, and `on-timer`, `on-scan-entry` and
   `on-scan-done` for timers and scans.
 
@@ -240,6 +241,13 @@ passed with each of its entries to `on-scan-entry`, and with its summary to
 
 The Rust crate wraps all of this; other languages can use the WIT file with
 their own bindings generator, such as `wit-bindgen`'s for C.
+
+The interface is versioned, as the WIT package `kiki:plugin@0.3.0`. A plugin
+built against an earlier version fails to load, with a message in the server
+log naming the interface it imports (`kiki:plugin/host@0.2.0`, say), and like
+any plugin that fails to load (see [Plugin config](#plugin-config)), it keeps
+the other plugins from loading too: rebuild it against the current
+`kiki-plugin` crate. Version 0.3.0 added the `entry.enrich` event.
 
 ## Plugin config
 
@@ -352,6 +360,7 @@ again must give a value that matches.
 | Event             | Payload                                    | Purpose |
 |-------------------|--------------------------------------------|---------|
 | `entry.parsed`    | `Entry` (see below)                        | Observe a newly-parsed entry, before any transformations. |
+| `entry.enrich`    | `Entry` (see below)                        | **Add to** a parsed entry from elsewhere, such as by fetching the article it links to, before any plugin's `entry.transform` handler sees it. Return the (possibly modified) entry to keep it, or `None` to drop it. |
 | `entry.transform` | `Entry` (see below)                        | **Rewrite** a parsed entry, such as by sanitizing its content, before any plugin's `entry.ingest` handler sees it. Return the (possibly modified) entry to keep it, or `None` to drop it. |
 | `entry.ingest`    | `Entry` (see below)                        | **Filter or tag** an entry, as it will be stored. Return the (possibly modified) entry to keep it, or `None` to drop it. |
 | `fetch.success`   | `FetchSuccess`: `feed_id`, `status`, `url`, `content_length` | Fires after a successful (2xx) feed fetch, once the response body has been read. |
@@ -361,12 +370,13 @@ again must give a value that matches.
 | `plugin.load`     | none                                       | Fires once plugins have loaded: when the server starts, and after every reload. Where to start a [scan](#stored-entries) of stored entries. |
 | `fetch.schedule`  | `FetchSchedule` (see below)                | **Lengthen the wait** before a feed's next fetch. Return a number of seconds, or `None` to leave it. See [Scheduling fetches](#scheduling-fetches). |
 
-`entry.transform`, `entry.ingest` and `fetch.schedule` are **transform**
-events: their handlers can change what happens. All other events are observe-only.
+`entry.enrich`, `entry.transform`, `entry.ingest` and `fetch.schedule` are
+**transform** events: their handlers can change what happens. All other events are observe-only.
 
 ### The entry
 
-The payload of `entry.parsed`, `entry.transform` and `entry.ingest` is an
+The payload of `entry.parsed`, `entry.enrich`, `entry.transform` and
+`entry.ingest` is an
 entry with the
 following fields:
 
@@ -413,17 +423,26 @@ Handlers may read them, but any modifications are discarded.
 ### Handler chaining
 
 Handlers for the same event run in the order of their plugins' directory
-names. A new entry goes through every `entry.transform` handler, then every
-`entry.ingest` handler, the output of one handler becoming the input to the
-next — if any handler returns `None`, the entry is dropped immediately and
-subsequent handlers do not run.
+names. A new entry goes through every `entry.enrich` handler, then every
+`entry.transform` handler, then every `entry.ingest` handler, the output of
+one handler becoming the input to the next — if any handler returns `None`,
+the entry is dropped immediately and subsequent handlers do not run.
 
-So `entry.ingest` handlers see an entry as it will be stored, whatever order
-plugins load in, just as a [scan](#stored-entries) of stored entries does. A
-plugin that rewrites entries, such as the default `privacy` and `sanitize`
-plugins, should handle `entry.transform`; one that decides about entries
-from what they say, such as `filter` and `auto-tag`, should handle
-`entry.ingest`, so that it decides the same way at ingest and on a scan.
+The three events are phases, so that which plugin sees an entry when never
+depends on what the plugins are called:
+
+- A plugin that adds to entries from elsewhere, such as the default
+  `full-content` plugin, which fetches the article an entry links to, should
+  handle `entry.enrich`, so that what it brings in is rewritten like the
+  rest of the entry.
+- A plugin that rewrites entries, such as the default `privacy` and
+  `sanitize` plugins, should handle `entry.transform`.
+- A plugin that decides about entries from what they say, such as `filter`
+  and `auto-tag`, should handle `entry.ingest`. Its handlers see an entry as
+  it will be stored, just as a [scan](#stored-entries) of stored entries
+  does, so it decides the same way at ingest and on a scan.
+
+Within a phase, don't rely on the order handlers run in.
 
 ## Scheduling fetches
 
@@ -483,7 +502,7 @@ values with `serde`. Keys are 1 to 256 bytes long, a value may take up
 
 ## Stored entries
 
-`entry.transform` and `entry.ingest` see each entry once, as it arrives. These calls reach the
+`entry.enrich`, `entry.transform` and `entry.ingest` see each entry once, as it arrives. These calls reach the
 entries already stored, such as those fetched before a plugin was installed
 or its config changed:
 
@@ -509,13 +528,13 @@ or its config changed:
 
 - `get-entry(feed_id, guid)` returns the stored entry of the feed `feed_id`
   whose guid is `guid`, as a scan would see it (with its `id` set and `tags`
-  empty), or none if it isn't stored yet. An `entry.transform` or
-  `entry.ingest` handler can use it to see what it made of the same entry
+  empty), or none if it isn't stored yet. A handler of a new entry, such as
+  an `entry.enrich` handler, can use it to see what it made of the same entry
   the last time its feed was fetched: Kiki stores an entry again, with what
   the handlers return, every time its feed is fetched and has changed.
 
-User tags added with `tag-entry` last only until an `entry.transform` or
-`entry.ingest` handler next sets the entry's user tags: when an entry is fetched again and a
+User tags added with `tag-entry` last only until an `entry.enrich`,
+`entry.transform` or `entry.ingest` handler next sets the entry's user tags: when an entry is fetched again and a
 handler returns any user tag for it, its user tags are replaced with the ones
 returned, as they would be for tags added by hand. Tags that must last are best
 set by the same plugin, on ingest as well as on stored entries.
@@ -964,7 +983,7 @@ compiling it again.
 When a handler traps, whether it ran out of time or memory, panicked, or
 called into WASI that Kiki doesn't provide, it fails:
 
-- For `entry.transform` and `entry.ingest`, the entry passes through that handler **unmodified** —
+- For `entry.enrich`, `entry.transform` and `entry.ingest`, the entry passes through that handler **unmodified** —
   a broken plugin will never silently drop entries.
 - For `fetch.schedule`, the wait is left as it was, and the next handler runs.
 - For other events, the failure is logged and dropped.

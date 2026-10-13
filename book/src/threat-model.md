@@ -317,8 +317,8 @@ and nor do their credentials.
 A plugin, or a feed that subverts one, runs in the script host, which has
 no files and no sockets. What it can do is what the plugin API allows:
 
-- change or drop the entries passed to its `entry.transform` and
-  `entry.ingest` handlers;
+- change or drop the entries passed to its `entry.enrich`,
+  `entry.transform` and `entry.ingest` handlers;
 - delay a feed's next fetch, through `fetch.schedule`, but never past the
   feed's own interval, and never to fetch it sooner than its server asks;
 - tag and untag any stored entry;

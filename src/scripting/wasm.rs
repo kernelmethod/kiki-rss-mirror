@@ -1066,6 +1066,7 @@ fn finish_call<R>(
 fn event_from_kind(kind: wit::EventKind) -> Event {
     match kind {
         wit::EventKind::EntryParsed => Event::EntryParsed,
+        wit::EventKind::EntryEnrich => Event::EntryEnrich,
         wit::EventKind::EntryTransform => Event::EntryTransform,
         wit::EventKind::EntryIngest => Event::EntryIngest,
         wit::EventKind::FetchSuccess => Event::FetchSuccess,
@@ -1559,8 +1560,8 @@ impl WasmScriptRunner {
         }
     }
 
-    /// Pass `entry` through each `entry.transform` handler and then each `entry.ingest`
-    /// handler, each in registration order, changing it in place, and calling `on_run` with the index in load order and the name of each
+    /// Pass `entry` through each `entry.enrich` handler, then each `entry.transform` handler
+    /// and then each `entry.ingest` handler, each in registration order, changing it in place, and calling `on_run` with the index in load order and the name of each
     /// plugin whose handler ran, and how long it took, in seconds.
     ///
     /// Returns which fields the handlers changed, or `None` if a handler dropped the entry.
@@ -1575,17 +1576,19 @@ impl WasmScriptRunner {
         // Moved into the WIT type once, and back at the end, rather than copied for each
         // plugin.
         let mut current = entry_to_wit(entry);
-        let chain = [Event::EntryTransform, Event::EntryIngest]
-            .into_iter()
-            .flat_map(|event| self.locked_for(event).map(move |(i, p)| (event, i, p)));
+        let chain = [
+            Event::EntryEnrich,
+            Event::EntryTransform,
+            Event::EntryIngest,
+        ]
+        .into_iter()
+        .flat_map(|event| self.locked_for(event).map(move |(i, p)| (event, i, p)));
         for (event, index, mut plugin) in chain {
             let start = Instant::now();
-            let returned = plugin.call(&mut dispatch, event.handler_name(), |b, s| {
-                if event == Event::EntryTransform {
-                    b.call_on_entry_transform(s, &current)
-                } else {
-                    b.call_on_entry_ingest(s, &current)
-                }
+            let returned = plugin.call(&mut dispatch, event.handler_name(), |b, s| match event {
+                Event::EntryEnrich => b.call_on_entry_enrich(s, &current),
+                Event::EntryTransform => b.call_on_entry_transform(s, &current),
+                _ => b.call_on_entry_ingest(s, &current),
             });
             on_run(index, &plugin.name, start.elapsed().as_secs_f64());
             match returned {

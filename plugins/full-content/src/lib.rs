@@ -4,7 +4,7 @@
 //! `plugins/Cargo.toml`) and installed as `plugins/full-content/plugin.wasm`.
 //!
 //! Many feeds give each entry's first paragraph, or nothing at all, and leave the rest to
-//! their website. As each entry is stored (`entry.transform`), this plugin measures its
+//! their website. As each entry is stored (`entry.enrich`), this plugin measures its
 //! content's text, leaving out markup and whitespace. An entry with less than `min_length`
 //! characters of it is taken for a summary, a *stub*: the plugin fetches the page the
 //! entry links to, with the host's `fetch-page`, and looks in it for the article, in the
@@ -12,8 +12,9 @@
 //! `min_length` characters of text (or, failing that, in the one with the most text, if it
 //! has more than the stub). The article replaces the entry's content, with its links and
 //! images made absolute, lazily loaded images given their real source, and scripts, styles,
-//! frames, forms and event handlers removed. The `sanitize` and `privacy` plugins, which
-//! come after this one, then clean it like any other content.
+//! frames, forms and event handlers removed. Every plugin's `entry.transform` handler runs
+//! after every `entry.enrich` handler, so the `sanitize` and `privacy` plugins then clean
+//! it like any other content, whatever order plugins load in.
 //!
 //! Kiki stores an entry again on every refresh of its feed, with the content the plugins
 //! give it then. So that an article is fetched once, not on every refresh, the plugin
@@ -346,7 +347,7 @@ impl FullContent {
 
 #[plugin]
 impl FullContent {
-    #[on(entry.transform)]
+    #[on(entry.enrich)]
     fn fill_in(&mut self, mut entry: Entry) -> Option<Entry> {
         let stub = entry.content.as_deref().map_or(0, text_length);
         if stub >= self.min_length || !self.applies(entry.feed_id) {

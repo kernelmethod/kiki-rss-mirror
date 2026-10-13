@@ -7,7 +7,7 @@
 // it, so that it ships with the crate; Kiki's own bindings, in
 // src/scripting/wasm.rs, are generated from this same file.
 
-package kiki:plugin@0.2.0;
+package kiki:plugin@0.3.0;
 
 interface types {
     /// The levels `log` writes at.
@@ -17,6 +17,7 @@ interface types {
     /// only those are delivered to it.
     enum event-kind {
         entry-parsed,
+        entry-enrich,
         entry-transform,
         entry-ingest,
         fetch-success,
@@ -338,6 +339,11 @@ world plugin {
     export init: func(config: string) -> result<list<event-kind>, string>;
 
     export on-entry-parsed: func(entry: entry);
+    /// Return the entry, possibly changed, to keep it, or `none` to drop it.
+    /// Every plugin's `on-entry-enrich` runs before any `on-entry-transform`,
+    /// so that what a handler brings in from elsewhere, such as an article
+    /// fetched with `fetch-page`, is rewritten like the rest of the entry.
+    export on-entry-enrich: func(entry: entry) -> option<entry>;
     /// Return the entry, possibly changed, to keep it, or `none` to drop it.
     /// Every plugin's `on-entry-transform` runs before any `on-entry-ingest`,
     /// so `on-entry-ingest` sees the entry as it will be stored.

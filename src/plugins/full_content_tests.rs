@@ -78,22 +78,26 @@ impl ScriptServices for Web {
     }
 }
 
-/// The plugin, loaded with `config` applied over its defaults, calling `web`.
-fn plugin(config: Value, web: &Arc<Web>) -> Result<WasmScriptRunner, String> {
+/// The plugin's source, with `config` applied over its defaults.
+fn source(config: Value) -> ScriptSource {
     let manifest = PluginManifest::parse(MANIFEST).unwrap();
     let time_budget = manifest.time_budget();
     let mut merged = manifest.config;
     if let Value::Object(overrides) = config {
         merged.extend(overrides);
     }
-    let source = ScriptSource {
+    ScriptSource {
         name: "full-content".to_string(),
         config: Value::Object(merged).to_string(),
         time_budget,
         ..ScriptSource::new(WASM.to_vec())
-    };
-    WasmScriptRunner::from_sources_with(&[source], Some(web.clone() as Arc<dyn ScriptServices>))
-        .map_err(|e| e.to_string())
+    }
+}
+
+/// The plugin, loaded with `config` applied over its defaults, calling `web`.
+fn plugin(config: Value, web: &Arc<Web>) -> Result<WasmScriptRunner, String> {
+    let services = Some(web.clone() as Arc<dyn ScriptServices>);
+    WasmScriptRunner::from_sources_with(&[source(config)], services).map_err(|e| e.to_string())
 }
 
 /// The plugin, with entries of less than 50 characters taken for stubs.
@@ -136,8 +140,34 @@ fn the_manifest_is_valid() {
     let names: Vec<_> = manifest.settings.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["feeds", "exclude", "min_length", "selectors"]);
     crate::plugins::settings::check_config(&manifest.settings, &manifest.config).unwrap();
-    // It runs before the plugins that clean what it fetches.
-    assert!("full-content" < "privacy" && "full-content" < "sanitize");
+}
+
+/// What the plugin fetches is cleaned by the plugins that rewrite entries, in
+/// `entry.transform`, even when they load before it.
+#[test]
+fn articles_go_through_the_plugins_that_rewrite_entries() {
+    let web = Arc::new(Web::default());
+    let page = format!(
+        "<main><p>{}</p><video src=\"v.mp4\"></video><span style=\"x\">s</span></main>",
+        text(60)
+    );
+    web.page("https://example.com/posts/a", Ok(&page));
+    let sanitize = ScriptSource {
+        // Loads, and would run, first by its name.
+        name: "0-sanitize".to_string(),
+        ..super::sanitize_tests::source(json!({}))
+    };
+    let services = Some(web.clone() as Arc<dyn ScriptServices>);
+    let runner = WasmScriptRunner::from_sources_with(
+        &[sanitize, source(json!({"min_length": 50}))],
+        services,
+    )
+    .unwrap();
+    assert!(runner.handles(crate::scripting::Event::EntryEnrich));
+    assert_eq!(
+        content(&runner, entry("a", Some("stub"))).unwrap(),
+        format!("<p>{}</p><span>s</span>", text(60))
+    );
 }
 
 #[test]

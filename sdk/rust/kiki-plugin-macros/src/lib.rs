@@ -38,6 +38,14 @@ const EVENTS: &[Event] = &[
         default: "",
     },
     Event {
+        name: "entry.enrich",
+        kind: Some("EntryEnrich"),
+        export: "on_entry_enrich",
+        params: &[("entry", "::kiki_plugin::Entry")],
+        returns: Some("::std::option::Option<::kiki_plugin::Entry>"),
+        default: "Some(entry)",
+    },
+    Event {
         name: "entry.transform",
         kind: Some("EntryTransform"),
         export: "on_entry_transform",
@@ -140,6 +148,7 @@ const EVENTS: &[Event] = &[
 /// | `#[on(...)]`      | arguments                         | returns         |
 /// |-------------------|-----------------------------------|-----------------|
 /// | `entry.parsed`    | `entry: Entry`                    |                 |
+/// | `entry.enrich`    | `entry: Entry`                    | `Option<Entry>` |
 /// | `entry.transform` | `entry: Entry`                    | `Option<Entry>` |
 /// | `entry.ingest`    | `entry: Entry`                    | `Option<Entry>` |
 /// | `fetch.success`   | `event: FetchSuccess`             |                 |
@@ -152,10 +161,12 @@ const EVENTS: &[Event] = &[
 /// | `scan.entry`      | `scan: u64, entry: Entry`         | `Option<Entry>` |
 /// | `scan.done`       | `scan: u64, summary: ScanSummary` |                 |
 ///
-/// The first nine are the server's events; see the guide's "Writing plugins" chapter.
-/// `entry.transform` and `entry.ingest` return the entry, possibly changed, to keep it,
-/// or `None` to drop it: every plugin's `entry.transform` runs before any
-/// `entry.ingest`, so `entry.ingest` sees the entry as it will be stored;
+/// The first ten are the server's events; see the guide's "Writing plugins" chapter.
+/// `entry.enrich`, `entry.transform` and `entry.ingest` return the entry, possibly
+/// changed, to keep it, or `None` to drop it: every plugin's `entry.enrich` runs before
+/// any `entry.transform`, so what it brings in is rewritten like the rest of the entry,
+/// and every plugin's `entry.transform` runs before any `entry.ingest`, so
+/// `entry.ingest` sees the entry as it will be stored;
 /// `fetch.schedule` returns a longer wait before the feed's next fetch, in seconds, or
 /// `None` to leave it. `timer` is called when a timer started with `host::every` is due,
 /// and `scan.entry` and `scan.done` for a scan started with `host::start_scan`: only

@@ -138,6 +138,25 @@ fn transform_handlers_run_before_ingest_handlers() {
     assert_eq!(out.title, "title b-transform a-ingest");
 }
 
+/// Every plugin's `entry.enrich` handler runs before any plugin's `entry.transform`
+/// handler, whatever order the plugins load in.
+#[test]
+fn enrich_handlers_run_before_transform_handlers() {
+    let (runner, _) = runner(&[
+        source("a", json!({ "transform_suffix": " a-transform" })),
+        source(
+            "b",
+            json!({ "suffix": " b-ingest", "enrich_suffix": " b-enrich" }),
+        ),
+    ]);
+    assert!(runner.handles(Event::EntryEnrich));
+    let out = runner
+        .dispatch_transform_entry(entry("title"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.title, "title b-enrich a-transform b-ingest");
+}
+
 #[test]
 fn ingest_handlers_can_drop_entries() {
     let (runner, _) = runner(&[
