@@ -674,7 +674,8 @@ async fn new_entries_are_recorded_as_pending_asset_caching() -> Result<()> {
 
     conn.execute("DELETE FROM pending_entry_assets", [])?;
     conn.execute(
-        "UPDATE feeds SET header_body_hash = NULL WHERE id = ?1",
+        "UPDATE http_cache SET body_hash = NULL
+         WHERE url = (SELECT url FROM feeds WHERE id = ?1)",
         [feed_id],
     )?;
     refresh_feed_manual(&client, feed_id, pool, &super::test_metrics(), &tx).await?;

@@ -75,6 +75,9 @@ fn row_to_asset(row: &rusqlite::Row) -> rusqlite::Result<AssetRow> {
 
 /// Insert a new `feed_assets` row and return its rowid.
 ///
+/// The response's `etag` and `last_modified` validators, if any, are kept
+/// in the HTTP cache under `original_url` (see [`crate::db::http_cache`]).
+///
 /// If a row with the same `blake3` hash already exists — another task may
 /// have stored the same bytes since the caller last looked — nothing is
 /// inserted and the id of the existing row is returned instead.
@@ -90,21 +93,23 @@ pub fn insert_asset(
     let inserted = conn
         .execute(
             "INSERT INTO feed_assets
-            (blake3, original_url, content_type, size_bytes, etag, last_modified)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            (blake3, original_url, content_type, size_bytes)
+         VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(blake3) DO NOTHING",
-            params![
-                blake3,
-                original_url,
-                content_type,
-                size_bytes,
-                etag,
-                last_modified
-            ],
+            params![blake3, original_url, content_type, size_bytes],
         )
         .with_context(|| format!("failed to insert feed_assets row for {}", blake3))?;
     if inserted > 0 {
-        return Ok(conn.last_insert_rowid());
+        let id = conn.last_insert_rowid();
+        if etag.is_some() || last_modified.is_some() {
+            let entry = crate::db::http_cache::CacheEntry {
+                etag: etag.map(str::to_string),
+                last_modified: last_modified.map(str::to_string),
+                ..Default::default()
+            };
+            crate::db::http_cache::store(conn, original_url, &entry)?;
+        }
+        return Ok(id);
     }
     conn.query_row(
         "SELECT id FROM feed_assets WHERE blake3 = ?1",

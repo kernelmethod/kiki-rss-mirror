@@ -1,5 +1,6 @@
 use crate::config::Settings;
 use crate::db::feeds::merge_feed_into;
+use crate::db::http_cache::{self, CacheEntry};
 use crate::db::Db;
 use crate::fetcher::{
     FeedHints, FetchReply, FetchSpec, FetchedBody, Fetcher, FetcherError, ParseOutcome, ParsedFeed,
@@ -30,17 +31,13 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 /// Snapshot of a `feeds` row loaded at the start of a refresh: the URL,
-/// cache validators, body fingerprint, and scheduling state that drive the
-/// fetch decision.
+/// its HTTP cache state, and the scheduling state that drive the fetch
+/// decision.
 struct FeedFetchRow {
     title: String,
     url: String,
-    header_etag: Option<String>,
-    header_last_modified: Option<String>,
-    header_expires: Option<i64>,
-    header_immutable_until: Option<i64>,
-    header_body_hash: Option<String>,
-    last_full_refresh_at: Option<i64>,
+    /// What `http_cache` holds for `url`; empty if nothing.
+    cache: CacheEntry,
     consecutive_failures: i64,
     next_fetch_at: Option<i64>,
     /// When the server's last `Retry-After` runs out, if it has not yet.
@@ -55,12 +52,12 @@ struct FeedFetchRow {
 fn load_feed_fetch_row(conn: &Connection, feed_id: i64) -> Result<FeedFetchRow> {
     let row = conn.query_row(
         "SELECT
-            url,
-            header_etag,
-            header_last_modified,
-            header_immutable_until,
-            header_body_hash,
-            last_full_refresh_at,
+            f.url,
+            c.etag,
+            c.last_modified,
+            c.immutable_until,
+            c.body_hash,
+            c.last_full_refresh_at,
             consecutive_failures,
             next_fetch_at,
             min_fetch_interval_seconds,
@@ -72,11 +69,12 @@ fn load_feed_fetch_row(conn: &Connection, feed_id: i64) -> Result<FeedFetchRow> 
             feed_update_interval_seconds,
             feed_skip_hours,
             feed_skip_days,
-            header_expires,
+            c.expires_at,
             title,
             retry_after_at
-         FROM feeds
-         WHERE id = ?1",
+         FROM feeds f
+         LEFT JOIN http_cache c ON c.url = f.url
+         WHERE f.id = ?1",
         [feed_id],
         |row| {
             let auth_type_raw: Option<String> = row.get(9)?;
@@ -90,11 +88,14 @@ fn load_feed_fetch_row(conn: &Connection, feed_id: i64) -> Result<FeedFetchRow> 
             Ok(FeedFetchRow {
                 title: row.get(18)?,
                 url: row.get(0)?,
-                header_etag: row.get(1)?,
-                header_last_modified: row.get(2)?,
-                header_immutable_until: row.get(3)?,
-                header_body_hash: row.get(4)?,
-                last_full_refresh_at: row.get(5)?,
+                cache: CacheEntry {
+                    etag: row.get(1)?,
+                    last_modified: row.get(2)?,
+                    expires_at: row.get(17)?,
+                    immutable_until: row.get(3)?,
+                    body_hash: row.get(4)?,
+                    last_full_refresh_at: row.get(5)?,
+                },
                 consecutive_failures: row.get(6)?,
                 next_fetch_at: row.get(7)?,
                 retry_after_at: row.get(19)?,
@@ -111,7 +112,6 @@ fn load_feed_fetch_row(conn: &Connection, feed_id: i64) -> Result<FeedFetchRow> 
                     skip_hours: row.get::<_, i64>(15)? as u32,
                     skip_days: row.get::<_, i64>(16)? as u8,
                 },
-                header_expires: row.get(17)?,
             })
         },
     )?;
@@ -218,7 +218,7 @@ pub(crate) async fn refresh_feed(
     // First-time fetches are always full, so `None` just means "not yet,
     // keep using conditionals once we have validators".
     let now_ts = Utc::now().timestamp();
-    let force_conditionals_off = row.last_full_refresh_at.is_some_and(|t| {
+    let force_conditionals_off = row.cache.last_full_refresh_at.is_some_and(|t| {
         row.consecutive_failures == 0 && now_ts.saturating_sub(t) as u64 >= cfg.force_refresh_after
     });
 
@@ -272,15 +272,16 @@ pub(crate) async fn refresh_feed(
         // refresh a no-op inside the immutable window (no conditionals to
         // suppress).
         let skip_conditionals = row
-            .header_immutable_until
+            .cache
+            .immutable_until
             .map(|until| Utc::now().timestamp() < until)
             .unwrap_or(false);
 
         let spec = FetchSpec {
             feed_id,
             url: row.url.clone(),
-            etag: row.header_etag.clone(),
-            last_modified: row.header_last_modified.clone(),
+            etag: row.cache.etag.clone(),
+            last_modified: row.cache.last_modified.clone(),
             // Also suppressed when a forced (non-conditional) refresh is
             // due, so the body-hash comparison can tell us whether the
             // server's validators have been honest.
@@ -548,7 +549,8 @@ impl Recorder<'_> {
     }
 }
 
-/// Write the outcome of an HTTP fetch into the `feeds` row, fire the
+/// Write the outcome of an HTTP fetch into the `feeds` row and the HTTP
+/// cache, fire the
 /// matching script event, and record metrics.
 ///
 /// Returns the parse result, and when the feed is next due, when the server
@@ -611,28 +613,27 @@ fn record_fetch_reply(
             )
             .with_hint_source(hint_source(&headers, hints.hint_secs, &row.feed_hints));
             let next_fetch_at = schedule.next_fetch_at;
-            rec.db.write_blocking(|conn| {
-                conn.execute(
+            // A 304 has no body, so the stored fingerprint of the last one
+            // stands.
+            let entry = CacheEntry {
+                body_hash: row.cache.body_hash.clone(),
+                last_full_refresh_at: row.cache.last_full_refresh_at,
+                ..cache.into_entry()
+            };
+            rec.db.write_blocking(|conn| -> Result<()> {
+                let tx = conn.transaction()?;
+                tx.execute(
                     "UPDATE feeds SET
-                    header_etag = ?1,
-                    header_last_modified = ?2,
-                    header_expires = ?3,
-                    header_immutable_until = ?4,
-                    last_checked = ?5,
-                    next_fetch_at = ?6,
+                    last_checked = ?1,
+                    next_fetch_at = ?2,
                     consecutive_failures = 0,
                     retry_after_at = NULL
-                 WHERE id = ?7",
-                    rusqlite::params![
-                        cache.etag,
-                        cache.last_modified,
-                        cache.expires,
-                        cache.immutable_until,
-                        now_ts,
-                        next_fetch_at,
-                        feed_id,
-                    ],
-                )
+                 WHERE id = ?3",
+                    rusqlite::params![now_ts, next_fetch_at, feed_id],
+                )?;
+                http_cache::store(&tx, feed_url, &entry)?;
+                tx.commit()?;
+                Ok(())
             })??;
             debug!("{} was not modified; next fetch {}", rec.label, schedule);
             metrics.record_feed_cache_hit("not_modified");
@@ -768,7 +769,7 @@ fn record_fetch_reply(
     let server_hint_secs = hints.hint_secs.or(feed_hints.refresh_hint_secs());
     // Whether the feed changed is judged by the body, since a server that
     // ignores conditional requests answers 200 whether or not it has.
-    let change = ContentChange::from_hashes(row.header_body_hash.as_deref(), &body_hash);
+    let change = ContentChange::from_hashes(row.cache.body_hash.as_deref(), &body_hash);
     let schedule = schedule_success(
         rec,
         FetchOutcome::Success { server_hint_secs },
@@ -794,19 +795,16 @@ fn record_fetch_reply(
     // server has been serving 304s (or stale validators) while the
     // representation actually changed.
     if force_conditionals_off {
-        let etag_unchanged = match (row.header_etag.as_deref(), etag.as_deref()) {
+        let etag_unchanged = match (row.cache.etag.as_deref(), etag.as_deref()) {
             (Some(a), Some(b)) => a == b,
             _ => false,
         };
-        let lm_unchanged = match (
-            row.header_last_modified.as_deref(),
-            last_modified.as_deref(),
-        ) {
+        let lm_unchanged = match (row.cache.last_modified.as_deref(), last_modified.as_deref()) {
             (Some(a), Some(b)) => a == b,
             _ => false,
         };
         let validators_unchanged = etag_unchanged || lm_unchanged;
-        let body_changed = match (row.header_body_hash.as_deref(), body_hash.as_deref()) {
+        let body_changed = match (row.cache.body_hash.as_deref(), body_hash.as_deref()) {
             (Some(stored), Some(fresh)) => stored != fresh,
             _ => false,
         };
@@ -821,15 +819,25 @@ fn record_fetch_reply(
         metrics.record_feed_forced_refresh(if body_changed { "mismatch" } else { "match" });
     }
 
-    rec.db.write_blocking(|conn| {
-        conn.execute(
+    // The response came from `final_url`, which is now the feed's URL if
+    // the redirect was permanent.
+    let cache_url = if permanent_redirect {
+        final_url.as_str()
+    } else {
+        feed_url
+    };
+    let entry = CacheEntry {
+        etag,
+        last_modified,
+        expires_at: expires,
+        immutable_until,
+        body_hash,
+        last_full_refresh_at: Some(now_ts),
+    };
+    rec.db.write_blocking(|conn| -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE feeds SET
-            header_etag = ?,
-            header_last_modified = ?,
-            header_expires = ?,
-            header_immutable_until = ?,
-            header_body_hash = ?,
-            last_full_refresh_at = ?,
             last_checked = ?,
             next_fetch_at = ?,
             consecutive_failures = 0,
@@ -840,12 +848,6 @@ fn record_fetch_reply(
             feed_skip_days = ?
          WHERE id = ?",
             rusqlite::params![
-                etag.as_deref(),
-                last_modified.as_deref(),
-                expires,
-                immutable_until,
-                body_hash.as_deref(),
-                now_ts,
                 now_ts,
                 next_fetch_at,
                 feed_hints.ttl_secs.map(saturating_i64),
@@ -854,7 +856,10 @@ fn record_fetch_reply(
                 feed_hints.skip_days,
                 feed_id,
             ],
-        )
+        )?;
+        http_cache::store(&tx, cache_url, &entry)?;
+        tx.commit()?;
+        Ok(())
     })??;
 
     metrics.record_feed_retry_scheduled(
@@ -867,7 +872,7 @@ fn record_fetch_reply(
     Ok(Some((parsed, schedule)))
 }
 
-/// The cache validators and freshness state stored on a feed row, derived
+/// The cache validators and freshness state to store for a feed, derived
 /// from one response's headers.
 struct CacheState {
     etag: Option<String>,
@@ -878,6 +883,20 @@ struct CacheState {
     immutable_until: Option<i64>,
     /// `Cache-Control: no-store` was present.
     no_store: bool,
+}
+
+impl CacheState {
+    /// The validators and freshness to store, with no body fingerprint.
+    fn into_entry(self) -> CacheEntry {
+        CacheEntry {
+            etag: self.etag,
+            last_modified: self.last_modified,
+            expires_at: self.expires,
+            immutable_until: self.immutable_until,
+            body_hash: None,
+            last_full_refresh_at: None,
+        }
+    }
 }
 
 /// Derive the cache state to store from a response's headers.
@@ -957,19 +976,19 @@ fn revalidated_cache_state(
     let carries_freshness =
         headers.contains_key("cache-control") || headers.contains_key("expires");
     CacheState {
-        etag: fresh.etag.or_else(|| row.header_etag.clone()),
+        etag: fresh.etag.or_else(|| row.cache.etag.clone()),
         last_modified: fresh
             .last_modified
-            .or_else(|| row.header_last_modified.clone()),
+            .or_else(|| row.cache.last_modified.clone()),
         expires: if carries_freshness {
             fresh.expires
         } else {
-            row.header_expires
+            row.cache.expires_at
         },
         immutable_until: if carries_freshness {
             fresh.immutable_until
         } else {
-            row.header_immutable_until
+            row.cache.immutable_until
         },
         no_store: false,
     }

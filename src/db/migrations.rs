@@ -36,6 +36,10 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0003_entry_search_index",
         sql: include_str!("include/migrations/0003_entry_search_index.sql"),
     },
+    Migration {
+        name: "0004_http_cache",
+        sql: include_str!("include/migrations/0004_http_cache.sql"),
+    },
 ];
 
 /// SQL to create the migrations table. Safe to run on databases that already
@@ -425,6 +429,77 @@ pub(crate) mod tests {
             [],
             |row| row.get::<_, i64>(0),
         )?;
+        Ok(())
+    }
+
+    /// `0004_http_cache` moves the cache state of feeds and assets into
+    /// `http_cache`, keyed by URL, and drops the old columns.
+    #[test]
+    fn test_0004_http_cache() -> Result<()> {
+        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
+        conn.execute_batch(
+            "DROP TRIGGER http_cache_feed_ad;
+             DROP TRIGGER http_cache_feed_au;
+             DROP TRIGGER http_cache_asset_ad;
+             DROP TABLE http_cache;
+             ALTER TABLE feeds ADD COLUMN header_etag VARCHAR;
+             ALTER TABLE feeds ADD COLUMN header_last_modified VARCHAR;
+             ALTER TABLE feeds ADD COLUMN header_body_hash VARCHAR;
+             ALTER TABLE feeds ADD COLUMN last_full_refresh_at INTEGER;
+             ALTER TABLE feeds ADD COLUMN header_expires INTEGER;
+             ALTER TABLE feeds ADD COLUMN header_immutable_until INTEGER;
+             ALTER TABLE feed_assets ADD COLUMN etag TEXT;
+             ALTER TABLE feed_assets ADD COLUMN last_modified TEXT;
+             DELETE FROM migrations WHERE name = '0004_http_cache';
+             INSERT INTO feeds (id, title, url, header_etag, header_last_modified,
+                                header_body_hash, last_full_refresh_at, header_expires,
+                                header_immutable_until) VALUES
+                 (1, 'cached', 'http://a/', '\"a\"', 'Mon', 'hash', 10, 20, 30),
+                 (2, 'never fetched', 'http://b/', NULL, NULL, NULL, NULL, NULL, NULL);
+             INSERT INTO feed_assets (blake3, original_url, size_bytes, etag, last_modified)
+             VALUES
+                 ('h1', 'http://x/a.png', 1, '\"x1\"', NULL),
+                 ('h2', 'http://x/a.png', 1, '\"x2\"', NULL),
+                 ('h3', 'http://x/b.png', 1, NULL, NULL);",
+        )?;
+        assert_eq!(run_pending_migrations(&mut conn)?, 1);
+
+        use crate::db::http_cache::{lookup, CacheEntry};
+        assert_eq!(
+            lookup(&conn, "http://a/")?,
+            Some(CacheEntry {
+                etag: Some("\"a\"".into()),
+                last_modified: Some("Mon".into()),
+                expires_at: Some(20),
+                immutable_until: Some(30),
+                body_hash: Some("hash".into()),
+                last_full_refresh_at: Some(10),
+            })
+        );
+        assert_eq!(lookup(&conn, "http://b/")?, None);
+        assert_eq!(
+            lookup(&conn, "http://x/a.png")?.and_then(|e| e.etag),
+            Some("\"x1\"".into())
+        );
+        assert_eq!(lookup(&conn, "http://x/b.png")?, None);
+
+        for table in ["feeds", "feed_assets"] {
+            let columns: Vec<String> = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            assert!(
+                !columns.iter().any(|c| c.starts_with("header_")
+                    || c == "etag"
+                    || c == "last_modified"
+                    || c == "last_full_refresh_at"),
+                "{table} still has cache columns: {columns:?}"
+            );
+        }
+
+        // The triggers came with it.
+        conn.execute("DELETE FROM feeds WHERE id = 1", [])?;
+        assert_eq!(lookup(&conn, "http://a/")?, None);
         Ok(())
     }
 }
