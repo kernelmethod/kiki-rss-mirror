@@ -5,7 +5,7 @@
 //! last body. Feeds and cached assets share it: a feed's row is found by
 //! `feeds.url`, an asset's by `feed_assets.original_url`. Triggers remove a
 //! row once no feed or asset has its URL. Deciding what to store from a
-//! response's headers is done by [`crate::tasks::cache`].
+//! response's headers is done by `crate::tasks::cache`.
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -186,8 +186,7 @@ mod tests {
     fn evicting_an_asset_drops_its_row_once_unused() {
         let conn = mem_conn();
         let insert = |hash: &str| {
-            crate::db::assets::insert_asset(&conn, hash, "http://x/a.png", None, 1, None, None)
-                .unwrap()
+            crate::db::assets::insert_asset(&conn, hash, "http://x/a.png", None, 1).unwrap()
         };
         insert("h1");
         insert("h2");
@@ -205,7 +204,7 @@ mod tests {
     fn a_feed_keeps_a_row_its_asset_namesake_loses() {
         let conn = mem_conn();
         add_feed(&conn, "http://x/feed");
-        crate::db::assets::insert_asset(&conn, "h", "http://x/feed", None, 1, None, None).unwrap();
+        crate::db::assets::insert_asset(&conn, "h", "http://x/feed", None, 1).unwrap();
         store(&conn, "http://x/feed", &entry("\"x\"")).unwrap();
         crate::db::assets::delete_by_hash(&conn, "h").unwrap();
         assert!(lookup(&conn, "http://x/feed").unwrap().is_some());

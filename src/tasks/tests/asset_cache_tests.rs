@@ -535,8 +535,7 @@ async fn assets_the_fetcher_should_have_refused_are_not_stored() -> Result<()> {
     let host = FeedFetcherHost::with_fake_worker(|job| match job {
         Job::FetchAsset(_) => JobResult::Asset(AssetReply::Fetched(Box::new(FetchedAsset {
             content_type: "text/html".into(),
-            etag: None,
-            last_modified: None,
+            headers: Default::default(),
             bytes: b"<script>alert(1)</script>".to_vec(),
         }))),
         _ => JobResult::Failed {
@@ -583,8 +582,7 @@ async fn concurrent_stores_of_the_same_bytes_share_one_asset() -> Result<()> {
     let host = FeedFetcherHost::with_fake_worker(|job| match job {
         Job::FetchAsset(_) => JobResult::Asset(AssetReply::Fetched(Box::new(FetchedAsset {
             content_type: "image/png".into(),
-            etag: None,
-            last_modified: None,
+            headers: Default::default(),
             bytes: TINY_PNG.to_vec(),
         }))),
         _ => JobResult::Failed {
@@ -680,5 +678,82 @@ async fn new_entries_are_recorded_as_pending_asset_caching() -> Result<()> {
     )?;
     refresh_feed_manual(&client, feed_id, pool, &super::test_metrics(), &tx).await?;
     assert_eq!(pending()?, 0, "entries already stored are not new");
+    Ok(())
+}
+
+/// Downloading an asset records its response in the HTTP cache, and a later
+/// download of the same URL is made conditional on what was recorded.
+#[tokio::test]
+async fn asset_downloads_use_the_http_cache() -> Result<()> {
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use std::sync::Mutex;
+
+    let seen = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let seen_by_server = seen.clone();
+    let app = Router::new().route(
+        "/img.png",
+        get(move |headers: HeaderMap| {
+            let seen = seen_by_server.clone();
+            async move {
+                let inm = headers
+                    .get("if-none-match")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                seen.lock().unwrap().push(inm.clone());
+                let cache = [("etag", "\"v1\""), ("cache-control", "max-age=3600")];
+                if inm.as_deref() == Some("\"v1\"") {
+                    return (StatusCode::NOT_MODIFIED, cache).into_response();
+                }
+                let headers = [cache[0], cache[1], ("content-type", "image/png")];
+                (headers, TINY_PNG).into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = reqwest::Url::parse(&format!("http://{}/img.png", listener.local_addr()?))?;
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+    let tc = TestBuilder::default().init_database().build()?;
+    let pool = make_pool(&tc.database_path())?;
+    let client = reqwest::Client::builder().build()?;
+    let fetcher = test_fetcher(&client);
+    let cache = super::super::assets::AssetCache {
+        fetcher: &fetcher,
+        proxy: &Default::default(),
+        db: &pool,
+        data_dir: tc.config_dir(),
+        max_bytes: i64::MAX,
+    };
+    let store = || {
+        super::super::assets::store_asset(
+            &cache,
+            &url,
+            super::super::assets::AssetKind::InlineImg,
+            |_, _| Ok(()),
+        )
+    };
+
+    let before = chrono::Utc::now().timestamp();
+    assert!(store().await?);
+    let conn = tc.database_conn()?;
+    let entry = crate::db::http_cache::lookup(&conn, url.as_str())?.expect("recorded");
+    assert_eq!(entry.etag.as_deref(), Some("\"v1\""));
+    let expires_at = entry.expires_at.expect("max-age gives an expiry");
+    assert!((before + 3600..=before + 3700).contains(&expires_at));
+    let png_hash = blake3::hash(TINY_PNG).to_hex().to_string();
+    assert_eq!(entry.body_hash.as_deref(), Some(png_hash.as_str()));
+
+    // Keep the cache row alive without the asset (a feed with the same URL
+    // does), so the next download has validators to send.
+    conn.execute(
+        "INSERT INTO feeds (title, url) VALUES ('same URL', ?1)",
+        [url.as_str()],
+    )?;
+    conn.execute("DELETE FROM feed_assets", [])?;
+    assert!(!store().await?, "a 304 leaves nothing to store");
+    assert_eq!(*seen.lock().unwrap(), [None, Some("\"v1\"".to_string())]);
+    let entry = crate::db::http_cache::lookup(&conn, url.as_str())?.expect("still recorded");
+    assert_eq!(entry.body_hash.as_deref(), Some(png_hash.as_str()));
     Ok(())
 }

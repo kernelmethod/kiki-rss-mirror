@@ -13,7 +13,7 @@ use crate::tasks::backoff::{
     SchedulerConfig,
 };
 use crate::tasks::cache::{
-    corrected_max_age, extract_server_hints, parse_http_date, CacheControl, ServerHints,
+    entry_after_response, extract_server_hints, request_validators, Response,
 };
 use crate::tasks::error::FetchError;
 use crate::tasks::error_recording::{clear_feed_error, defer_feed, set_feed_error_with_schedule};
@@ -266,26 +266,13 @@ pub(crate) async fn refresh_feed(
             }
         }
     } else {
-        // RFC 8246: while a prior response advertised `immutable` and is
-        // still fresh, suppress conditional revalidation — the server has
-        // promised the representation won't change. This also makes forced
-        // refresh a no-op inside the immutable window (no conditionals to
-        // suppress).
-        let skip_conditionals = row
-            .cache
-            .immutable_until
-            .map(|until| Utc::now().timestamp() < until)
-            .unwrap_or(false);
-
         let spec = FetchSpec {
             feed_id,
             url: row.url.clone(),
-            etag: row.cache.etag.clone(),
-            last_modified: row.cache.last_modified.clone(),
-            // Also suppressed when a forced (non-conditional) refresh is
-            // due, so the body-hash comparison can tell us whether the
-            // server's validators have been honest.
-            send_conditionals: !skip_conditionals && !force_conditionals_off,
+            // None when a forced (non-conditional) refresh is due, so the
+            // body-hash comparison can tell us whether the server's
+            // validators have been honest.
+            validators: request_validators(&row.cache, now_ts, force_conditionals_off),
             auth: row.auth.clone(),
             // Both taken from the settings snapshot for this fetch, so an
             // operator changing them does not have to restart the server
@@ -601,7 +588,7 @@ fn record_fetch_reply(
             let now_ts = Utc::now().timestamp();
             let headers = headers.to_header_map();
             let hints = extract_server_hints(&headers, now_ts);
-            let cache = revalidated_cache_state(row, &headers, &hints, now_ts);
+            let entry = entry_after_response(&row.cache, Response::NotModified, &headers, now_ts);
             let server_hint_secs = hints.hint_secs.or(row.feed_hints.refresh_hint_secs());
             let schedule = schedule_success(
                 rec,
@@ -613,13 +600,6 @@ fn record_fetch_reply(
             )
             .with_hint_source(hint_source(&headers, hints.hint_secs, &row.feed_hints));
             let next_fetch_at = schedule.next_fetch_at;
-            // A 304 has no body, so the stored fingerprint of the last one
-            // stands.
-            let entry = CacheEntry {
-                body_hash: row.cache.body_hash.clone(),
-                last_full_refresh_at: row.cache.last_full_refresh_at,
-                ..cache.into_entry()
-            };
             rec.db.write_blocking(|conn| -> Result<()> {
                 let tx = conn.transaction()?;
                 tx.execute(
@@ -749,13 +729,14 @@ fn record_fetch_reply(
 
     let now_ts = Utc::now().timestamp();
     let hints = extract_server_hints(&headers, now_ts);
-    let CacheState {
-        etag,
-        last_modified,
-        expires,
-        immutable_until,
-        no_store,
-    } = cache_state(&headers, &hints, now_ts);
+    let entry = entry_after_response(
+        &row.cache,
+        Response::Full {
+            body_hash: &body_hash,
+        },
+        &headers,
+        now_ts,
+    );
 
     // Refresh hints from the feed document. A body that did not parse
     // leaves the previously stored ones in force.
@@ -783,10 +764,6 @@ fn record_fetch_reply(
 
     metrics.record_feed_response_bytes(body_len);
 
-    // Don't persist a body-hash fingerprint for responses we've been told
-    // not to store (RFC 9111 §5.2.2 no-store).
-    let body_hash: Option<String> = if no_store { None } else { Some(body_hash) };
-
     // Validator-lie detection. Only meaningful on a forced (non-
     // conditional) refresh, since otherwise the server is free to return
     // a body conditional on the validators we sent. A genuine content
@@ -795,16 +772,20 @@ fn record_fetch_reply(
     // server has been serving 304s (or stale validators) while the
     // representation actually changed.
     if force_conditionals_off {
-        let etag_unchanged = match (row.cache.etag.as_deref(), etag.as_deref()) {
+        let etag_unchanged = match (row.cache.etag.as_deref(), entry.etag.as_deref()) {
             (Some(a), Some(b)) => a == b,
             _ => false,
         };
-        let lm_unchanged = match (row.cache.last_modified.as_deref(), last_modified.as_deref()) {
+        let lm_unchanged = match (
+            row.cache.last_modified.as_deref(),
+            entry.last_modified.as_deref(),
+        ) {
             (Some(a), Some(b)) => a == b,
             _ => false,
         };
         let validators_unchanged = etag_unchanged || lm_unchanged;
-        let body_changed = match (row.cache.body_hash.as_deref(), body_hash.as_deref()) {
+        // No fingerprint is kept of a `no-store` response.
+        let body_changed = match (row.cache.body_hash.as_deref(), entry.body_hash.as_deref()) {
             (Some(stored), Some(fresh)) => stored != fresh,
             _ => false,
         };
@@ -825,14 +806,6 @@ fn record_fetch_reply(
         final_url.as_str()
     } else {
         feed_url
-    };
-    let entry = CacheEntry {
-        etag,
-        last_modified,
-        expires_at: expires,
-        immutable_until,
-        body_hash,
-        last_full_refresh_at: Some(now_ts),
     };
     rec.db.write_blocking(|conn| -> Result<()> {
         let tx = conn.transaction()?;
@@ -870,128 +843,6 @@ fn record_fetch_reply(
     fire_fetch_success(rec.script_runner, feed_id, 200, final_url, Some(body_len));
 
     Ok(Some((parsed, schedule)))
-}
-
-/// The cache validators and freshness state to store for a feed, derived
-/// from one response's headers.
-struct CacheState {
-    etag: Option<String>,
-    last_modified: Option<String>,
-    /// Absolute expiry: `max-age` (age-corrected) or else `Expires`.
-    expires: Option<i64>,
-    /// End of an RFC 8246 `immutable` window.
-    immutable_until: Option<i64>,
-    /// `Cache-Control: no-store` was present.
-    no_store: bool,
-}
-
-impl CacheState {
-    /// The validators and freshness to store, with no body fingerprint.
-    fn into_entry(self) -> CacheEntry {
-        CacheEntry {
-            etag: self.etag,
-            last_modified: self.last_modified,
-            expires_at: self.expires,
-            immutable_until: self.immutable_until,
-            body_hash: None,
-            last_full_refresh_at: None,
-        }
-    }
-}
-
-/// Derive the cache state to store from a response's headers.
-///
-/// `hints` must be [`extract_server_hints`] of the same headers at
-/// `now_ts`. Applies the Cache-Control precedence rules (RFC 9111 §5.2):
-/// `no-store` clears everything, `no-cache` clears the expiry but keeps the
-/// validators for conditional requests, and `max-age` overrides `Expires`
-/// after the RFC 9111 §4.2.3 age correction.
-fn cache_state(headers: &HeaderMap, hints: &ServerHints, now_ts: i64) -> CacheState {
-    let header = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|h| h.to_str().ok())
-            .map(str::to_string)
-    };
-    let mut etag = header("etag");
-    let mut last_modified = header("last-modified");
-
-    // Accepts all three HTTP-date formats (RFC 9110 §5.6.7).
-    let mut expires: Option<i64> = header("expires")
-        .as_deref()
-        .and_then(parse_http_date)
-        .map(|dt| dt.timestamp());
-
-    let cc_values: Vec<&str> = headers
-        .get_all("cache-control")
-        .iter()
-        .filter_map(|h| h.to_str().ok())
-        .collect();
-    let cc = CacheControl::parse_many(&cc_values);
-    if cc.no_store {
-        etag = None;
-        last_modified = None;
-        expires = None;
-    } else if cc.no_cache {
-        expires = None;
-    } else if let Some(max_age) = cc.max_age {
-        let corrected = corrected_max_age(headers, max_age, now_ts);
-        expires = Some(now_ts + corrected as i64);
-    }
-
-    // RFC 8246: while the response is fresh, skip conditional revalidation
-    // entirely. Only meaningful when paired with a positive max-age.
-    let immutable_until = hints
-        .hint_secs
-        .filter(|&s| hints.immutable && s > 0)
-        .map(|s| now_ts.saturating_add(s as i64));
-
-    CacheState {
-        etag,
-        last_modified,
-        expires,
-        immutable_until,
-        no_store: cc.no_store,
-    }
-}
-
-/// The cache state to store after a `304 Not Modified`.
-///
-/// A 304 freshens the stored response: header fields it carries replace
-/// the stored ones, and fields it omits keep their stored values
-/// (RFC 9111 §4.3.4). So a server that rotates its `ETag` or
-/// `Last-Modified` on a 304 has the new validator sent next time, and one
-/// that re-sends `Cache-Control: immutable` opens a new immutable window.
-/// `no-store` on the 304 still clears everything.
-fn revalidated_cache_state(
-    row: &FeedFetchRow,
-    headers: &HeaderMap,
-    hints: &ServerHints,
-    now_ts: i64,
-) -> CacheState {
-    let fresh = cache_state(headers, hints, now_ts);
-    if fresh.no_store {
-        return fresh;
-    }
-    let carries_freshness =
-        headers.contains_key("cache-control") || headers.contains_key("expires");
-    CacheState {
-        etag: fresh.etag.or_else(|| row.cache.etag.clone()),
-        last_modified: fresh
-            .last_modified
-            .or_else(|| row.cache.last_modified.clone()),
-        expires: if carries_freshness {
-            fresh.expires
-        } else {
-            row.cache.expires_at
-        },
-        immutable_until: if carries_freshness {
-            fresh.immutable_until
-        } else {
-            row.cache.immutable_until
-        },
-        no_store: false,
-    }
 }
 
 /// Convert seconds to SQLite's integer type; an absurd `<ttl>` saturates

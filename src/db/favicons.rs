@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(check.asset_id, None);
         assert_eq!(favicon_hash(&conn, 1).unwrap(), None);
 
-        let asset = insert_asset(&conn, "abc", "http://x/i.ico", None, 1, None, None).unwrap();
+        let asset = insert_asset(&conn, "abc", "http://x/i.ico", None, 1).unwrap();
         record_check(&conn, 1, Some(asset)).unwrap();
         assert_eq!(last_check(&conn, 1).unwrap().unwrap().asset_id, Some(asset));
         assert_eq!(favicon_hash(&conn, 1).unwrap().as_deref(), Some("abc"));
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn evicting_the_asset_forgets_the_favicon() {
         let mut conn = conn_with_feed();
-        let asset = insert_asset(&conn, "abc", "http://x/i.ico", None, 10, None, None).unwrap();
+        let asset = insert_asset(&conn, "abc", "http://x/i.ico", None, 10).unwrap();
         record_check(&conn, 1, Some(asset)).unwrap();
 
         evict_to(&mut conn, 0).unwrap();

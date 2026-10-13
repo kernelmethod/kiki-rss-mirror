@@ -75,9 +75,6 @@ fn row_to_asset(row: &rusqlite::Row) -> rusqlite::Result<AssetRow> {
 
 /// Insert a new `feed_assets` row and return its rowid.
 ///
-/// The response's `etag` and `last_modified` validators, if any, are kept
-/// in the HTTP cache under `original_url` (see [`crate::db::http_cache`]).
-///
 /// If a row with the same `blake3` hash already exists — another task may
 /// have stored the same bytes since the caller last looked — nothing is
 /// inserted and the id of the existing row is returned instead.
@@ -87,8 +84,6 @@ pub fn insert_asset(
     original_url: &str,
     content_type: Option<&str>,
     size_bytes: i64,
-    etag: Option<&str>,
-    last_modified: Option<&str>,
 ) -> Result<i64> {
     let inserted = conn
         .execute(
@@ -100,16 +95,7 @@ pub fn insert_asset(
         )
         .with_context(|| format!("failed to insert feed_assets row for {}", blake3))?;
     if inserted > 0 {
-        let id = conn.last_insert_rowid();
-        if etag.is_some() || last_modified.is_some() {
-            let entry = crate::db::http_cache::CacheEntry {
-                etag: etag.map(str::to_string),
-                last_modified: last_modified.map(str::to_string),
-                ..Default::default()
-            };
-            crate::db::http_cache::store(conn, original_url, &entry)?;
-        }
-        return Ok(id);
+        return Ok(conn.last_insert_rowid());
     }
     conn.query_row(
         "SELECT id FROM feed_assets WHERE blake3 = ?1",
@@ -249,16 +235,7 @@ mod tests {
     #[test]
     fn insert_lookup_touch_delete() {
         let conn = mem_conn();
-        let id = insert_asset(
-            &conn,
-            "abc",
-            "http://x/y.png",
-            Some("image/png"),
-            10,
-            None,
-            None,
-        )
-        .unwrap();
+        let id = insert_asset(&conn, "abc", "http://x/y.png", Some("image/png"), 10).unwrap();
         let row = lookup_by_hash(&conn, "abc").unwrap().unwrap();
         assert_eq!(row.id, id);
         assert_eq!(row.original_url, "http://x/y.png");
@@ -273,8 +250,8 @@ mod tests {
     #[test]
     fn insert_existing_hash_returns_existing_id() {
         let conn = mem_conn();
-        let first = insert_asset(&conn, "abc", "http://x/a.png", None, 10, None, None).unwrap();
-        let second = insert_asset(&conn, "abc", "http://y/b.png", None, 10, None, None).unwrap();
+        let first = insert_asset(&conn, "abc", "http://x/a.png", None, 10).unwrap();
+        let second = insert_asset(&conn, "abc", "http://y/b.png", None, 10).unwrap();
         assert_eq!(first, second);
         let row = lookup_by_hash(&conn, "abc").unwrap().unwrap();
         assert_eq!(row.original_url, "http://x/a.png");
@@ -284,8 +261,8 @@ mod tests {
     #[test]
     fn total_cache_size_sums() {
         let conn = mem_conn();
-        insert_asset(&conn, "a", "http://x/a", None, 100, None, None).unwrap();
-        insert_asset(&conn, "b", "http://x/b", None, 250, None, None).unwrap();
+        insert_asset(&conn, "a", "http://x/a", None, 100).unwrap();
+        insert_asset(&conn, "b", "http://x/b", None, 250).unwrap();
         assert_eq!(total_cache_size(&conn).unwrap(), 350);
     }
 
@@ -294,9 +271,9 @@ mod tests {
         let mut conn = mem_conn();
         // Insert three rows with explicit last_accessed_at values so the
         // order is deterministic.
-        insert_asset(&conn, "a", "http://x/a", None, 100, None, None).unwrap();
-        insert_asset(&conn, "b", "http://x/b", None, 200, None, None).unwrap();
-        insert_asset(&conn, "c", "http://x/c", None, 300, None, None).unwrap();
+        insert_asset(&conn, "a", "http://x/a", None, 100).unwrap();
+        insert_asset(&conn, "b", "http://x/b", None, 200).unwrap();
+        insert_asset(&conn, "c", "http://x/c", None, 300).unwrap();
         conn.execute(
             "UPDATE feed_assets SET last_accessed_at = 100 WHERE blake3 = 'a'",
             [],
@@ -323,7 +300,7 @@ mod tests {
     #[test]
     fn evict_to_noop_when_under_cap() {
         let mut conn = mem_conn();
-        insert_asset(&conn, "a", "http://x/a", None, 10, None, None).unwrap();
+        insert_asset(&conn, "a", "http://x/a", None, 10).unwrap();
         let deleted = evict_to(&mut conn, 100).unwrap();
         assert!(deleted.is_empty());
     }
@@ -343,26 +320,8 @@ mod tests {
             rusqlite::params![1i64, "rss", "g", 1i64, "t", "http://example.com/e"],
         )
         .unwrap();
-        let a = insert_asset(
-            &conn,
-            "a",
-            "http://x/a.png",
-            Some("image/png"),
-            10,
-            None,
-            None,
-        )
-        .unwrap();
-        let b = insert_asset(
-            &conn,
-            "b",
-            "http://x/b.mp3",
-            Some("audio/mpeg"),
-            20,
-            None,
-            None,
-        )
-        .unwrap();
+        let a = insert_asset(&conn, "a", "http://x/a.png", Some("image/png"), 10).unwrap();
+        let b = insert_asset(&conn, "b", "http://x/b.mp3", Some("audio/mpeg"), 20).unwrap();
         link_entry_asset(&conn, 1, a, "inline_img").unwrap();
         link_entry_asset(&conn, 1, b, "enclosure").unwrap();
         // Duplicate link is a no-op.
