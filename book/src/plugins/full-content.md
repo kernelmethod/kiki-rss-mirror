@@ -50,9 +50,13 @@ echo 'feeds = [3, "https://example.com/feed.xml"]' | kiki plugin config set full
 
 The plugin tries `selectors`, CSS selectors such as `article` or
 `.entry-content`, in order, and takes the first element that holds at
-least `min_length` characters of text (or, if none does, the one holding
-the most, if that is more than the summary). The defaults find the article
-on most blogs and news sites. For a site where they find the wrong thing,
+least `min_length` characters of text. If none does, it takes the one
+holding the most, but only if that is at least twice as much as the
+summary, and at least half of `min_length`: on a page that needs a script
+to show its article, or keeps it for subscribers, what the selectors find
+is often just the page's menus or a notice asking you to subscribe, which
+would be no better than the summary. The defaults find the article on most
+blogs and news sites. For a site where they find the wrong thing,
 put a selector for its article first:
 
 ```bash

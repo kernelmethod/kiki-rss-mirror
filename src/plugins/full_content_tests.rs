@@ -250,16 +250,47 @@ fn articles_fetched_before_are_kept() {
 #[test]
 fn the_best_candidate_wins_when_none_is_long_enough() {
     let web = Arc::new(Web::default());
-    let page = format!("<article>{}</article><main>{}</main>", text(20), text(10));
+    let page = format!("<article>{}</article><main>{}</main>", text(30), text(25));
     web.page("https://example.com/posts/a", Ok(&page));
     web.page("https://example.com/posts/b", Ok("<main>abc</main>"));
     let runner = default_plugin(&web);
-    assert_eq!(content(&runner, entry("a", Some("stub"))), Some(text(20)));
+    assert_eq!(content(&runner, entry("a", Some("stub"))), Some(text(30)));
     // Nothing longer than the stub: it stays.
     assert_eq!(
         content(&runner, entry("b", Some("stub"))).as_deref(),
         Some("stub")
     );
+}
+
+/// A page whose article isn't found, as one that needs a script to show it, or keeps it
+/// for subscribers, may still have an element with a little more text than the summary:
+/// its menus, or a notice asking to subscribe. That isn't taken for the article.
+#[test]
+fn a_candidate_barely_longer_than_the_stub_is_not_the_article() {
+    let web = Arc::new(Web::default());
+    let summary = format!("<p>{}</p>", text(20));
+    // More than the summary, but less than twice it.
+    let paywall = format!("<main>{}</main>", text(39));
+    web.page("https://example.com/posts/a", Ok(&paywall));
+    // More than the empty stub, but less than half of `min_length`.
+    web.page("https://example.com/posts/b", Ok("<main>Subscribe!</main>"));
+    let runner = default_plugin(&web);
+    assert_eq!(
+        content(&runner, entry("a", Some(&summary))),
+        Some(summary.clone())
+    );
+    assert_eq!(content(&runner, entry("b", None)), None);
+    assert_eq!(
+        web.fetched(),
+        ["https://example.com/posts/a", "https://example.com/posts/b"]
+    );
+
+    // Twice the summary is enough.
+    web.page(
+        "https://example.com/posts/c",
+        Ok(&format!("<main>{}</main>", text(40))),
+    );
+    assert_eq!(content(&runner, entry("c", Some(&summary))), Some(text(40)));
 }
 
 #[test]

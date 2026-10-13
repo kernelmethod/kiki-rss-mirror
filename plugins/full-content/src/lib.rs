@@ -10,11 +10,12 @@
 //! entry links to, with the host's `fetch-page`, and looks in it for the article, in the
 //! content of the first element that one of `selectors` matches with at least
 //! `min_length` characters of text (or, failing that, in the one with the most text, if it
-//! has more than the stub). The article replaces the entry's content, with its links and
-//! images made absolute, lazily loaded images given their real source, and scripts, styles,
-//! frames, forms and event handlers removed. Every plugin's `entry.transform` handler runs
-//! after every `entry.enrich` handler, so the `sanitize` and `privacy` plugins then clean
-//! it like any other content, whatever order plugins load in.
+//! has at least twice the stub's, and half of `min_length`: less may be a page's menus, or
+//! a notice asking readers to subscribe). The article replaces the entry's content, with
+//! its links and images made absolute, lazily loaded images given their real source, and
+//! scripts, styles, frames, forms and event handlers removed. Every plugin's
+//! `entry.transform` handler runs after every `entry.enrich` handler, so the `sanitize` and
+//! `privacy` plugins then clean it like any other content, whatever order plugins load in.
 //!
 //! Kiki stores an entry again on every refresh of its feed, with the content the plugins
 //! give it then. So that an article is fetched once, not on every refresh, the plugin
@@ -266,9 +267,25 @@ impl FullContent {
         }
     }
 
-    /// The article on `page`, or `None` if none of the selectors finds one with more
-    /// than `stub` characters of text.
+    /// The fewest characters of text an element needs to be taken for the article when no
+    /// element has `min_length`, for an entry whose content has `stub` characters of it.
+    ///
+    /// On a page that builds its article with a script, or keeps it from readers who
+    /// haven't paid, what the selectors find may be the page's menus or a notice asking
+    /// to subscribe, often a little longer than the summary it would replace. So the
+    /// element needs at least twice the stub's text, more than the stub's in any case,
+    /// and, for an entry with next to no text of its own, half of `min_length`.
+    fn fallback(&self, stub: usize) -> usize {
+        stub.saturating_mul(2)
+            .max(self.min_length / 2)
+            .max(stub.saturating_add(1))
+    }
+
+    /// The article on `page`: the content of the first element a selector finds with
+    /// `min_length` characters of text, or else of the one with the most text, if it has
+    /// at least [`Self::fallback`]`(stub)`. `None` if there is neither.
     fn article(&self, page: &Page, stub: usize) -> Option<String> {
+        let fallback = self.fallback(stub);
         let mut best: Option<(usize, String)> = None;
         for selector in &self.selectors {
             let content = match html::inner(&page.body, selector) {
@@ -283,7 +300,7 @@ impl FullContent {
             if length >= self.min_length {
                 return Some(content);
             }
-            if length > stub && best.as_ref().is_none_or(|(most, _)| length > *most) {
+            if length >= fallback && best.as_ref().is_none_or(|(most, _)| length > *most) {
                 best = Some((length, content));
             }
         }
