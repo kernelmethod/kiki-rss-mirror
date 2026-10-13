@@ -24,8 +24,12 @@ CREATE TABLE task_queue (
 --                hidden). They are seeded below, cannot be renamed or
 --                deleted, and their names all start with the reserved
 --                prefix 'system:', which user tags may not use.
+-- Tag, feed and entry ids are AUTOINCREMENT so that they are never reused,
+-- even for the newest row once it is deleted: a client holding an id from
+-- before the deletion, or a task that was working on the deleted row, would
+-- otherwise act on whichever row took the id next.
 CREATE TABLE tags (
-    id      INTEGER PRIMARY KEY,
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
     name    VARCHAR UNIQUE NOT NULL,
     kind    VARCHAR NOT NULL DEFAULT 'user' CHECK (kind IN ('user', 'system'))
 );
@@ -71,7 +75,7 @@ CREATE TABLE plugin_store (
 ---------------------------------------------------------------------------------
 
 CREATE TABLE feeds (
-    id                      INTEGER PRIMARY KEY,
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
 
     -- "rss" or "atom"
     -- Should be NULL if unknown (e.g. if the feed was just created)
@@ -186,7 +190,7 @@ CREATE TABLE entry_sources (
 ---------------------------------------------------------------------------------
 
 CREATE TABLE entries (
-    id                  INTEGER PRIMARY KEY,
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     feed_id             INTEGER,
     source_id           INTEGER,
 
@@ -206,9 +210,7 @@ CREATE TABLE entries (
     -- have been dropped for longer than `retention.max_age_days`.
     dropped_at      INTEGER,
 
-    -- Unix timestamp of when Kiki first stored the entry. Set explicitly by
-    -- the entry insert, since databases migrated from before this column
-    -- existed have no default for it.
+    -- Unix timestamp of when Kiki first stored the entry.
     ingested_at     INTEGER NOT NULL DEFAULT (unixepoch()),
 
     -- 1 while the entry has neither `system:read` nor `system:hidden`, 0
@@ -223,19 +225,6 @@ CREATE TABLE entries (
 CREATE UNIQUE INDEX idx_entry_guids ON entries(feed_id, guid);
 CREATE INDEX idx_entry_dropped_at ON entries(dropped_at) WHERE dropped_at IS NOT NULL;
 CREATE INDEX idx_entry_ingested_at ON entries(ingested_at);
-
--- The highest entry id ever used, so that new entries never reuse the id of
--- a deleted one: clients that sync by id would take the new entry for one
--- they had already seen. New entries take the next id after this; see
--- `upsert_entry` in src/tasks/processing.rs. (AUTOINCREMENT would do the
--- same, but cannot be added to the entries table of an existing database.)
-CREATE TABLE entry_id_high_water (id INTEGER NOT NULL);
-INSERT INTO entry_id_high_water (id) VALUES (0);
-CREATE TRIGGER entries_id_high_water AFTER INSERT ON entries
-WHEN NEW.id > (SELECT id FROM entry_id_high_water)
-BEGIN
-    UPDATE entry_id_high_water SET id = NEW.id;
-END;
 
 -- Table mapping entries to the tags that they belong to
 CREATE TABLE entry_tags (
