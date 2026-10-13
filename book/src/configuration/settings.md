@@ -118,6 +118,14 @@ Changes apply to the next request, with no restart.
 | `anonymous_access` | `"full"` | What a request without an [API token](../tokens.md) may do: `"full"` (anything, administration included), `"read-only"` (as with a token holding only the `read` scope), or `"token-required"` (nothing but `GET /v1/health`, `GET /v1/`, `GET /v1/access`, `GET /v1/tokens/current` and `/docs`). Requests with a token are held to its scopes either way. `GET /v1/access` reports the setting to anyone. See [Anonymous access](../tokens.md#anonymous-access). |
 | `allowed_hosts` | unset | Hosts the API answers to besides `localhost`, `127.0.0.1` and `::1`, in place of `http.allowed_hosts`. Unset, the API uses the `[http]` list. An empty list, set here or inherited, turns the check off, and the API answers any host. Otherwise a request naming another host in its `Host` header is refused with `400 Bad Request`. See [Exposing Kiki over the network](../deployment.md#exposing-kiki-over-the-network). |
 
+## `[plugins]`
+
+Changes apply to the next call a plugin makes, with no restart.
+
+| Key | Default | Description |
+| --- | ------- | ----------- |
+| `allow_network` | `false` | Whether plugins whose manifest asks for the [`network` permission](../writing-plugins.md#permissions) may fetch web pages, as the [`full-content`](../plugins/full-content.md) plugin does. The pages are fetched by the feed fetcher, through the `[proxy]`, if one is set. Off, their fetches fail. |
+
 ## Per-feed settings
 
 Each feed also has a fetch interval (`min_fetch_interval_seconds`) and, for

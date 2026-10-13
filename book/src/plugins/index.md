@@ -9,7 +9,7 @@ with Kiki, and in `plugins/user/` if you installed it.
 
 ## Plugins installed by default
 
-`kiki init` installs six plugins, bundled into the `kiki` binary, into
+`kiki init` installs seven plugins, bundled into the `kiki` binary, into
 `plugins/system/`:
 
 | Plugin | What it does |
@@ -18,11 +18,13 @@ with Kiki, and in `plugins/user/` if you installed it.
 | [`auto-tag`](auto-tag.md) | Tags entries matching rules you set. |
 | [`sanitize`](sanitize.md) | Removes scripts, styles, embedded content and unsafe links from entries' HTML. |
 | [`privacy`](privacy.md) | Removes tracking parameters from links, and tracking pixels from content. |
+| [`full-content`](full-content.md) | Fetches the whole article for entries whose feed gives only a summary. |
 | [`adaptive-fetch`](adaptive-fetch.md) | Fetches feeds less often while they keep turning out unchanged. |
 | [`retention`](retention.md) | Deletes entries some days after their feed stops listing them. |
 
-`filter` and `auto-tag` do nothing until you give them rules, and
-`retention` keeps every entry until you tell it how long to keep them.
+`filter` and `auto-tag` do nothing until you give them rules,
+`retention` keeps every entry until you tell it how long to keep them, and
+`full-content` does nothing until you let plugins use the network.
 `sanitize`, `privacy` and `adaptive-fetch` work out of the box.
 
 Pass `kiki init --no-default-plugins` to skip them. `kiki init --check`,

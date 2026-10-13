@@ -121,6 +121,11 @@ pub const HOST_FD_ENV: &str = "KIKI_SCRIPT_HOST_FD";
 /// this, so that a plugin stuck for good cannot hold up its callers for
 /// ever while the others keep the child talking.
 ///
+/// Neither counts the time the server spends answering plugins' calls, such
+/// as fetching a page for one: the child is waiting on the server then, not
+/// the other way round, and every request waiting behind the plugin making
+/// the call waits on the server too.
+///
 /// Generous next to the child's own default per-handler budget
 /// ([`SCRIPT_TIMEOUT_MS`]) so that a slow chain of handlers, or a reload
 /// loading many plugins, is never mistaken for a hung child — but
@@ -270,6 +275,47 @@ struct Shared {
     /// When the child last sent a frame, in milliseconds since `started`.
     last_frame: AtomicU64,
     started: Instant,
+    /// How long the server has spent answering plugins' calls.
+    answering: Mutex<CallClock>,
+}
+
+/// How long the server has spent answering plugins' calls, counting time
+/// when it answers several at once only once.
+#[derive(Default)]
+struct CallClock {
+    /// How many calls are being answered.
+    calls: usize,
+    /// When the calls being answered started, if any are.
+    since: Option<Instant>,
+    /// Time spent answering calls before `since`.
+    total: Duration,
+}
+
+impl CallClock {
+    fn now(&self) -> Duration {
+        self.total + self.since.map_or(Duration::ZERO, |since| since.elapsed())
+    }
+}
+
+/// Counts the time until it is dropped as the server answering a call; see
+/// [`Shared::answering_time`].
+struct Answering<'a>(&'a Shared);
+
+impl Drop for Answering<'_> {
+    fn drop(&mut self) {
+        let shared = self.0;
+        {
+            let mut clock = shared.answering.lock().unwrap_or_else(|e| e.into_inner());
+            clock.calls = clock.calls.saturating_sub(1);
+            if clock.calls == 0 {
+                if let Some(since) = clock.since.take() {
+                    clock.total += since.elapsed();
+                }
+            }
+        }
+        // The child was waiting on the server, so its silence starts now.
+        shared.heard();
+    }
 }
 
 struct HostState {
@@ -282,10 +328,40 @@ struct HostState {
 }
 
 impl Shared {
-    /// How long it has been since the child last sent a frame.
+    /// How long it has been since the child last sent a frame, or the server
+    /// last answered one of its plugins' calls; zero while it answers one.
     fn silence(&self) -> Duration {
+        if self
+            .answering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .calls
+            > 0
+        {
+            return Duration::ZERO;
+        }
         let last = Duration::from_millis(self.last_frame.load(Ordering::Relaxed));
         self.started.elapsed().saturating_sub(last)
+    }
+
+    /// How long the server has spent answering plugins' calls since it
+    /// started, counting time when it answered several at once only once.
+    fn answering_time(&self) -> Duration {
+        self.answering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .now()
+    }
+
+    /// Count the time until the guard returned is dropped as the server
+    /// answering a call.
+    fn answer_call(&self) -> Answering<'_> {
+        let mut clock = self.answering.lock().unwrap_or_else(|e| e.into_inner());
+        if clock.calls == 0 {
+            clock.since = Some(Instant::now());
+        }
+        clock.calls += 1;
+        Answering(self)
     }
 
     /// Note that the child just sent a frame.
@@ -503,6 +579,7 @@ impl ScriptHost {
             alive: AtomicBool::new(true),
             last_frame: AtomicU64::new(0),
             started: Instant::now(),
+            answering: Mutex::new(CallClock::default()),
         });
         Ok(ScriptHost {
             shared,
@@ -566,6 +643,7 @@ impl ScriptHost {
         }
 
         let sent = Instant::now();
+        let answering_at_send = self.shared.answering_time();
         let services = self
             .services
             .read()
@@ -589,12 +667,14 @@ impl ScriptHost {
                     };
                 }
                 Some(Inbound::Call(plugin, call)) => {
+                    let answering = self.shared.answer_call();
                     let result =
                         match &services {
                             Some(services) => services.call(&plugin, call),
                             None => Err("not available: the server is not answering plugin calls"
                                 .to_string()),
                         };
+                    drop(answering);
                     let answer = ToHostRef {
                         id,
                         busy: false,
@@ -613,7 +693,12 @@ impl ScriptHost {
                 }
                 Some(Inbound::Lead) => {}
                 None => {
-                    let waited = sent.elapsed();
+                    // Time the server spent answering calls is not the child's.
+                    let answered = self
+                        .shared
+                        .answering_time()
+                        .saturating_sub(answering_at_send);
+                    let waited = sent.elapsed().saturating_sub(answered);
                     let silent = waited >= timeout && self.shared.silence() >= timeout;
                     if silent || waited >= timeout * HARD_LIMIT_FACTOR {
                         let e = HostError::Io(io::Error::new(

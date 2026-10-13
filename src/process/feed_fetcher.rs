@@ -10,7 +10,8 @@
 //! Caching assets is the same kind of work — downloading entries' images
 //! and enclosures, and feeds' favicons, and parsing HTML to find them — so
 //! it runs here too ([`Job::FetchAsset`], [`Job::FindPageIcons`],
-//! [`Job::ExtractImages`]), and the server holds no HTTP client at all.
+//! [`Job::ExtractImages`]), and so does fetching the web pages plugins ask
+//! for ([`Job::FetchPage`]): the server holds no HTTP client at all.
 //!
 //! This module moves that work into a child that holds none of those: no
 //! database, no writable filesystem (Landlock grants only read access to
@@ -135,6 +136,7 @@ use crate::fetcher::assets::{
     asset_client_builder, fetch_asset, find_page_icons, AssetReply, AssetSpec, AssetTimeouts,
     PageIcons, PageSpec,
 };
+use crate::fetcher::page::{fetch_page, FetchedPage, PageFetchSpec, PAGE_FETCH_TIMEOUT};
 use crate::fetcher::parsing::{ParseOutput, ParseReply, ParseTask};
 use crate::fetcher::{
     client_builder, fetch_with, FetchReply, FetchSpec, FetcherError, ParseFailure, ParseOutcome,
@@ -235,6 +237,10 @@ const ASSET_DEADLINE: Duration = AssetTimeouts::DEFAULT
     .total
     .saturating_add(PARSE_BUDGET)
     .saturating_add(DEADLINE_SLACK);
+
+/// How long the server waits for a page to be fetched for a plugin: the
+/// fetch's own limit, plus slack. Nothing is parsed.
+const PAGE_DEADLINE: Duration = PAGE_FETCH_TIMEOUT.saturating_add(DEADLINE_SLACK);
 
 /// How long the supervisor waits for a worker to finish a frame it has
 /// started writing, or to accept one, before declaring it wedged.
@@ -356,6 +362,9 @@ pub enum Job {
     /// Find the images an entry's HTML `content` shows, resolving them
     /// against `base`.
     ExtractImages { content: String, base: String },
+
+    /// Fetch a web page for a plugin.
+    FetchPage(PageFetchSpec),
 }
 
 /// A message from the fetcher back to the server.
@@ -374,6 +383,8 @@ pub enum JobResult {
     Asset(AssetReply),
     PageIcons(PageIcons),
     Images(Vec<String>),
+    /// A page, or why it could not be fetched.
+    Page(Result<FetchedPage, String>),
 
     /// The job could not be completed: the task serving it panicked, the
     /// reply was too large to send, or the parser could not serve it.
@@ -714,6 +725,22 @@ impl FeedFetcherHost {
             .await?
         {
             JobResult::Images(urls) => Ok(urls),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Fetch the web page in `spec` for a plugin.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::fetch`]; the inner `Err` is why the page could not be
+    /// fetched.
+    pub async fn fetch_page(
+        &self,
+        spec: PageFetchSpec,
+    ) -> Result<Result<FetchedPage, String>, FetcherError> {
+        match self.request(Job::FetchPage(spec), PAGE_DEADLINE).await? {
+            JobResult::Page(page) => Ok(page),
             other => Err(unexpected(other)),
         }
     }
@@ -1842,6 +1869,7 @@ async fn run_job(clients: Clients, job: Job) -> JobResult {
         Job::ExtractImages { content, base } => {
             parsers.images(content, base).await.map(JobResult::Images)
         }
+        Job::FetchPage(spec) => Ok(JobResult::Page(fetch_page(&clients.assets, &spec).await)),
     };
     result.unwrap_or_else(|failure| match failure {
         ParseFailure::Crashed(why) => JobResult::Crashed { why },

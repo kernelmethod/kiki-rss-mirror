@@ -608,6 +608,119 @@ pub fn strip(
     })
 }
 
+/// The content of the first element of `html` that `selector` matches, as HTML: what is
+/// between its start tag and its end tag, or `None` if nothing matches. An element whose
+/// end tag is missing has the rest of the HTML as its content, and one that cannot have
+/// content, such as `<img>`, has none. The content may be at most `max_bytes` long (and at
+/// most [`HTML_OUTPUT_LIMIT_BYTES`]). `expired` says whether the plugin's time budget has
+/// run out.
+///
+/// # Errors
+///
+/// Fails if the selector is invalid, the HTML cannot be parsed within the rewriter's
+/// memory limit, or the content is too long; or with [`HtmlError::Expired`] once `expired`
+/// says so.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::scripting::html::inner;
+///
+/// let html = r#"<nav>x</nav><article><p>One</p><article>Two</article></article>"#;
+/// let content = inner(html, "article", 1024, &|| false).unwrap();
+/// assert_eq!(content.as_deref(), Some("<p>One</p><article>Two</article>"));
+/// assert_eq!(inner(html, "main", 1024, &|| false).unwrap(), None);
+/// ```
+pub fn inner(
+    html: &str,
+    selector: &str,
+    max_bytes: u32,
+    expired: &dyn Fn() -> bool,
+) -> Result<Option<String>, HtmlError> {
+    /// Where the output sink is: before the element's content, in it, or past it.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum At {
+        Before,
+        In,
+        After,
+    }
+
+    let selector = parse_selector(selector)?;
+    let limit = (max_bytes as usize).min(HTML_OUTPUT_LIMIT_BYTES);
+    // The content is found between two markers, so the HTML may not hold any.
+    let html: Cow<str> = if html.contains(STRIP_MARKER) {
+        Cow::Owned(html.replace(STRIP_MARKER, "\u{FFFD}"))
+    } else {
+        Cow::Borrowed(html)
+    };
+    let marker = STRIP_MARKER.to_string();
+    let pass = Pass::new(expired);
+    let found = Cell::new(false);
+
+    let handler = ElementContentHandlers::default().element(|el: &mut Element| {
+        pass.next_element()?;
+        if found.replace(true) || !el.can_have_content() {
+            return Ok(());
+        }
+        el.prepend(&marker, ContentType::Html);
+        if let Some(end_tag) = el.end_tag_handlers() {
+            let marker = marker.clone();
+            end_tag.push(Box::new(move |end| {
+                end.before(&marker, ContentType::Html);
+                Ok(())
+            }));
+        }
+        Ok(())
+    });
+
+    let at = Cell::new(At::Before);
+    let mut out = Vec::new();
+    let overflowed = Cell::new(false);
+    let rewriter = HtmlRewriter::new(
+        settings(vec![(Cow::Owned(selector), handler)], vec![]),
+        |mut chunk: &[u8]| {
+            // A marker is one byte, so it is never split across chunks.
+            if at.get() == At::Before {
+                match chunk.iter().position(|&b| b == 0) {
+                    Some(i) => {
+                        at.set(At::In);
+                        chunk = chunk.get(i + 1..).unwrap_or_default();
+                    }
+                    None => return,
+                }
+            }
+            if at.get() == At::In {
+                if let Some(i) = chunk.iter().position(|&b| b == 0) {
+                    at.set(At::After);
+                    chunk = chunk.get(..i).unwrap_or_default();
+                }
+                if overflowed.get() || out.len() + chunk.len() > limit {
+                    overflowed.set(true);
+                } else {
+                    out.extend_from_slice(chunk);
+                }
+            }
+        },
+    );
+    pass.run(rewriter, &html)?;
+    if !found.get() {
+        return Ok(None);
+    }
+    if overflowed.get() {
+        return Err(HtmlError::failed(format!(
+            "the element's content is longer than {limit} bytes"
+        )));
+    }
+    // An element that cannot have content takes no markers.
+    if at.get() == At::Before {
+        return Ok(Some(String::new()));
+    }
+    // The output is the input's UTF-8, cut at markers, which are ASCII.
+    String::from_utf8(out)
+        .map(Some)
+        .map_err(|e| HtmlError::failed(format!("the element's content is not UTF-8: {e}")))
+}
+
 fn apply(el: &mut Element, op: EditOp) -> Result<(), HtmlError> {
     match op {
         EditOp::Remove => el.remove(),

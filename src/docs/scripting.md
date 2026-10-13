@@ -175,6 +175,7 @@ Kiki installs by default, whose source is in
 [`plugins/`](https://github.com/kernelmethod/kiki-rss/tree/main/plugins) in
 Kiki's source: [`filter`](plugins/filter.md), [`auto-tag`](plugins/auto-tag.md),
 [`sanitize`](plugins/sanitize.md), [`privacy`](plugins/privacy.md),
+[`full-content`](plugins/full-content.md),
 [`adaptive-fetch`](plugins/adaptive-fetch.md) and
 [`retention`](plugins/retention.md).
 
@@ -222,7 +223,7 @@ for `wasm32-unknown-unknown`, which Kiki turns into one), which:
 
 - imports `kiki:plugin/host`, the plugin's calls to the server: `log`,
   `store-get` and `store-set`, `tag-entry` and `untag-entry`, `start-scan`,
-  `delete-entries`, `get-feed`, and `every`;
+  `delete-entries`, `get-feed`, `get-entry`, `fetch-page`, and `every`;
 - imports `kiki:plugin/regex`: see [Regular expressions](#regular-expressions);
 - imports `kiki:plugin/html`: see [Parsing HTML](#parsing-html);
 - exports `init`, which Kiki calls with the plugin's config, as a JSON
@@ -506,6 +507,13 @@ or its config changed:
   saw, and `updated`, how many gained a system tag. It is not called for a
   scan that ends early.
 
+- `get-entry(feed_id, guid)` returns the stored entry of the feed `feed_id`
+  whose guid is `guid`, as a scan would see it (with its `id` set and `tags`
+  empty), or none if it isn't stored yet. An `entry.transform` or
+  `entry.ingest` handler can use it to see what it made of the same entry
+  the last time its feed was fetched: Kiki stores an entry again, with what
+  the handlers return, every time its feed is fetched and has changed.
+
 User tags added with `tag-entry` last only until an `entry.transform` or
 `entry.ingest` handler next sets the entry's user tags: when an entry is fetched again and a
 handler returns any user tag for it, its user tags are replaced with the ones
@@ -654,6 +662,7 @@ permissions = ["entries.delete"]
 | Permission       | Allows |
 |------------------|--------|
 | `entries.delete` | Deleting stored entries, with [`delete-entries`](#deleting-entries). |
+| `network`        | Fetching web pages, with [`fetch-page`](#fetching-web-pages), while `allow_network` under `[plugins]` in [`kiki.toml`](configuration/settings.md#plugins) lets plugins. |
 
 A call a plugin has not asked for permission to make fails. A manifest naming
 a permission Kiki does not know is invalid. The permissions each plugin asks
@@ -675,13 +684,54 @@ feed has the new URL already, the feed is merged into that one and removed),
 and a removed feed's id may be given to a feed added later (handle
 `feed.removed` to forget it).
 
+## Fetching web pages
+
+`fetch-page(url)` fetches the web page at `url`, an `http` or `https` URL,
+and returns it:
+
+| Field          | Meaning |
+|----------------|---------|
+| `url`          | The URL the page was served from, after any redirects. |
+| `content_type` | `"text/html"` or `"application/xhtml+xml"`. |
+| `body`         | The page, decoded to UTF-8 from the character encoding its `Content-Type` or a `<meta charset>` declares. |
+| `truncated`    | Whether the page was longer than 2 MiB, and was cut short. |
+
+It needs the `network` [permission](#permissions), and network access for
+plugins is off unless the operator turns it on, with `allow_network` under
+`[plugins]` in `kiki.toml`; until then, or once the setting is turned off
+again, the call fails. Be ready for that, as the bundled
+[`full-content`](plugins/full-content.md) plugin is: it stops asking for a
+while once Kiki refuses it.
+
+Kiki fetches the page in its feed fetcher, as it fetches feeds, through
+the same proxy, following up to ten redirects, and within 20 seconds in
+all; the plugin never touches the network itself. The call fails if the
+server can't be reached, answers with anything but a success, or sends
+something other than an HTML page. Nothing is cached, so a plugin that may
+want the same page again should keep what it needs from it, such as in the
+entry it returns (see `get-entry` under [Stored entries](#stored-entries)).
+
+A URL from an entry came from a feed, so a feed can have Kiki fetch any
+URL it likes, on any server Kiki can reach. What comes back is text from a
+server Kiki doesn't trust: parse it with the [`html`](#parsing-html)
+interface, and don't hand any of it on without the care you'd give a
+feed's own HTML.
+
+The call waits for the page, so a handler that fetches one takes as long
+as the server takes to send it. That time doesn't count against the
+handler's [time budget](#resource-limits), up to 30 seconds per handler
+call, and other plugins' handlers carry on meanwhile; but the entry being
+handled waits, and so do the next entries for the same plugin.
+
 ## Calls to the server
 
 Calls to the plugin's store, to stored entries and to feeds go to the
 server, which answers them from the database, and checks that the plugin has
 the [permission](#permissions) a call needs. A call that fails returns an
 error message. Time a handler spends waiting on them does not count against
-its [time budget](#resource-limits), up to a second per handler call.
+its [time budget](#resource-limits), up to a second per handler call, and
+time it spends waiting for [`fetch-page`](#fetching-web-pages) up to 30
+seconds more.
 
 ## Regular expressions
 
@@ -783,6 +833,17 @@ checks a URL and sets it again writes what it checked.
 `html::escape(s)` escapes `&`, `<`, `>`, `"` and `'` for putting text into
 HTML.
 
+To take an element out of a page whole, such as the article in a page that
+[`fetch-page`](#fetching-web-pages) returned,
+`html::inner(html, selector)` returns the content of the first element the
+selector matches, as HTML: everything between its start tag and its end
+tag, markup and all, as it was written. An element whose end tag is
+missing has the rest of the HTML as its content.
+
+```rust,ignore
+let article = html::inner(&page.body, "article")?; // Option<String>
+```
+
 Parsing runs outside the plugin's memory, so it has limits of its own: the
 parser may use 4 MiB for its buffers, and what a call returns may take at
 most 8 MiB. Each call also checks how much room the plugin's memory has for
@@ -852,8 +913,10 @@ any other plugin, and can reach nothing but what the `host`, `regex` and
 WebAssembly toolchains build on, Kiki provides only randomness
 (`wasi:random`) and the clocks (`wasi:clocks`' `now` and `resolution`), which
 libraries use without being asked: Rust's `HashMap` seeds its hasher from
-it, for instance. There are no files, no network, no environment and no
-standard streams. A plugin built for `wasm32-wasip2` still loads, but calling
+it, for instance. There are no files, no network (but for the pages Kiki
+fetches for plugins allowed to ask, with
+[`fetch-page`](#fetching-web-pages)), no environment and no standard
+streams. A plugin built for `wasm32-wasip2` still loads, but calling
 any of them, as `std::fs`, `std::env` or `println!` do, traps. Write to
 Kiki's log with `log` instead.
 
@@ -873,7 +936,9 @@ Every call into a plugin runs under hard limits:
   times its budget by the clock, or its budget plus a second, whichever is
   less, however little CPU time it used. Time spent on
   [calls to the server](#calls-to-the-server) is not counted, up to one
-  second per call; past that, it counts like anything else. Loading a
+  second per call, and 30 seconds more spent waiting for
+  [`fetch-page`](#fetching-web-pages); past that, it counts like anything
+  else. Loading a
   plugin, which runs its `init`, may take up to 5 seconds of CPU time.
 
   Each plugin's handlers run one call at a time, but different plugins run

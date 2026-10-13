@@ -90,6 +90,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiki-full-content"
+version = "1.0.0"
+dependencies = [
+ "kiki-plugin",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "kiki-plugin"
 version = "0.2.0"
 dependencies = [

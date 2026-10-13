@@ -278,7 +278,7 @@ pub fn parse_script_config(
 /// (`feed_id`, `syndication_format`, `guid`) are read-only from the script's perspective —
 /// any changes made to them in a script are ignored when converting back from the scripting
 /// layer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedEntry {
     /// ID of the stored entry, for entries handed to a scan (see [`ServiceCall::StartScan`]).
     /// `None` for entries being ingested, which are not stored yet. Read-only for scripts.
@@ -775,6 +775,21 @@ pub enum ServiceCall {
     /// [`entries.delete`](crate::plugins::Permission::EntriesDelete) permission. Answered
     /// with [`ServiceReply::Deleted`].
     DeleteEntries { filter: DeleteFilter },
+    /// Look up the stored entry of the feed `feed_id` whose guid is `guid`. Answered with
+    /// [`ServiceReply::Entry`].
+    GetEntry { feed_id: i64, guid: String },
+    /// Fetch the web page at `url`. Needs the plugin to have the
+    /// [`network`](crate::plugins::Permission::Network) permission, and network access for
+    /// plugins to be turned on. Answered with [`ServiceReply::Page`].
+    FetchPage { url: String },
+}
+
+impl ServiceCall {
+    /// Whether answering the call may take the server a while, as it waits on the network,
+    /// so that the time is not counted against the plugin making it.
+    pub fn is_slow(&self) -> bool {
+        matches!(self, ServiceCall::FetchPage { .. })
+    }
 }
 
 /// A feed, as plugins see it through `get-feed`.
@@ -801,6 +816,10 @@ pub enum ServiceReply {
     Feed(Option<FeedInfo>),
     /// How many entries were deleted.
     Deleted(u64),
+    /// A stored entry, or `None` if there is none.
+    Entry(Option<Box<FeedEntry>>),
+    /// A web page.
+    Page(Box<crate::fetcher::page::FetchedPage>),
     /// The call succeeded and has nothing to report.
     Done,
 }

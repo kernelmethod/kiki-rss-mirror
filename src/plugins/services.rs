@@ -1,16 +1,30 @@
 //! The server's answers to the calls plugins make through the host
 //! interface: their key-value stores (`store-get` and `store-set`), tagging
 //! stored entries (`tag-entry` and `untag-entry`), scans of stored entries
-//! (`start-scan`), deleting stored entries (`delete-entries`), and looking
-//! up feeds (`get-feed`).
+//! (`start-scan`), deleting stored entries (`delete-entries`), looking up
+//! feeds (`get-feed`) and stored entries (`get-entry`), and fetching web
+//! pages (`fetch-page`).
 //!
 //! # Permissions
 //!
-//! Calls that cannot be undone are answered only for plugins whose manifest
-//! asks for the [`Permission`] they need: deleting entries needs
-//! [`Permission::EntriesDelete`]. The permissions come from the manifests
-//! the server read, not from the script host, which is not trusted to
-//! report them.
+//! Calls that cannot be undone, or that reach beyond Kiki, are answered only
+//! for plugins whose manifest asks for the [`Permission`] they need:
+//! deleting entries needs [`Permission::EntriesDelete`], and fetching pages
+//! [`Permission::Network`]. The permissions come from the manifests the
+//! server read, not from the script host, which is not trusted to report
+//! them.
+//!
+//! # Fetching pages
+//!
+//! `fetch-page` is answered only while network access for plugins is turned
+//! on, with [`PluginSettings::allow_network`], which is off by default and
+//! read at every call, so turning it off takes effect at once. The page is
+//! fetched by the feed fetcher, as feeds are, through the same proxy (see
+//! [`crate::fetcher::page`]): the server itself never connects anywhere.
+//! The call waits for the page, on the thread dispatching the event that
+//! the plugin is handling.
+//!
+//! [`PluginSettings::allow_network`]: crate::config::PluginSettings::allow_network
 //!
 //! # Deleting entries
 //!
@@ -85,6 +99,20 @@ pub struct ServerServices {
     /// The plugins loaded into the script runner.
     loaded: ArcSwap<LoadedPlugins>,
     scans: Arc<ScanState>,
+    /// What fetching pages needs, if plugins may ever fetch them.
+    network: Option<PluginNetwork>,
+}
+
+/// What `fetch-page` needs: the fetcher that fetches the pages, the settings
+/// saying whether plugins may, and the runtime to wait for the fetcher on.
+#[derive(Clone)]
+pub struct PluginNetwork {
+    /// Fetches the pages.
+    pub fetcher: crate::fetcher::Fetcher,
+    /// The server's settings, read at each call.
+    pub config: crate::config::ConfigHandle,
+    /// The multi-threaded runtime the fetcher's requests run on.
+    pub runtime: tokio::runtime::Handle,
 }
 
 /// What the scan threads share.
@@ -113,7 +141,15 @@ impl ServerServices {
             db,
             metrics: None,
             loaded: ArcSwap::from_pointee(HashMap::new()),
+            network: None,
         }
+    }
+
+    /// Lets plugins fetch web pages through `network`, while its settings
+    /// allow them to. Without it, `fetch-page` always fails.
+    pub fn with_network(mut self, network: PluginNetwork) -> Self {
+        self.network = Some(network);
+        self
     }
 
     /// Counts the entries plugins delete in `metrics`.
@@ -205,7 +241,63 @@ impl ScriptServices for ServerServices {
                 }
                 Ok(ServiceReply::Deleted(deleted))
             }
+            ServiceCall::GetEntry { feed_id, guid } => Ok(ServiceReply::Entry(
+                self.read(|conn| get_entry(conn, feed_id, &guid))?
+                    .map_err(|e| format!("database error: {e}"))?
+                    .map(Box::new),
+            )),
+            ServiceCall::FetchPage { url } => {
+                require(Permission::Network)?;
+                let page = self.fetch_page(url)?;
+                debug!(plugin, url = %page.url, bytes = page.body.len(), "plugin fetched a page");
+                Ok(ServiceReply::Page(Box::new(page)))
+            }
         }
+    }
+}
+
+impl ServerServices {
+    /// Fetches the page at `url` with the fetcher, if plugins may.
+    fn fetch_page(&self, url: String) -> Result<crate::fetcher::page::FetchedPage, String> {
+        let Some(network) = &self.network else {
+            return Err("not available: this server does not fetch pages for plugins".to_string());
+        };
+        let settings = network.config.current();
+        if !settings.plugins.allow_network {
+            return Err(
+                "network access for plugins is turned off; set allow_network = true \
+                 under [plugins] in kiki.toml to turn it on"
+                    .to_string(),
+            );
+        }
+        let spec = crate::fetcher::page::PageFetchSpec {
+            url,
+            proxy: settings.effective_proxy(),
+        };
+        let fetched = block_on(&network.runtime, network.fetcher.fetch_page(spec))?;
+        fetched.map_err(|e| format!("the fetcher failed: {e}"))?
+    }
+}
+
+/// Waits for `future` on `runtime`, from whatever thread a call is answered
+/// on: a thread of the runtime's blocking pool, a runtime worker inside
+/// [`tokio::task::block_in_place`] (as a feed refresh stores its entries), or
+/// a thread of Kiki's own, such as a scan's.
+///
+/// # Errors
+///
+/// Fails on a thread of a current-thread runtime, which waiting would stall.
+fn block_on<F: std::future::Future>(
+    runtime: &tokio::runtime::Handle,
+    future: F,
+) -> Result<F::Output, String> {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(current) if current.runtime_flavor() == RuntimeFlavor::CurrentThread => {
+            Err("not available: the server cannot wait for the network here".to_string())
+        }
+        Ok(_) => Ok(tokio::task::block_in_place(|| runtime.block_on(future))),
+        Err(_) => Ok(runtime.block_on(future)),
     }
 }
 
@@ -590,58 +682,87 @@ fn load_batch(
             hidden,
             READ_BATCH as i64
         ],
-        |row| {
-            let id: i64 = row.get(0)?;
-            Ok((
-                id,
-                FeedEntry {
-                    id: Some(id),
-                    feed_id: row.get(1)?,
-                    syndication_format: row.get(2)?,
-                    guid: row.get(3)?,
-                    published_at: row.get(4)?,
-                    title: row.get(5)?,
-                    url: row.get(6)?,
-                    content: row.get(7)?,
-                    authors: Vec::new(),
-                    categories: Vec::new(),
-                    tags: Vec::new(),
-                    cache_assets: true,
-                },
-            ))
-        },
+        entry_from_row,
     )?;
     let mut batch = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     for (entry_id, entry) in &mut batch {
-        if entry.syndication_format == "atom" {
-            entry.authors = strings(
-                conn,
-                "SELECT author FROM atom_entry_authors WHERE entry_id = ?1 ORDER BY id",
-                *entry_id,
-            )?;
-            entry.categories = strings(
-                conn,
-                "SELECT c.category FROM atom_entry_categories ec
-                 JOIN atom_categories c ON c.id = ec.category_id
-                 WHERE ec.entry_id = ?1 ORDER BY ec.rowid",
-                *entry_id,
-            )?;
-        } else {
-            entry.authors = conn
-                .prepare_cached("SELECT author FROM rss_entry_data WHERE entry_id = ?1")?
-                .query_row([*entry_id], |row| row.get::<_, Option<String>>(0))
-                .optional()?
-                .flatten()
-                .into_iter()
-                .collect();
-            entry.categories = strings(
-                conn,
-                "SELECT category FROM rss_categories WHERE entry_id = ?1 ORDER BY rowid",
-                *entry_id,
-            )?;
-        }
+        load_lists(conn, *entry_id, entry)?;
     }
     Ok(batch)
+}
+
+/// Reads the stored entry of the feed `feed_id` whose guid is `guid`, as
+/// scans see entries, or `None` if there is none.
+fn get_entry(conn: &Connection, feed_id: i64, guid: &str) -> rusqlite::Result<Option<FeedEntry>> {
+    let found = conn
+        .prepare_cached(
+            "SELECT id, feed_id, syndication_format, guid, published_at, title, url, content
+             FROM entries WHERE feed_id = ?1 AND guid = ?2",
+        )?
+        .query_row(rusqlite::params![feed_id, guid], entry_from_row)
+        .optional()?;
+    let Some((entry_id, mut entry)) = found else {
+        return Ok(None);
+    };
+    load_lists(conn, entry_id, &mut entry)?;
+    Ok(Some(entry))
+}
+
+/// The entry in `row`, which holds an entry's `id`, `feed_id`,
+/// `syndication_format`, `guid`, `published_at`, `title`, `url` and
+/// `content`, in that order, with its id, and with no authors, categories
+/// or tags yet.
+fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, FeedEntry)> {
+    let id: i64 = row.get(0)?;
+    Ok((
+        id,
+        FeedEntry {
+            id: Some(id),
+            feed_id: row.get(1)?,
+            syndication_format: row.get(2)?,
+            guid: row.get(3)?,
+            published_at: row.get(4)?,
+            title: row.get(5)?,
+            url: row.get(6)?,
+            content: row.get(7)?,
+            authors: Vec::new(),
+            categories: Vec::new(),
+            tags: Vec::new(),
+            cache_assets: true,
+        },
+    ))
+}
+
+/// Reads the authors and categories of `entry`, the stored entry `entry_id`.
+fn load_lists(conn: &Connection, entry_id: i64, entry: &mut FeedEntry) -> rusqlite::Result<()> {
+    if entry.syndication_format == "atom" {
+        entry.authors = strings(
+            conn,
+            "SELECT author FROM atom_entry_authors WHERE entry_id = ?1 ORDER BY id",
+            entry_id,
+        )?;
+        entry.categories = strings(
+            conn,
+            "SELECT c.category FROM atom_entry_categories ec
+             JOIN atom_categories c ON c.id = ec.category_id
+             WHERE ec.entry_id = ?1 ORDER BY ec.rowid",
+            entry_id,
+        )?;
+    } else {
+        entry.authors = conn
+            .prepare_cached("SELECT author FROM rss_entry_data WHERE entry_id = ?1")?
+            .query_row([entry_id], |row| row.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten()
+            .into_iter()
+            .collect();
+        entry.categories = strings(
+            conn,
+            "SELECT category FROM rss_categories WHERE entry_id = ?1 ORDER BY rowid",
+            entry_id,
+        )?;
+    }
+    Ok(())
 }
 
 /// Runs `sql`, a query of one text column taking an entry id, for `entry_id`.
@@ -1089,6 +1210,136 @@ mod tests {
             call(&*h.services, ServiceCall::GetFeed { feed_id: 5 }).unwrap(),
             ServiceReply::Feed(None)
         );
+    }
+
+    #[test]
+    fn plugins_can_look_up_stored_entries() {
+        let pool = pool();
+        let conn = pool.connect();
+        let feed_id = insert_feed(&conn);
+        let entry_id = insert_entry(&conn, feed_id, "rss", "a");
+        conn.execute(
+            "INSERT INTO rss_entry_data (entry_id, author) VALUES (?1, 'Ada')",
+            [entry_id],
+        )
+        .unwrap();
+        let h = Harness::idle(pool.clone());
+        let get = |feed_id, guid: &str| {
+            let guid = guid.to_string();
+            call(&*h.services, ServiceCall::GetEntry { feed_id, guid }).unwrap()
+        };
+        assert_eq!(
+            get(feed_id, "a"),
+            ServiceReply::Entry(Some(Box::new(FeedEntry {
+                id: Some(entry_id),
+                feed_id,
+                syndication_format: "rss".to_string(),
+                guid: "a".to_string(),
+                published_at: Some(0),
+                title: "a".to_string(),
+                url: Some("u".to_string()),
+                content: None,
+                authors: vec!["Ada".to_string()],
+                categories: Vec::new(),
+                tags: Vec::new(),
+                cache_assets: true,
+            })))
+        );
+        assert_eq!(get(feed_id, "b"), ServiceReply::Entry(None));
+        assert_eq!(get(feed_id + 1, "a"), ServiceReply::Entry(None));
+    }
+
+    /// A website serving one page, `/page`, and the base URL it is at.
+    fn start_site(runtime: &tokio::runtime::Runtime) -> String {
+        use axum::http::header::CONTENT_TYPE;
+        runtime.block_on(async {
+            let app = axum::Router::new().route(
+                "/page",
+                axum::routing::get(|| async { ([(CONTENT_TYPE, "text/html")], "<p>Hello</p>") }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+            base
+        })
+    }
+
+    #[test]
+    fn fetching_pages_needs_the_permission_and_the_setting() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let base = start_site(&runtime);
+        let td = tempfile::tempdir().unwrap();
+        let config: crate::config::ConfigHandle =
+            Arc::new(crate::config::ConfigStore::open(td.path().join("kiki.toml")).unwrap());
+        let pool = pool();
+        let services = ServerServices::new(
+            pool.clone(),
+            ScriptRunnerHandle::empty(),
+            CancellationToken::new(),
+        )
+        .with_network(PluginNetwork {
+            fetcher: crate::fetcher::Fetcher::in_process().unwrap(),
+            config: config.clone(),
+            runtime: runtime.handle().clone(),
+        });
+        let fetch = |url: String| services.call("p", ServiceCall::FetchPage { url });
+
+        services.set_loaded(HashMap::from([("p".to_string(), vec![])]));
+        let err = fetch(format!("{base}/page")).unwrap_err();
+        assert!(err.contains("network"), "{err}");
+
+        // Off by default.
+        services.set_loaded(HashMap::from([(
+            "p".to_string(),
+            vec![Permission::Network],
+        )]));
+        let err = fetch(format!("{base}/page")).unwrap_err();
+        assert!(err.contains("turned off"), "{err}");
+
+        config
+            .update(|o| o.set("plugins", "allow_network", true))
+            .unwrap();
+        assert_eq!(
+            fetch(format!("{base}/page")).unwrap(),
+            ServiceReply::Page(Box::new(crate::fetcher::page::FetchedPage {
+                url: format!("{base}/page"),
+                content_type: "text/html".to_string(),
+                body: "<p>Hello</p>".to_string(),
+                truncated: false,
+            }))
+        );
+        let err = fetch(format!("{base}/nothing")).unwrap_err();
+        assert!(err.contains("404"), "{err}");
+
+        // Turned off again, at once.
+        config
+            .update(|o| {
+                o.unset("plugins", "allow_network");
+                Ok(())
+            })
+            .unwrap();
+        let err = fetch(format!("{base}/page")).unwrap_err();
+        assert!(err.contains("turned off"), "{err}");
+
+        // A server with no way to fetch pages refuses.
+        let offline =
+            ServerServices::new(pool, ScriptRunnerHandle::empty(), CancellationToken::new());
+        offline.set_loaded(HashMap::from([(
+            "p".to_string(),
+            vec![Permission::Network],
+        )]));
+        let err = offline
+            .call(
+                "p",
+                ServiceCall::FetchPage {
+                    url: format!("{base}/page"),
+                },
+            )
+            .unwrap_err();
+        assert!(err.contains("not available"), "{err}");
     }
 
     #[test]

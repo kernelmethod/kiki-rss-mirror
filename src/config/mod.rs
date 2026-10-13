@@ -26,6 +26,9 @@
 //!
 //! [api]
 //! anonymous_access = "read-only"
+//!
+//! [plugins]
+//! allow_network = true
 //! ```
 //!
 //! The proxy can also be set with environment variables, which take
@@ -101,6 +104,8 @@ pub struct Settings {
     pub web_ui: WebUiSettings,
     #[serde(default)]
     pub api: ApiSettings,
+    #[serde(default)]
+    pub plugins: PluginSettings,
 }
 
 /// Settings governing how and how often feeds are fetched.
@@ -303,6 +308,30 @@ pub struct ApiSettings {
     pub allowed_hosts: Option<Vec<HostPattern>>,
 }
 
+/// Settings for plugins.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginSettings {
+    /// Whether plugins whose manifest asks for the
+    /// [`network`](crate::plugins::Permission::Network) permission may fetch web
+    /// pages. Off by default: a plugin fetching pages reaches servers no feed
+    /// was added for, at URLs that may come from feeds. While it is off, their
+    /// `fetch-page` calls fail. A change takes effect with the next call, with
+    /// no restart.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::Overrides;
+    ///
+    /// let o = Overrides::parse("[plugins]\nallow_network = true\n").unwrap();
+    /// assert!(o.resolve().unwrap().plugins.allow_network);
+    /// assert!(!Overrides::parse("").unwrap().resolve().unwrap().plugins.allow_network);
+    /// ```
+    #[serde(default)]
+    pub allow_network: bool,
+}
+
 /// What a request without an API token may do; see
 /// [`ApiSettings::anonymous_access`].
 ///
@@ -444,6 +473,7 @@ impl Default for Settings {
             http: HttpSettings::default(),
             web_ui: WebUiSettings::default(),
             api: ApiSettings::default(),
+            plugins: PluginSettings::default(),
         }
     }
 }

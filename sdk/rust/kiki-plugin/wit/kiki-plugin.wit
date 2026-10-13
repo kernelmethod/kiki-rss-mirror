@@ -103,6 +103,19 @@ interface types {
         include-hidden: bool,
     }
 
+    /// A web page, as `fetch-page` returns it.
+    record page {
+        /// The URL the page was served from, after any redirects.
+        url: string,
+        /// `"text/html"` or `"application/xhtml+xml"`.
+        content-type: string,
+        /// The page, decoded to UTF-8.
+        body: string,
+        /// Whether the page was longer than Kiki reads (2 MiB), and was cut
+        /// short.
+        truncated: bool,
+    }
+
     /// What a finished scan did.
     record scan-summary {
         scanned: u64,
@@ -120,9 +133,9 @@ interface types {
 }
 
 /// What the server does for plugins: logging, their stores, stored entries,
-/// feeds and timers.
+/// feeds, timers and web pages.
 interface host {
-    use types.{level, feed, scan-options, delete-filter};
+    use types.{level, entry, feed, page, scan-options, delete-filter};
 
     /// Write `message` to the server log.
     log: func(level: level, message: string);
@@ -146,6 +159,15 @@ interface host {
 
     /// The feed `id`, or `none`.
     get-feed: func(id: s64) -> result<option<feed>, string>;
+
+    /// The stored entry of the feed `feed-id` whose guid is `guid`, as a
+    /// scan would see it, or `none` if there is none yet.
+    get-entry: func(feed-id: s64, guid: string) -> result<option<entry>, string>;
+
+    /// Fetch the web page at `url`, an http(s) URL, following redirects.
+    /// Needs the `network` permission, and network access for plugins
+    /// turned on in Kiki's settings (`plugins.allow_network`).
+    fetch-page: func(url: string) -> result<page, string>;
 
     /// Call `on-timer` with the returned id every `secs` seconds (60 to a
     /// year), starting `secs` seconds from now.
@@ -295,6 +317,10 @@ interface html {
 
     /// `s` with its character references decoded, as `select` decodes attribute values.
     unescape: func(s: string, max-bytes: u32) -> result<string, string>;
+
+    /// The content of the first element of `html` that `selector` matches, as HTML: what
+    /// is between its start tag and its end tag, or `none` if nothing matches.
+    inner: func(html: string, selector: string, max-bytes: u32) -> result<option<string>, string>;
 }
 
 world plugin {

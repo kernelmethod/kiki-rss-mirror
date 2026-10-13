@@ -58,6 +58,15 @@ impl ScriptServices for Recorder {
                 }
                 ServiceReply::Deleted(3)
             }
+            ServiceCall::GetEntry { .. } => ServiceReply::Entry(None),
+            ServiceCall::FetchPage { url } => {
+                ServiceReply::Page(Box::new(crate::fetcher::page::FetchedPage {
+                    url,
+                    content_type: "text/html".to_string(),
+                    body: "<p>page</p>".to_string(),
+                    truncated: false,
+                }))
+            }
         })
     }
 }
@@ -775,8 +784,19 @@ fn budgets_count_cpu_time() {
     budget.start(Some(Duration::from_millis(10)));
     first_check(&budget);
     std::thread::sleep(Duration::from_millis(60));
-    budget.give_back(Duration::from_millis(100));
+    budget.give_back(Duration::from_millis(100), false);
     assert!(!budget.expired());
+
+    // Only so much time is given back, unless it was spent waiting on the network, which
+    // has an allowance of its own.
+    budget.start(Some(Duration::from_millis(10)));
+    budget.give_back(MAX_CALL_ALLOWANCE * 2, false);
+    assert_eq!(budget.credit, MAX_CALL_ALLOWANCE);
+    budget.start(Some(Duration::from_millis(10)));
+    budget.give_back(MAX_NETWORK_ALLOWANCE + MAX_CALL_ALLOWANCE * 2, true);
+    assert_eq!(budget.credit, MAX_NETWORK_ALLOWANCE + MAX_CALL_ALLOWANCE);
+    budget.give_back(Duration::from_secs(1), true);
+    assert_eq!(budget.credit, MAX_NETWORK_ALLOWANCE + MAX_CALL_ALLOWANCE);
 
     // A call that has not run for its budget by the clock has not used it up.
     budget.start(Some(Duration::from_millis(100)));
