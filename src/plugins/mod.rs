@@ -86,6 +86,8 @@ mod auto_tag_tests;
 #[cfg(all(test, feature = "default-plugins"))]
 mod filter_tests;
 #[cfg(all(test, feature = "default-plugins"))]
+mod full_content_tests;
+#[cfg(all(test, feature = "default-plugins"))]
 mod privacy_tests;
 #[cfg(test)]
 mod retention_setting_tests;
@@ -273,7 +275,7 @@ impl PluginSource {
 /// Something a plugin may only do once its manifest asks for it, in its
 /// `permissions` array.
 ///
-/// Permissions guard what cannot be undone. A plugin that asks for one
+/// Permissions guard what cannot be undone, or reaches beyond Kiki. A plugin that asks for one
 /// says so where anyone installing it can see it: in its manifest, in
 /// `GET /v1/plugins`, in `kiki plugin ls` and in the web UI. The server
 /// refuses the calls a plugin makes without the permission they need.
@@ -282,6 +284,11 @@ pub enum Permission {
     /// Delete stored entries, with `delete-entries`.
     #[serde(rename = "entries.delete")]
     EntriesDelete,
+    /// Fetch web pages, with `fetch-page`. Granted only while network access
+    /// for plugins is turned on, with
+    /// [`PluginSettings::allow_network`](crate::config::PluginSettings::allow_network).
+    #[serde(rename = "network")]
+    Network,
 }
 
 impl Permission {
@@ -293,10 +300,12 @@ impl Permission {
     /// use kiki_rss::plugins::Permission;
     ///
     /// assert_eq!(Permission::EntriesDelete.name(), "entries.delete");
+    /// assert_eq!(Permission::Network.name(), "network");
     /// ```
     pub fn name(self) -> &'static str {
         match self {
             Self::EntriesDelete => "entries.delete",
+            Self::Network => "network",
         }
     }
 }

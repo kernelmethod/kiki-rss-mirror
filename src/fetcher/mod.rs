@@ -26,6 +26,7 @@
 //! it is `Serialize` + `Deserialize` so it can be sent over the IPC channel.
 
 pub mod assets;
+pub mod page;
 pub mod parse;
 pub mod parsing;
 pub mod retrieve;
@@ -35,6 +36,7 @@ use crate::config::ProxySettings;
 use crate::http::{FeedAuth, USER_AGENT};
 use crate::scripting::FeedEntry;
 use assets::{AssetReply, AssetSpec, PageIcons, PageSpec};
+use page::{FetchedPage, PageFetchSpec};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -602,6 +604,25 @@ impl Fetcher {
             } => Ok(assets::find_page_icons(clients, &Parsers::InProcess, &spec).await?),
             #[cfg(unix)]
             Fetcher::Isolated(host) => host.find_page_icons(spec).await,
+        }
+    }
+
+    /// Fetch the web page in `spec` for a plugin; see [`page::fetch_page`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::fetch`]; the inner `Err` is why the page could not be
+    /// fetched, for the plugin.
+    pub async fn fetch_page(
+        &self,
+        spec: PageFetchSpec,
+    ) -> Result<Result<FetchedPage, String>, FetcherError> {
+        match self {
+            Fetcher::InProcess {
+                assets: clients, ..
+            } => Ok(page::fetch_page(clients, &spec).await),
+            #[cfg(unix)]
+            Fetcher::Isolated(host) => host.fetch_page(spec).await,
         }
     }
 

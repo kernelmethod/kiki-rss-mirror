@@ -1,0 +1,16 @@
+[package]
+name = "kiki-full-content"
+version = "1.0.1"
+edition = "2021"
+publish = false
+description = "Kiki's full-content plugin, installed as plugins/full-content/plugin.wasm"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kiki-plugin = { path = "../../sdk/rust/kiki-plugin" }
+serde_json = "1"
+# For WASI's wall clock; the same version kiki-plugin uses.
+wit-bindgen = { version = "0.57", default-features = false, features = ["macros", "realloc"] }

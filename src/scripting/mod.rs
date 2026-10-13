@@ -19,16 +19,16 @@
 //!
 //! # Handler chaining and return values
 //!
-//! `entry.transform` handlers run in plugin order, and then `entry.ingest` handlers do;
-//! the output of one becomes the input of the next. A handler may return nothing to drop
+//! `entry.enrich` handlers run in plugin order, then `entry.transform` handlers do, and
+//! then `entry.ingest` handlers; the output of one becomes the input of the next. A handler may return nothing to drop
 //! the entry; subsequent handlers are not called. `fetch.schedule` handlers also run in order, each seeing the wait the one before
 //! it chose (see [`FetchSchedule`]). Handlers for observe-only events (everything else) are
 //! called for their side effects.
 //!
 //! # Error handling
 //!
-//! If a handler times out or traps, the error is logged as a warning. For `entry.transform`
-//! and `entry.ingest` the entry passes through the failing handler **unmodified**, and for `fetch.schedule`
+//! If a handler times out or traps, the error is logged as a warning. For `entry.enrich`,
+//! `entry.transform` and `entry.ingest` the entry passes through the failing handler **unmodified**, and for `fetch.schedule`
 //! the wait is left as it was; for observe events the failure is simply dropped. A broken
 //! plugin never silently drops entries.
 //!
@@ -278,7 +278,7 @@ pub fn parse_script_config(
 /// (`feed_id`, `syndication_format`, `guid`) are read-only from the script's perspective —
 /// any changes made to them in a script are ignored when converting back from the scripting
 /// layer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedEntry {
     /// ID of the stored entry, for entries handed to a scan (see [`ServiceCall::StartScan`]).
     /// `None` for entries being ingested, which are not stored yet. Read-only for scripts.
@@ -441,6 +441,10 @@ pub enum Event {
     /// `EntryIngest` handler, so those see the entry as it will be stored. For plugins
     /// that rewrite entries, such as by sanitizing their content.
     EntryTransform,
+    /// Like `EntryTransform`, and run before it: every plugin's handler runs before any
+    /// `EntryTransform` handler, so those rewrite what it brings in. For plugins that add
+    /// to entries from elsewhere, such as by fetching the article an entry links to.
+    EntryEnrich,
     /// Fires per-entry during feed refresh, immediately before `EntryIngest`. Observe-only;
     /// sees the entry exactly as parsed from the feed source.
     EntryParsed,
@@ -474,6 +478,7 @@ impl Event {
         match self {
             Self::EntryIngest => "entry.ingest",
             Self::EntryTransform => "entry.transform",
+            Self::EntryEnrich => "entry.enrich",
             Self::EntryParsed => "entry.parsed",
             Self::FetchSuccess => "fetch.success",
             Self::FetchError => "fetch.error",
@@ -491,6 +496,7 @@ impl Event {
         match self {
             Self::EntryIngest => "entry.ingest handler",
             Self::EntryTransform => "entry.transform handler",
+            Self::EntryEnrich => "entry.enrich handler",
             Self::EntryParsed => "entry.parsed handler",
             Self::FetchSuccess => "fetch.success handler",
             Self::FetchError => "fetch.error handler",
@@ -512,7 +518,7 @@ impl Event {
 ///
 /// Packed into two bytes, so the script host can report its subscriptions
 /// on every response for next to nothing. That holds sixteen events;
-/// [`Event`] has ten.
+/// [`Event`] has eleven.
 ///
 /// # Examples
 ///
@@ -574,7 +580,8 @@ impl EventSet {
 /// Payload variants carried alongside an [`Event`] when dispatched to scripts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventPayload {
-    /// Used for [`Event::EntryTransform`], [`Event::EntryIngest`] and [`Event::EntryParsed`].
+    /// Used for [`Event::EntryEnrich`], [`Event::EntryTransform`], [`Event::EntryIngest`] and
+    /// [`Event::EntryParsed`].
     Entry(FeedEntry),
     /// Used for [`Event::FetchSuccess`].
     FetchSuccess {
@@ -775,6 +782,21 @@ pub enum ServiceCall {
     /// [`entries.delete`](crate::plugins::Permission::EntriesDelete) permission. Answered
     /// with [`ServiceReply::Deleted`].
     DeleteEntries { filter: DeleteFilter },
+    /// Look up the stored entry of the feed `feed_id` whose guid is `guid`. Answered with
+    /// [`ServiceReply::Entry`].
+    GetEntry { feed_id: i64, guid: String },
+    /// Fetch the web page at `url`. Needs the plugin to have the
+    /// [`network`](crate::plugins::Permission::Network) permission, and network access for
+    /// plugins to be turned on. Answered with [`ServiceReply::Page`].
+    FetchPage { url: String },
+}
+
+impl ServiceCall {
+    /// Whether answering the call may take the server a while, as it waits on the network,
+    /// so that the time is not counted against the plugin making it.
+    pub fn is_slow(&self) -> bool {
+        matches!(self, ServiceCall::FetchPage { .. })
+    }
 }
 
 /// A feed, as plugins see it through `get-feed`.
@@ -801,6 +823,10 @@ pub enum ServiceReply {
     Feed(Option<FeedInfo>),
     /// How many entries were deleted.
     Deleted(u64),
+    /// A stored entry, or `None` if there is none.
+    Entry(Option<Box<FeedEntry>>),
+    /// A web page.
+    Page(Box<crate::fetcher::page::FetchedPage>),
     /// The call succeeded and has nothing to report.
     Done,
 }
@@ -823,8 +849,8 @@ pub trait ScriptServices: Send + Sync {
 /// Implementations hold a live scripting VM plus the handlers registered by scripts at load
 /// time, and route [`Event`]s to the appropriate handlers.
 ///
-/// Transform events use methods of their own: [`Event::EntryTransform`] and
-/// [`Event::EntryIngest`] use [`Self::dispatch_transform_entry`], which may return `Ok(None)` to filter the entry out,
+/// Transform events use methods of their own: [`Event::EntryEnrich`],
+/// [`Event::EntryTransform`] and [`Event::EntryIngest`] use [`Self::dispatch_transform_entry`], which may return `Ok(None)` to filter the entry out,
 /// and [`Event::FetchSchedule`] uses [`Self::dispatch_schedule`]. All other events are
 /// observe-only and dispatched via [`Self::dispatch_observe`].
 pub trait ScriptRunner: Send + Sync {
@@ -838,15 +864,18 @@ pub trait ScriptRunner: Send + Sync {
         true
     }
 
-    /// Whether any handler may be registered for [`Event::EntryTransform`] or
-    /// [`Event::EntryIngest`], the events [`Self::dispatch_transform_entry`] runs. Like
-    /// [`Self::handles`], a `false` is a promise and a `true` is not.
+    /// Whether any handler may be registered for [`Event::EntryEnrich`],
+    /// [`Event::EntryTransform`] or [`Event::EntryIngest`], the events
+    /// [`Self::dispatch_transform_entry`] runs. Like [`Self::handles`], a `false` is a
+    /// promise and a `true` is not.
     fn transforms_entries(&self) -> bool {
-        self.handles(Event::EntryTransform) || self.handles(Event::EntryIngest)
+        self.handles(Event::EntryEnrich)
+            || self.handles(Event::EntryTransform)
+            || self.handles(Event::EntryIngest)
     }
 
-    /// Pass `entry` through each `entry.transform` handler, then each `entry.ingest`
-    /// handler, each in registration order.
+    /// Pass `entry` through each `entry.enrich` handler, then each `entry.transform`
+    /// handler, then each `entry.ingest` handler, each in registration order.
     ///
     /// # Return values
     ///

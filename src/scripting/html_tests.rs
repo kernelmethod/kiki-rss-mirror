@@ -1,4 +1,4 @@
-//! Tests of the `html` interface: `select` and `rewrite`'s two passes, and `strip`'s one.
+//! Tests of the `html` interface: `select` and `rewrite`'s two passes, `strip`'s one, and `inner`.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
@@ -387,4 +387,71 @@ fn strip_is_capped_and_stops_once_the_budget_runs_out() {
         strip(&html, &rules, MAX, &|| true).unwrap_err(),
         HtmlError::Expired
     );
+}
+
+fn inner_of(html: &str, selector: &str) -> Option<String> {
+    inner(html, selector, MAX, &never).unwrap()
+}
+
+#[test]
+fn inner_returns_the_first_match_with_whatever_it_holds() {
+    let html =
+        "<div class=a><p>One <b>two</b></p><div class=a>nested</div></div><div class=a>later</div>";
+    assert_eq!(
+        inner_of(html, "div.a").as_deref(),
+        Some("<p>One <b>two</b></p><div class=a>nested</div>")
+    );
+    assert_eq!(inner_of(html, "b").as_deref(), Some("two"));
+    assert_eq!(inner_of(html, "section"), None);
+    // Comments and character references come back as they were written.
+    let html = "<main><!-- c -->&amp; &lt;x&gt;</main>";
+    assert_eq!(
+        inner_of(html, "main").as_deref(),
+        Some("<!-- c -->&amp; &lt;x&gt;")
+    );
+}
+
+#[test]
+fn inner_handles_empty_void_and_unclosed_elements() {
+    assert_eq!(inner_of("<p></p>", "p").as_deref(), Some(""));
+    assert_eq!(
+        inner_of("<p>x<img src=a.png>y</p>", "img").as_deref(),
+        Some("")
+    );
+    // With no end tag, the content runs to the end of the HTML.
+    assert_eq!(
+        inner_of("<article><p>x</p><p>y", "article").as_deref(),
+        Some("<p>x</p><p>y")
+    );
+}
+
+/// Only markers are NULs, so a NUL in the HTML can't end the content early.
+#[test]
+fn inner_replaces_nuls_in_the_html() {
+    assert_eq!(
+        inner_of("<p>a\x00b</p>", "p").as_deref(),
+        Some("a\u{FFFD}b")
+    );
+}
+
+#[test]
+fn inner_is_capped_and_stops_once_the_budget_runs_out() {
+    let html = "<article>0123456789</article>";
+    assert_eq!(
+        inner(html, "article", 10, &never).unwrap().as_deref(),
+        Some("0123456789")
+    );
+    let err = inner(html, "article", 9, &never).unwrap_err();
+    assert!(
+        matches!(&err, HtmlError::Failed(m) if m.contains("longer than")),
+        "{err:?}"
+    );
+    assert_eq!(
+        inner(html, "article", MAX, &|| true).unwrap_err(),
+        HtmlError::Expired
+    );
+    assert!(matches!(
+        inner(html, "<<", MAX, &never).unwrap_err(),
+        HtmlError::Failed(m) if m.contains("invalid selector")
+    ));
 }

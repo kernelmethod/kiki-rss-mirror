@@ -317,12 +317,22 @@ and nor do their credentials.
 A plugin, or a feed that subverts one, runs in the script host, which has
 no files and no sockets. What it can do is what the plugin API allows:
 
-- change or drop the entries passed to its `entry.transform` and
-  `entry.ingest` handlers;
+- change or drop the entries passed to its `entry.enrich`,
+  `entry.transform` and `entry.ingest` handlers;
 - delay a feed's next fetch, through `fetch.schedule`, but never past the
   feed's own interval, and never to fetch it sooner than its server asks;
 - tag and untag any stored entry;
-- read the URL and title of any feed;
+- read the URL and title of any feed, and any stored entry;
+- with the `network` permission, and only while `allow_network` under
+  [`[plugins]`](configuration/settings.md#plugins) is on (it is off by
+  default), have the feed fetcher fetch a web page from any URL, and read
+  it. The fetcher sends no credentials, and nothing but `GET` requests,
+  but it reaches whatever a feed can, your local network included: a feed
+  that subverts such a plugin, or merely links where it likes, as the
+  [`full-content`](plugins/full-content.md) plugin follows entries' links,
+  can make Kiki request a page from a server on your network and read it
+  into an entry. Feeds can make Kiki request images from anywhere already,
+  but can't read what comes back;
 - read and write plugin state. The server keeps each plugin's state
   apart, but it takes the script host's word for which plugin is asking, so
   code that breaks out of a plugin's sandbox can reach every plugin's state.
@@ -347,7 +357,8 @@ Each handler has a time and a memory budget (see
 may lift its time budget, as the bundled `sanitize` plugin does so that no
 entry is stored unsanitized; the server still stops a script host that
 goes silent for 10 seconds while requests wait on it, or keeps one waiting
-for 40. A script host that
+for 40, not counting the time the server itself spends answering plugins'
+calls, such as fetching a page. A script host that
 crashes or stops answering is not replaced; plugins stay disabled until
 Kiki is restarted, rather than handing a fresh script host to whatever
 broke the last one. Entries keep flowing in either way. A plugin that

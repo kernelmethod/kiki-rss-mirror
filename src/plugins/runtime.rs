@@ -18,7 +18,7 @@
 //! a plugin that needs to apply itself to the entries already stored starts a
 //! scan of them (see [`crate::plugins::services`]).
 
-use super::services::{LoadedPlugins, ServerServices};
+use super::services::{LoadedPlugins, PluginNetwork, ServerServices};
 use super::{discover, Discovery, PluginError};
 use crate::db::plugins::PluginConfigError;
 use crate::metrics::Metrics;
@@ -92,7 +92,8 @@ impl PluginRuntime {
     /// Plugins that cannot be discovered, and plugins that fail to compile,
     /// are logged, and the server runs without them until they are fixed
     /// and reloaded. The calls plugins make are answered until `cancel`
-    /// fires.
+    /// fires, and they may fetch web pages through `network`, if given and
+    /// while its settings allow it.
     ///
     /// # Errors
     ///
@@ -105,13 +106,16 @@ impl PluginRuntime {
         metrics: Arc<Metrics>,
         script_runner: ScriptRunnerHandle,
         script_host: crate::process::ScriptHostHandle,
+        network: Option<PluginNetwork>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Self, ReloadError> {
         let discovery = ArcSwap::from_pointee(Discovery::default());
-        let services = Arc::new(
-            ServerServices::new(db.clone(), script_runner.clone(), cancel)
-                .with_metrics(metrics.clone()),
-        );
+        let mut services = ServerServices::new(db.clone(), script_runner.clone(), cancel)
+            .with_metrics(metrics.clone());
+        if let Some(network) = network {
+            services = services.with_network(network);
+        }
+        let services = Arc::new(services);
         #[cfg(unix)]
         if let Some(host) = &script_host {
             host.set_services(services.clone());

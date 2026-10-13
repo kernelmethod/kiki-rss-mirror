@@ -403,8 +403,23 @@ impl Server {
             );
         }
 
+        let fetcher = match &self.feed_fetcher {
+            #[cfg(unix)]
+            Some(host) => crate::fetcher::Fetcher::Isolated(host.clone()),
+            #[cfg(not(unix))]
+            Some(()) => crate::fetcher::Fetcher::in_process()?,
+            None => crate::fetcher::Fetcher::in_process()?,
+        };
+
         // Plugins are reloaded while the server runs, whenever the plugins
         // directory changes or a plugin's config is changed through the API.
+        // They fetch web pages, while `plugins.allow_network` lets them,
+        // with the fetcher that fetches feeds.
+        let network = plugins::services::PluginNetwork {
+            fetcher: fetcher.clone(),
+            config: config.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        };
         let plugins = Arc::new(
             plugins::runtime::PluginRuntime::start(
                 self.plugins_dir.clone(),
@@ -412,6 +427,7 @@ impl Server {
                 metrics.clone(),
                 script_runner.clone(),
                 self.script_host.clone(),
+                Some(network),
                 self.cancel_token.clone(),
             )
             .with_context(|| "failed to load plugins")?,
@@ -440,14 +456,6 @@ impl Server {
                 e
             );
         }
-
-        let fetcher = match &self.feed_fetcher {
-            #[cfg(unix)]
-            Some(host) => crate::fetcher::Fetcher::Isolated(host.clone()),
-            #[cfg(not(unix))]
-            Some(()) => crate::fetcher::Fetcher::in_process()?,
-            None => crate::fetcher::Fetcher::in_process()?,
-        };
 
         let fetcher_lost = fetcher_lost(self.feed_fetcher.clone());
 

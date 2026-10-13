@@ -18,6 +18,7 @@
     - [Tagging entries automatically](plugins/auto-tag.md)
     - [Sanitizing entries' HTML](plugins/sanitize.md)
     - [Stripping tracking parameters](plugins/privacy.md)
+    - [Fetching full articles](plugins/full-content.md)
     - [Backing off from feeds that rarely change](plugins/adaptive-fetch.md)
     - [Deleting old entries](plugins/retention.md)
 

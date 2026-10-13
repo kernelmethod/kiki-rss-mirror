@@ -1,0 +1,80 @@
+name = "full-content"
+version = "1.0.1"
+engine = "wasm"
+entrypoint = "plugin.wasm"
+description = "Fetch the whole article for entries whose feed gives only a short summary of it"
+license = "MIT"
+homepage = "https://github.com/kernelmethod/kiki-rss"
+
+# Written in Rust, as a WebAssembly component: its source is beside this
+# manifest in Kiki's repository.
+
+# Fetching an article means fetching a web page, which plugins may only do
+# with the `network` permission, and only while network access for plugins
+# is turned on in kiki.toml, which it isn't by default:
+#
+#     [plugins]
+#     allow_network = true
+#
+# Until then this plugin does nothing.
+permissions = ["network"]
+
+# Each article is fetched while its entry is being stored, which can take
+# far longer than the 100 ms other plugins get. Time spent waiting on the
+# network doesn't count against this, up to 30 seconds a handler call;
+# this is for finding the article in a long page.
+time_budget_ms = 2000
+
+# An entry whose content has fewer than `min_length` characters of text,
+# not counting spaces, is taken for a summary: the plugin fetches the page
+# its link leads to, and replaces the entry's content with the article
+# found there, in the first element that one of `selectors` matches. An
+# article fetched once is kept, and not fetched again on later refreshes.
+# See src/lib.rs for the details.
+#
+# `feeds` and `exclude` name feeds by id, or by the URL they are fetched
+# from. With both empty, every feed's summaries are filled in.
+[config]
+feeds = []
+exclude = []
+min_length = 500
+selectors = [
+    '[itemprop="articleBody"]',
+    ".entry-content",
+    ".post-content",
+    ".article-content",
+    ".article-body",
+    ".post-body",
+    "article",
+    '[role="main"]',
+    "main",
+]
+
+[[settings]]
+name = "feeds"
+type = "list"
+items = { type = "feed" }
+label = "Only these feeds"
+description = "Fetch articles only for these feeds' entries, each feed given by its id or the URL it is fetched from. Empty means every feed."
+
+[[settings]]
+name = "exclude"
+type = "list"
+items = { type = "feed" }
+label = "Never these feeds"
+description = "Never fetch articles for these feeds' entries, each feed given by its id or the URL it is fetched from."
+
+[[settings]]
+name = "min_length"
+type = "integer"
+label = "Shortest full entry"
+description = "An entry whose content has fewer characters of text than this, not counting spaces, is taken for a summary, and its article is fetched."
+min = 1
+max = 1000000
+
+[[settings]]
+name = "selectors"
+type = "list"
+items = { type = "string" }
+label = "Where the article is"
+description = "CSS selectors for the element holding the article on its page, tried in order. Put one for a site whose articles aren't found first."

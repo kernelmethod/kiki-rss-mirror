@@ -67,7 +67,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kiki-adaptive-fetch"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "kiki-plugin",
  "serde_json",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "kiki-auto-tag"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "kiki-plugin",
  "serde_json",
@@ -83,15 +83,24 @@ dependencies = [
 
 [[package]]
 name = "kiki-filter"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "kiki-plugin",
  "serde_json",
 ]
 
 [[package]]
+name = "kiki-full-content"
+version = "1.0.1"
+dependencies = [
+ "kiki-plugin",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "kiki-plugin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "kiki-plugin-macros",
  "serde",
@@ -101,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "kiki-plugin-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -110,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "kiki-privacy"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "kiki-plugin",
  "memchr",
@@ -119,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "kiki-retention"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "kiki-plugin",
  "serde_json",
@@ -128,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "kiki-sanitize"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "kiki-plugin",
  "serde_json",

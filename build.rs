@@ -37,6 +37,7 @@ mod default_plugins {
         "adaptive-fetch",
         "auto-tag",
         "filter",
+        "full-content",
         "privacy",
         "retention",
         "sanitize",

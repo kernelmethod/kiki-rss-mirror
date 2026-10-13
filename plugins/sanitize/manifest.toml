@@ -1,5 +1,5 @@
 name = "sanitize"
-version = "2.1.0"
+version = "2.2.0"
 engine = "wasm"
 entrypoint = "plugin.wasm"
 description = "Sanitize the HTML content of new entries: keep only the elements and attributes allowed, and drop scripts, styles, embedded content, event handlers and links to unsafe URLs"

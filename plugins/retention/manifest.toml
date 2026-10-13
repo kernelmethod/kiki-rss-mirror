@@ -1,5 +1,5 @@
 name = "retention"
-version = "2.0.0"
+version = "2.1.0"
 engine = "wasm"
 entrypoint = "plugin.wasm"
 description = "Delete entries once their feed has stopped listing them for a number of days"

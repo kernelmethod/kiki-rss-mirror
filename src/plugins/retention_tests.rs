@@ -237,6 +237,7 @@ fn the_installed_plugin_deletes_old_entries() {
         Arc::new(crate::metrics::Metrics::new().unwrap()),
         ScriptRunnerHandle::empty(),
         None,
+        None,
         CancellationToken::new(),
     )
     .unwrap();

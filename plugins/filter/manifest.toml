@@ -1,5 +1,5 @@
 name = "filter"
-version = "3.1.0"
+version = "3.2.0"
 engine = "wasm"
 entrypoint = "plugin.wasm"
 description = "Hide entries whose fields match, or fail to match, regular expressions"

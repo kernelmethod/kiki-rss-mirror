@@ -111,6 +111,12 @@ pub const LOAD_BUDGET: Duration = super::WASM_LOAD_BUDGET;
 /// time budget.
 pub const MAX_CALL_ALLOWANCE: Duration = Duration::from_secs(1);
 
+/// How much of the time a call spends waiting on the network, as for `fetch-page`, does
+/// not count against its time budget, on top of [`MAX_CALL_ALLOWANCE`]: about long enough
+/// to fetch one page that takes as long as the fetcher allows
+/// ([`crate::fetcher::page::PAGE_FETCH_TIMEOUT`]), and a quick one besides.
+pub const MAX_NETWORK_ALLOWANCE: Duration = Duration::from_secs(30);
+
 /// How many traps a plugin may hit in [`TRAP_WINDOW`] before it is disabled until plugins
 /// next reload.
 pub const MAX_TRAPS: usize = 5;
@@ -332,7 +338,8 @@ fn thread_cpu_time() -> Duration {
 /// not stopped because the machine is busy and its thread waits for a CPU. So that a call
 /// still cannot run for ever, it is also stopped once it has taken [`wall_limit`] in
 /// wall-clock time. Time the call spends on the server's behalf, waiting on it or doing
-/// its work on this thread, is given back to it, up to [`MAX_CALL_ALLOWANCE`].
+/// its work on this thread, is given back to it, up to [`MAX_CALL_ALLOWANCE`], and time
+/// it spends waiting on the network up to [`MAX_NETWORK_ALLOWANCE`] more.
 ///
 /// Reading the CPU time is a system call, which in the sandboxed script host also runs
 /// through its seccomp filter, and a plugin checks its budget on every call to the host,
@@ -352,6 +359,7 @@ struct CallBudget {
     /// The time given back to the call, which neither its budget nor its ceiling counts.
     credit: Duration,
     allowance: Duration,
+    network_allowance: Duration,
 }
 
 /// How long a call with a CPU time budget runs before it first reads the CPU time; see
@@ -377,6 +385,7 @@ impl CallBudget {
         self.cpu_start.set(None);
         self.credit = Duration::ZERO;
         self.allowance = MAX_CALL_ALLOWANCE;
+        self.network_allowance = MAX_NETWORK_ALLOWANCE;
     }
 
     fn stop(&mut self) {
@@ -407,8 +416,16 @@ impl CallBudget {
     }
 
     /// Give back `waited`, time the call spent on the server's behalf, up to what is left
-    /// of [`MAX_CALL_ALLOWANCE`].
-    fn give_back(&mut self, waited: Duration) {
+    /// of [`MAX_CALL_ALLOWANCE`]; or, if the server spent it waiting on the network, up to
+    /// what is left of [`MAX_NETWORK_ALLOWANCE`] first.
+    fn give_back(&mut self, waited: Duration, network: bool) {
+        let mut waited = waited;
+        if network {
+            let credit = waited.min(self.network_allowance);
+            self.network_allowance -= credit;
+            self.credit += credit;
+            waited -= credit;
+        }
         let credit = waited.min(self.allowance);
         self.allowance -= credit;
         self.credit += credit;
@@ -483,9 +500,10 @@ impl State {
                 "{name}: the handler has used up its time budget"
             )));
         }
+        let network = call.is_slow();
         let start = Instant::now();
         let result = services.call(&self.plugin, call);
-        self.budget.give_back(start.elapsed());
+        self.budget.give_back(start.elapsed(), network);
         Ok(result.map_err(|e| format!("{name}: {e}")))
     }
 }
@@ -725,6 +743,18 @@ impl html_host::Host for State {
         self.check_budget("html.unescape")?;
         Self::html_result("html.unescape", super::html::unescape(&s, max_bytes))
     }
+
+    fn inner(
+        &mut self,
+        html: String,
+        selector: String,
+        max_bytes: u32,
+    ) -> wasmtime::Result<Result<Option<String>, String>> {
+        self.check_budget("html.inner")?;
+        let budget = &self.budget;
+        let content = super::html::inner(&html, &selector, max_bytes, &|| budget.expired());
+        Self::html_result("html.inner", content)
+    }
 }
 
 fn unexpected<T>(name: &str, reply: ServiceReply) -> wasmtime::Result<Result<T, String>> {
@@ -839,6 +869,31 @@ impl Host for State {
                 title: f.title,
             }))),
             Ok(other) => unexpected("get-feed", other),
+            Err(e) => Ok(Err(e)),
+        }
+    }
+
+    fn get_entry(
+        &mut self,
+        feed_id: i64,
+        guid: String,
+    ) -> wasmtime::Result<Result<Option<wit::Entry>, String>> {
+        match self.service("get-entry", ServiceCall::GetEntry { feed_id, guid })? {
+            Ok(ServiceReply::Entry(entry)) => Ok(Ok(entry.map(|mut e| entry_to_wit(&mut e)))),
+            Ok(other) => unexpected("get-entry", other),
+            Err(e) => Ok(Err(e)),
+        }
+    }
+
+    fn fetch_page(&mut self, url: String) -> wasmtime::Result<Result<wit::Page, String>> {
+        match self.service("fetch-page", ServiceCall::FetchPage { url })? {
+            Ok(ServiceReply::Page(page)) => Ok(Ok(wit::Page {
+                url: page.url,
+                content_type: page.content_type,
+                body: page.body,
+                truncated: page.truncated,
+            })),
+            Ok(other) => unexpected("fetch-page", other),
             Err(e) => Ok(Err(e)),
         }
     }
@@ -1011,6 +1066,7 @@ fn finish_call<R>(
 fn event_from_kind(kind: wit::EventKind) -> Event {
     match kind {
         wit::EventKind::EntryParsed => Event::EntryParsed,
+        wit::EventKind::EntryEnrich => Event::EntryEnrich,
         wit::EventKind::EntryTransform => Event::EntryTransform,
         wit::EventKind::EntryIngest => Event::EntryIngest,
         wit::EventKind::FetchSuccess => Event::FetchSuccess,
@@ -1504,8 +1560,8 @@ impl WasmScriptRunner {
         }
     }
 
-    /// Pass `entry` through each `entry.transform` handler and then each `entry.ingest`
-    /// handler, each in registration order, changing it in place, and calling `on_run` with the index in load order and the name of each
+    /// Pass `entry` through each `entry.enrich` handler, then each `entry.transform` handler
+    /// and then each `entry.ingest` handler, each in registration order, changing it in place, and calling `on_run` with the index in load order and the name of each
     /// plugin whose handler ran, and how long it took, in seconds.
     ///
     /// Returns which fields the handlers changed, or `None` if a handler dropped the entry.
@@ -1520,17 +1576,19 @@ impl WasmScriptRunner {
         // Moved into the WIT type once, and back at the end, rather than copied for each
         // plugin.
         let mut current = entry_to_wit(entry);
-        let chain = [Event::EntryTransform, Event::EntryIngest]
-            .into_iter()
-            .flat_map(|event| self.locked_for(event).map(move |(i, p)| (event, i, p)));
+        let chain = [
+            Event::EntryEnrich,
+            Event::EntryTransform,
+            Event::EntryIngest,
+        ]
+        .into_iter()
+        .flat_map(|event| self.locked_for(event).map(move |(i, p)| (event, i, p)));
         for (event, index, mut plugin) in chain {
             let start = Instant::now();
-            let returned = plugin.call(&mut dispatch, event.handler_name(), |b, s| {
-                if event == Event::EntryTransform {
-                    b.call_on_entry_transform(s, &current)
-                } else {
-                    b.call_on_entry_ingest(s, &current)
-                }
+            let returned = plugin.call(&mut dispatch, event.handler_name(), |b, s| match event {
+                Event::EntryEnrich => b.call_on_entry_enrich(s, &current),
+                Event::EntryTransform => b.call_on_entry_transform(s, &current),
+                _ => b.call_on_entry_ingest(s, &current),
             });
             on_run(index, &plugin.name, start.elapsed().as_secs_f64());
             match returned {
