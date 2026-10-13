@@ -931,7 +931,3 @@ is listed under `errors` in `GET /v1/plugins`, and skipped. To keep using
 one, rewrite it as a WebAssembly plugin. The plugins Kiki bundles were all
 rewritten in Rust, taking the same configs, and `kiki init --check` replaces
 their Lua versions, unless you edited them.
-
-Earlier still, Kiki stored scripts in the database and managed them through
-the `/v1/scripts/*` API. `kiki migrate` drops those scripts along with the
-tables they were kept in.

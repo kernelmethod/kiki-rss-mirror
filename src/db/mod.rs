@@ -103,8 +103,10 @@ impl<'a> ConnectionBuilder<'a> {
             tx.execute_batch(include_str!("include/init.sql"))
                 .with_context(|| "Failed to initialize database")?;
 
-            // Mark all known migrations as applied since init.sql
-            // contains the complete current schema
+            // init.sql holds the complete current schema: record its
+            // generation, and mark all known migrations as applied
+            tx.pragma_update(None, "user_version", migrations::SCHEMA_GENERATION)
+                .with_context(|| "unable to record the schema generation during init")?;
             for migration in migrations::MIGRATIONS {
                 tx.execute(
                     "INSERT INTO migrations (name) VALUES (?1)",
@@ -220,7 +222,6 @@ mod tests {
             "entries_fts_docsize",
             "entries_fts_idx",
             "entry_assets",
-            "entry_id_high_water",
             "entry_sources",
             "entry_tags",
             "feed_assets",
@@ -258,6 +259,35 @@ mod tests {
         let applied_names: Vec<String> = applied.into_iter().map(|r| r.text).collect();
         assert_eq!(applied_names, expected_migrations);
 
+        Ok(())
+    }
+
+    /// Deleting the newest tag, feed or entry doesn't free its id for the
+    /// next one to take.
+    #[test]
+    fn test_ids_are_not_reused() -> Result<()> {
+        let conn = ConnectionBuilder::default().in_memory().create().build()?;
+        let insert = |sql: &str| -> Result<i64> {
+            Ok(conn.query_row(&format!("{sql} RETURNING id"), [], |r| r.get(0))?)
+        };
+        let cases = [
+            ("tags", "INSERT INTO tags (name) VALUES ('t')"),
+            (
+                "feeds",
+                "INSERT INTO feeds (title, url) VALUES ('f', 'http://f/')",
+            ),
+            (
+                "entries",
+                "INSERT INTO entries (syndication_format, guid, published_at, title, url)
+                 VALUES ('rss', 'g', 0, 't', 'u')",
+            ),
+        ];
+        for (table, sql) in cases {
+            let first = insert(sql)?;
+            conn.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [first])?;
+            let second = insert(sql)?;
+            assert!(second > first, "{table} reused id {first}");
+        }
         Ok(())
     }
 

@@ -20,27 +20,44 @@ pub struct Migration {
 /// When adding a new migration:
 /// 1. Create the SQL file in `src/db/include/migrations/`
 /// 2. Append an entry to this array, numbering it after the last one
-///    (the first is `0001_...`)
+///    (the first of each [`SCHEMA_GENERATION`] is `0001_...`)
 /// 3. Make the same change to `src/db/include/init.sql`, which always holds
 ///    the complete current schema
-pub const MIGRATIONS: &[Migration] = &[
-    Migration {
-        name: "0001_api_tokens",
-        sql: include_str!("include/migrations/0001_api_tokens.sql"),
-    },
-    Migration {
-        name: "0002_adaptive_fetch_plugin",
-        sql: include_str!("include/migrations/0002_adaptive_fetch_plugin.sql"),
-    },
-    Migration {
-        name: "0003_entry_search_index",
-        sql: include_str!("include/migrations/0003_entry_search_index.sql"),
-    },
-    Migration {
-        name: "0004_http_cache",
-        sql: include_str!("include/migrations/0004_http_cache.sql"),
-    },
-];
+pub const MIGRATIONS: &[Migration] = &[];
+
+/// The generation of the schema that `init.sql` creates, which a new
+/// database stores as its `user_version`.
+///
+/// Migrations only go from one schema to the next within a generation. A
+/// change that they can't make, or that isn't worth writing one for, such
+/// as rebuilding a table to add `AUTOINCREMENT`, starts a new generation
+/// instead: bump this, clear [`MIGRATIONS`], and describe the break in the
+/// release notes. Databases from an earlier generation are refused, and
+/// have to be created again.
+pub const SCHEMA_GENERATION: i64 = 1;
+
+/// Check that the database is from the current [`SCHEMA_GENERATION`], so
+/// that its schema is one that [`MIGRATIONS`] can bring up to date.
+///
+/// # Errors
+///
+/// Returns an error if the database is from another generation (databases
+/// from before generations were introduced have a `user_version` of 0), or
+/// if its `user_version` can't be read.
+pub fn check_generation(conn: &Connection) -> Result<()> {
+    let generation: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .with_context(|| "failed to read the database's schema generation")?;
+    if generation != SCHEMA_GENERATION {
+        anyhow::bail!(
+            "the database is from an incompatible version of Kiki (schema generation {}, \
+             expected {}) and can't be migrated; move it aside to start with a new one",
+            generation,
+            SCHEMA_GENERATION
+        );
+    }
+    Ok(())
+}
 
 /// SQL to create the migrations table. Safe to run on databases that already
 /// have it (uses `IF NOT EXISTS`).
@@ -67,8 +84,7 @@ fn applied_migration_names(conn: &Connection) -> Result<HashSet<String>> {
 
 /// Returns the list of migrations that have not yet been applied.
 ///
-/// This bootstraps the `migrations` table if it does not exist, making it
-/// safe to call on legacy databases that only have `schema_version`.
+/// This creates the `migrations` table if it does not exist.
 pub fn pending_migrations(conn: &Connection) -> Result<Vec<&'static Migration>> {
     pending_in(conn, MIGRATIONS)
 }
@@ -168,6 +184,20 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A fresh database is from the current generation, and one from an
+    /// earlier generation (or from before generations) is refused.
+    #[test]
+    fn test_check_generation() -> Result<()> {
+        let conn = ConnectionBuilder::default().in_memory().create().build()?;
+        check_generation(&conn)?;
+        for generation in [0, SCHEMA_GENERATION + 1] {
+            conn.pragma_update(None, "user_version", generation)?;
+            let err = check_generation(&conn).expect_err("an old generation is refused");
+            assert!(err.to_string().contains("incompatible"), "{err}");
+        }
+        Ok(())
+    }
+
     /// Running the migration runner on a fresh database should be a no-op
     /// since all migrations are already marked as applied during init.
     #[test]
@@ -178,85 +208,6 @@ pub(crate) mod tests {
             count, 0,
             "no migrations should be applied on fresh database"
         );
-        Ok(())
-    }
-
-    /// `0001_api_tokens` adds the `api_tokens` table to a database from
-    /// before it.
-    #[test]
-    fn test_0001_api_tokens() -> Result<()> {
-        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
-        conn.execute_batch(
-            "DROP TABLE api_tokens; DELETE FROM migrations WHERE name = '0001_api_tokens';",
-        )?;
-        assert_eq!(run_pending_migrations(&mut conn)?, 1);
-        let (token, secret) =
-            crate::db::tokens::create(&conn, "t", crate::auth::Scopes::all(), None)?;
-        assert_eq!(
-            crate::db::tokens::authenticate(&conn, &secret, 0)?,
-            crate::db::tokens::Authentication::Valid(token)
-        );
-        Ok(())
-    }
-
-    /// `0002_adaptive_fetch_plugin` hands each feed's adaptive level to the
-    /// adaptive-fetch plugin's store, and the feeds it was turned off for to
-    /// the plugin's `exclude` setting, then drops the columns.
-    #[test]
-    fn test_0002_adaptive_fetch_plugin() -> Result<()> {
-        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
-        conn.execute_batch(
-            "ALTER TABLE feeds ADD COLUMN adaptive_fetch INTEGER;
-             ALTER TABLE feeds ADD COLUMN adaptive_fetch_level INTEGER NOT NULL DEFAULT 0;
-             DELETE FROM migrations WHERE name = '0002_adaptive_fetch_plugin';
-             INSERT INTO feeds (id, title, url, adaptive_fetch, adaptive_fetch_level) VALUES
-                 (1, 'follows the server', 'http://a/', NULL, 3),
-                 (2, 'turned on', 'http://b/', 1, 5),
-                 (3, 'turned off', 'http://c/', 0, 2),
-                 (4, 'never backed off', 'http://d/', NULL, 0),
-                 (5, 'also turned off', 'http://e/', 0, 0);",
-        )?;
-        assert_eq!(run_pending_migrations(&mut conn)?, 1);
-
-        let levels: Vec<(String, String)> = conn
-            .prepare(
-                "SELECT key, value FROM plugin_store
-                 WHERE plugin = 'adaptive-fetch' ORDER BY key",
-            )?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<_, _>>()?;
-        assert_eq!(
-            levels,
-            [
-                ("level:1".to_string(), "3".to_string()),
-                ("level:2".to_string(), "5".to_string()),
-            ]
-        );
-        let config = crate::db::plugins::get_config_overrides(&conn, "adaptive-fetch")?;
-        assert_eq!(config["exclude"], serde_json::json!([3, 5]));
-
-        let columns: Vec<String> = conn
-            .prepare("SELECT name FROM pragma_table_info('feeds')")?
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        assert!(!columns.iter().any(|c| c.starts_with("adaptive")));
-        Ok(())
-    }
-
-    /// Without feeds turned off, `0002_adaptive_fetch_plugin` leaves the
-    /// adaptive-fetch plugin with no config overrides.
-    #[test]
-    fn test_0002_adaptive_fetch_plugin_without_overrides() -> Result<()> {
-        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
-        conn.execute_batch(
-            "ALTER TABLE feeds ADD COLUMN adaptive_fetch INTEGER;
-             ALTER TABLE feeds ADD COLUMN adaptive_fetch_level INTEGER NOT NULL DEFAULT 0;
-             DELETE FROM migrations WHERE name = '0002_adaptive_fetch_plugin';
-             INSERT INTO feeds (title, url) VALUES ('feed', 'http://a/');",
-        )?;
-        assert_eq!(run_pending_migrations(&mut conn)?, 1);
-        let rows: i64 = conn.query_row("SELECT count(*) FROM plugins", [], |row| row.get(0))?;
-        assert_eq!(rows, 0);
         Ok(())
     }
 
@@ -409,97 +360,6 @@ pub(crate) mod tests {
         // Deleting an entry takes its tags with it, leaving the rest alone.
         conn.execute("DELETE FROM entries WHERE id = 1", [])?;
         check(2000)?;
-        Ok(())
-    }
-
-    /// `0003_entry_search_index` adds the index that full-text searches
-    /// name with INDEXED BY, without which they would fail.
-    #[test]
-    fn test_0003_entry_search_index() -> Result<()> {
-        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
-        conn.execute_batch(
-            "DROP INDEX idx_entry_search;
-             DELETE FROM migrations WHERE name = '0003_entry_search_index';",
-        )?;
-        assert_eq!(run_pending_migrations(&mut conn)?, 1);
-        conn.query_row(
-            "SELECT COUNT(*) FROM entries e INDEXED BY idx_entry_search
-             JOIN entries_fts ON e.id = entries_fts.rowid
-             WHERE entries_fts MATCH 'news'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        Ok(())
-    }
-
-    /// `0004_http_cache` moves the cache state of feeds and assets into
-    /// `http_cache`, keyed by URL, and drops the old columns.
-    #[test]
-    fn test_0004_http_cache() -> Result<()> {
-        let mut conn = ConnectionBuilder::default().in_memory().create().build()?;
-        conn.execute_batch(
-            "DROP TRIGGER http_cache_feed_ad;
-             DROP TRIGGER http_cache_feed_au;
-             DROP TRIGGER http_cache_asset_ad;
-             DROP TABLE http_cache;
-             ALTER TABLE feeds ADD COLUMN header_etag VARCHAR;
-             ALTER TABLE feeds ADD COLUMN header_last_modified VARCHAR;
-             ALTER TABLE feeds ADD COLUMN header_body_hash VARCHAR;
-             ALTER TABLE feeds ADD COLUMN last_full_refresh_at INTEGER;
-             ALTER TABLE feeds ADD COLUMN header_expires INTEGER;
-             ALTER TABLE feeds ADD COLUMN header_immutable_until INTEGER;
-             ALTER TABLE feed_assets ADD COLUMN etag TEXT;
-             ALTER TABLE feed_assets ADD COLUMN last_modified TEXT;
-             DELETE FROM migrations WHERE name = '0004_http_cache';
-             INSERT INTO feeds (id, title, url, header_etag, header_last_modified,
-                                header_body_hash, last_full_refresh_at, header_expires,
-                                header_immutable_until) VALUES
-                 (1, 'cached', 'http://a/', '\"a\"', 'Mon', 'hash', 10, 20, 30),
-                 (2, 'never fetched', 'http://b/', NULL, NULL, NULL, NULL, NULL, NULL);
-             INSERT INTO feed_assets (blake3, original_url, size_bytes, etag, last_modified)
-             VALUES
-                 ('h1', 'http://x/a.png', 1, '\"x1\"', NULL),
-                 ('h2', 'http://x/a.png', 1, '\"x2\"', NULL),
-                 ('h3', 'http://x/b.png', 1, NULL, NULL);",
-        )?;
-        assert_eq!(run_pending_migrations(&mut conn)?, 1);
-
-        use crate::db::http_cache::{lookup, CacheEntry};
-        assert_eq!(
-            lookup(&conn, "http://a/")?,
-            Some(CacheEntry {
-                etag: Some("\"a\"".into()),
-                last_modified: Some("Mon".into()),
-                expires_at: Some(20),
-                immutable_until: Some(30),
-                body_hash: Some("hash".into()),
-                last_full_refresh_at: Some(10),
-            })
-        );
-        assert_eq!(lookup(&conn, "http://b/")?, None);
-        assert_eq!(
-            lookup(&conn, "http://x/a.png")?.and_then(|e| e.etag),
-            Some("\"x1\"".into())
-        );
-        assert_eq!(lookup(&conn, "http://x/b.png")?, None);
-
-        for table in ["feeds", "feed_assets"] {
-            let columns: Vec<String> = conn
-                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
-                .query_map([], |row| row.get(0))?
-                .collect::<Result<_, _>>()?;
-            assert!(
-                !columns.iter().any(|c| c.starts_with("header_")
-                    || c == "etag"
-                    || c == "last_modified"
-                    || c == "last_full_refresh_at"),
-                "{table} still has cache columns: {columns:?}"
-            );
-        }
-
-        // The triggers came with it.
-        conn.execute("DELETE FROM feeds WHERE id = 1", [])?;
-        assert_eq!(lookup(&conn, "http://a/")?, None);
         Ok(())
     }
 }

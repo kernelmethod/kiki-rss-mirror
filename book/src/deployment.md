@@ -39,6 +39,12 @@ sudo -u kiki env KIKI_HOME=/var/lib/kiki kiki migrate
 `kiki migrate` backs up the database first, so it needs about as much free
 space as the database takes; `--no-backup` skips the backup.
 
+Some releases change the schema in ways that migrations can't follow, and
+start a new schema generation. Their release notes say so. `kiki serve` and
+`kiki migrate` refuse a database from an earlier generation: stop the
+service, export your feeds with `kiki opml export` if you want to keep them,
+move the database aside, and let Kiki create a new one.
+
 ## Sandboxing
 
 On Linux, `kiki serve` sandboxes itself as it starts, with Landlock limiting

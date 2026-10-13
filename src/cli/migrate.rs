@@ -60,6 +60,7 @@ impl MigrateArgs {
                 .read_write()
                 .build()
                 .with_context(|| format!("failed to open database at {database:?}"))?;
+            migrations::check_generation(&conn)?;
 
             let pending = migrations::pending_in(&conn, known)?;
             if pending.is_empty() {
@@ -76,6 +77,7 @@ impl MigrateArgs {
                 .read_write()
                 .build()
                 .with_context(|| format!("failed to open database at {database:?}"))?;
+            migrations::check_generation(&conn)?;
 
             if !self.no_backup {
                 if let Some(first) = migrations::pending_in(&conn, known)?.first() {
@@ -182,6 +184,26 @@ mod tests {
             no_backup: false,
         }
         .run_with(TEST_MIGRATIONS)?;
+        assert!(backups(td.path())?.is_empty());
+        Ok(())
+    }
+
+    /// A database from an earlier schema generation is refused, without a
+    /// backup or any migration.
+    #[test]
+    fn databases_from_an_earlier_generation_are_refused() -> Result<()> {
+        let (td, path) = outdated_database()?;
+        Connection::open(&path)?.pragma_update(None, "user_version", 0)?;
+        for dry_run in [true, false] {
+            let result = MigrateArgs {
+                database: Some(path.clone()),
+                dry_run,
+                no_backup: false,
+            }
+            .run_with(TEST_MIGRATIONS);
+            assert!(result.is_err(), "dry_run = {dry_run}");
+        }
+        assert!(!has_table(&path)?);
         assert!(backups(td.path())?.is_empty());
         Ok(())
     }
