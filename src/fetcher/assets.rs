@@ -11,7 +11,7 @@
 //! ([`crate::tasks::assets`]), after checking it again.
 
 use super::svg::SVG_CONTENT_TYPE;
-use super::{ParseFailure, Parsers, ProxiedClient};
+use super::{ParseFailure, Parsers, ProxiedClient, ResponseHeaders, Validators};
 use crate::config::ProxySettings;
 use crate::http::{read_body_capped, CappedBody};
 use lol_html::html_content::Element;
@@ -228,6 +228,10 @@ pub struct AssetSpec {
     /// What the asset is, which decides the content types accepted.
     pub kind: AssetKind,
 
+    /// What the HTTP cache holds for `url`, to make the download
+    /// conditional on.
+    pub validators: Validators,
+
     /// The proxy to download through, with environment overrides already
     /// applied by the server.
     #[serde(with = "super::proxy_wire")]
@@ -244,7 +248,10 @@ pub enum AssetReply {
     /// or the client could not be configured for the proxy.
     Network { message: String },
 
-    /// Any status other than a success.
+    /// `304 Not Modified`: the copy the validators came from is current.
+    NotModified { headers: ResponseHeaders },
+
+    /// Any status other than a success or `304 Not Modified`.
     HttpStatus { status: u16 },
 
     /// The response's `Content-Type` was missing, or not one cached for
@@ -268,9 +275,9 @@ pub struct FetchedAsset {
     /// The normalized `Content-Type`; see [`normalize_content_type`].
     pub content_type: String,
 
-    pub etag: Option<String>,
-
-    pub last_modified: Option<String>,
+    /// The response's caching headers, for the server to record in the
+    /// HTTP cache.
+    pub headers: ResponseHeaders,
 
     /// Encoded as one length and the raw bytes, not byte by byte.
     #[serde(with = "serde_bytes")]
@@ -306,7 +313,7 @@ pub async fn fetch_asset(
         }
     };
 
-    let resp = match client.get(url).send().await {
+    let resp = match spec.validators.apply(client.get(url)).send().await {
         Ok(r) => r,
         Err(e) => {
             return Ok(AssetReply::Network {
@@ -314,6 +321,10 @@ pub async fn fetch_asset(
             })
         }
     };
+    let headers = ResponseHeaders::capture(resp.headers());
+    if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(AssetReply::NotModified { headers });
+    }
     if !resp.status().is_success() {
         return Ok(AssetReply::HttpStatus {
             status: resp.status().as_u16(),
@@ -332,15 +343,6 @@ pub async fn fetch_asset(
             })
         }
     };
-    let header = |name| {
-        resp.headers()
-            .get(name)
-            .and_then(|v: &reqwest::header::HeaderValue| v.to_str().ok())
-            .map(str::to_string)
-    };
-    let etag = header(reqwest::header::ETAG);
-    let last_modified = header(reqwest::header::LAST_MODIFIED);
-
     // Streamed under the cap: checking `Content-Length` up front and then
     // calling `bytes()` would still buffer the whole body for a server
     // that lies about (or omits) the header.
@@ -364,8 +366,7 @@ pub async fn fetch_asset(
     };
     Ok(AssetReply::Fetched(Box::new(FetchedAsset {
         content_type,
-        etag,
-        last_modified,
+        headers,
         bytes,
     })))
 }
@@ -847,8 +848,7 @@ mod tests {
     fn asset_bodies_are_encoded_as_raw_bytes() {
         let reply = AssetReply::Fetched(Box::new(FetchedAsset {
             content_type: "image/png".into(),
-            etag: None,
-            last_modified: None,
+            headers: Default::default(),
             bytes: vec![0xff; 4096],
         }));
         let encoded = crate::process::ipc::encode(&reply).unwrap();

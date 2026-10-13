@@ -1,12 +1,28 @@
-//! HTTP response cache-header parsing for the feed fetcher.
+//! The HTTP cache rules every outbound request follows.
 //!
-//! Covers the subset of RFC 9111 / RFC 9110 / RFC 8246 / RFC 5861 that a
-//! polling single-client cache needs: Cache-Control directives (`max-age`,
-//! `no-cache`, `no-store`, `immutable`, `stale-if-error`), Age/Date-based
-//! corrected-age adjustment, Expires parsing across all three HTTP-date
-//! formats, and Pragma: no-cache as an HTTP/1.0 fallback.
+//! Requests are made by the fetcher, which may be another process with no
+//! database, so using the HTTP cache ([`crate::db::http_cache`]) is split
+//! in two around it, the way proxy settings are:
+//!
+//! 1. Before the request, [`request_validators`] turns what is stored for
+//!    the URL into the [`Validators`] put in the request's spec, which the
+//!    fetcher sends with [`Validators::apply`].
+//! 2. After it, [`record_response`] stores what the response's headers say,
+//!    whether it was a full response or a `304 Not Modified`.
+//!
+//! Underneath is header parsing covering the subset of RFC 9111 / RFC 9110
+//! / RFC 8246 / RFC 5861 that a polling single-client cache needs:
+//! Cache-Control directives (`max-age`, `no-cache`, `no-store`,
+//! `immutable`, `stale-if-error`), Age/Date-based corrected-age adjustment,
+//! Expires parsing across all three HTTP-date formats, and Pragma: no-cache
+//! as an HTTP/1.0 fallback.
 
+use crate::db::http_cache::{self, CacheEntry};
+use crate::fetcher::Validators;
+use anyhow::Result;
 use chrono::{DateTime, Utc};
+use reqwest::header::HeaderMap;
+use rusqlite::Connection;
 use tracing::debug;
 
 /// Parsed `Cache-Control` directives relevant to the fetcher.
@@ -209,4 +225,136 @@ pub fn extract_server_hints(resp_headers: &reqwest::header::HeaderMap, now_ts: i
         stale_if_error: cc.stale_if_error,
         immutable: cc.immutable,
     }
+}
+
+/// The validators to make a request conditional on, given the `entry`
+/// stored for its URL, at Unix time `now_ts`.
+///
+/// None are sent on a `full` request, one that must fetch the whole body
+/// whatever the server holds, or while an RFC 8246 `immutable` window is
+/// open: the server has promised the representation won't change.
+pub fn request_validators(entry: &CacheEntry, now_ts: i64, full: bool) -> Validators {
+    let immutable = entry.immutable_until.is_some_and(|until| now_ts < until);
+    if full || immutable {
+        return Validators::default();
+    }
+    Validators {
+        etag: entry.etag.clone(),
+        last_modified: entry.last_modified.clone(),
+    }
+}
+
+/// What kind of response is being recorded in the HTTP cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Response<'a> {
+    /// A `200 OK` whose body was read, with its Blake3 hex digest.
+    Full { body_hash: &'a str },
+    /// A `304 Not Modified`.
+    NotModified,
+}
+
+/// The cache entry to store after `response`, whose headers are `headers`,
+/// for a URL that had `prev` stored, at Unix time `now_ts`.
+///
+/// Applies the Cache-Control precedence rules (RFC 9111 §5.2): `no-store`
+/// clears the validators, expiry and body hash, `no-cache` clears the
+/// expiry but keeps the validators, and `max-age` overrides `Expires` after
+/// the RFC 9111 §4.2.3 age correction.
+///
+/// A 304 freshens the stored response instead (RFC 9111 §4.3.4): header
+/// fields it carries replace the stored ones, and fields it omits keep
+/// their stored values, as does the fingerprint of the last full body.
+pub fn entry_after_response(
+    prev: &CacheEntry,
+    response: Response,
+    headers: &HeaderMap,
+    now_ts: i64,
+) -> CacheEntry {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string)
+    };
+    let cc_values: Vec<&str> = headers
+        .get_all("cache-control")
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .collect();
+    let cc = CacheControl::parse_many(&cc_values);
+
+    // Accepts all three HTTP-date formats (RFC 9110 §5.6.7).
+    let mut expires_at: Option<i64> = header("expires")
+        .as_deref()
+        .and_then(parse_http_date)
+        .map(|dt| dt.timestamp());
+    if cc.no_cache {
+        expires_at = None;
+    } else if let Some(max_age) = cc.max_age {
+        let corrected = corrected_max_age(headers, max_age, now_ts);
+        expires_at = Some(now_ts + corrected as i64);
+    }
+
+    // RFC 8246: while the response is fresh, skip conditional revalidation
+    // entirely. Only meaningful when paired with a positive max-age.
+    let hints = extract_server_hints(headers, now_ts);
+    let immutable_until = hints
+        .hint_secs
+        .filter(|&s| hints.immutable && s > 0)
+        .map(|s| now_ts.saturating_add(s as i64));
+
+    let (body_hash, last_full_refresh_at) = match response {
+        Response::Full { body_hash } => (Some(body_hash.to_string()), Some(now_ts)),
+        Response::NotModified => (prev.body_hash.clone(), prev.last_full_refresh_at),
+    };
+
+    if cc.no_store {
+        return CacheEntry {
+            body_hash: match response {
+                Response::Full { .. } => None,
+                Response::NotModified => body_hash,
+            },
+            last_full_refresh_at,
+            ..CacheEntry::default()
+        };
+    }
+
+    let mut entry = CacheEntry {
+        etag: header("etag"),
+        last_modified: header("last-modified"),
+        expires_at,
+        immutable_until,
+        body_hash,
+        last_full_refresh_at,
+    };
+    if response == Response::NotModified {
+        let carries_freshness =
+            headers.contains_key("cache-control") || headers.contains_key("expires");
+        entry.etag = entry.etag.or_else(|| prev.etag.clone());
+        entry.last_modified = entry.last_modified.or_else(|| prev.last_modified.clone());
+        if !carries_freshness {
+            entry.expires_at = prev.expires_at;
+            entry.immutable_until = prev.immutable_until;
+        }
+    }
+    entry
+}
+
+/// Record `response` in the HTTP cache under `url`, which had `prev`
+/// stored, and return the entry stored. See [`entry_after_response`].
+///
+/// # Errors
+///
+/// Returns an error if the write fails.
+pub fn record_response(
+    conn: &Connection,
+    url: &str,
+    prev: &CacheEntry,
+    response: Response,
+    headers: &HeaderMap,
+    now_ts: i64,
+) -> Result<CacheEntry> {
+    let entry = entry_after_response(prev, response, headers, now_ts);
+    http_cache::store(conn, url, &entry)?;
+    Ok(entry)
 }

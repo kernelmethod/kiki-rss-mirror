@@ -1179,8 +1179,6 @@ fn cache_asset(
         original_url,
         Some(content_type),
         bytes.len() as i64,
-        None,
-        None,
     )?;
     crate::db::assets::link_entry_asset(&conn, entry_id, asset_id, kind)?;
     Ok(hash)

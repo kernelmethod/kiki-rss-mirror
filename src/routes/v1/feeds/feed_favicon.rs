@@ -89,8 +89,6 @@ mod tests {
             "https://a.example/favicon.ico",
             Some("image/x-icon"),
             ICON.len() as i64,
-            None,
-            None,
         )?;
         crate::db::favicons::record_check(&conn, 1, Some(asset))?;
         crate::db::favicons::record_check(&conn, 2, None)?;
