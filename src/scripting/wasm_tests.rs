@@ -58,6 +58,15 @@ impl ScriptServices for Recorder {
                 }
                 ServiceReply::Deleted(3)
             }
+            ServiceCall::GetEntry { .. } => ServiceReply::Entry(None),
+            ServiceCall::FetchPage { url } => {
+                ServiceReply::Page(Box::new(crate::fetcher::page::FetchedPage {
+                    url,
+                    content_type: "text/html".to_string(),
+                    body: "<p>page</p>".to_string(),
+                    truncated: false,
+                }))
+            }
         })
     }
 }
@@ -127,6 +136,25 @@ fn transform_handlers_run_before_ingest_handlers() {
         .unwrap()
         .unwrap();
     assert_eq!(out.title, "title b-transform a-ingest");
+}
+
+/// Every plugin's `entry.enrich` handler runs before any plugin's `entry.transform`
+/// handler, whatever order the plugins load in.
+#[test]
+fn enrich_handlers_run_before_transform_handlers() {
+    let (runner, _) = runner(&[
+        source("a", json!({ "transform_suffix": " a-transform" })),
+        source(
+            "b",
+            json!({ "suffix": " b-ingest", "enrich_suffix": " b-enrich" }),
+        ),
+    ]);
+    assert!(runner.handles(Event::EntryEnrich));
+    let out = runner
+        .dispatch_transform_entry(entry("title"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.title, "title b-enrich a-transform b-ingest");
 }
 
 #[test]
@@ -775,8 +803,19 @@ fn budgets_count_cpu_time() {
     budget.start(Some(Duration::from_millis(10)));
     first_check(&budget);
     std::thread::sleep(Duration::from_millis(60));
-    budget.give_back(Duration::from_millis(100));
+    budget.give_back(Duration::from_millis(100), false);
     assert!(!budget.expired());
+
+    // Only so much time is given back, unless it was spent waiting on the network, which
+    // has an allowance of its own.
+    budget.start(Some(Duration::from_millis(10)));
+    budget.give_back(MAX_CALL_ALLOWANCE * 2, false);
+    assert_eq!(budget.credit, MAX_CALL_ALLOWANCE);
+    budget.start(Some(Duration::from_millis(10)));
+    budget.give_back(MAX_NETWORK_ALLOWANCE + MAX_CALL_ALLOWANCE * 2, true);
+    assert_eq!(budget.credit, MAX_NETWORK_ALLOWANCE + MAX_CALL_ALLOWANCE);
+    budget.give_back(Duration::from_secs(1), true);
+    assert_eq!(budget.credit, MAX_NETWORK_ALLOWANCE + MAX_CALL_ALLOWANCE);
 
     // A call that has not run for its budget by the clock has not used it up.
     budget.start(Some(Duration::from_millis(100)));

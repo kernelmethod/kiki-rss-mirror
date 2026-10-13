@@ -20,8 +20,8 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 /// A zstd-compressed tarball of the plugins installed by default: currently
-/// `adaptive-fetch`, `auto-tag`, `filter`, `privacy`, `retention` and
-/// `sanitize`.
+/// `adaptive-fetch`, `auto-tag`, `filter`, `full-content`, `privacy`,
+/// `retention` and `sanitize`.
 ///
 /// Each plugin's directory is stored under its own name at the root of the
 /// archive, and holds only regular files.
@@ -280,6 +280,7 @@ fn replace_plugin(plugins_dir: &Path, name: &str, files: &[&BundledFile]) -> Res
 ///         ("adaptive-fetch".to_string(), SyncOutcome::Installed),
 ///         ("auto-tag".to_string(), SyncOutcome::Installed),
 ///         ("filter".to_string(), SyncOutcome::Installed),
+///         ("full-content".to_string(), SyncOutcome::Installed),
 ///         ("privacy".to_string(), SyncOutcome::Installed),
 ///         ("retention".to_string(), SyncOutcome::Installed),
 ///         ("sanitize".to_string(), SyncOutcome::Installed),
@@ -370,6 +371,8 @@ mod tests {
                 Path::new("auto-tag/plugin.wasm"),
                 Path::new("filter/manifest.toml"),
                 Path::new("filter/plugin.wasm"),
+                Path::new("full-content/manifest.toml"),
+                Path::new("full-content/plugin.wasm"),
                 Path::new("privacy/manifest.toml"),
                 Path::new("privacy/plugin.wasm"),
                 Path::new("retention/manifest.toml"),
@@ -388,6 +391,8 @@ mod tests {
                 "auto-tag",
                 "filter",
                 "filter",
+                "full-content",
+                "full-content",
                 "privacy",
                 "privacy",
                 "retention",
@@ -415,14 +420,18 @@ mod tests {
             ),
             (
                 7,
-                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/privacy.wasm")),
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/full-content.wasm")),
             ),
             (
                 9,
-                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/retention.wasm")),
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/privacy.wasm")),
             ),
             (
                 11,
+                include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/retention.wasm")),
+            ),
+            (
+                13,
                 include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/sanitize.wasm")),
             ),
         ] {
@@ -440,6 +449,7 @@ mod tests {
                 "adaptive-fetch",
                 "auto-tag",
                 "filter",
+                "full-content",
                 "privacy",
                 "retention",
                 "sanitize"
@@ -480,6 +490,7 @@ mod tests {
                 "adaptive-fetch",
                 "auto-tag",
                 "filter",
+                "full-content",
                 "privacy",
                 "retention",
                 "sanitize"
@@ -534,6 +545,7 @@ mod tests {
                 "adaptive-fetch",
                 "auto-tag",
                 "filter",
+                "full-content",
                 "privacy",
                 "retention",
                 "sanitize"

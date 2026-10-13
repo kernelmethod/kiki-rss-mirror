@@ -12,7 +12,7 @@ const MANIFEST: &str = include_str!("../../plugins/sanitize/manifest.toml");
 const WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/plugins-wasm/sanitize.wasm"));
 
 /// The plugin's source, with `config` applied over its defaults.
-fn source(config: Value) -> ScriptSource {
+pub(super) fn source(config: Value) -> ScriptSource {
     let manifest = PluginManifest::parse(MANIFEST).unwrap();
     let time_budget = manifest.time_budget();
     let mut merged = manifest.config;

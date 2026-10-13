@@ -1,5 +1,5 @@
 name = "auto-tag"
-version = "2.0.0"
+version = "2.1.0"
 engine = "wasm"
 entrypoint = "plugin.wasm"
 description = "Tag entries whose fields match regular expressions, or that come from given feeds"

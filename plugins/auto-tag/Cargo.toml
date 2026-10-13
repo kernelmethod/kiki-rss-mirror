@@ -1,6 +1,6 @@
 [package]
 name = "kiki-auto-tag"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 publish = false
 description = "Kiki's auto-tag plugin, installed as plugins/auto-tag/plugin.wasm"

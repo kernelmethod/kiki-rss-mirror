@@ -21,6 +21,8 @@ struct Config {
     suffix: Option<String>,
     /// Append this to the title of each entry in `entry.transform`.
     transform_suffix: Option<String>,
+    /// Append this to the title of each entry in `entry.enrich`.
+    enrich_suffix: Option<String>,
     /// Add this tag to each ingested entry.
     tag: Option<String>,
     /// Drop ingested entries with this title.
@@ -106,7 +108,11 @@ impl Plugin for Fixture {
     }
 
     fn wants(&self, event: EventKind) -> bool {
-        event != EventKind::EntryTransform || self.config.transform_suffix.is_some()
+        match event {
+            EventKind::EntryTransform => self.config.transform_suffix.is_some(),
+            EventKind::EntryEnrich => self.config.enrich_suffix.is_some(),
+            _ => true,
+        }
     }
 }
 
@@ -115,6 +121,14 @@ impl Fixture {
     #[on(entry.parsed)]
     fn entry_parsed(&mut self, entry: Entry) {
         seen("entry.parsed", entry.title);
+    }
+
+    #[on(entry.enrich)]
+    fn entry_enrich(&mut self, mut entry: Entry) -> Option<Entry> {
+        if let Some(suffix) = &self.config.enrich_suffix {
+            entry.title.push_str(suffix);
+        }
+        Some(entry)
     }
 
     #[on(entry.transform)]

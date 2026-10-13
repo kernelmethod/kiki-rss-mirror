@@ -63,10 +63,15 @@ pub mod bindings {
 
 pub use bindings::kiki::plugin::types::{
     ContentChange, DeleteFilter, Entry, EventKind, Feed, FeedEvent, FetchError, FetchSchedule,
-    FetchSuccess, Level, ScanOptions, ScanSummary,
+    FetchSuccess, Level, Page, ScanOptions, ScanSummary,
 };
 
-/// Calls to the server: logging, the plugin's store, stored entries, feeds and timers.
+/// Calls to the server: logging, the plugin's store, stored entries, feeds, timers and web
+/// pages.
+///
+/// [`fetch_page`](host::fetch_page) needs the `network` permission in the plugin's
+/// manifest, and fails unless Kiki's settings allow plugins to use the network
+/// (`allow_network` under `[plugins]` in `kiki.toml`), which they don't by default.
 pub mod host {
     pub use crate::bindings::kiki::plugin::host::*;
 
@@ -533,6 +538,24 @@ pub mod html {
     pub fn unescape(s: &str) -> Result<String, String> {
         // `&nGt;`, five bytes, decodes to six.
         wit::unescape(s, room(s.len() + s.len() / 5))
+    }
+
+    /// The content of the first element of `html` that `selector`, a CSS selector such as
+    /// `"article"`, matches, as HTML: what is between its start tag and its end tag, or
+    /// `None` if nothing matches. An element whose end tag is missing has the rest of the
+    /// HTML as its content.
+    ///
+    /// ```ignore
+    /// let html = "<nav>Menu</nav><article><p>Text</p></article>";
+    /// assert_eq!(html::inner(html, "article")?.as_deref(), Some("<p>Text</p>"));
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Fails if the selector is invalid, the HTML needs more memory than the server allows
+    /// to parse, or the content needs more room than the plugin's memory has.
+    pub fn inner(html: &str, selector: &str) -> Result<Option<String>, String> {
+        wit::inner(html, selector, room(html.len()))
     }
 
     /// `s` with `&`, `<`, `>`, `"` and `'` escaped, for use as text or as a quoted

@@ -5,7 +5,15 @@
 # each as `<name>/plugin.wasm`, leaving the crate out.
 [workspace]
 resolver = "2"
-members = ["adaptive-fetch", "auto-tag", "filter", "privacy", "retention", "sanitize"]
+members = [
+    "adaptive-fetch",
+    "auto-tag",
+    "filter",
+    "full-content",
+    "privacy",
+    "retention",
+    "sanitize",
+]
 
 [profile.release]
 opt-level = 3

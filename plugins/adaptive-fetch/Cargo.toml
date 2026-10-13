@@ -1,6 +1,6 @@
 [package]
 name = "kiki-adaptive-fetch"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 publish = false
 description = "Kiki's adaptive-fetch plugin, installed as plugins/adaptive-fetch/plugin.wasm"
