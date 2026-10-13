@@ -1,6 +1,6 @@
 [package]
 name = "kiki-rss"
-version = "0.38.0"
+version = "0.39.0"
 edition = "2021"
 description = "An RSS feed aggregator"
 license = "MIT"
