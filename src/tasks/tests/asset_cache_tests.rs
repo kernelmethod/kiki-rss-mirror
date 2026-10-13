@@ -757,3 +757,59 @@ async fn asset_downloads_use_the_http_cache() -> Result<()> {
     assert_eq!(entry.body_hash.as_deref(), Some(png_hash.as_str()));
     Ok(())
 }
+
+/// Sweeping deletes the assets nothing links to, files and all, and leaves
+/// the rest.
+#[tokio::test]
+async fn sweeping_deletes_unused_assets_and_their_files() -> Result<()> {
+    let tc = TestBuilder::default().init_database().build()?;
+    let pool = make_pool(&tc.database_path())?;
+    let addr = start_asset_server().await?;
+    let client = reqwest::Client::builder().build()?;
+    let fetcher = test_fetcher(&client);
+    let cache = super::super::assets::AssetCache {
+        fetcher: &fetcher,
+        proxy: &Default::default(),
+        db: &pool,
+        data_dir: tc.config_dir(),
+        max_bytes: i64::MAX,
+    };
+    let conn = tc.database_conn()?;
+    conn.execute(
+        "INSERT INTO feeds (id, title, url) VALUES (1, 'F', 'http://f/')",
+        [],
+    )?;
+
+    // The image is the feed's favicon; nothing uses the enclosure.
+    for (path, kind) in [
+        ("img.png", super::super::assets::AssetKind::InlineImg),
+        ("audio.mp3", super::super::assets::AssetKind::Enclosure),
+    ] {
+        let url = reqwest::Url::parse(&format!("http://{addr}/{path}"))?;
+        let favicon = path == "img.png";
+        let stored =
+            super::super::assets::store_asset(&cache, &url, kind, move |conn, asset_id| {
+                if favicon {
+                    conn.execute(
+                        "INSERT INTO feed_favicons (feed_id, asset_id) VALUES (1, ?1)",
+                        [asset_id],
+                    )?;
+                }
+                Ok(())
+            })
+            .await?;
+        assert!(stored);
+    }
+    let enclosure = blake3::hash(ENCLOSURE).to_hex().to_string();
+    let image = blake3::hash(TINY_PNG).to_hex().to_string();
+    let file = |hash: &str| crate::tasks::assets::asset_path(tc.config_dir(), hash);
+    assert!(file(&enclosure).exists());
+
+    let swept = crate::tasks::assets::sweep_unused_assets(&pool, tc.config_dir()).await?;
+    assert_eq!(swept, 1);
+    assert!(!file(&enclosure).exists());
+    assert!(file(&image).exists());
+    let remaining: String = conn.query_row("SELECT blake3 FROM feed_assets", [], |r| r.get(0))?;
+    assert_eq!(remaining, image);
+    Ok(())
+}

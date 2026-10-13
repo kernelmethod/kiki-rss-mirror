@@ -102,6 +102,25 @@ pub fn unlink_asset_file(data_dir: &Path, blake3: &str) {
     }
 }
 
+/// Delete the assets nothing uses any more, rows and files, and return
+/// how many there were. See [`crate::db::assets::delete_unused`].
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be reached or the delete fails.
+/// Files that cannot be removed are logged and left behind.
+pub async fn sweep_unused_assets(db: &crate::db::Db, data_dir: &Path) -> Result<usize> {
+    let data_dir = data_dir.to_path_buf();
+    db.write(move |conn| -> Result<usize> {
+        let deleted = crate::db::assets::delete_unused(conn)?;
+        for hash in &deleted {
+            unlink_asset_file(&data_dir, hash);
+        }
+        Ok(deleted.len())
+    })
+    .await?
+}
+
 /// Fetch, hash, store, and index a single asset, and link it to entry
 /// `entry_id` as an asset of kind `kind`.
 ///

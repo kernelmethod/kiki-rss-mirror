@@ -489,7 +489,12 @@ impl Server {
                 self.cancel_token.clone(),
                 metrics.clone(),
             ));
-            tokio::spawn(timer_loop(script_runner.clone(), self.cancel_token.clone()));
+            tokio::spawn(timer_loop(
+                script_runner.clone(),
+                db.clone(),
+                self.data_dir.clone(),
+                self.cancel_token.clone(),
+            ));
             tokio::spawn(retry_entry_assets_loop(
                 tx.clone(),
                 db.clone(),
@@ -718,7 +723,16 @@ async fn check_feeds_loop(
 /// Timer handlers may take a while, such as the `retention` plugin's,
 /// which deletes entries, so they run on the blocking thread pool, and a
 /// tick that comes while they run waits for them.
-async fn timer_loop(script_runner: ScriptRunnerHandle, cancel_token: CancellationToken) {
+///
+/// After them, every tick deletes the cached assets nothing uses any more
+/// ([`crate::tasks::assets::sweep_unused_assets`]), so that those of the
+/// entries a timer just deleted go straight away.
+async fn timer_loop(
+    script_runner: ScriptRunnerHandle,
+    db: crate::db::Db,
+    data_dir: PathBuf,
+    cancel_token: CancellationToken,
+) {
     use crate::scripting::{Event, EventPayload, TIMER_TICK};
 
     let mut interval = tokio::time::interval(TIMER_TICK);
@@ -727,6 +741,11 @@ async fn timer_loop(script_runner: ScriptRunnerHandle, cancel_token: Cancellatio
         tokio::select! {
             _ = interval.tick() => {
                 script_runner.observe(Event::Timer, EventPayload::Timer).await;
+                match crate::tasks::assets::sweep_unused_assets(&db, &data_dir).await {
+                    Ok(0) => {}
+                    Ok(n) => debug!("Deleted {} cached assets nothing uses", n),
+                    Err(e) => tracing::warn!("Failed to delete unused assets: {:?}", e),
+                }
             }
             _ = cancel_token.cancelled() => {
                 break;
