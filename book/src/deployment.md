@@ -98,6 +98,32 @@ everything, so set `anonymous_access = "token-required"` (or
 `"read-only"`) under `[api]` in `kiki.toml`. See
 [Security](api.md#security).
 
+A proxy that a browser can reach also lets any web page that browser
+opens send requests to it, by pointing the page's own domain at the
+proxy's address (DNS rebinding). To refuse those, list the names Kiki is
+reached at in `kiki.toml`. The web UI and the API share one list:
+
+```toml
+[http]
+allowed_hosts = ["kiki.example.com"]
+```
+
+Both then answer only requests for those names and for `localhost`,
+`127.0.0.1` and `::1`, which Kiki's own clients use. Names given to
+`kiki web --allowed-host` apply to the web UI alone. To give either one a
+list of its own, set `allowed_hosts` under `[web_ui]` or `[api]`, which
+replaces the shared list for it; an empty list under `[api]` turns the
+API's check off. The proxy has to pass the client's `Host` header through. Caddy does by default; nginx sends
+`localhost` for a socket unless told otherwise, which the API always
+accepts, so add:
+
+```nginx
+location / {
+    proxy_pass http://unix:/run/kiki/kiki.sock:;
+    proxy_set_header Host $host;
+}
+```
+
 ## Monitoring
 
 The server answers `GET /v1/health`, and serves Prometheus metrics at

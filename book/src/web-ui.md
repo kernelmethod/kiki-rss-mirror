@@ -59,13 +59,18 @@ To reach the web UI by another name, such as a LAN host name or address,
 allow that name in `kiki.toml`:
 
 ```toml
-[web_ui]
+[http]
 allowed_hosts = ["kiki.lan", "192.168.1.5", "*.home.example"]
 ```
 
 or with `--allowed-host`, which can be given more than once and adds to the
 file's list. `*.home.example` allows every subdomain of `home.example`, and
 `*` allows any host at all, which turns the check off.
+
+The list under `[http]` is shared with the [API](api.md), for when a
+reverse proxy serves it at the same name. To give the web UI a list of its
+own, set `allowed_hosts` under `[web_ui]` instead; it replaces the shared
+one for the web UI.
 
 `kiki web` reads the file as it starts, so restart it after changing the
 list.

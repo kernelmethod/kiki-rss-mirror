@@ -10,22 +10,17 @@
 //! header, though, so the web UI only answers requests whose `Host` is one
 //! it was told to expect.
 
-use crate::config::hosts::normalize;
+use crate::config::hosts;
 use crate::config::HostPattern;
 use axum::{
     extract::{Request, State},
-    http::{header, StatusCode},
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use std::net::Ipv6Addr;
 use std::sync::Arc;
 
-/// Host names the web UI always answers to. They name the local machine,
-/// so no other site can have a browser send them.
-const LOCALHOST: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
-
-/// The hosts the web UI answers to: the [`LOCALHOST`] names, and whatever
+/// The hosts the web UI answers to: the [`LOCALHOST`](hosts::LOCALHOST) names, and whatever
 /// was given to `--allowed-host`.
 #[derive(Clone, Debug, Default)]
 pub(super) struct AllowedHosts {
@@ -33,7 +28,7 @@ pub(super) struct AllowedHosts {
 }
 
 impl AllowedHosts {
-    /// Allow the [`LOCALHOST`] names and the hosts matching `patterns`.
+    /// Allow the [`LOCALHOST`](hosts::LOCALHOST) names and the hosts matching `patterns`.
     pub(super) fn new(patterns: Vec<HostPattern>) -> Self {
         Self { patterns }
     }
@@ -43,7 +38,7 @@ impl AllowedHosts {
         self.patterns.contains(&HostPattern::Any)
     }
 
-    /// Whether only the [`LOCALHOST`] names are allowed.
+    /// Whether only the [`LOCALHOST`](hosts::LOCALHOST) names are allowed.
     pub(super) fn only_localhost(&self) -> bool {
         self.patterns.is_empty()
     }
@@ -52,39 +47,8 @@ impl AllowedHosts {
     /// `authority` may be answered. The port, if any, is ignored: a site
     /// rebinding its domain has to use the web UI's port anyway.
     pub(super) fn allows(&self, authority: &str) -> bool {
-        let Some(host) = host_of(authority) else {
-            return false;
-        };
-        LOCALHOST.contains(&host.as_str())
-            || self.patterns.iter().any(|pattern| match pattern {
-                HostPattern::Any => true,
-                HostPattern::Exact(allowed) => *allowed == host,
-                HostPattern::Subdomains(parent) => host
-                    .strip_suffix(parent.as_str())
-                    .is_some_and(|sub| sub.len() > 1 && sub.ends_with('.')),
-            })
+        hosts::allows(&self.patterns, authority)
     }
-}
-
-/// The host in `authority`, a `Host` header's value: `host`, `host:port`,
-/// `[v6]` or `[v6]:port`, normalized as [`normalize`] does. `None` if it
-/// is malformed.
-fn host_of(authority: &str) -> Option<String> {
-    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
-        let (v6, rest) = rest.split_once(']')?;
-        v6.parse::<Ipv6Addr>().ok()?;
-        (v6, rest.strip_prefix(':'))
-    } else {
-        match authority.split_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (authority, None),
-        }
-    };
-    if port.is_some_and(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
-        return None;
-    }
-    let host = normalize(host);
-    (!host.is_empty()).then_some(host)
 }
 
 /// Middleware that refuses, with `400 Bad Request`, any request that does
@@ -95,12 +59,7 @@ pub(super) async fn check_host(
     req: Request,
     next: Next,
 ) -> Response {
-    let authority = match req.headers().get(header::HOST) {
-        Some(host) => host.to_str().ok(),
-        None => req.uri().authority().map(|a| a.as_str()),
-    };
-    // An HTTP/2 `:authority` may carry userinfo, which is no part of the host.
-    let authority = authority.map(|a| a.rsplit_once('@').map_or(a, |(_, host)| host));
+    let authority = hosts::request_authority(&req);
     if authority.is_some_and(|a| allowed.allows(a)) {
         return next.run(req).await;
     }

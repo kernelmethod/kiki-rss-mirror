@@ -293,7 +293,7 @@ fn apply_to_server(home: &Path, name: &str, overrides: &ConfigOverrides) -> Resu
     }
 
     let url = format!(
-        "http://kiki/v1/plugins/name/{}/config",
+        "http://localhost/v1/plugins/name/{}/config",
         url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>()
     );
     tokio::runtime::Builder::new_current_thread()

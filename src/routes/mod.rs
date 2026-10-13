@@ -1,3 +1,4 @@
+pub mod hosts;
 pub mod v1;
 
 use crate::server::AppState;
@@ -39,7 +40,10 @@ async fn api_fallback() -> (StatusCode, &'static str) {
 ///
 /// Every route, the fallback included, is wrapped in
 /// [`crate::auth::authorize`], which checks the token a request carries.
-/// The router is returned finished, with the layer added last, so that
+/// Outside that, while
+/// [`ApiSettings::allowed_hosts`](crate::config::ApiSettings::allowed_hosts)
+/// lists any hosts, [`hosts::check_host`] refuses requests for others.
+/// The router is returned finished, with the layers added last, so that
 /// routes are only ever added here, inside it. A route added to the
 /// returned router afterwards would not be wrapped: don't. The
 /// `every_route_checks_tokens` test catches one that isn't.
@@ -70,6 +74,10 @@ pub fn create_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::authorize,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            hosts::check_host,
         ))
         .with_state(state)
 }

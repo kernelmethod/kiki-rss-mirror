@@ -2584,7 +2584,7 @@ async fn requests_for_other_hosts_are_refused() -> Result<()> {
 }
 
 /// Hosts from `--allowed-host` and from the config file's
-/// `web_ui.allowed_hosts` are both allowed.
+/// `http.allowed_hosts` (or `web_ui.allowed_hosts`) are both allowed.
 #[test]
 fn allowed_hosts_combine_flags_and_config() {
     let args = parse(&["--allowed-host", "kiki.lan"]);
