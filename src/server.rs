@@ -489,8 +489,8 @@ impl Server {
                 self.cancel_token.clone(),
                 metrics.clone(),
             ));
-            tokio::spawn(timer_loop(
-                script_runner.clone(),
+            tokio::spawn(timer_loop(script_runner.clone(), self.cancel_token.clone()));
+            tokio::spawn(sweep_unused_assets_loop(
                 db.clone(),
                 self.data_dir.clone(),
                 self.cancel_token.clone(),
@@ -723,16 +723,7 @@ async fn check_feeds_loop(
 /// Timer handlers may take a while, such as the `retention` plugin's,
 /// which deletes entries, so they run on the blocking thread pool, and a
 /// tick that comes while they run waits for them.
-///
-/// After them, every tick deletes the cached assets nothing uses any more
-/// ([`crate::tasks::assets::sweep_unused_assets`]), so that those of the
-/// entries a timer just deleted go straight away.
-async fn timer_loop(
-    script_runner: ScriptRunnerHandle,
-    db: crate::db::Db,
-    data_dir: PathBuf,
-    cancel_token: CancellationToken,
-) {
+async fn timer_loop(script_runner: ScriptRunnerHandle, cancel_token: CancellationToken) {
     use crate::scripting::{Event, EventPayload, TIMER_TICK};
 
     let mut interval = tokio::time::interval(TIMER_TICK);
@@ -741,15 +732,40 @@ async fn timer_loop(
         tokio::select! {
             _ = interval.tick() => {
                 script_runner.observe(Event::Timer, EventPayload::Timer).await;
+            }
+            _ = cancel_token.cancelled() => {
+                break;
+            }
+        }
+    }
+}
+
+/// How often [`sweep_unused_assets_loop`] deletes the cached assets nothing
+/// uses any more.
+const ASSET_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Every [`ASSET_SWEEP_INTERVAL`], starting when the server starts, delete
+/// the cached assets nothing uses any more
+/// ([`crate::tasks::assets::sweep_unused_assets`]): those of entries that
+/// have been deleted, such as by the `retention` plugin, and the favicons
+/// of feeds that have been removed.
+async fn sweep_unused_assets_loop(
+    db: crate::db::Db,
+    data_dir: PathBuf,
+    cancel_token: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(ASSET_SWEEP_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
                 match crate::tasks::assets::sweep_unused_assets(&db, &data_dir).await {
                     Ok(0) => {}
                     Ok(n) => debug!("Deleted {} cached assets nothing uses", n),
                     Err(e) => tracing::warn!("Failed to delete unused assets: {:?}", e),
                 }
             }
-            _ = cancel_token.cancelled() => {
-                break;
-            }
+            _ = cancel_token.cancelled() => break,
         }
     }
 }

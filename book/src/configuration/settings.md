@@ -59,10 +59,11 @@ The on-disk cache of entries' images and enclosures.
 | `max_bytes` | `1073741824` (1 GiB) | The size, in bytes, the cache is trimmed down to. |
 
 Once the cache grows past `max_bytes`, the assets used least recently are
-deleted until it is back under. Separately, every minute Kiki deletes the
-assets nothing uses any more: those of entries that have been deleted, such
-as by the [`retention`](../plugins/retention.md) plugin, and the favicons of
-feeds that have been removed.
+deleted until it is back under. Separately, when the server starts and
+every six hours after, Kiki deletes the assets nothing uses any more: those
+of entries that have been deleted, such as by the
+[`retention`](../plugins/retention.md) plugin, and the favicons of feeds
+that have been removed.
 
 ## `[retention]`
 
