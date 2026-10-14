@@ -372,10 +372,12 @@ fn bad_configs_fail_to_load() {
         json!({"selectors": ["<<"]}),
         json!({"selectors": [""]}),
         json!({"selectors": "article"}),
+        json!({"selectors": vec!["article"; 65]}),
         json!({"min_length": 0}),
         json!({"min_length": "long"}),
         json!({"feeds": [true]}),
     ] {
         assert!(plugin(config.clone(), &web).is_err(), "{config}");
     }
+    assert!(plugin(json!({"selectors": vec!["article"; 64]}), &web).is_ok());
 }

@@ -7,7 +7,7 @@
 // it, so that it ships with the crate; Kiki's own bindings, in
 // src/scripting/wasm.rs, are generated from this same file.
 
-package kiki:plugin@0.3.0;
+package kiki:plugin@0.3.1;
 
 interface types {
     /// The levels `log` writes at.
@@ -219,8 +219,9 @@ interface regex {
 /// result may take there, and fail rather than return more: a plugin whose memory cannot
 /// hold a result would trap.
 interface html {
-    /// Where a piece of `elements.text` starts, in bytes, and how long it is; or, for an
-    /// element's attributes, which run of `elements.attributes` they are.
+    /// Where a piece of `elements.text` starts, in bytes, and how long it is; for an
+    /// element's attributes, which run of `elements.attributes` they are; or, from
+    /// `inner-each`, where an element's content is in the HTML given.
     record span { start: u32, len: u32 }
 
     enum namespace { html, svg, mathml }
@@ -322,6 +323,12 @@ interface html {
     /// The content of the first element of `html` that `selector` matches, as HTML: what
     /// is between its start tag and its end tag, or `none` if nothing matches.
     inner: func(html: string, selector: string, max-bytes: u32) -> result<option<string>, string>;
+
+    /// For each of `selectors`, where in `html` the content of the first element it
+    /// matches is, in bytes, as `inner` would return it, or `none` if it matches nothing:
+    /// one pass over `html` for every selector, at most 64 of them, returning no copy of
+    /// the content. Added in 0.3.1.
+    inner-each: func(html: string, selectors: list<string>) -> result<list<option<span>>, string>;
 }
 
 world plugin {

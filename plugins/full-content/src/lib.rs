@@ -35,7 +35,8 @@
 //! * `exclude`: feeds whose entries never to fill in, given the same way.
 //! * `min_length`: the fewest characters of text, not counting whitespace, that an entry's
 //!   content needs not to be taken for a stub.
-//! * `selectors`: CSS selectors for the element holding the article, tried in order.
+//! * `selectors`: CSS selectors for the element holding the article, tried in order; at
+//!   most 64.
 
 use kiki_plugin::html::{self, Edits, StripRules};
 use kiki_plugin::{
@@ -218,10 +219,14 @@ impl Plugin for FullContent {
                 return Err("full-content: 'selectors' must be a list of CSS selectors".into())
             }
         };
-        // An invalid selector fails now, not on every page.
-        for selector in &selectors {
-            html::inner("", selector).map_err(|e| format!("full-content: {e}"))?;
+        // An invalid selector, or too many, fails now, not on every page.
+        if selectors.len() > html::MAX_INNER_SELECTORS {
+            return Err(format!(
+                "full-content: at most {} selectors may be given",
+                html::MAX_INNER_SELECTORS
+            ));
         }
+        html::inner_each("", &selectors).map_err(|e| format!("full-content: {e}"))?;
         Ok(FullContent {
             only: FeedSet::from_config(&config, "feeds")?,
             exclude: FeedSet::from_config(&config, "exclude")?,
@@ -284,23 +289,24 @@ impl FullContent {
     /// The article on `page`: the content of the first element a selector finds with
     /// `min_length` characters of text, or else of the one with the most text, if it has
     /// at least [`Self::fallback`]`(stub)`. `None` if there is neither.
-    fn article(&self, page: &Page, stub: usize) -> Option<String> {
+    ///
+    /// The page is read once for every selector.
+    fn article<'p>(&self, page: &'p Page, stub: usize) -> Option<&'p str> {
+        let found = match html::inner_each(&page.body, &self.selectors) {
+            Ok(found) => found,
+            Err(e) => {
+                log(Level::Debug, &format!("full-content: {}: {e}", page.url));
+                return None;
+            }
+        };
         let fallback = self.fallback(stub);
-        let mut best: Option<(usize, String)> = None;
-        for selector in &self.selectors {
-            let content = match html::inner(&page.body, selector) {
-                Ok(Some(content)) => content,
-                Ok(None) => continue,
-                Err(e) => {
-                    log(Level::Debug, &format!("full-content: {}: {e}", page.url));
-                    continue;
-                }
-            };
-            let length = text_length(&content);
+        let mut best: Option<(usize, &str)> = None;
+        for content in found.into_iter().flatten() {
+            let length = text_length(content);
             if length >= self.min_length {
                 return Some(content);
             }
-            if length >= fallback && best.as_ref().is_none_or(|(most, _)| length > *most) {
+            if length >= fallback && best.is_none_or(|(most, _)| length > most) {
                 best = Some((length, content));
             }
         }
@@ -351,7 +357,7 @@ impl FullContent {
             self.failed(url, now);
             return None;
         };
-        match clean(&article, &page.url) {
+        match clean(article, &page.url) {
             Ok(article) => Some(article),
             Err(e) => {
                 log(Level::Info, &format!("full-content: {}: {e}", page.url));
