@@ -18,6 +18,53 @@ leaves the file invalid, the server logs the problem and keeps its current
 settings. Unknown keys are rejected, so a typo is reported rather than
 silently ignored.
 
+## Changing settings from the command line
+
+`kiki config` reads and changes the settings in the data directory, whether
+or not the server is running:
+
+```bash
+kiki config get                                  # every setting in effect
+kiki config get feed_fetch                       # one section
+kiki config get api.anonymous_access             # one setting: "full"
+kiki config get --overrides                      # just what kiki.toml sets
+
+kiki config set api.anonymous_access read-only
+kiki config set http.allowed_hosts '["kiki.example.com"]'
+kiki config unset api.anonymous_access           # back to the default
+```
+
+Values are TOML: `3600`, `false`, `'["a", "b"]'`. A value that is not valid
+TOML is taken as a string, so `read-only` needs no quotes. `get` prints
+values in TOML, and prints nothing for a setting that is unset.
+`$KIKI_PROXY` and `$KIKI_NO_PROXY` are not applied to what it prints.
+
+`kiki config set --file FILE` sets every setting in a TOML file laid out as
+`kiki.toml` is (`-` reads standard input), and keeps the other overrides.
+With `--replace`, it removes the overrides the file leaves out as well, so
+`kiki.toml` ends up holding exactly that file's settings. That suits a
+config kept in Ansible, NixOS or a container image, applied on each deploy:
+
+```bash
+kiki config set --replace --file /etc/kiki/settings.toml
+```
+
+Every change is checked before it is saved, and nothing is saved if it is
+invalid. `set` and `unset` report on standard error whether they changed
+anything, starting their report with `No change` when they did not, and
+leave the file alone in that case.
+
+Run them as the user Kiki runs as, such as
+`sudo -u kiki env KIKI_HOME=/var/lib/kiki kiki config set ...`: they
+refuse to change the settings in a data directory that belongs to another
+user, since the server could then be left unable to read the file they save.
+
+`kiki web` reads `[http]`, `[web_ui]` and `api.anonymous_access` only as it
+starts, so restart it after changing those; everything else applies to a
+running server as it notices the change.
+
+## Changing settings over the API
+
 The `feed_fetch` and `asset_cache` sections can also be changed over the
 API, at `/v1/settings/feed-fetch` and `/v1/settings/asset-cache`. A `PUT`
 changes only the fields it is given:
@@ -29,9 +76,12 @@ curl --unix-socket "$sock" --request PUT \
     http://localhost/v1/settings/asset-cache
 ```
 
-The API rewrites `kiki.toml` on every change, dropping its comments and
-formatting. While the file is invalid, settings updates through the API fail
-with `409 Conflict` rather than overwrite it.
+The API and `kiki config` rewrite `kiki.toml` whenever they change it,
+dropping its comments and formatting. Each save re-reads the file and
+holds a lock on `.kiki.toml.lock` beside it while it does, so a change
+saved through one is never lost to a save through the other at the same
+moment. While the file is invalid, changes through either fail
+(the API answers `409 Conflict`) rather than overwrite it.
 
 <!-- Keep in sync with `Settings` and `Settings::default` in src/config/mod.rs. -->
 

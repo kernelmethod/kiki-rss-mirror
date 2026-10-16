@@ -34,16 +34,19 @@
 //! The proxy can also be set with environment variables, which take
 //! precedence over the file; see [`ProxySettings`].
 //!
-//! The file is owned by Kiki: the settings API rewrites it through a
-//! [`ConfigStore`], which re-reads it from disk before every change, so
-//! comments and formatting are not preserved. Edits made to the file from
-//! outside the server are picked up by [`watch::spawn_watcher`].
+//! The file is owned by Kiki: the settings API and `kiki config` rewrite it
+//! through a [`ConfigStore`], so comments and formatting are not
+//! preserved. The store re-reads the file before every change, holding a
+//! lock that stores in other processes wait on, so no change is saved over
+//! another. Edits made to the file from outside the server are picked up by
+//! [`watch::spawn_watcher`].
 
 pub mod hosts;
 mod store;
 pub mod watch;
 
 pub use hosts::{HostPattern, HostPatternError};
+pub(crate) use store::read_overrides;
 pub use store::{ConfigHandle, ConfigStore};
 
 use serde::{Deserialize, Serialize};
@@ -565,6 +568,70 @@ impl Settings {
     pub fn effective_proxy(&self) -> ProxySettings {
         self.proxy.clone().with_env(|name| std::env::var(name).ok())
     }
+
+    /// Every setting, as `(section, key)`, sorted by section and then key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the settings cannot be represented in TOML,
+    /// which they always can.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::Settings;
+    ///
+    /// let keys = Settings::keys().unwrap();
+    /// assert!(keys.contains(&("asset_cache".into(), "enabled".into())));
+    /// // Settings that are unset by default are listed too.
+    /// assert!(keys.contains(&("proxy".into(), "url".into())));
+    /// ```
+    pub fn keys() -> Result<Vec<(String, String)>, ConfigError> {
+        // Defaults with every optional setting given a value, since TOML
+        // leaves unset ones out. Every struct is taken apart in full, so a
+        // new setting fails to compile here until it is given one.
+        let mut s = Settings::default();
+        let Settings {
+            feed_fetch:
+                FeedFetchSettings {
+                    timeout_seconds: _,
+                    min_polling_cadence_seconds: _,
+                    default_fetch_interval_seconds: _,
+                    max_backoff_seconds: _,
+                    force_refresh_after_seconds: _,
+                    max_feed_bytes: _,
+                },
+            asset_cache:
+                AssetCacheSettings {
+                    enabled: _,
+                    max_bytes: _,
+                },
+            proxy: ProxySettings { url, no_proxy },
+            http: HttpSettings { allowed_hosts: _ },
+            web_ui:
+                WebUiSettings {
+                    allowed_hosts: web_ui_hosts,
+                    require_login: _,
+                },
+            api:
+                ApiSettings {
+                    anonymous_access: _,
+                    allowed_hosts: api_hosts,
+                },
+            plugins: PluginSettings { allow_network: _ },
+        } = &mut s;
+        *url = Some(String::new());
+        *no_proxy = Some(String::new());
+        *web_ui_hosts = Some(Vec::new());
+        *api_hosts = Some(Vec::new());
+
+        let table = toml::Table::try_from(s)?;
+        Ok(table
+            .iter()
+            .filter_map(|(section, keys)| Some((section, keys.as_table()?)))
+            .flat_map(|(section, keys)| keys.keys().map(|key| (section.clone(), key.clone())))
+            .collect())
+    }
 }
 
 /// The contents of the config file: a sparse set of overrides on top of
@@ -596,6 +663,29 @@ impl Overrides {
     /// Returns an error if a value cannot be represented in TOML.
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         Ok(toml::to_string(&self.0)?)
+    }
+
+    /// The overrides as a TOML table of sections.
+    pub fn as_table(&self) -> &toml::Table {
+        &self.0
+    }
+
+    /// Sets every key `other` sets, keeping the overrides it leaves out.
+    /// Each key's value replaces the whole of what was there.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::Overrides;
+    ///
+    /// let mut o = Overrides::parse("[asset_cache]\nenabled = false\nmax_bytes = 10\n").unwrap();
+    /// o.extend(&Overrides::parse("[asset_cache]\nmax_bytes = 20\n").unwrap());
+    /// let s = o.resolve().unwrap();
+    /// assert!(!s.asset_cache.enabled);
+    /// assert_eq!(s.asset_cache.max_bytes, 20);
+    /// ```
+    pub fn extend(&mut self, other: &Overrides) {
+        merge(&mut self.0, &other.0);
     }
 
     /// Returns the override for `section.key`, if one is set.

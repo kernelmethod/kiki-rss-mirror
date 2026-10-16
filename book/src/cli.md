@@ -11,6 +11,9 @@ Every command prints its full set of options with `--help`, e.g.
 | `kiki migrate` | Migrates the database to the current schema; see [Upgrading](deployment.md#upgrading). `--dry-run`, `--no-backup`. |
 | `kiki opml import FILE` | Imports feeds from OPML; `-` reads from stdin. |
 | `kiki opml export` | Exports feeds as OPML; `-o FILE` writes to a file. |
+| `kiki config get [SECTION[.KEY]]` | Prints [settings](configuration/settings.md#changing-settings-from-the-command-line) as TOML: all of them, a section, or one. `--defaults` or `--overrides` for just one part. |
+| `kiki config set SECTION.KEY VALUE` | Changes a setting. `--file FILE` sets every setting in a TOML file instead (`-` reads stdin); `--replace` drops overrides the file doesn't give. |
+| `kiki config unset SECTION.KEY...` | Restores settings to their defaults. |
 | `kiki plugin ls` | Lists installed plugins. |
 | `kiki plugin config get NAME` | Prints a plugin's config as TOML. `--defaults` or `--overrides` for just one part. |
 | `kiki plugin config set NAME [FILE]` | Overrides a plugin's config from TOML, read from `FILE` or stdin. `--replace` drops overrides not given. |
