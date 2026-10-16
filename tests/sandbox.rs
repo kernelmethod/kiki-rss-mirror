@@ -385,6 +385,11 @@ const RSS_BODY: &str = r#"<?xml version="1.0"?>
 /// [`RSS_BODY`] once and exits. Returns the bound address and the
 /// thread handle.
 fn spawn_local_rss_server() -> (SocketAddr, JoinHandle<()>) {
+    spawn_rss_server(RSS_BODY)
+}
+
+/// As [`spawn_local_rss_server`], serving `body`.
+fn spawn_rss_server(body: &'static str) -> (SocketAddr, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local rss server");
@@ -407,8 +412,8 @@ fn spawn_local_rss_server() -> (SocketAddr, JoinHandle<()>) {
                  Content-Type: application/rss+xml; charset=utf-8\r\n\
                  Content-Length: {}\r\n\
                  Connection: close\r\n\r\n{}",
-                RSS_BODY.len(),
-                RSS_BODY
+                body.len(),
+                body
             );
             let _ = stream.write_all(resp.as_bytes());
         }
@@ -486,6 +491,91 @@ fn sandboxed_server_fetches_outbound_http() {
         thread::sleep(Duration::from_millis(200));
     };
     let _ = last;
+    kiki.shutdown();
+}
+
+/// A feed whose entry the default `sanitize` plugin rewrites, for
+/// [`plugins_run_in_the_sandboxed_script_host`].
+const UNSANITIZED_RSS_BODY: &str = r#"<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <title>sandbox-test plugins</title>
+    <link>http://127.0.0.1/</link>
+    <description>test</description>
+    <item>
+      <title>an entry to sanitize</title>
+      <link>http://127.0.0.1/item-1</link>
+      <guid>urn:kiki:sandbox-test:sanitize-1</guid>
+      <description><![CDATA[<p>kept text</p><script>alert(1)</script>]]></description>
+    </item>
+  </channel>
+</rss>
+"#;
+
+/// The default plugins load and run in the sandboxed script host, which
+/// pages out the compiler's code once it has compiled them (or fails to,
+/// on kernels without `MADV_PAGEOUT`) and goes on running plugins.
+#[cfg(feature = "default-plugins")]
+#[test]
+fn plugins_run_in_the_sandboxed_script_host() {
+    let logs = TempDir::with_prefix("kiki-plugin-logs").expect("create tempdir");
+    let path = logs.path().join("stderr.log");
+    let log = std::fs::File::create(&path).expect("create the log file");
+    let mut kiki = Kiki::spawn_as(
+        &[],
+        |dir| {
+            let status = Command::new(KIKI_BIN)
+                .args(["init", "--check"])
+                .env("KIKI_HOME", dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("spawn kiki init --check");
+            assert!(status.success(), "installing the default plugins failed");
+        },
+        None,
+        &[("RUST_LOG", "warn,kiki_rss::process::script_host=debug")],
+        log.into(),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        kiki.assert_still_running();
+        let logged = std::fs::read_to_string(&path).unwrap_or_default();
+        if logged.contains("paged out the executable's code")
+            || logged.contains("could not page out the executable's code")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the script host never tried to page out its code:\n{logged}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let (addr, _server) = spawn_rss_server(UNSANITIZED_RSS_BODY);
+    kiki.post_json(
+        "/v1/feeds/create",
+        &format!(r#"{{"title":"plugins","url":"http://{addr}/feed.xml"}}"#),
+    )
+    .assert_success();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let entries = loop {
+        kiki.assert_still_running();
+        let entries = kiki.get("/v1/entries?limit=5").assert_success();
+        if entries.json()["count"].as_i64().unwrap_or(0) >= 1 {
+            break entries;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the entry never appeared: {}",
+            entries.body_str()
+        );
+        thread::sleep(Duration::from_millis(200));
+    };
+    let content = entries.json()["entries"][0]["content"].clone();
+    assert_eq!(content, "<p>kept text</p>", "sanitize did not run");
     kiki.shutdown();
 }
 
@@ -872,13 +962,25 @@ mod fetch_isolation {
     /// Each of the supervisor's children installs a sandbox of its own on
     /// top of the supervisor's, which shows as more seccomp filters, on
     /// kernels that say how many (5.9+).
+    ///
+    /// A child is found as soon as it has started, which can be before it
+    /// has installed its sandbox, when it runs under only the filters it
+    /// inherited; so wait a while for it to.
     fn assert_stricter_than_the_supervisor(kiki: &Kiki, child: u32, what: &str) {
         let supervisor = kiki.fetcher_supervisor_pids()[0];
-        if let (Some(s), Some(c)) = (seccomp_filters(supervisor), seccomp_filters(child)) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (Some(s), Some(c)) = (seccomp_filters(supervisor), seccomp_filters(child)) else {
+                return;
+            };
+            if c > s {
+                return;
+            }
             assert!(
-                c > s,
+                Instant::now() < deadline,
                 "the {what} runs under {c} seccomp filters, no more than the supervisor's {s}"
             );
+            thread::sleep(Duration::from_millis(20));
         }
     }
 
