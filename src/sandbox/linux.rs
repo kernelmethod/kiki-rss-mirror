@@ -218,7 +218,8 @@ pub fn restrict_syscalls(config: &SandboxConfig) -> Result<()> {
 ///
 /// The setting cannot be undone, and is inherited by forked children and
 /// kept across `execve` (so the feed fetcher's worker, parser and resolver
-/// start out with it). Like Landlock, it has
+/// start out with it where the supervisor starts them; the zygote, which
+/// forks the script host, goes without it). Like Landlock, it has
 /// no log-only mode, so `log_only` does not affect it.
 ///
 /// An older kernel that lacks it is logged and otherwise ignored.
@@ -237,8 +238,8 @@ fn apply_mdwe(config: &SandboxConfig) -> Result<()> {
         } else {
             tracing::info!(
                 profile,
-                "mdwe: writable and executable memory allowed, to compile \
-                 WebAssembly plugins"
+                "mdwe: writable and executable memory allowed, which compiling \
+                 WebAssembly plugins needs"
             );
         }
         return Ok(());
@@ -277,11 +278,13 @@ enum Mdwe {
 }
 
 /// Whether processes with `profile` refuse writable and executable memory:
-/// all but those that compile WebAssembly plugins.
+/// all but those that compile WebAssembly plugins, and the zygote, which
+/// forks the script host, and whose refusal the script host would inherit.
 fn refuses_write_exec(profile: &SandboxProfile) -> bool {
     !matches!(
         profile,
         SandboxProfile::ScriptHost
+            | SandboxProfile::Zygote
             | SandboxProfile::Server {
                 runs_plugins: true,
                 ..
@@ -429,12 +432,13 @@ fn landlock_paths(profile: &SandboxProfile) -> (Vec<PathBuf>, Vec<PathBuf>) {
         SandboxProfile::ScriptHost | SandboxProfile::FeedParser | SandboxProfile::WebUi => {
             (Vec::new(), Vec::new())
         }
-        // The supervisor starts the resolver, whose domain nests inside its
-        // own, so it holds the resolver's paths for it, and the worker's
-        // too: the configuration is readable by every user. What it needs
-        // to start them is added in `apply_landlock`.
+        // The supervisor, or the zygote, starts the resolver, whose domain
+        // nests inside its own, so it holds the resolver's paths for it,
+        // and the worker's too: the configuration is readable by every
+        // user. What the supervisor needs to start them by running kiki
+        // again is added in `apply_landlock`.
         SandboxProfile::FeedWorker => (Vec::new(), tls_paths()),
-        SandboxProfile::FeedFetcher => (
+        SandboxProfile::FeedFetcher { .. } | SandboxProfile::Zygote => (
             Vec::new(),
             tls_paths().into_iter().chain(dns_paths()).collect(),
         ),
@@ -469,7 +473,8 @@ fn landlock_scopes(profile: &SandboxProfile) -> BitFlags<Scope> {
         SandboxProfile::WebUi => Scope::AbstractUnixSocket.into(),
         SandboxProfile::Server { .. }
         | SandboxProfile::ScriptHost
-        | SandboxProfile::FeedFetcher
+        | SandboxProfile::FeedFetcher { .. }
+        | SandboxProfile::Zygote
         | SandboxProfile::FeedWorker
         | SandboxProfile::FeedParser
         | SandboxProfile::FeedResolver => Scope::AbstractUnixSocket | Scope::Signal,
@@ -485,9 +490,11 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
     let (exec_paths, child_ro_paths, child_rw_paths) = match config.profile {
         SandboxProfile::Server { .. } => server_child_paths(),
         // The supervisor starts its worker, parser and resolver by running
-        // the kiki executable again. They inherit its standard streams, so
-        // need no `/dev/null`.
-        SandboxProfile::FeedFetcher => {
+        // the kiki executable again, unless the zygote forks them. They
+        // inherit its standard streams, so need no `/dev/null`.
+        SandboxProfile::FeedFetcher {
+            starts_by_exec: true,
+        } => {
             let (executable, loader) = self_exec_paths();
             (executable, loader, Vec::new())
         }
@@ -497,7 +504,7 @@ fn apply_landlock(config: &SandboxConfig) -> Result<()> {
     let mut ruleset = Ruleset::default().handle_access(all)?.scope(scopes)?;
     if matches!(
         config.profile,
-        SandboxProfile::FeedFetcher | SandboxProfile::FeedWorker
+        SandboxProfile::FeedFetcher { .. } | SandboxProfile::Zygote | SandboxProfile::FeedWorker
     ) {
         // Handling `BindTcp` with no rule allowing any port denies TCP
         // binds outright (Linux 6.7+, ABI v4) — for the worker, redundant
@@ -668,8 +675,8 @@ const DENIED_COMMON: &[i64] = &[
     libc::SYS_vhangup,
     libc::SYS_sethostname,
     libc::SYS_setdomainname,
-    // Only the feed fetcher's supervisor may `execve` (see [`DENIED_EXEC`]),
-    // and nothing needs `execveat`.
+    // Only the feed fetcher's supervisor may `execve`, where there is no
+    // zygote (see [`DENIED_EXEC`]), and nothing needs `execveat`.
     libc::SYS_execveat,
 ];
 
@@ -679,10 +686,12 @@ const DENIED_COMMON: &[i64] = &[
 const DENIED_COMMON_X86_64: &[i64] = &[libc::SYS_ioperm, libc::SYS_iopl, libc::SYS_uselib];
 
 /// Executing a program, denied to every profile but the feed fetcher's
-/// supervisor, which starts its worker, parser and resolver by running the
+/// supervisor when it starts its worker, parser and resolver by running the
 /// kiki executable again — the one file Landlock lets it execute (see
 /// `self_exec_paths`). The processes it starts install filters of their
-/// own on top of its, which deny it.
+/// own on top of its, which deny it. When the zygote forks them instead
+/// (see [`crate::process::zygote`]), the supervisor is denied it too, as is
+/// the zygote, which forks but never executes anything.
 ///
 /// No other Kiki process spawns children after its sandbox is installed
 /// — the server starts its children *before* its filter goes up. Blocking
@@ -837,7 +846,8 @@ fn refuses_filesystem(profile: &SandboxProfile) -> bool {
     match profile {
         SandboxProfile::ScriptHost | SandboxProfile::FeedParser | SandboxProfile::WebUi => true,
         SandboxProfile::Server { .. }
-        | SandboxProfile::FeedFetcher
+        | SandboxProfile::FeedFetcher { .. }
+        | SandboxProfile::Zygote
         | SandboxProfile::FeedWorker
         | SandboxProfile::FeedResolver => false,
     }
@@ -918,7 +928,13 @@ fn denied_syscalls(profile: &SandboxProfile) -> Vec<i64> {
         SandboxProfile::ScriptHost | SandboxProfile::FeedParser => {
             &[DENIED_EXEC, DENIED_SCRIPT_HOST, accept]
         }
-        SandboxProfile::FeedFetcher => &[DENIED_FEED_FETCHER, accept],
+        SandboxProfile::FeedFetcher {
+            starts_by_exec: true,
+        } => &[DENIED_FEED_FETCHER, accept],
+        SandboxProfile::FeedFetcher {
+            starts_by_exec: false,
+        }
+        | SandboxProfile::Zygote => &[DENIED_EXEC, DENIED_FEED_FETCHER, accept],
         SandboxProfile::FeedResolver => &[DENIED_EXEC, DENIED_FEED_FETCHER, accept],
         SandboxProfile::FeedWorker => &[DENIED_EXEC, DENIED_FEED_WORKER, accept],
         SandboxProfile::WebUi => &[DENIED_EXEC, DENIED_WEB_UI],
@@ -961,9 +977,10 @@ const WEB_UI_SOCKET_FAMILIES: &[i32] = &[libc::AF_UNIX];
 /// whose denylist leaves `socket` out.
 fn socket_domains(profile: &SandboxProfile) -> Option<&'static [i32]> {
     match profile {
-        SandboxProfile::FeedFetcher | SandboxProfile::FeedWorker | SandboxProfile::FeedResolver => {
-            Some(FETCHER_SOCKET_FAMILIES)
-        }
+        SandboxProfile::FeedFetcher { .. }
+        | SandboxProfile::Zygote
+        | SandboxProfile::FeedWorker
+        | SandboxProfile::FeedResolver => Some(FETCHER_SOCKET_FAMILIES),
         SandboxProfile::WebUi => Some(WEB_UI_SOCKET_FAMILIES),
         // `socket` is on their denylist outright.
         SandboxProfile::Server { .. } | SandboxProfile::ScriptHost | SandboxProfile::FeedParser => {
@@ -1187,17 +1204,23 @@ mod tests {
         let all = [
             server(false),
             SandboxConfig::script_host(false),
-            SandboxConfig::feed_fetcher(false),
+            SandboxConfig::feed_fetcher(false, true),
+            SandboxConfig::feed_fetcher(false, false),
+            SandboxConfig::zygote(false),
             SandboxConfig::feed_worker(false),
             SandboxConfig::feed_parser(false),
             SandboxConfig::feed_resolver(false),
             SandboxConfig::web_ui(false),
         ];
         for config in &all {
-            let script_host = matches!(config.profile, SandboxProfile::ScriptHost);
+            // The zygote forks the script host, which would inherit it.
+            let allowed = matches!(
+                config.profile,
+                SandboxProfile::ScriptHost | SandboxProfile::Zygote
+            );
             assert_eq!(
                 refuses_write_exec(&config.profile),
-                !script_host,
+                !allowed,
                 "{}",
                 config.profile_name()
             );
@@ -1410,7 +1433,13 @@ mod tests {
                 runs_plugins: false,
             },
             SandboxProfile::ScriptHost,
-            SandboxProfile::FeedFetcher,
+            SandboxProfile::FeedFetcher {
+                starts_by_exec: true,
+            },
+            SandboxProfile::FeedFetcher {
+                starts_by_exec: false,
+            },
+            SandboxProfile::Zygote,
             SandboxProfile::FeedWorker,
             SandboxProfile::FeedParser,
             SandboxProfile::FeedResolver,
@@ -1449,7 +1478,9 @@ mod tests {
 
     #[test]
     fn feed_fetcher_gets_only_read_only_tls_paths() {
-        let (rw, ro) = landlock_paths(&SandboxProfile::FeedFetcher);
+        let (rw, ro) = landlock_paths(&SandboxProfile::FeedFetcher {
+            starts_by_exec: true,
+        });
         assert!(rw.is_empty(), "the feed fetcher must get no writable paths");
         assert!(
             !ro.iter()
@@ -1540,12 +1571,21 @@ mod tests {
     }
 
     /// musl's resolver binds each UDP socket it queries from, and a
-    /// process the supervisor starts can do nothing the supervisor
-    /// may not, so neither the supervisor nor the resolver may be denied
-    /// `bind`; only the worker, which installs its own filter, is.
+    /// process the supervisor or the zygote starts can do nothing they
+    /// may not, so none of them nor the resolver may be denied `bind`; only
+    /// the worker, which installs its own filter, is.
     #[test]
     fn the_supervisor_and_the_resolver_may_bind_for_musls_resolver() {
-        for profile in [SandboxProfile::FeedFetcher, SandboxProfile::FeedResolver] {
+        for profile in [
+            SandboxProfile::FeedFetcher {
+                starts_by_exec: true,
+            },
+            SandboxProfile::FeedFetcher {
+                starts_by_exec: false,
+            },
+            SandboxProfile::Zygote,
+            SandboxProfile::FeedResolver,
+        ] {
             let denied = denied_syscalls(&profile);
             assert!(!denied.contains(&libc::SYS_bind));
             assert!(denied.contains(&libc::SYS_listen));
@@ -1553,26 +1593,55 @@ mod tests {
         }
     }
 
-    /// The supervisor's children run under its filter as well as their
-    /// own, so a syscall one of them needs that the supervisor's denylist
-    /// names would kill it. Each child's denylist must therefore cover the
-    /// supervisor's, and its socket families lie within the supervisor's.
+    /// A process's children run under its sandbox as well as their own, so
+    /// a syscall one of them needs that the parent's denylist names would
+    /// kill it, and a path it needs that the parent's Landlock rules leave
+    /// out would be out of its reach. For the supervisor that starts its
+    /// children by running kiki again, and for the zygote, each child's
+    /// denylist must therefore cover the parent's, its socket families lie
+    /// within the parent's, and its paths within the parent's.
     #[test]
-    fn the_supervisor_denies_nothing_its_children_need() {
-        let supervisor = denied_syscalls(&SandboxProfile::FeedFetcher);
-        for child in [
+    fn no_parent_denies_what_its_children_need() {
+        let fetcher_children = [
             SandboxProfile::FeedWorker,
             SandboxProfile::FeedParser,
             SandboxProfile::FeedResolver,
-        ] {
-            let denied = denied_syscalls(&child);
-            for nr in &supervisor {
-                assert!(denied.contains(nr), "syscall {nr} denied to the supervisor");
-            }
-            if let Some(families) = socket_domains(&child) {
-                assert!(families.iter().all(|f| FETCHER_SOCKET_FAMILIES.contains(f)));
+        ];
+        let zygote_children = [
+            SandboxProfile::FeedFetcher {
+                starts_by_exec: false,
+            },
+            SandboxProfile::ScriptHost,
+            SandboxProfile::FeedWorker,
+            SandboxProfile::FeedParser,
+            SandboxProfile::FeedResolver,
+        ];
+        let families = |p: &SandboxProfile| socket_domains(p).unwrap_or(&[]);
+        let parents: [(SandboxProfile, &[SandboxProfile]); 2] = [
+            (
+                SandboxProfile::FeedFetcher {
+                    starts_by_exec: true,
+                },
+                &fetcher_children,
+            ),
+            (SandboxProfile::Zygote, &zygote_children),
+        ];
+        for (parent, children) in &parents {
+            let parent_denied = denied_syscalls(parent);
+            let (_, parent_paths) = landlock_paths(parent);
+            for child in *children {
+                let denied = denied_syscalls(child);
+                for nr in &parent_denied {
+                    assert!(denied.contains(nr), "syscall {nr} denied to a parent");
+                }
+                assert!(families(child).iter().all(|f| families(parent).contains(f)));
+                let (rw, ro) = landlock_paths(child);
+                assert!(rw.is_empty());
+                assert!(ro.iter().all(|p| parent_paths.contains(p)), "{ro:?}");
             }
         }
+        // And the zygote leaves the script host free to compile plugins.
+        assert!(!refuses_write_exec(&SandboxProfile::Zygote));
     }
 
     #[test]
@@ -1675,13 +1744,19 @@ mod tests {
         assert!(DENIED_COMMON.contains(&libc::SYS_unshare));
     }
 
-    /// Only the supervisor may execute anything, and the processes it
-    /// starts, which install their own filters on top of its, may not.
-    /// Nothing may `execveat`.
+    /// Only the supervisor that starts its children by running kiki again
+    /// may execute anything, and the processes it starts, which install
+    /// their own filters on top of its, may not; nor may the zygote, or a
+    /// supervisor whose children the zygote forks. Nothing may `execveat`.
     #[test]
     fn only_the_supervisor_may_execute() {
         for profile in every_profile() {
-            let supervisor = matches!(profile, SandboxProfile::FeedFetcher);
+            let supervisor = matches!(
+                profile,
+                SandboxProfile::FeedFetcher {
+                    starts_by_exec: true
+                }
+            );
             let denied = denied_syscalls(&profile);
             assert!(denied.contains(&libc::SYS_execveat));
             assert_eq!(

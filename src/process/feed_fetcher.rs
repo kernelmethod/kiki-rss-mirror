@@ -83,10 +83,11 @@
 //! spawn anything once its own sandbox is up (its profile denies
 //! `execve`), which is acceptable for the optional script host but not
 //! for fetching, which is Kiki's core job. The supervisor — single-threaded,
-//! and never touching untrusted input — is the one profile that may
-//! `execve`, and then only the kiki executable (see
-//! [`SandboxProfile::FeedFetcher`]), so it starts a fresh worker whenever
-//! the last one dies. The supervisor tracks
+//! and never touching untrusted input — has its own connection to the
+//! zygote ([`crate::process::zygote`]), so it has a fresh worker forked
+//! whenever the last one dies; where there is no zygote, it is the one
+//! profile that may `execve`, and then only the kiki executable (see
+//! [`SandboxProfile::FeedFetcher`]), and starts the worker itself. The supervisor tracks
 //! which requests were in flight and answers each of them with
 //! [`JobResult::WorkerExited`]. Any of them may be what killed the worker,
 //! so the server retries them one at a time: a request that kills the
@@ -146,6 +147,7 @@ use crate::process::ipc::{
     decode, decode_prefix, encode, read_frame_async, read_frame_limited, write_frame_async,
     write_frame_limited,
 };
+use crate::process::ChildProcess;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -161,7 +163,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, warn};
 
-/// The hidden subcommand the server re-execs itself with.
+/// The hidden subcommand the supervisor runs: the server re-execs itself
+/// with it, or the zygote forks a child that runs it.
 pub const SUBCOMMAND: &str = "__feed-fetcher";
 
 /// Environment variable set on the child, naming [`CHILD_FD`](crate::process::CHILD_FD).
@@ -558,7 +561,7 @@ pub struct FeedFetcherHost {
     /// A clone of the socket kept only to shut it down on drop, which
     /// wakes the reader thread and tells the supervisor to exit.
     control: UnixStream,
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<ChildProcess>>,
     /// Held while a job that was in hand when a worker died is retried,
     /// so that suspects are retried one at a time; see [`Self::request`].
     suspects: tokio::sync::Mutex<()>,
@@ -583,12 +586,37 @@ impl FeedFetcherHost {
             crate::process::spawn_child(SUBCOMMAND, HOST_FD_ENV, log_only, no_sandbox)
                 .context("spawning the feed fetcher")?;
         info!(pid = child.id(), "feed fetcher: spawned");
-        Self::from_stream(stream, Some(child))
+        Self::from_stream(stream, Some(ChildProcess::Exec(child)))
+    }
+
+    /// [`Self::spawn`], having `zygote` fork the supervisor rather than
+    /// running the kiki executable again; the supervisor then has the
+    /// zygote fork its own children too. See [`crate::process::zygote`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if the zygote cannot start the supervisor, or the threads that
+    /// service its socket cannot be started.
+    #[cfg(target_os = "linux")]
+    pub fn spawn_by(
+        zygote: &Arc<crate::process::zygote::Zygote>,
+        log_only: bool,
+        no_sandbox: bool,
+    ) -> Result<Self> {
+        let (stream, child) = zygote
+            .start(
+                crate::process::zygote::Role::FeedFetcher,
+                log_only,
+                no_sandbox,
+            )
+            .context("starting the feed fetcher")?;
+        info!(pid = child.id(), "feed fetcher: spawned");
+        Self::from_stream(stream, Some(ChildProcess::Forked(child)))
     }
 
     /// Wrap an already-connected socket. The far end must speak the
     /// supervisor's side of the protocol.
-    fn from_stream(stream: UnixStream, child: Option<Child>) -> Result<Self> {
+    fn from_stream(stream: UnixStream, child: Option<ChildProcess>) -> Result<Self> {
         let pending = Arc::new(Pending::new());
 
         let control = stream.try_clone().context("cloning the fetcher socket")?;
@@ -920,14 +948,18 @@ impl Drop for FeedFetcherHost {
 /// normal shutdown, not an error.
 pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
     let spawner = Spawner::new(log_only, no_sandbox)?;
+    let starts_by_exec = spawner.starts_by_exec();
     if no_sandbox {
         warn!(
             "feed fetcher: sandbox disabled via --no-sandbox; feeds are fetched and parsed \
              with full filesystem and syscall access"
         );
     } else {
-        crate::sandbox::apply(&crate::sandbox::SandboxConfig::feed_fetcher(log_only))
-            .context("failed to install the feed fetcher sandbox")?;
+        crate::sandbox::apply(&crate::sandbox::SandboxConfig::feed_fetcher(
+            log_only,
+            starts_by_exec,
+        ))
+        .context("failed to install the feed fetcher sandbox")?;
     }
 
     let mut server = crate::process::take_parent_socket(SUBCOMMAND)?;
@@ -1023,6 +1055,19 @@ enum ChildKind {
 }
 
 impl ChildKind {
+    /// The role of a child of this kind, forked by the zygote.
+    #[cfg(target_os = "linux")]
+    fn role(self) -> crate::process::zygote::Role {
+        use crate::process::zygote::Role;
+        match self {
+            ChildKind::Worker => Role::FeedWorker,
+            ChildKind::Parser { threads } => Role::FeedParser {
+                threads: u32::try_from(threads).unwrap_or(u32::MAX),
+            },
+            ChildKind::Resolver => Role::FeedResolver,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             ChildKind::Worker => "worker",
@@ -1055,44 +1100,90 @@ impl ChildKind {
         use crate::process::ChildEnv;
         match self {
             ChildKind::Worker => ChildEnv::Inherit,
-            ChildKind::Parser { .. } => ChildEnv::Only(&[LOG_ENV]),
+            ChildKind::Parser { .. } => ChildEnv::Only(PARSER_ENV),
             ChildKind::Resolver => ChildEnv::Only(RESOLVER_ENV),
         }
     }
 }
 
+/// How the supervisor starts its children.
+#[derive(Clone)]
+enum Starter {
+    /// By running the kiki executable, as it was when the supervisor
+    /// started, again.
+    Exec(PathBuf),
+    /// By having the zygote, which forked the supervisor, fork them; see
+    /// [`crate::process::zygote`].
+    #[cfg(target_os = "linux")]
+    Zygote(Arc<crate::process::zygote::Zygote>),
+}
+
 /// Starts the supervisor's children, as the same executable as itself.
 #[derive(Clone)]
 struct Spawner {
-    /// The kiki executable, as it was when the supervisor started.
-    exe: PathBuf,
+    starter: Starter,
     log_only: bool,
     no_sandbox: bool,
 }
 
 impl Spawner {
-    /// A spawner for this executable, whose children install a sandbox
-    /// like this process's.
+    /// A spawner whose children install a sandbox like this process's:
+    /// through the zygote, if this process was given a connection to it,
+    /// and otherwise by running this executable again.
     ///
     /// Must be called before the sandbox is installed, while the path to
     /// the executable can still be looked up.
     fn new(log_only: bool, no_sandbox: bool) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        if let Some(zygote) = crate::process::zygote::Zygote::inherited()? {
+            return Ok(Spawner {
+                starter: Starter::Zygote(zygote),
+                log_only,
+                no_sandbox,
+            });
+        }
         let exe = std::env::current_exe().context("locating the kiki executable")?;
         Ok(Spawner {
-            exe,
+            starter: Starter::Exec(exe),
             log_only,
             no_sandbox,
         })
+    }
+
+    /// Whether the children are started by running the kiki executable
+    /// again, which the supervisor's sandbox must then allow.
+    fn starts_by_exec(&self) -> bool {
+        matches!(self.starter, Starter::Exec(_))
     }
 
     /// Start a child of `kind`, and return the supervisor's end of its
     /// socket pair, with [`WORKER_IO_TIMEOUT`] on reads and writes.
     ///
     /// The child inherits no descriptor but that socket and the standard
-    /// streams, and dies with the supervisor.
-    fn spawn(&self, kind: ChildKind) -> io::Result<(UnixStream, Child)> {
+    /// streams, and dies with the supervisor, or with the zygote, which
+    /// stops it when the supervisor's connection to it closes.
+    fn spawn(&self, kind: ChildKind) -> io::Result<(UnixStream, ChildProcess)> {
+        let (ours, child) = match &self.starter {
+            Starter::Exec(exe) => {
+                let (ours, child) = self.exec(exe, kind)?;
+                (ours, ChildProcess::Exec(child))
+            }
+            #[cfg(target_os = "linux")]
+            Starter::Zygote(zygote) => {
+                let (ours, child) = zygote.start(kind.role(), self.log_only, self.no_sandbox)?;
+                (ours, ChildProcess::Forked(child))
+            }
+        };
+        ours.set_read_timeout(Some(WORKER_IO_TIMEOUT))?;
+        ours.set_write_timeout(Some(WORKER_IO_TIMEOUT))?;
+        info!(pid = child.id(), "feed fetcher: {} started", kind.name());
+        Ok((ours, child))
+    }
+
+    /// Start a child of `kind` by running `exe` again.
+    fn exec(&self, exe: &std::path::Path, kind: ChildKind) -> io::Result<(UnixStream, Child)> {
         let mut cmd = crate::process::child_command(
-            &self.program(),
+            &Self::program(exe),
             kind.subcommand(),
             kind.fd_env(),
             kind.env(),
@@ -1102,16 +1193,12 @@ impl Spawner {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::process::CommandExt;
-            cmd.arg0(&self.exe);
+            cmd.arg0(exe);
         }
         if let ChildKind::Parser { threads } = kind {
             cmd.env(PARSER_THREADS_ENV, threads.to_string());
         }
-        let (ours, child) = crate::process::spawn_with_socket(&mut cmd, true)?;
-        ours.set_read_timeout(Some(WORKER_IO_TIMEOUT))?;
-        ours.set_write_timeout(Some(WORKER_IO_TIMEOUT))?;
-        info!(pid = child.id(), "feed fetcher: {} started", kind.name());
-        Ok((ours, child))
+        crate::process::spawn_with_socket(&mut cmd, true)
     }
 
     /// Start a helper of `kind`.
@@ -1129,19 +1216,18 @@ impl Spawner {
     /// been replaced — an upgrade, say — since the channels' messages are
     /// only understood by the same build at both ends. (The supervisor's
     /// Landlock rules allow executing that file, and no other.)
-    fn program(&self) -> PathBuf {
+    fn program(exe: &std::path::Path) -> PathBuf {
         if cfg!(target_os = "linux") {
             PathBuf::from("/proc/self/exe")
         } else {
-            self.exe.clone()
+            exe.to_path_buf()
         }
     }
 }
 
 /// Kill `child`, if it is still running, reap it, and say how it ended.
-fn stop(mut child: Child) -> String {
-    let _ = child.kill();
-    match child.wait() {
+fn stop(child: ChildProcess) -> String {
+    match child.kill() {
         Ok(status) => describe_exit(status),
         Err(e) => format!("could not be waited for: {e}"),
     }
@@ -1322,7 +1408,7 @@ struct ChildProc {
     /// [`WORKER_IO_TIMEOUT`] on reads and writes.
     stream: UnixStream,
     /// `None` for a helper that is not a process of its own, in tests.
-    child: Option<Child>,
+    child: Option<ChildProcess>,
     started: Instant,
 }
 
@@ -1998,7 +2084,10 @@ const LOG_ENV: &str = "RUST_LOG";
 /// Environment variables the C library's resolver reads, which, with
 /// [`LOG_ENV`], are all the resolver is given of the supervisor's
 /// environment.
-const RESOLVER_ENV: &[&str] = &["LOCALDOMAIN", "RES_OPTIONS", "HOSTALIASES", LOG_ENV];
+pub(crate) const RESOLVER_ENV: &[&str] = &["LOCALDOMAIN", "RES_OPTIONS", "HOSTALIASES", LOG_ENV];
+
+/// The environment variables the parser is given: what it logs.
+pub(crate) const PARSER_ENV: &[&str] = &[LOG_ENV];
 
 /// Run the feed fetcher's parser, `kiki __feed-parser`: tighten the
 /// sandbox it started under, the supervisor's, to the

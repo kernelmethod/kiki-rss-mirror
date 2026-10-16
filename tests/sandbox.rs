@@ -767,6 +767,42 @@ fn child_pids_matching(parent: u32, needle: &str) -> Vec<u32> {
     found
 }
 
+/// The parent of `pid`, from its /proc status.
+fn parent_pid(pid: u32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("PPid:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// Scan /proc for descendants of `ancestor`, at any depth, whose command
+/// line contains `needle`. The server's children, and the feed fetcher's,
+/// are its grandchildren when the zygote forks them, and its children and
+/// the supervisor's when they are started by running kiki again.
+fn descendant_pids_matching(ancestor: u32, needle: &str) -> Vec<u32> {
+    let mut parents: Vec<(u32, u32)> = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
+            if let Some(ppid) = parent_pid(pid) {
+                parents.push((pid, ppid));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    let mut pending = vec![ancestor];
+    while let Some(parent) = pending.pop() {
+        for &(pid, _) in parents.iter().filter(|(_, ppid)| *ppid == parent) {
+            pending.push(pid);
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            if String::from_utf8_lossy(&cmdline).contains(needle) {
+                found.push(pid);
+            }
+        }
+    }
+    found
+}
+
 /// Read the `Seccomp` mode out of a process's /proc status. `2` is
 /// `SECCOMP_MODE_FILTER`.
 fn seccomp_mode(pid: u32) -> Option<u32> {
@@ -865,13 +901,13 @@ fn the_sandboxed_server_reports_its_childrens_memory() {
 
 mod fetch_isolation {
     use super::*;
-    use kiki_rss::process::feed_fetcher;
+    use kiki_rss::process::{feed_fetcher, zygote};
 
     impl Kiki {
         /// PID of this server's feed fetcher supervisor, if it has one.
         fn fetcher_supervisor_pids(&self) -> Vec<u32> {
             let server_pid = self.child.as_ref().expect("child").id();
-            child_pids_matching(server_pid, feed_fetcher::SUBCOMMAND)
+            descendant_pids_matching(server_pid, feed_fetcher::SUBCOMMAND)
         }
 
         /// Wait for the supervisor's worker to exist and return its PID.
@@ -891,17 +927,14 @@ mod fetch_isolation {
             self.wait_for_fetcher_child(feed_fetcher::RESOLVER_SUBCOMMAND, not)
         }
 
-        /// Wait for a child of the supervisor started with `subcommand`,
-        /// other than `not`, and return its PID.
+        /// Wait for one of the supervisor's children, running
+        /// `subcommand`, other than `not`, and return its PID.
         fn wait_for_fetcher_child(&mut self, subcommand: &str, not: Option<u32>) -> u32 {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 self.assert_still_running();
-                let supervisor = *self
-                    .fetcher_supervisor_pids()
-                    .first()
-                    .expect("a feed fetcher supervisor");
-                let children = child_pids_matching(supervisor, subcommand);
+                let server_pid = self.child.as_ref().expect("child").id();
+                let children = descendant_pids_matching(server_pid, subcommand);
                 if let Some(&c) = children.iter().find(|&&c| Some(c) != not) {
                     return c;
                 }
@@ -955,30 +988,32 @@ mod fetch_isolation {
                 "fetcher pid {pid} is not running under a seccomp filter"
             );
         }
-        assert_stricter_than_the_supervisor(&kiki, worker, "worker");
+        assert_stricter_than_its_parent(worker, "worker");
         kiki.shutdown();
     }
 
     /// Each of the supervisor's children installs a sandbox of its own on
-    /// top of the supervisor's, which shows as more seccomp filters, on
-    /// kernels that say how many (5.9+).
+    /// top of the one it started under, its parent's, which shows as more
+    /// seccomp filters, on kernels that say how many (5.9+). Its parent is
+    /// the supervisor when the supervisor starts it by running kiki again,
+    /// and the zygote when the zygote forks it.
     ///
     /// A child is found as soon as it has started, which can be before it
     /// has installed its sandbox, when it runs under only the filters it
     /// inherited; so wait a while for it to.
-    fn assert_stricter_than_the_supervisor(kiki: &Kiki, child: u32, what: &str) {
-        let supervisor = kiki.fetcher_supervisor_pids()[0];
+    fn assert_stricter_than_its_parent(child: u32, what: &str) {
+        let parent = parent_pid(child).expect("the child's parent");
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let (Some(s), Some(c)) = (seccomp_filters(supervisor), seccomp_filters(child)) else {
+            let (Some(p), Some(c)) = (seccomp_filters(parent), seccomp_filters(child)) else {
                 return;
             };
-            if c > s {
+            if c > p {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "the {what} runs under {c} seccomp filters, no more than the supervisor's {s}"
+                "the {what} runs under {c} seccomp filters, no more than its parent's {p}"
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -1001,7 +1036,7 @@ mod fetch_isolation {
         if std::env::var_os(WORKER_PROBE_ENV).is_none() {
             return;
         }
-        apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
+        apply(&SandboxConfig::feed_fetcher(false, true)).expect("install the fetcher sandbox");
         // The supervisor may bind, for the resolver it starts.
         std::net::UdpSocket::bind("127.0.0.1:0").expect("the supervisor may bind");
         apply(&SandboxConfig::feed_worker(false)).expect("install the worker sandbox");
@@ -1072,7 +1107,7 @@ mod fetch_isolation {
         let copy = dir.path().join("copy");
         std::fs::copy(&exe, &copy).expect("copy this executable");
 
-        apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
+        apply(&SandboxConfig::feed_fetcher(false, true)).expect("install the fetcher sandbox");
 
         // With the standard streams inherited, as the supervisor's children
         // have them: the sandbox grants no `/dev/null`.
@@ -1170,7 +1205,7 @@ mod fetch_isolation {
         let resolver = kiki.wait_for_fetcher_resolver(None);
         assert_ne!(worker, resolver);
         assert_eq!(seccomp_mode(resolver), Some(2));
-        assert_stricter_than_the_supervisor(&kiki, resolver, "resolver");
+        assert_stricter_than_its_parent(resolver, "resolver");
         let environ = std::fs::read(format!("/proc/{resolver}/environ")).expect("read environ");
         let kept: Vec<String> = environ
             .split(|&b| b == 0)
@@ -1221,7 +1256,7 @@ mod fetch_isolation {
             .expect("valid probe TCP address");
         // Asked before the sandbox goes up.
         let abi = landlock_abi();
-        apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
+        apply(&SandboxConfig::feed_fetcher(false, true)).expect("install the fetcher sandbox");
         apply(&SandboxConfig::feed_resolver(false)).expect("install the resolver sandbox");
 
         // What the resolver is for still works.
@@ -1335,7 +1370,42 @@ mod fetch_isolation {
             }),
             "the parser got more of the environment than it needs: {names:?}"
         );
-        assert_stricter_than_the_supervisor(&kiki, parser, "parser");
+        assert_stricter_than_its_parent(parser, "parser");
+        kiki.shutdown();
+    }
+
+    /// With `--no-zygote`, the supervisor is started by the server, and
+    /// its worker, parser and resolver by the supervisor, each by running
+    /// kiki again — as everywhere there is no zygote — and fetching a feed
+    /// by hostname works as with the zygote.
+    #[test]
+    fn feeds_are_fetched_without_the_zygote() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&["--no-zygote"]);
+        let server = kiki.child.as_ref().expect("child").id();
+        assert!(descendant_pids_matching(server, zygote::SUBCOMMAND).is_empty());
+        let created = kiki
+            .post_json(
+                "/v1/feeds/create",
+                &format!(
+                    r#"{{"title":"by name","url":"http://localhost:{}/feed.xml"}}"#,
+                    addr.port()
+                ),
+            )
+            .assert_success();
+        let feed_id = created.json()["id"].as_i64().expect("id");
+        refresh_until_entries(&mut kiki, feed_id, 1);
+
+        let supervisor = kiki.fetcher_supervisor_pids()[0];
+        assert_eq!(parent_pid(supervisor), Some(server));
+        for (child, what) in [
+            (kiki.wait_for_fetcher_worker(None), "worker"),
+            (kiki.wait_for_fetcher_parser(None), "parser"),
+            (kiki.wait_for_fetcher_resolver(None), "resolver"),
+        ] {
+            assert_eq!(parent_pid(child), Some(supervisor), "the {what}");
+            assert_stricter_than_its_parent(child, what);
+        }
         kiki.shutdown();
     }
 
@@ -1387,7 +1457,7 @@ mod fetch_isolation {
         };
         // Asked before the sandbox goes up.
         let abi = landlock_abi();
-        apply(&SandboxConfig::feed_fetcher(false)).expect("install the fetcher sandbox");
+        apply(&SandboxConfig::feed_fetcher(false, true)).expect("install the fetcher sandbox");
         apply(&SandboxConfig::feed_parser(false)).expect("install the parser sandbox");
 
         // The fetcher may read the TLS trust stores; the parser may not
@@ -1501,7 +1571,7 @@ mod script_isolation {
         /// word for it.
         fn script_host_pids(&mut self) -> Vec<u32> {
             let server_pid = self.child.as_ref().expect("child").id();
-            child_pids_matching(server_pid, script_host::SUBCOMMAND)
+            descendant_pids_matching(server_pid, script_host::SUBCOMMAND)
         }
 
         /// Block until `kiki_plugins_loaded` reaches `n`, so a test never
@@ -1668,6 +1738,24 @@ mod script_isolation {
             format!("{TITLE} [plugin]"),
             "entry title was not transformed by the isolated script host"
         );
+        kiki.shutdown();
+    }
+
+    /// With `--no-zygote`, the script host is started by running kiki
+    /// again, as everywhere there is no zygote, and runs plugins as it
+    /// does when the zygote forks it.
+    #[test]
+    fn an_isolated_plugin_runs_without_the_zygote() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = spawn_with_plugin(&["--no-zygote"], title_stamping());
+        let server = kiki.child.as_ref().expect("child").id();
+        let hosts = kiki.script_host_pids();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(parent_pid(hosts[0]), Some(server));
+
+        let feed_id = create_local_feed(&mut kiki, addr);
+        let title = refresh_and_read_title(&mut kiki, feed_id);
+        assert_eq!(title, format!("{TITLE} [plugin]"));
         kiki.shutdown();
     }
 
@@ -2356,7 +2444,7 @@ mod landlock_scoping {
                 false,
             ),
             "script-host" => SandboxConfig::script_host(false),
-            "feed-fetcher" => SandboxConfig::feed_fetcher(false),
+            "feed-fetcher" => SandboxConfig::feed_fetcher(false, true),
             "web-ui" => SandboxConfig::web_ui(false),
             other => panic!("unknown profile {other}"),
         };
@@ -2495,6 +2583,117 @@ mod landlock_scoping {
         let msg = String::from_utf8_lossy(&buf[..n]);
         assert!(msg.contains("READY=1"), "unexpected notification: {msg:?}");
         kiki.assert_still_running();
+        kiki.shutdown();
+    }
+}
+
+// --------------------------------------------------------------------
+// The zygote
+// --------------------------------------------------------------------
+
+mod zygote_forking {
+    use super::*;
+    use kiki_rss::process::{feed_fetcher, script_host, zygote};
+
+    /// The subcommand `pid` runs, as its command line shows it.
+    fn subcommand_of(pid: u32) -> Option<String> {
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        cmdline
+            .split(|&b| b == 0)
+            .nth(1)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+    }
+
+    /// The one descendant of `ancestor` running `subcommand`, waiting up to
+    /// ten seconds for it to appear.
+    fn wait_for_one(kiki: &mut Kiki, ancestor: u32, subcommand: &str) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            kiki.assert_still_running();
+            let found = descendant_pids_matching(ancestor, subcommand);
+            match found.as_slice() {
+                [pid] => return *pid,
+                [] if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                _ => panic!("expected one `{subcommand}` under {ancestor}, found {found:?}"),
+            }
+        }
+    }
+
+    /// By default the server starts the zygote, which forks the supervisor
+    /// and the script host, and the supervisor's worker, parser and
+    /// resolver, each of which shows as the subcommand it runs.
+    #[test]
+    fn the_zygote_forks_the_servers_children_and_the_fetchers() {
+        let (addr, _server) = spawn_local_rss_server();
+        let mut kiki = Kiki::spawn(&[]);
+        let server = kiki.child.as_ref().expect("child").id();
+        let zygote = wait_for_one(&mut kiki, server, zygote::SUBCOMMAND);
+        assert_eq!(parent_pid(zygote), Some(server));
+
+        // A feed named by hostname, so that the resolver and the parser
+        // are started too.
+        let created = kiki
+            .post_json(
+                "/v1/feeds/create",
+                &format!(
+                    r#"{{"title":"by name","url":"http://localhost:{}/feed.xml"}}"#,
+                    addr.port()
+                ),
+            )
+            .assert_success();
+        let feed_id = created.json()["id"].as_i64().expect("id");
+        refresh_until_entries(&mut kiki, feed_id, 1);
+
+        for subcommand in [
+            feed_fetcher::SUBCOMMAND,
+            feed_fetcher::WORKER_SUBCOMMAND,
+            feed_fetcher::PARSER_SUBCOMMAND,
+            feed_fetcher::RESOLVER_SUBCOMMAND,
+            script_host::SUBCOMMAND,
+        ] {
+            let pid = wait_for_one(&mut kiki, server, subcommand);
+            assert_eq!(parent_pid(pid), Some(zygote), "{subcommand}");
+            assert_eq!(subcommand_of(pid).as_deref(), Some(subcommand));
+        }
+        kiki.shutdown();
+    }
+
+    /// What a child forked by the zygote has of the executable's pages that
+    /// were written when the zygote started — its relocated data, chiefly —
+    /// it shares with the zygote and its siblings, rather than holding a
+    /// copy of its own, which is what the zygote is for.
+    #[test]
+    fn forked_children_share_the_executables_relocated_pages() {
+        let mut kiki = Kiki::spawn(&[]);
+        let server = kiki.child.as_ref().expect("child").id();
+        let worker = wait_for_one(&mut kiki, server, feed_fetcher::WORKER_SUBCOMMAND);
+        let exe = std::fs::canonicalize(KIKI_BIN).expect("the kiki executable");
+        let smaps = std::fs::read_to_string(format!("/proc/{worker}/smaps")).expect("read smaps");
+        let mut in_exe = false;
+        let mut shared_dirty = 0u64;
+        for line in smaps.lines() {
+            if line
+                .split_whitespace()
+                .next()
+                .is_some_and(|f| f.contains('-'))
+                && !line.starts_with(|c: char| c.is_ascii_uppercase())
+            {
+                in_exe = line.ends_with(exe.to_str().expect("a UTF-8 path"));
+            } else if in_exe {
+                if let Some(kb) = line.strip_prefix("Shared_Dirty:") {
+                    shared_dirty += kb
+                        .trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse::<u64>()
+                        .unwrap_or(0);
+                }
+            }
+        }
+        assert!(
+            shared_dirty > 0,
+            "the worker shares none of the executable's written pages"
+        );
         kiki.shutdown();
     }
 }

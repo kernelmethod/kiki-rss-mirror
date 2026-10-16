@@ -78,6 +78,7 @@ use crate::process::ipc::{
     HostResponse, PluginTime, RequestId, Subscriptions, ToHost, ToHostRef, KEPT_BUFFER_BYTES,
     MAX_FRAME_BYTES,
 };
+use crate::process::ChildProcess;
 use crate::scripting::wasm::WasmScriptRunner;
 use crate::scripting::{
     EntryPatch, Event, EventPayload, EventSet, FeedEntry, FetchSchedule, PluginRun, ScanSummary,
@@ -91,14 +92,14 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
-use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// The hidden subcommand the server re-execs itself with.
+/// The hidden subcommand the script host runs: the server re-execs itself
+/// with it, or the zygote forks a child that runs it.
 pub const SUBCOMMAND: &str = "__script-host";
 
 /// File descriptor the child inherits its end of the socket pair on.
@@ -321,7 +322,7 @@ impl Drop for Answering<'_> {
 struct HostState {
     /// `None` when the host was not spawned as a process, as in tests, or
     /// once it has been reaped.
-    child: Option<Child>,
+    child: Option<ChildProcess>,
     /// Where to send what arrives for each request in flight.
     pending: HashMap<RequestId, mpsc::Sender<Inbound>>,
     next_id: RequestId,
@@ -382,9 +383,8 @@ impl Shared {
             error = reason,
             "script host: channel failed, disabling scripting until restart"
         );
-        if let Some(mut child) = state.child.take() {
+        if let Some(child) = state.child.take() {
             let _ = child.kill();
-            let _ = child.wait();
         }
         // Wakes the request reading the channel, if one is.
         let _ = self
@@ -549,12 +549,35 @@ impl ScriptHost {
             crate::process::spawn_child_exe(exe, SUBCOMMAND, HOST_FD_ENV, log_only, no_sandbox)
                 .context("spawning the script host process")?;
         info!(pid = child.id(), "script host: spawned");
-        Self::over(ours, Some(child))
+        Self::over(ours, Some(ChildProcess::Exec(child)))
+    }
+
+    /// [`Self::spawn`], having `zygote` fork the child rather than running
+    /// the kiki executable again; see [`crate::process::zygote`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if the zygote cannot start the child.
+    #[cfg(target_os = "linux")]
+    pub fn spawn_by(
+        zygote: &Arc<crate::process::zygote::Zygote>,
+        log_only: bool,
+        no_sandbox: bool,
+    ) -> Result<Self> {
+        let (ours, child) = zygote
+            .start(
+                crate::process::zygote::Role::ScriptHost,
+                log_only,
+                no_sandbox,
+            )
+            .context("starting the script host process")?;
+        info!(pid = child.id(), "script host: spawned");
+        Self::over(ours, Some(ChildProcess::Forked(child)))
     }
 
     /// A host that talks to whatever serves the other end of `stream`, the
     /// process `child` if it is one.
-    fn over(stream: UnixStream, child: Option<Child>) -> Result<Self> {
+    fn over(stream: UnixStream, child: Option<ChildProcess>) -> Result<Self> {
         // Bounded both ways, so that a child that stops reading, or stops
         // in the middle of a frame, is noticed. Waiting for a frame to
         // start is bounded by the requests themselves.
