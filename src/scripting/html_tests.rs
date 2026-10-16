@@ -1,4 +1,4 @@
-//! Tests of the `html` interface: `select` and `rewrite`'s two passes, `strip`'s one, and `inner`.
+//! Tests of the `html` interface: `select` and `rewrite`'s two passes, `strip`'s one, `inner` and `inner_each`.
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
@@ -454,4 +454,72 @@ fn inner_is_capped_and_stops_once_the_budget_runs_out() {
         inner(html, "<<", MAX, &never).unwrap_err(),
         HtmlError::Failed(m) if m.contains("invalid selector")
     ));
+}
+
+/// What `inner_each` finds in `html` for each of `selectors`, as text.
+fn inner_each_of<'a>(html: &'a str, selectors: &[&str]) -> Vec<Option<&'a str>> {
+    let selectors: Vec<String> = selectors.iter().map(|s| s.to_string()).collect();
+    inner_each(html, &selectors, &never)
+        .unwrap()
+        .into_iter()
+        .map(|span| span.map(|s| &html[s.start as usize..(s.start + s.len) as usize]))
+        .collect()
+}
+
+#[test]
+fn inner_each_finds_what_inner_finds_for_each_selector() {
+    let long = format!("<p>{}</p>", "é".repeat(WRITE_CHUNK_BYTES));
+    let pages = [
+        "<div class=a><p>One <b>two</b></p><div class=a>nested</div></div><div class=a>later</div>"
+            .to_string(),
+        "<main><!-- c -->&amp; &lt;x&gt;</main>".to_string(),
+        "<p></p><p>x<img src=a.png>y</p>".to_string(),
+        "<article><p>x</p><p>y".to_string(),
+        "<div><section><p>x</div><section>y</section>".to_string(),
+        "<html><head><title>T</title></head><body><svg><g/></svg><main>m</main></body></html>"
+            .to_string(),
+        // Content that runs across the chunks the HTML is parsed in.
+        format!("<nav>menu</nav><article>{long}</article><main>{long}{long}</main>"),
+    ];
+    let selectors = [
+        "div.a", "b", "section", "main", "p", "img", "article", "g", "svg", "title", "nav",
+    ];
+    for page in &pages {
+        let expected: Vec<Option<String>> = selectors.iter().map(|s| inner_of(page, s)).collect();
+        let found = inner_each_of(page, &selectors);
+        assert_eq!(
+            found,
+            expected.iter().map(Option::as_deref).collect::<Vec<_>>(),
+            "{page:.80}"
+        );
+    }
+}
+
+#[test]
+fn inner_each_takes_a_selector_twice_and_none_at_all() {
+    let html = "<main>m</main>";
+    assert_eq!(
+        inner_each_of(html, &["main", "main"]),
+        [Some("m"), Some("m")]
+    );
+    assert_eq!(inner_each_of(html, &[]), Vec::<Option<&str>>::new());
+}
+
+#[test]
+fn inner_each_refuses_bad_selectors_and_stops_once_the_budget_runs_out() {
+    let html = "<article>0123456789</article>";
+    let selectors = vec!["article".to_string(), "<<".to_string()];
+    assert!(matches!(
+        inner_each(html, &selectors, &never).unwrap_err(),
+        HtmlError::Failed(m) if m.contains("invalid selector \"<<\"")
+    ));
+    let too_many = vec!["p".to_string(); MAX_INNER_SELECTORS + 1];
+    assert!(matches!(
+        inner_each(html, &too_many, &never).unwrap_err(),
+        HtmlError::Failed(m) if m.contains("at most")
+    ));
+    assert_eq!(
+        inner_each(html, &["article".to_string()], &|| true).unwrap_err(),
+        HtmlError::Expired
+    );
 }

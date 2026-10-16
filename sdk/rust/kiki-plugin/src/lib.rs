@@ -558,6 +558,45 @@ pub mod html {
         wit::inner(html, selector, room(html.len()))
     }
 
+    /// The most selectors [`inner_each`] takes at once.
+    pub const MAX_INNER_SELECTORS: usize = 64;
+
+    /// For each of `selectors`, the content of the first element of `html` it matches, as
+    /// [`inner`] returns it, or `None` if it matches nothing. Reads `html` once for all
+    /// the selectors, rather than once for each, as calling [`inner`] for each would, and
+    /// returns slices of `html` rather than copies. Needs Kiki's plugin interface 0.3.1.
+    ///
+    /// ```ignore
+    /// let html = "<nav>Menu</nav><main><article><p>Text</p></article></main>";
+    /// let found = html::inner_each(html, &["article", "aside", "main"])?;
+    /// assert_eq!(found[0], Some("<p>Text</p>"));
+    /// assert_eq!(found[1], None);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Fails if a selector is invalid, there are more than [`MAX_INNER_SELECTORS`] of
+    /// them, or the HTML needs more memory than the server allows to parse.
+    pub fn inner_each<'a, S: AsRef<str>>(
+        html: &'a str,
+        selectors: &[S],
+    ) -> Result<Vec<Option<&'a str>>, String> {
+        let selectors: Vec<String> = selectors.iter().map(|s| s.as_ref().to_string()).collect();
+        wit::inner_each(html, &selectors)?
+            .into_iter()
+            .map(|span| {
+                span.map(|span| {
+                    let (start, len) = (span.start as usize, span.len as usize);
+                    start
+                        .checked_add(len)
+                        .and_then(|end| html.get(start..end))
+                        .ok_or_else(|| format!("html.inner-each: bad span {start}+{len}"))
+                })
+                .transpose()
+            })
+            .collect()
+    }
+
     /// `s` with `&`, `<`, `>`, `"` and `'` escaped, for use as text or as a quoted
     /// attribute value in HTML.
     pub fn escape(s: &str) -> String {

@@ -242,12 +242,14 @@ passed with each of its entries to `on-scan-entry`, and with its summary to
 The Rust crate wraps all of this; other languages can use the WIT file with
 their own bindings generator, such as `wit-bindgen`'s for C.
 
-The interface is versioned, as the WIT package `kiki:plugin@0.3.0`. A plugin
-built against an earlier version fails to load, with a message in the server
+The interface is versioned, as the WIT package `kiki:plugin@0.3.1`. A plugin
+built against 0.3.0 still loads; one built against an earlier version fails to load, with a message in the server
 log naming the interface it imports (`kiki:plugin/host@0.2.0`, say), and like
 any plugin that fails to load (see [Plugin config](#plugin-config)), it keeps
 the other plugins from loading too: rebuild it against the current
-`kiki-plugin` crate. Version 0.3.0 added the `entry.enrich` event.
+`kiki-plugin` crate. Version 0.3.0 added the `entry.enrich` event, and
+0.3.1 added `html::inner_each`; a plugin built against 0.3.1 fails to load in a
+Kiki with only 0.3.0.
 
 ## Plugin config
 
@@ -861,6 +863,15 @@ missing has the rest of the HTML as its content.
 
 ```rust,ignore
 let article = html::inner(&page.body, "article")?; // Option<String>
+```
+
+To try several selectors, `html::inner_each(html, &selectors)` reads the
+HTML once for all of them, where calling `inner` for each reads it once per
+selector. It returns, for each selector, the content of the first element it
+matches, as a slice of `html`, or `None`; it takes at most 64 selectors.
+
+```rust,ignore
+let found = html::inner_each(&page.body, &["article", "main"])?; // Vec<Option<&str>>
 ```
 
 Parsing runs outside the plugin's memory, so it has limits of its own: the

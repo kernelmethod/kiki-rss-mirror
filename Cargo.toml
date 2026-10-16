@@ -133,3 +133,9 @@ harness = false
 # The default plugins are built only with the feature, and the script host is
 # the `kiki` binary, which needs `cli`.
 required-features = ["default-plugins", "cli"]
+
+[[bench]]
+name = "full_content"
+harness = false
+# The plugin is built only for the default plugins.
+required-features = ["default-plugins"]
