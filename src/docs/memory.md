@@ -150,6 +150,77 @@ few MiB the second costs.
   Under systemd, the unit's cgroup is killed as a whole, so this only
   affects processes run by hand.
 
+## WebAssembly plugins and long articles
+
+Measured again in October 2026 against v0.39.0, with the static musl
+build that nixdev runs, 48 feeds (as many as nixdev has), nixdev's
+`filter` and `auto-tag` rules, and network access for plugins turned on,
+so that the `full-content` plugin fetches articles. Two loads, with no
+clients:
+
+* **Quiet**: `tools/stress` in web mode, whose entries are a few hundred
+  bytes. Kiki held about 55 MiB, twice what it did at v0.28.0, mostly
+  because of the script host, which now compiles WebAssembly plugins: 21.6
+  MiB, against 17–20 for the server.
+* **Long articles**: a local site of 48 feeds, half giving short summaries
+  of articles on pages of 100 KiB–1.5 MiB, which `full-content` fetches,
+  and half giving whole articles of 20–150 KiB. Once every entry was in,
+  Kiki held 88.9 MiB (the script host 41.9, the server 31.8), after
+  peaking at 114.
+
+### What was done
+
+| | Quiet | Long articles, after | Long articles, peak |
+|---|---|---|---|
+| Before | 55 | 88.9 | 114 |
+| With both changes below | 48 | 64.0 | 73 |
+
+* **Frame buffers kept by every thread.** Each server thread that sends
+  entries to the script host keeps a buffer to encode them into, and the
+  script host keeps buffers too. Each could keep up to 1 MiB, and after a
+  burst of long articles the server held 16 of them. They now keep at
+  most 256 KiB (`KEPT_BUFFER_BYTES` in [`crate::process::ipc`]). A frame
+  read into a kept buffer is read straight into its spare capacity, rather
+  than into memory zeroed first, which with musl's malloc, mapping every
+  allocation over 128 KiB afresh, meant touching each page of a large
+  frame's buffer twice.
+* **Cranelift's code in the script host.** Compiling plugins runs several
+  MiB of the executable's code that no other process runs, and that the
+  script host runs again only when a plugin changes: 7.7 MiB of its 21.6 in
+  the quiet run. Those pages are clean and file-backed, so the kernel would
+  reclaim them under pressure, but until then they count towards the script
+  host's memory and its cgroup's. Once plugins are compiled, the script host
+  now asks the kernel to reclaim the pages of the executable that only it
+  maps ([`crate::process::code_pages`]). Paged out by hand from a running
+  script host, they never came back over minutes of plugins at work. It
+  does so before instantiating the plugins, so that loading them, under
+  its generous time budget, reads back the runtime's code they need, rather
+  than the first entry they handle, under 100 ms.
+
+Keeping smaller buffers means a frame over 256 KiB needs an allocation of
+its own. `benches/plugin_dispatch`, run on the musl build with entries of
+256 KiB, 1 MiB and 4 MiB through the default plugins, took 15.5, 59.2 and
+228 ms an entry, against 15.0, 57.5 and 224 ms with buffers of 1 MiB kept:
+within the spread between repeated runs, which was as wide for the 4 MiB
+entries, over either limit.
+
+### Left as they are
+
+* **Plugins' linear memory.** After the long articles, the plugins'
+  linear memories held 16.5 MiB, two of them 6.6 and 4.7 MiB. WebAssembly
+  memory cannot shrink, so a plugin keeps its high-water mark until it
+  traps or plugins reload. Starting a plugin afresh once its memory passes
+  a threshold would give it back, at the cost of what plugins keep in
+  memory between calls, such as `full-content`'s list of pages that failed.
+* **Relocated data.** Each process keeps a private copy of the pages of
+  the executable that are relocated when it starts (its `.data.rel.ro`),
+  972 KiB each, about 6.8 MiB across seven processes. A static executable
+  that is not position-independent would share them, but would give up
+  address-space randomization of the executable in the very processes that
+  parse untrusted input.
+* **The server's heap** is about 4 MiB at rest and peaked at 11 MiB, most
+  of it SQLite's page caches.
+
 ## Measuring again
 
 Build with symbols, start a run of the stress harness, and read each
