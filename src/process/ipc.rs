@@ -425,12 +425,24 @@ pub fn read_frame_limited<R: Read>(r: &mut R, max: usize) -> io::Result<Vec<u8>>
 /// Most bytes a buffer passed to [`read_frame_into`] keeps between frames,
 /// as do the buffers the script host's messages are encoded into.
 /// One that grew past this for a large frame is shrunk back, so that one
-/// large entry does not pin megabytes for the life of the channel.
-pub(crate) const KEPT_BUFFER_BYTES: usize = 1024 * 1024;
+/// large entry does not pin memory for the life of the channel.
+///
+/// Every server thread that sends entries to the script host keeps a
+/// buffer of its own, and a burst of long articles leaves dozens of them
+/// at this size, so it is a quarter of a MiB rather than a whole one: big
+/// enough that most entries, full articles included, still fit, while a
+/// longer one costs an allocation, which is little next to what plugins
+/// then do with an entry that size.
+pub(crate) const KEPT_BUFFER_BYTES: usize = 256 * 1024;
 
 /// [`read_frame`] into `buf`, which is kept between frames so that most
 /// frames need no allocation, rather than into a new vector. Returns the
-/// frame, which is the start of `buf`.
+/// frame, which is the whole of `buf`.
+///
+/// The frame is read straight into `buf`'s spare capacity, which is not
+/// zeroed first: with musl's malloc, every allocation over 128 KiB is
+/// freshly mapped, and zeroing a large frame's buffer before reading over
+/// it would touch every page of it twice.
 ///
 /// # Errors
 ///
@@ -439,19 +451,22 @@ pub fn read_frame_into<'b, R: Read>(r: &mut R, buf: &'b mut Vec<u8>) -> io::Resu
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = checked_len(len_buf, MAX_FRAME_BYTES)?;
+    buf.clear();
     if buf.capacity() > KEPT_BUFFER_BYTES && len <= KEPT_BUFFER_BYTES {
-        buf.truncate(KEPT_BUFFER_BYTES);
         buf.shrink_to(KEPT_BUFFER_BYTES);
     }
-    // Zeroed only where it grows: what a previous frame left is overwritten.
-    if buf.len() < len {
-        buf.resize(len, 0);
+    buf.reserve_exact(len);
+    // `read_to_end` hands the reader the spare capacity as a `BorrowedBuf`,
+    // which the standard library's sockets and `BufReader` fill without
+    // initializing it first.
+    let read = r.take(len as u64).read_to_end(buf)?;
+    if read < len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("the peer closed the connection after {read} of a {len}-byte frame"),
+        ));
     }
-    let frame = buf
-        .get_mut(..len)
-        .ok_or_else(|| io::Error::other("frame buffer too short"))?;
-    r.read_exact(frame)?;
-    Ok(frame)
+    Ok(buf)
 }
 
 /// Async counterpart of [`read_frame_limited`].
@@ -741,6 +756,40 @@ mod tests {
         );
         assert_eq!(read_frame_into(&mut cursor, &mut buf).unwrap(), b"after");
         assert!(buf.capacity() <= KEPT_BUFFER_BYTES);
+    }
+
+    /// A frame cut short by the peer closing the connection is an error,
+    /// not a shorter frame.
+    #[test]
+    fn a_truncated_frame_read_into_a_kept_buffer_is_an_error() {
+        let mut framed = Vec::new();
+        write_frame(&mut framed, &[7u8; 100]).unwrap();
+        framed.truncate(4 + 60);
+        let mut buf = Vec::new();
+        let err = read_frame_into(&mut std::io::Cursor::new(framed), &mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A frame read over a stream comes through whole, however the peer
+    /// splits its writes, and a frame that follows a larger one is not
+    /// mixed with what the larger one left in the buffer.
+    #[cfg(unix)]
+    #[test]
+    fn frames_read_into_a_kept_buffer_from_a_socket_are_whole() {
+        let (mut tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        let large: Vec<u8> = (0..KEPT_BUFFER_BYTES * 3).map(|i| i as u8).collect();
+        let writer = std::thread::spawn(move || {
+            write_frame(&mut tx, &large).unwrap();
+            write_frame(&mut tx, b"small").unwrap();
+        });
+        let mut reader = std::io::BufReader::new(rx);
+        let mut buf = Vec::new();
+        let frame = read_frame_into(&mut reader, &mut buf).unwrap();
+        assert_eq!(frame.len(), KEPT_BUFFER_BYTES * 3);
+        assert!(frame.iter().enumerate().all(|(i, b)| *b == i as u8));
+        assert_eq!(read_frame_into(&mut reader, &mut buf).unwrap(), b"small");
+        assert!(buf.capacity() <= KEPT_BUFFER_BYTES);
+        writer.join().unwrap();
     }
 
     #[test]
