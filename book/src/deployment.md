@@ -101,7 +101,8 @@ The API holds a request that carries an API token to the token's scopes,
 but by default a request without one may do anything. Unless the proxy
 authenticates requests itself, anyone who can reach it can read and change
 everything, so set `anonymous_access = "token-required"` (or
-`"read-only"`) under `[api]` in `kiki.toml`. See
+`"read-only"`) under `[api]` in `kiki.toml`, with
+`kiki config set api.anonymous_access token-required`. See
 [Security](api.md#security).
 
 A proxy that a browser can reach also lets any web page that browser

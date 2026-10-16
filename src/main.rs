@@ -38,6 +38,9 @@ pub enum Commands {
     /// Import or export feeds as OPML
     Opml(cli::opml::OpmlArgs),
 
+    /// Read or change Kiki's settings
+    Config(cli::config::ConfigArgs),
+
     /// List plugins and read or change their config
     Plugin(cli::plugin::PluginArgs),
 
@@ -94,6 +97,7 @@ impl Commands {
             Commands::Migrate(args) => args.run(),
             Commands::Serve(args) => args.run(),
             Commands::Opml(args) => args.run(),
+            Commands::Config(args) => args.run(),
             Commands::Plugin(args) => args.run(),
             Commands::Token(args) => args.run(),
             #[cfg(feature = "api-docs")]

@@ -388,7 +388,7 @@ fn json_to_toml(value: &Value) -> Result<toml::Value> {
 }
 
 /// Read the whole of `path`, treating `-` as standard input.
-fn read_input(path: &Path) -> Result<String> {
+pub(super) fn read_input(path: &Path) -> Result<String> {
     if path == Path::new("-") {
         let mut buf = String::new();
         std::io::stdin()

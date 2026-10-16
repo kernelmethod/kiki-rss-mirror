@@ -15,12 +15,16 @@ pub type ConfigHandle = Arc<ConfigStore>;
 const FILE_HEADER: &str = "# Kiki settings. Keys here override the built-in defaults.\n\
                            # This file is rewritten by Kiki whenever settings change.\n\n";
 
-/// Holds the current [`Settings`] and is the only writer of the config file.
+/// Holds the current [`Settings`] and writes the config file.
 ///
 /// Reads are lock-free: [`ConfigStore::current`] hands out an
 /// `Arc<Settings>` snapshot, so a feed refresh sees one consistent set of
 /// settings even if they change mid-fetch. Writes and reloads are
-/// serialized by an internal lock.
+/// serialized by an internal lock, and writes also by a lock on a file
+/// beside the config file, `.kiki.toml.lock` for `kiki.toml`, so that
+/// every process saving through a `ConfigStore` — the server, and `kiki
+/// config set` — waits for the others rather than overwriting their
+/// changes.
 pub struct ConfigStore {
     path: PathBuf,
     current: ArcSwap<Settings>,
@@ -116,27 +120,61 @@ impl ConfigStore {
     where
         F: FnOnce(&mut Overrides) -> Result<(), ConfigError>,
     {
+        self.update_reporting(edit).map(|(settings, _)| settings)
+    }
+
+    /// Like [`ConfigStore::update`], but also returns whether `edit`
+    /// changed the overrides. When it did not, the file is not rewritten.
+    ///
+    /// # Errors
+    ///
+    /// As for [`ConfigStore::update`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kiki_rss::config::ConfigStore;
+    ///
+    /// let dir = tempfile::TempDir::new().unwrap();
+    /// let store = ConfigStore::open(dir.path().join("kiki.toml")).unwrap();
+    /// let set = |o: &mut kiki_rss::config::Overrides| o.set("asset_cache", "enabled", false);
+    /// let (settings, changed) = store.update_reporting(set).unwrap();
+    /// assert!(!settings.asset_cache.enabled && changed);
+    /// let (_, changed) = store.update_reporting(set).unwrap();
+    /// assert!(!changed);
+    /// ```
+    pub fn update_reporting<F>(&self, edit: F) -> Result<(Arc<Settings>, bool), ConfigError>
+    where
+        F: FnOnce(&mut Overrides) -> Result<(), ConfigError>,
+    {
         let _guard = self.lock();
-        let mut overrides = read_overrides(&self.path)?;
-        if let Err(ConfigError::Invalid(reason)) = overrides.resolve() {
+        // Held until the new file is in place, so that no other process
+        // saves between the read below and the write.
+        let _file_lock = lock_file(&self.path)?;
+        let before = read_overrides(&self.path)?;
+        if let Err(ConfigError::Invalid(reason)) = before.resolve() {
             return Err(ConfigError::InvalidFile {
                 path: self.path.clone(),
                 reason,
             });
         }
+        let mut overrides = before.clone();
         edit(&mut overrides)?;
         let settings = Arc::new(overrides.resolve()?);
 
-        let body = overrides.to_toml_string()?;
-        write_atomically(&self.path, &format!("{FILE_HEADER}{body}")).map_err(|source| {
-            ConfigError::Io {
-                path: self.path.clone(),
-                source,
-            }
-        })?;
+        let changed = overrides != before;
+        if changed {
+            let body = overrides.to_toml_string()?;
+            write_atomically(&self.path, &format!("{FILE_HEADER}{body}")).map_err(|source| {
+                ConfigError::Io {
+                    path: self.path.clone(),
+                    source,
+                }
+            })?;
+        }
 
         self.current.store(settings.clone());
-        Ok(settings)
+        Ok((settings, changed))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -148,8 +186,45 @@ impl ConfigStore {
     }
 }
 
+/// The file whose lock serializes saves of the config file at `path`
+/// across processes: `.kiki.toml.lock` beside `kiki.toml`.
+///
+/// It cannot be the config file itself, since every save renames a new
+/// file over it: a process waiting on the old file's lock would get it
+/// once the save is done, and then lock a file no longer in place.
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or(path.as_os_str()));
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+/// Takes the lock on [`lock_path`] for the config file at `path`, waiting
+/// for any other process holding it, and creating the lock file if it is
+/// missing. The lock is released when the returned file is closed.
+fn lock_file(path: &Path) -> Result<fs::File, ConfigError> {
+    let lock_path = lock_path(path);
+    let io_error = |source| ConfigError::Io {
+        path: lock_path.clone(),
+        source,
+    };
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(io_error)?;
+    file.lock().map_err(io_error)?;
+    Ok(file)
+}
+
 /// Reads and parses the overrides at `path`; a missing file is empty.
-fn read_overrides(path: &Path) -> Result<Overrides, ConfigError> {
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or is not valid TOML.
+pub(crate) fn read_overrides(path: &Path) -> Result<Overrides, ConfigError> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Overrides::default()),
@@ -165,6 +240,11 @@ fn read_overrides(path: &Path) -> Result<Overrides, ConfigError> {
         source,
     })
 }
+
+/// The mode of a config file created by a save: read and write for its
+/// owner and group, and nothing for anyone else.
+#[cfg(unix)]
+const NEW_FILE_MODE: u32 = 0o660;
 
 /// Replaces the file at `path` with `contents` via a temporary file in the
 /// same directory and a `rename(2)`, so readers never see a partial file.
@@ -191,8 +271,13 @@ fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
         // Create the temporary file no more permissive than the original,
         // so the new contents are never more widely readable, even briefly.
         // The umask may strip bits from `mode`; they are restored below.
+        // A new file gets what Kiki's umask (see `main`) leaves of 0o666:
+        // the mode is set explicitly below, which the umask does not
+        // touch, and the file can hold a proxy password.
         #[cfg(unix)]
-        let mode = existing.as_ref().map_or(0o666, |p| p.mode() & 0o777);
+        let mode = existing
+            .as_ref()
+            .map_or(NEW_FILE_MODE, |p| p.mode() & 0o777);
         #[cfg(unix)]
         options.mode(mode);
         let mut file = options.open(&tmp_path)?;
@@ -347,6 +432,108 @@ mod tests {
             .unwrap();
         let mode = fs::metadata(store.path()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o640);
+    }
+
+    #[test]
+    fn an_update_that_changes_nothing_leaves_the_file_alone() {
+        let (_td, store) = store();
+        let text = "# tuned for the slow mirror\n[feed_fetch]\ntimeout_seconds = 30\n";
+        fs::write(store.path(), text).unwrap();
+
+        let (settings, changed) = store
+            .update_reporting(|o| o.set("feed_fetch", "timeout_seconds", 30u64))
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(settings.feed_fetch.timeout_seconds, 30);
+        assert_eq!(fs::read_to_string(store.path()).unwrap(), text);
+
+        let (_, changed) = store
+            .update_reporting(|o| o.set("feed_fetch", "timeout_seconds", 31u64))
+            .unwrap();
+        assert!(changed);
+    }
+
+    /// Increments `feed_fetch.timeout_seconds`, reading it from the
+    /// overrides the update sees.
+    fn increment(o: &mut Overrides) -> Result<(), ConfigError> {
+        let n = o
+            .get("feed_fetch", "timeout_seconds")
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(0);
+        o.set("feed_fetch", "timeout_seconds", n + 1)
+    }
+
+    /// Two stores on one file stand for two processes, such as the server
+    /// and `kiki config set`: their in-memory locks are separate, so only
+    /// the file lock keeps one from saving over the other's change.
+    #[test]
+    fn stores_on_the_same_file_never_lose_each_others_updates() {
+        let (_td, store) = store();
+        let other = ConfigStore::open(store.path()).unwrap();
+        const ROUNDS: i64 = 50;
+
+        std::thread::scope(|s| {
+            for store in [&store, &other] {
+                s.spawn(move || {
+                    for _ in 0..ROUNDS {
+                        store.update(increment).unwrap();
+                    }
+                });
+            }
+        });
+
+        let reopened = ConfigStore::open(store.path()).unwrap();
+        assert_eq!(
+            reopened.current().feed_fetch.timeout_seconds,
+            2 * ROUNDS as u64
+        );
+    }
+
+    #[test]
+    fn an_update_waits_for_another_process_holding_the_lock() {
+        let (_td, store) = store();
+        let lock = lock_file(store.path()).unwrap();
+
+        std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            s.spawn(|| {
+                let tx = tx;
+                store.update(increment).unwrap();
+                tx.send(()).unwrap();
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "the update must wait for the lock"
+            );
+
+            // The other process saves while it holds the lock...
+            fs::write(store.path(), "[feed_fetch]\ntimeout_seconds = 10\n").unwrap();
+            drop(lock);
+            rx.recv().unwrap();
+        });
+
+        // ...and the update builds on that save rather than replacing it.
+        assert_eq!(store.current().feed_fetch.timeout_seconds, 11);
+    }
+
+    #[test]
+    fn the_lock_file_sits_beside_the_config_file() {
+        assert_eq!(
+            lock_path(Path::new("/var/lib/kiki/kiki.toml")),
+            Path::new("/var/lib/kiki/.kiki.toml.lock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_is_not_accessible_to_other_users() {
+        let (_td, store) = store();
+        store
+            .update(|o| o.set("asset_cache", "enabled", false))
+            .unwrap();
+        let mode = fs::metadata(store.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o660);
     }
 
     #[test]
