@@ -513,21 +513,21 @@ mod imp {
                 KeyName::from_const_str("kiki_process_cpu_seconds_total"),
                 None,
                 SharedString::const_str(
-                    "CPU time used by kiki's processes, in seconds, labeled by process: the server, the feed fetcher, the script host, or `kiki web`. Includes each process's children; resets when a process is replaced.",
+                    "CPU time used by kiki's processes, in seconds, labeled by process: the server, the feed fetcher, the script host, the zygote that forks them, or `kiki web`. Includes each process's children; resets when a process is replaced.",
                 ),
             );
             r.describe_gauge(
                 KeyName::from_const_str("kiki_process_resident_memory_bytes"),
                 None,
                 SharedString::const_str(
-                    "Resident memory of kiki's processes, labeled by process: the server, the feed fetcher, the script host, or `kiki web`. Includes each process's children. Pages shared between processes are counted once per process, so this overstates kiki's total; see kiki_process_proportional_memory_bytes.",
+                    "Resident memory of kiki's processes, labeled by process: the server, the feed fetcher, the script host, the zygote that forks them, or `kiki web`. Includes each process's children. Pages shared between processes are counted once per process, so this overstates kiki's total; see kiki_process_proportional_memory_bytes.",
                 ),
             );
             r.describe_gauge(
                 KeyName::from_const_str("kiki_process_proportional_memory_bytes"),
                 None,
                 SharedString::const_str(
-                    "Proportional set size (PSS) of kiki's processes, labeled by process: the server, the feed fetcher, the script host, or `kiki web`. Includes each process's children. Each page shared between processes is divided among them, so the values sum to the memory kiki occupies. NaN when it cannot be read; always so for `web`, whose memory the server may not inspect.",
+                    "Proportional set size (PSS) of kiki's processes, labeled by process: the server, the feed fetcher, the script host, the zygote that forks them, or `kiki web`. Includes each process's children. Each page shared between processes is divided among them, so the values sum to the memory kiki occupies. NaN when it cannot be read; always so for `web`, whose memory the server may not inspect.",
                 ),
             );
             r.describe_gauge(

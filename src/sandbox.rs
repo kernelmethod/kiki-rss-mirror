@@ -27,10 +27,12 @@
 //!   module loading, `io_uring`, `userfaultfd`, and friends, and `clone`
 //!   with any namespace flag (`clone3`, whose flags seccomp cannot see,
 //!   fails with `ENOSYS`, and the C library falls back to `clone`).
-//!   Every profile but the feed fetcher's supervisor is also denied
-//!   `execve`; the supervisor starts its worker, parser and resolver by
-//!   executing the kiki executable again, the one file Landlock lets it
-//!   execute. On top of that, the server is denied making, connecting,
+//!   Every profile is also denied `execve` but the feed fetcher's
+//!   supervisor where there is no zygote, which then starts its worker,
+//!   parser and resolver by executing the kiki executable again, the one
+//!   file Landlock lets it execute; with the zygote (see
+//!   [`crate::process::zygote`]), which forks them, it is denied it too.
+//!   On top of that, the server is denied making, connecting,
 //!   binding and listening on sockets, as it binds its API socket before
 //!   its filter goes up; the script host and the feed fetcher's parser
 //!   every socket call; the feed fetcher's supervisor and resolver
@@ -61,10 +63,12 @@
 //! input — for the server, just after it binds its listening socket; for
 //! the children, before they read their first byte of IPC; for the web
 //! UI, before it accepts its first connection. They are
-//! inherited by every thread and task spawned later, and by the feed
-//! fetcher's worker, parser and resolver across the `execve` that starts
-//! them, each of which adds a stricter set of its own on top. The server installs them one at a time, with
-//! its children started in between; see [`restrict_filesystem`].
+//! inherited by every thread and task spawned later, and by the processes
+//! the zygote forks — or, where there is none, the feed fetcher's worker,
+//! parser and resolver across the `execve` that starts them — each of
+//! which adds a stricter set of its own on top. The server installs them
+//! one at a time, with its children started in between; see
+//! [`restrict_filesystem`].
 //!
 //! On non-Linux platforms [`apply`] is a no-op that logs a warning.
 
@@ -125,28 +129,45 @@ pub enum SandboxProfile {
     /// The feed fetcher's supervisor: talks to the server over an
     /// inherited socket pair, and starts the processes that do the
     /// fetcher's work, each of which installs a profile of its own on top
-    /// of this one — [`Self::FeedWorker`], [`Self::FeedParser`] and
-    /// [`Self::FeedResolver`].
+    /// of the one it started under — [`Self::FeedWorker`],
+    /// [`Self::FeedParser`] and [`Self::FeedResolver`].
     ///
-    /// A process it starts can have no more than it has, so this profile
-    /// holds what its children need between them, and no more: read-only
-    /// access to the TLS trust stores and the resolver's configuration,
-    /// and nothing else — no data directory, no `/proc` — but the kiki
-    /// executable and the libraries it loads, which it may execute. It is
-    /// the only profile that may `execve`, which is how it starts its
-    /// children; theirs deny it.
+    /// Read-only access to the TLS trust stores and the resolver's
+    /// configuration, and nothing else — no data directory, no `/proc`.
     /// It may make outbound connections, and bind UDP sockets, which the
     /// resolver needs, but may not bind TCP ports, listen for or accept
     /// connections, or create a Unix socket: the last keeps the fetcher's
     /// processes away from the server's API socket, whose only access
     /// control is reachability.
-    FeedFetcher,
+    FeedFetcher {
+        /// Whether it starts its children by running the kiki executable
+        /// again, rather than having the zygote ([`Self::Zygote`]) fork
+        /// them. A process it starts that way can have no more than it
+        /// has, so it then holds what its children need between them, as
+        /// above, and may also execute the kiki executable and the
+        /// libraries it loads: it is then the only profile beside the
+        /// server's that may `execve`, and theirs deny it.
+        starts_by_exec: bool,
+    },
+
+    /// The zygote, which forks the server's children and the feed
+    /// fetcher's (see [`crate::process::zygote`]), each of which installs
+    /// a profile of its own on top of this one.
+    ///
+    /// A process it forks can have no more than it has, so this profile
+    /// holds what they need between them, and no more: the feed fetcher's
+    /// paths and network, as [`Self::FeedFetcher`] has them, but no
+    /// `execve`, which none of them needs. Nor does it refuse writable and
+    /// executable memory, which the script host needs and could not get
+    /// back, so each of the others refuses it itself.
+    Zygote,
 
     /// The feed fetcher's worker: retrieves feeds over HTTP(S), downloads
     /// their assets and favicons, and hands what it downloads to the
     /// parser, all through the supervisor.
     ///
-    /// Forked from the supervisor, it installs this profile on top of
+    /// Started by the zygote, or by the supervisor where there is none, it
+    /// installs this profile on top of [`Self::Zygote`] or
     /// [`Self::FeedFetcher`], which takes away what only the resolver
     /// needs: it may read the TLS trust stores and nothing else, and may
     /// not bind any socket.
@@ -156,7 +177,8 @@ pub enum SandboxProfile {
     /// feeds, web pages, SVG images, entries' HTML — and talks to the
     /// fetcher's supervisor over a socket pair it inherited, nothing else.
     ///
-    /// Forked from the feed fetcher's supervisor, it starts out under the
+    /// Started by the zygote, or by the feed fetcher's supervisor where
+    /// there is none, it starts out under the [`Self::Zygote`] or
     /// [`Self::FeedFetcher`] profile and installs this one on top, which
     /// takes away what parsing does not need: like the script host's, it
     /// grants **no filesystem access whatsoever**, denies every syscall
@@ -169,7 +191,8 @@ pub enum SandboxProfile {
     /// the C library's resolver, and talks to the fetcher's supervisor over
     /// a socket pair it inherited.
     ///
-    /// Forked from the supervisor, it installs this profile on top of
+    /// Started by the zygote, or by the supervisor where there is none, it
+    /// installs this profile on top of [`Self::Zygote`] or
     /// [`Self::FeedFetcher`]. It may read the resolver's configuration
     /// files and nothing else, create only IPv4 and IPv6 sockets, and make
     /// TCP connections only to port 53. With no Unix sockets it cannot
@@ -232,10 +255,20 @@ impl SandboxConfig {
         }
     }
 
-    /// Configuration for the feed fetcher process.
-    pub fn feed_fetcher(log_only: bool) -> Self {
+    /// Configuration for the feed fetcher process, which starts its
+    /// children by running the kiki executable again if `starts_by_exec`;
+    /// see [`SandboxProfile::FeedFetcher`].
+    pub fn feed_fetcher(log_only: bool, starts_by_exec: bool) -> Self {
         SandboxConfig {
-            profile: SandboxProfile::FeedFetcher,
+            profile: SandboxProfile::FeedFetcher { starts_by_exec },
+            log_only,
+        }
+    }
+
+    /// Configuration for the zygote process.
+    pub fn zygote(log_only: bool) -> Self {
+        SandboxConfig {
+            profile: SandboxProfile::Zygote,
             log_only,
         }
     }
@@ -277,7 +310,8 @@ impl SandboxConfig {
         match self.profile {
             SandboxProfile::Server { .. } => "server",
             SandboxProfile::ScriptHost => "script-host",
-            SandboxProfile::FeedFetcher => "feed-fetcher",
+            SandboxProfile::FeedFetcher { .. } => "feed-fetcher",
+            SandboxProfile::Zygote => "zygote",
             SandboxProfile::FeedWorker => "feed-worker",
             SandboxProfile::FeedParser => "feed-parser",
             SandboxProfile::FeedResolver => "feed-resolver",

@@ -16,13 +16,23 @@
 //! | Process | Started by | Filesystem | Network | Sandbox profile |
 //! |---|---|---|---|---|
 //! | server | `kiki serve` | data dir + socket dir + SQLite temp dir (rw), system paths (ro) | listening on Unix sockets only | [`SandboxProfile::Server`] |
-//! | feed fetcher's supervisor | the server, at startup | TLS trust stores, resolver configuration (ro) | none of its own | [`SandboxProfile::FeedFetcher`] |
-//! | ↳ worker | the supervisor | TLS trust stores (ro) | outbound TCP only; DNS via the resolver | [`SandboxProfile::FeedWorker`] |
-//! | ↳ parser | the supervisor | none | none | [`SandboxProfile::FeedParser`] |
-//! | ↳ resolver | the supervisor | resolver configuration (ro) | DNS: UDP, TCP to port 53 only | [`SandboxProfile::FeedResolver`] |
-//! | script host | the server, at startup | none | none | [`SandboxProfile::ScriptHost`] |
+//! | zygote | the server, at startup | TLS trust stores, resolver configuration (ro) | none of its own | [`SandboxProfile::Zygote`] |
+//! | feed fetcher's supervisor | the zygote, for the server, at startup | TLS trust stores, resolver configuration (ro) | none of its own | [`SandboxProfile::FeedFetcher`] |
+//! | ↳ worker | the zygote, for the supervisor | TLS trust stores (ro) | outbound TCP only; DNS via the resolver | [`SandboxProfile::FeedWorker`] |
+//! | ↳ parser | the zygote, for the supervisor | none | none | [`SandboxProfile::FeedParser`] |
+//! | ↳ resolver | the zygote, for the supervisor | resolver configuration (ro) | DNS: UDP, TCP to port 53 only | [`SandboxProfile::FeedResolver`] |
+//! | script host | the zygote, for the server, at startup | none | none | [`SandboxProfile::ScriptHost`] |
+//!
+//! The zygote ([`zygote`]) forks the other children, so that they share
+//! the executable's relocated pages with it rather than each holding a
+//! copy, and is started before the server opens anything worth hiding, so
+//! that what they share is nothing. Where there is no zygote — on other
+//! systems than Linux, and with `kiki serve --no-zygote` — each child is
+//! started by the process that would ask the zygote for it, by running the
+//! kiki executable again.
 //!
 //! [`SandboxProfile::Server`]: crate::sandbox::SandboxProfile::Server
+//! [`SandboxProfile::Zygote`]: crate::sandbox::SandboxProfile::Zygote
 //! [`SandboxProfile::FeedFetcher`]: crate::sandbox::SandboxProfile::FeedFetcher
 //! [`SandboxProfile::FeedWorker`]: crate::sandbox::SandboxProfile::FeedWorker
 //! [`SandboxProfile::FeedParser`]: crate::sandbox::SandboxProfile::FeedParser
@@ -44,8 +54,9 @@
 //! The server's sandbox profile denies `execve`, so it cannot spawn
 //! children once its sandbox is installed. It therefore
 //! installs its sandbox in two halves, in [`crate::cli::serve`]: its
-//! Landlock rules, then both children, then — once it has bound its API
-//! socket, which the filter leaves it no way to do — its seccomp filter.
+//! Landlock rules, then its children (the zygote, which then forks the
+//! other two), then — once it has bound its API socket, which the filter
+//! leaves it no way to do — its seccomp filter.
 //! Starting the children under the server's Landlock rules nests their
 //! Landlock domains inside its own, which is what lets it read their
 //! memory use from `/proc` (see [`stats`]); see
@@ -60,9 +71,10 @@
 //!   kill, a panic, or a seccomp violation, and refusing to hand a fresh
 //!   host to whatever caused the last one to die is the safer default.
 //! * The **feed fetcher** is a supervisor that starts a replacement worker
-//!   whenever the last one dies, because fetching is Kiki's core job: its
-//!   profile is the one that may `execve`, and then only the kiki
-//!   executable; see [`feed_fetcher`]. Should the
+//!   whenever the last one dies, because fetching is Kiki's core job: it
+//!   has its own connection to the zygote, which forks it a new one, and
+//!   where there is no zygote, its profile is the one that may `execve`,
+//!   and then only the kiki executable; see [`feed_fetcher`]. Should the
 //!   supervisor itself go, the server stops with an error, so that
 //!   whatever supervises it (systemd, say) can start both afresh.
 //!
@@ -70,8 +82,11 @@
 //!
 //! Parent and child talk over an anonymous `SOCK_STREAM` socket pair
 //! created before the child is started, which it inherits on
-//! [`CHILD_FD`]. Every child is the kiki executable run again with a hidden
-//! subcommand, and inherits no other descriptor but the standard streams.
+//! [`CHILD_FD`]. Every child runs what the kiki executable runs for a hidden
+//! subcommand, and inherits no other descriptor but the standard streams,
+//! and, for the supervisor, its connection to the zygote, on
+//! [`zygote::ZYGOTE_FD`]. When the zygote forks a child, the process that
+//! asked for it gets its end of the socket pair from the zygote.
 //! Messages are length-prefixed postcard frames (see [`ipc`]). Neither child
 //! can open a Unix socket to connect elsewhere, so its parent is the only
 //! local process it can ever talk to.
@@ -92,6 +107,9 @@ pub mod script_host;
 
 #[cfg(target_os = "linux")]
 pub mod stats;
+
+#[cfg(target_os = "linux")]
+pub mod zygote;
 
 /// File descriptor each child inherits its end of the socket pair on.
 ///
@@ -128,10 +146,56 @@ pub type FeedFetcherHandle = Option<()>;
 #[cfg(unix)]
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// A child process: one started by running the kiki executable again, or
+/// one the zygote forked (see [`zygote`]).
+#[cfg(unix)]
+pub(crate) enum ChildProcess {
+    /// Started by running the kiki executable again; this process is its
+    /// parent.
+    Exec(std::process::Child),
+    /// Forked by the zygote, which is its parent, and stops and reaps it
+    /// on request.
+    #[cfg(target_os = "linux")]
+    Forked(zygote::ZygoteChild),
+}
+
+#[cfg(unix)]
+impl ChildProcess {
+    /// The child's pid.
+    pub(crate) fn id(&self) -> u32 {
+        match self {
+            ChildProcess::Exec(child) => child.id(),
+            #[cfg(target_os = "linux")]
+            ChildProcess::Forked(child) => child.id(),
+        }
+    }
+
+    /// Kill the child, if it is still running, reap it, and return how it
+    /// ended.
+    pub(crate) fn kill(self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            ChildProcess::Exec(mut child) => {
+                let _ = child.kill();
+                child.wait()
+            }
+            #[cfg(target_os = "linux")]
+            ChildProcess::Forked(child) => child.end(std::time::Duration::ZERO),
+        }
+    }
+}
+
 /// Wait up to [`SHUTDOWN_GRACE`] for `child` to exit on its own — callers
 /// close its channel first, which is its signal to go — then kill it.
 #[cfg(unix)]
-pub(crate) fn reap(mut child: std::process::Child) {
+pub(crate) fn reap(child: ChildProcess) {
+    let mut child = match child {
+        ChildProcess::Exec(child) => child,
+        #[cfg(target_os = "linux")]
+        ChildProcess::Forked(child) => {
+            let _ = child.end(SHUTDOWN_GRACE);
+            return;
+        }
+    };
     let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
     while std::time::Instant::now() < deadline {
         match child.try_wait() {

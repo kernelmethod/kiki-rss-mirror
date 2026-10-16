@@ -1,5 +1,11 @@
 use crate::cli::paths::{self, Env};
 use crate::sandbox::{self, SandboxConfig};
+
+/// The zygote, where there is one: see `crate::process::zygote`.
+#[cfg(target_os = "linux")]
+type Zygote = std::sync::Arc<crate::process::zygote::Zygote>;
+#[cfg(not(target_os = "linux"))]
+type Zygote = std::convert::Infallible;
 use crate::server;
 #[cfg(unix)]
 use anyhow::anyhow;
@@ -48,6 +54,13 @@ pub struct ServeArgs {
     #[cfg(unix)]
     #[arg(long)]
     no_script_isolation: bool,
+
+    /// Start each child process by running kiki again, rather than having
+    /// the zygote fork it (see `kiki_rss::process::zygote`). For testing
+    /// the way children are started where there is no zygote.
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true)]
+    no_zygote: bool,
 }
 
 impl ServeArgs {
@@ -118,9 +131,27 @@ impl ServeArgs {
             sandbox::restrict_filesystem(config).context("failed to install sandbox")?;
         }
 
-        let feed_fetcher = self.spawn_feed_fetcher()?;
+        // The zygote forks the server's children, and the feed fetcher's,
+        // so that they share the executable's relocated pages; see
+        // `crate::process::zygote`. It is started, and so knows nothing of
+        // the database, before the server opens it.
+        #[cfg(target_os = "linux")]
+        let zygote = if self.no_zygote {
+            None
+        } else {
+            Some(
+                crate::process::zygote::Zygote::spawn(self.seccomp_log_only, self.no_sandbox)
+                    .context("failed to start the zygote")?,
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        let zygote = None;
+
+        let feed_fetcher = self.spawn_feed_fetcher(zygote.as_ref())?;
         #[cfg(unix)]
-        let script_host = self.spawn_script_host()?;
+        let script_host = self.spawn_script_host(zygote.as_ref())?;
+        // The children hold the zygote for as long as they run.
+        drop(zygote);
 
         // Bound before the syscall filter goes up, so that the filter need
         // not let the server create, bind or listen on a socket at all.
@@ -204,6 +235,10 @@ impl ServeArgs {
         if self.no_script_isolation {
             argv.push("--no-script-isolation".into());
         }
+        #[cfg(target_os = "linux")]
+        if self.no_zygote {
+            argv.push("--no-zygote".into());
+        }
         argv
     }
 
@@ -214,16 +249,26 @@ impl ServeArgs {
     /// is fatal rather than a silent fall back to fetching untrusted feeds
     /// next to the database. `--no-sandbox` still lifts the fetcher's
     /// sandbox along with the server's.
-    fn spawn_feed_fetcher(&self) -> Result<crate::process::FeedFetcherHandle> {
+    fn spawn_feed_fetcher(
+        &self,
+        zygote: Option<&Zygote>,
+    ) -> Result<crate::process::FeedFetcherHandle> {
         #[cfg(unix)]
         {
             use crate::process::feed_fetcher::FeedFetcherHost;
-            let host = FeedFetcherHost::spawn(self.seccomp_log_only, self.no_sandbox)
-                .context("failed to start the isolated feed fetcher")?;
+            let host = match zygote {
+                #[cfg(target_os = "linux")]
+                Some(zygote) => {
+                    FeedFetcherHost::spawn_by(zygote, self.seccomp_log_only, self.no_sandbox)
+                }
+                _ => FeedFetcherHost::spawn(self.seccomp_log_only, self.no_sandbox),
+            }
+            .context("failed to start the isolated feed fetcher")?;
             Ok(Some(std::sync::Arc::new(host)))
         }
         #[cfg(not(unix))]
         {
+            let _ = zygote;
             Ok(None)
         }
     }
@@ -235,7 +280,10 @@ impl ServeArgs {
     /// because a `fork` failed would be a security downgrade nobody
     /// asked for. The error names the flag that makes it explicit.
     #[cfg(unix)]
-    fn spawn_script_host(&self) -> Result<crate::process::ScriptHostHandle> {
+    fn spawn_script_host(
+        &self,
+        zygote: Option<&Zygote>,
+    ) -> Result<crate::process::ScriptHostHandle> {
         use crate::process::script_host::ScriptHost;
         use std::sync::Arc;
 
@@ -247,7 +295,12 @@ impl ServeArgs {
             return Ok(None);
         }
 
-        let host = ScriptHost::spawn(self.seccomp_log_only, self.no_sandbox).map_err(|e| {
+        let host = match zygote {
+            #[cfg(target_os = "linux")]
+            Some(zygote) => ScriptHost::spawn_by(zygote, self.seccomp_log_only, self.no_sandbox),
+            _ => ScriptHost::spawn(self.seccomp_log_only, self.no_sandbox),
+        }
+        .map_err(|e| {
             anyhow!(
                 "failed to start the isolated script host: {e:#}. Pass \
                  --no-script-isolation to run plugins in the server process instead."
@@ -710,7 +763,7 @@ mod tests {
     #[test]
     fn opting_out_yields_no_script_host() {
         let handle = parse(&["--no-script-isolation"])
-            .spawn_script_host()
+            .spawn_script_host(None)
             .expect("opting out must not fail");
         assert!(handle.is_none());
     }
