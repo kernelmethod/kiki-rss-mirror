@@ -81,6 +81,9 @@ use anyhow::Context;
 
 pub mod ipc;
 
+#[cfg(target_os = "linux")]
+pub mod code_pages;
+
 #[cfg(unix)]
 pub mod feed_fetcher;
 
