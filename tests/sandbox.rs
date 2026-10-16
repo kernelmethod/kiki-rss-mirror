@@ -962,13 +962,25 @@ mod fetch_isolation {
     /// Each of the supervisor's children installs a sandbox of its own on
     /// top of the supervisor's, which shows as more seccomp filters, on
     /// kernels that say how many (5.9+).
+    ///
+    /// A child is found as soon as it has started, which can be before it
+    /// has installed its sandbox, when it runs under only the filters it
+    /// inherited; so wait a while for it to.
     fn assert_stricter_than_the_supervisor(kiki: &Kiki, child: u32, what: &str) {
         let supervisor = kiki.fetcher_supervisor_pids()[0];
-        if let (Some(s), Some(c)) = (seccomp_filters(supervisor), seccomp_filters(child)) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (Some(s), Some(c)) = (seccomp_filters(supervisor), seccomp_filters(child)) else {
+                return;
+            };
+            if c > s {
+                return;
+            }
             assert!(
-                c > s,
+                Instant::now() < deadline,
                 "the {what} runs under {c} seccomp filters, no more than the supervisor's {s}"
             );
+            thread::sleep(Duration::from_millis(20));
         }
     }
 
