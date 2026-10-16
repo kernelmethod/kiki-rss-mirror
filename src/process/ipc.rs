@@ -437,12 +437,7 @@ pub(crate) const KEPT_BUFFER_BYTES: usize = 256 * 1024;
 
 /// [`read_frame`] into `buf`, which is kept between frames so that most
 /// frames need no allocation, rather than into a new vector. Returns the
-/// frame, which is the whole of `buf`.
-///
-/// The frame is read straight into `buf`'s spare capacity, which is not
-/// zeroed first: with musl's malloc, every allocation over 128 KiB is
-/// freshly mapped, and zeroing a large frame's buffer before reading over
-/// it would touch every page of it twice.
+/// frame, which is the start of `buf`.
 ///
 /// # Errors
 ///
@@ -451,22 +446,19 @@ pub fn read_frame_into<'b, R: Read>(r: &mut R, buf: &'b mut Vec<u8>) -> io::Resu
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = checked_len(len_buf, MAX_FRAME_BYTES)?;
-    buf.clear();
     if buf.capacity() > KEPT_BUFFER_BYTES && len <= KEPT_BUFFER_BYTES {
+        buf.truncate(KEPT_BUFFER_BYTES);
         buf.shrink_to(KEPT_BUFFER_BYTES);
     }
-    buf.reserve_exact(len);
-    // `read_to_end` hands the reader the spare capacity as a `BorrowedBuf`,
-    // which the standard library's sockets and `BufReader` fill without
-    // initializing it first.
-    let read = r.take(len as u64).read_to_end(buf)?;
-    if read < len {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            format!("the peer closed the connection after {read} of a {len}-byte frame"),
-        ));
+    // Zeroed only where it grows: what a previous frame left is overwritten.
+    if buf.len() < len {
+        buf.resize(len, 0);
     }
-    Ok(buf)
+    let frame = buf
+        .get_mut(..len)
+        .ok_or_else(|| io::Error::other("frame buffer too short"))?;
+    r.read_exact(frame)?;
+    Ok(frame)
 }
 
 /// Async counterpart of [`read_frame_limited`].

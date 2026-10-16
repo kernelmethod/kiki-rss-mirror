@@ -179,11 +179,7 @@ clients:
   entries to the script host keeps a buffer to encode them into, and the
   script host keeps buffers too. Each could keep up to 1 MiB, and after a
   burst of long articles the server held 16 of them. They now keep at
-  most 256 KiB (`KEPT_BUFFER_BYTES` in [`crate::process::ipc`]). A frame
-  read into a kept buffer is read straight into its spare capacity, rather
-  than into memory zeroed first, which with musl's malloc, mapping every
-  allocation over 128 KiB afresh, meant touching each page of a large
-  frame's buffer twice.
+  most 256 KiB (`KEPT_BUFFER_BYTES` in [`crate::process::ipc`]).
 * **Cranelift's code in the script host.** Compiling plugins runs several
   MiB of the executable's code that no other process runs, and that the
   script host runs again only when a plugin changes: 7.7 MiB of its 21.6 in
@@ -199,8 +195,8 @@ clients:
 
 Keeping smaller buffers means a frame over 256 KiB needs an allocation of
 its own. `benches/plugin_dispatch`, run on the musl build with entries of
-256 KiB, 1 MiB and 4 MiB through the default plugins, took 15.5, 59.2 and
-228 ms an entry, against 15.0, 57.5 and 224 ms with buffers of 1 MiB kept:
+256 KiB, 1 MiB and 4 MiB through the default plugins, took 15.3, 58.7 and
+238 ms an entry, against 15.0, 57.5 and 224 ms with buffers of 1 MiB kept:
 within the spread between repeated runs, which was as wide for the 4 MiB
 entries, over either limit.
 
