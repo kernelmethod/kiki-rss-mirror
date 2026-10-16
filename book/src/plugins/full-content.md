@@ -70,7 +70,7 @@ kiki plugin config set full-content full-content.toml
 | `feeds` | `[]` | Only fill in these feeds' entries, each given by its id or the URL it is fetched from. Empty means every feed. |
 | `exclude` | `[]` | Never fill in these feeds' entries. |
 | `min_length` | `500` | An entry with fewer characters of text than this, not counting whitespace, is taken for a summary. |
-| `selectors` | see `manifest.toml` | Where to look for the article on its page, in order. |
+| `selectors` | see `manifest.toml` | Where to look for the article on its page, in order; at most 64. |
 
 ## What to know before turning it on
 

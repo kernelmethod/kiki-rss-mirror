@@ -78,6 +78,7 @@ use crate::process::ipc::{
     HostResponse, PluginTime, RequestId, Subscriptions, ToHost, ToHostRef, KEPT_BUFFER_BYTES,
     MAX_FRAME_BYTES,
 };
+use crate::process::ChildProcess;
 use crate::scripting::wasm::WasmScriptRunner;
 use crate::scripting::{
     EntryPatch, Event, EventPayload, EventSet, FeedEntry, FetchSchedule, PluginRun, ScanSummary,
@@ -91,14 +92,14 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
-use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// The hidden subcommand the server re-execs itself with.
+/// The hidden subcommand the script host runs: the server re-execs itself
+/// with it, or the zygote forks a child that runs it.
 pub const SUBCOMMAND: &str = "__script-host";
 
 /// File descriptor the child inherits its end of the socket pair on.
@@ -321,7 +322,7 @@ impl Drop for Answering<'_> {
 struct HostState {
     /// `None` when the host was not spawned as a process, as in tests, or
     /// once it has been reaped.
-    child: Option<Child>,
+    child: Option<ChildProcess>,
     /// Where to send what arrives for each request in flight.
     pending: HashMap<RequestId, mpsc::Sender<Inbound>>,
     next_id: RequestId,
@@ -382,9 +383,8 @@ impl Shared {
             error = reason,
             "script host: channel failed, disabling scripting until restart"
         );
-        if let Some(mut child) = state.child.take() {
+        if let Some(child) = state.child.take() {
             let _ = child.kill();
-            let _ = child.wait();
         }
         // Wakes the request reading the channel, if one is.
         let _ = self
@@ -549,12 +549,35 @@ impl ScriptHost {
             crate::process::spawn_child_exe(exe, SUBCOMMAND, HOST_FD_ENV, log_only, no_sandbox)
                 .context("spawning the script host process")?;
         info!(pid = child.id(), "script host: spawned");
-        Self::over(ours, Some(child))
+        Self::over(ours, Some(ChildProcess::Exec(child)))
+    }
+
+    /// [`Self::spawn`], having `zygote` fork the child rather than running
+    /// the kiki executable again; see [`crate::process::zygote`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if the zygote cannot start the child.
+    #[cfg(target_os = "linux")]
+    pub fn spawn_by(
+        zygote: &Arc<crate::process::zygote::Zygote>,
+        log_only: bool,
+        no_sandbox: bool,
+    ) -> Result<Self> {
+        let (ours, child) = zygote
+            .start(
+                crate::process::zygote::Role::ScriptHost,
+                log_only,
+                no_sandbox,
+            )
+            .context("starting the script host process")?;
+        info!(pid = child.id(), "script host: spawned");
+        Self::over(ours, Some(ChildProcess::Forked(child)))
     }
 
     /// A host that talks to whatever serves the other end of `stream`, the
     /// process `child` if it is one.
-    fn over(stream: UnixStream, child: Option<Child>) -> Result<Self> {
+    fn over(stream: UnixStream, child: Option<ChildProcess>) -> Result<Self> {
         // Bounded both ways, so that a child that stops reading, or stops
         // in the middle of a frame, is noticed. Waiting for a frame to
         // start is bounded by the requests themselves.
@@ -1105,7 +1128,7 @@ pub fn run_child(log_only: bool, no_sandbox: bool) -> Result<()> {
         crate::sandbox::apply(&crate::sandbox::SandboxConfig::script_host(log_only))
             .context("failed to install the script host sandbox")?;
     }
-    serve_channel(crate::process::take_parent_socket(SUBCOMMAND)?)
+    serve_channel(crate::process::take_parent_socket(SUBCOMMAND)?, true)
 }
 
 /// The child's end of the channel, for reading.
@@ -1426,6 +1449,12 @@ struct ChildState {
     runner: RwLock<Option<Arc<WasmScriptRunner>>>,
     /// Numbers the reports of what plugins handle; see [`Subscriptions`].
     seq: AtomicU64,
+    /// Whether to page out the compiler's code once plugins are compiled;
+    /// see [`page_out_compiler`].
+    page_out_code: bool,
+    /// Whether a component has been compiled since the compiler's code was
+    /// last paged out.
+    compiled: AtomicBool,
 }
 
 thread_local! {
@@ -1437,11 +1466,17 @@ thread_local! {
 /// Serve requests from the server on `stream` until it closes the channel,
 /// on [`WORKERS`] threads, this one among them.
 ///
+/// With `page_out_code`, the kiki executable's code that only compiling
+/// plugins runs is handed back to the kernel once they are compiled (see
+/// [`page_out_compiler`]). Only a script host that is a process of its
+/// own does that: one run on a thread shares the executable's code with
+/// whatever else its process runs.
+///
 /// # Errors
 ///
 /// Fails if the socket cannot be cloned or the worker threads cannot be
 /// started. A broken channel is a normal shutdown, not an error.
-fn serve_channel(stream: UnixStream) -> Result<()> {
+fn serve_channel(stream: UnixStream, page_out_code: bool) -> Result<()> {
     let io = Arc::new(ChildIo {
         writer: Mutex::new(stream.try_clone().context("cloning the parent socket")?),
         watch: stream.try_clone().context("cloning the parent socket")?,
@@ -1459,6 +1494,8 @@ fn serve_channel(stream: UnixStream) -> Result<()> {
         services: Arc::new(IpcServices { io }),
         runner: RwLock::new(None),
         seq: AtomicU64::new(0),
+        page_out_code,
+        compiled: AtomicBool::new(false),
     });
 
     let workers = std::thread::available_parallelism()
@@ -1644,6 +1681,11 @@ fn serve(state: &ChildState, request: HostRequest<'static>) -> HostResponse {
     match request {
         HostRequest::Reload { sources } => {
             let count = sources.len();
+            // Before the plugins are instantiated rather than after, so
+            // that what loading them runs of the runtime's code is read
+            // back in under the time budget of loading, not that of the
+            // first event they handle.
+            page_out_compiler(state);
             match WasmScriptRunner::from_sources_with(&sources, Some(state.services.clone())) {
                 Ok(new_runner) => {
                     *state.runner.write().unwrap_or_else(|e| e.into_inner()) =
@@ -1728,7 +1770,9 @@ fn serve(state: &ChildState, request: HostRequest<'static>) -> HostResponse {
             HostResponse::Ack
         }
 
-        HostRequest::PutComponent { plugin, component } => put_component(&plugin, &component),
+        HostRequest::PutComponent { plugin, component } => {
+            put_component(state, &plugin, &component)
+        }
 
         HostRequest::CallResult { .. } => HostResponse::Failed {
             message: "a call result arrived with no call outstanding".to_string(),
@@ -1737,12 +1781,40 @@ fn serve(state: &ChildState, request: HostRequest<'static>) -> HostResponse {
 }
 
 /// Compile `component` and keep it for the next reload.
-fn put_component(plugin: &str, component: &crate::scripting::WasmComponent) -> HostResponse {
+fn put_component(
+    state: &ChildState,
+    plugin: &str,
+    component: &crate::scripting::WasmComponent,
+) -> HostResponse {
     match crate::scripting::wasm::put_component(plugin, component) {
-        Ok(()) => HostResponse::Ack,
+        Ok(()) => {
+            state.compiled.store(true, Ordering::Relaxed);
+            HostResponse::Ack
+        }
         Err(e) => HostResponse::Failed {
             message: format!("{e}"),
         },
+    }
+}
+
+/// Once plugins are compiled, hand the pages of the executable that only
+/// compiling them ran (Cranelift's, chiefly) back to the kernel, if any
+/// component was compiled since this last ran and the child pages out its
+/// code at all (see [`serve_channel`]).
+///
+/// Compiling happens when plugins first load and when one changes, and
+/// nothing else in the child runs that code, so it would otherwise stay
+/// resident, uselessly, for the life of the process: in a quiet deployment
+/// it was about a third of the child's memory. See
+/// [`crate::process::code_pages`].
+fn page_out_compiler(state: &ChildState) {
+    if !state.page_out_code || !state.compiled.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    match crate::process::code_pages::page_out_executable() {
+        Ok(bytes) => debug!(bytes, "script host: paged out the executable's code"),
+        Err(e) => debug!(error = %e, "script host: could not page out the executable's code"),
     }
 }
 
@@ -1892,7 +1964,7 @@ mod tests {
     /// with `sources`.
     fn host_in_thread(sources: Vec<ScriptSource>) -> (Arc<ScriptHost>, Arc<Counter>) {
         let (ours, theirs) = UnixStream::pair().unwrap();
-        std::thread::spawn(move || serve_channel(theirs).unwrap());
+        std::thread::spawn(move || serve_channel(theirs, false).unwrap());
         let host = Arc::new(ScriptHost::over(ours, None).unwrap());
         let counter = Arc::new(Counter::default());
         host.set_services(counter.clone());

@@ -38,6 +38,9 @@ pub enum Commands {
     /// Import or export feeds as OPML
     Opml(cli::opml::OpmlArgs),
 
+    /// Read or change Kiki's settings
+    Config(cli::config::ConfigArgs),
+
     /// List plugins and read or change their config
     Plugin(cli::plugin::PluginArgs),
 
@@ -82,6 +85,12 @@ pub enum Commands {
     #[command(name = kiki_rss::process::script_host::SUBCOMMAND, hide = true)]
     ScriptHost(cli::child::ChildArgs),
 
+    /// Internal: run the zygote, which forks the other children. Spawned
+    /// by `serve`.
+    #[cfg(target_os = "linux")]
+    #[command(name = kiki_rss::process::zygote::SUBCOMMAND, hide = true)]
+    Zygote(cli::child::ChildArgs),
+
     /// Print the version of Kiki
     Version,
 }
@@ -94,6 +103,7 @@ impl Commands {
             Commands::Migrate(args) => args.run(),
             Commands::Serve(args) => args.run(),
             Commands::Opml(args) => args.run(),
+            Commands::Config(args) => args.run(),
             Commands::Plugin(args) => args.run(),
             Commands::Token(args) => args.run(),
             #[cfg(feature = "api-docs")]
@@ -126,6 +136,11 @@ impl Commands {
             Commands::ScriptHost(args) => {
                 use kiki_rss::process::script_host as s;
                 args.run(s::SUBCOMMAND, s::HOST_FD_ENV, s::run_child)
+            }
+            #[cfg(target_os = "linux")]
+            Commands::Zygote(args) => {
+                use kiki_rss::process::zygote as z;
+                args.run(z::SUBCOMMAND, z::FD_ENV, z::run_zygote)
             }
             Commands::Version => {
                 println!("kiki {}", env!("CARGO_PKG_VERSION"));

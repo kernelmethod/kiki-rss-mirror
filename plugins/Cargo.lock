@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "kiki-full-content"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "kiki-plugin",
  "serde_json",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "kiki-plugin"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "kiki-plugin-macros",
  "serde",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "kiki-plugin-macros"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "proc-macro2",
  "quote",

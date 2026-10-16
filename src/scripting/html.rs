@@ -52,6 +52,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fmt::Write;
+use std::rc::Rc;
 
 /// Most memory the rewriter may use for its buffers during one pass.
 pub const HTML_MEMORY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
@@ -87,8 +88,9 @@ impl HtmlError {
     }
 }
 
-/// Where a piece of [`Selected::text`] starts, in bytes, and how long it is; or which run
-/// of [`Selected::attributes`] an element's attributes are.
+/// Where a piece of [`Selected::text`] starts, in bytes, and how long it is; which run
+/// of [`Selected::attributes`] an element's attributes are; or, from [`inner_each`],
+/// where an element's content is in the HTML.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub start: u32,
@@ -719,6 +721,91 @@ pub fn inner(
     String::from_utf8(out)
         .map(Some)
         .map_err(|e| HtmlError::failed(format!("the element's content is not UTF-8: {e}")))
+}
+
+/// The most selectors [`inner_each`] takes at once.
+pub const MAX_INNER_SELECTORS: usize = 64;
+
+/// For each of `selectors`, where the content of the first element of `html` it matches
+/// is, as [`inner`] would return it: a span of `html`'s bytes, between the element's start
+/// tag and its end tag, or `None` if the selector matches nothing. Takes one pass over
+/// `html`, however many selectors there are, and returns no copy of the content. Unlike
+/// [`inner`], NULs in the content are left as they are. `expired` says whether the
+/// plugin's time budget has run out.
+///
+/// # Errors
+///
+/// Fails if a selector is invalid, there are more than [`MAX_INNER_SELECTORS`] of them,
+/// `html` is longer than a span can describe, or the HTML cannot be parsed within the
+/// rewriter's memory limit; or with [`HtmlError::Expired`] once `expired` says so.
+///
+/// # Examples
+///
+/// ```
+/// use kiki_rss::scripting::html::{inner_each, Span};
+///
+/// let html = "<nav>x</nav><main><article>Text</article></main>";
+/// let selectors = ["article", "aside", "main"].map(String::from);
+/// let spans = inner_each(html, &selectors, &|| false).unwrap();
+/// assert_eq!(spans, [Some(Span { start: 27, len: 4 }), None, Some(Span { start: 18, len: 23 })]);
+/// ```
+pub fn inner_each(
+    html: &str,
+    selectors: &[String],
+    expired: &dyn Fn() -> bool,
+) -> Result<Vec<Option<Span>>, HtmlError> {
+    if selectors.len() > MAX_INNER_SELECTORS {
+        return Err(HtmlError::failed(format!(
+            "at most {MAX_INNER_SELECTORS} selectors may be given, not {}",
+            selectors.len()
+        )));
+    }
+    let end = u32::try_from(html.len())
+        .map_err(|_| HtmlError::failed("the HTML is longer than 4 GiB"))?;
+    let parsed = selectors
+        .iter()
+        .map(|selector| parse_selector(selector))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pass = Pass::new(expired);
+    // Where each selector's first match has its content, which runs to the end of the
+    // HTML until its end tag is seen. Shared with end tag handlers, which must be
+    // `'static`.
+    let found: Vec<Rc<Cell<Option<Span>>>> = selectors.iter().map(|_| Rc::default()).collect();
+    let handlers = parsed
+        .into_iter()
+        .zip(&found)
+        .map(|(selector, found)| {
+            let pass = &pass;
+            let found = found.clone();
+            let handler = ElementContentHandlers::default().element(move |el: &mut Element| {
+                pass.next_element()?;
+                if found.get().is_some() {
+                    return Ok(());
+                }
+                // Offsets within `html`, which is at most `u32::MAX` bytes long.
+                let start = el.source_location().bytes().end as u32;
+                let Some(end_tag) = el.end_tag_handlers() else {
+                    // An element that cannot have content has none.
+                    found.set(Some(Span { start, len: 0 }));
+                    return Ok(());
+                };
+                let len = end.saturating_sub(start);
+                found.set(Some(Span { start, len }));
+                let found = found.clone();
+                end_tag.push(Box::new(move |tag| {
+                    let end = tag.source_location().bytes().start as u32;
+                    let len = end.saturating_sub(start);
+                    found.set(Some(Span { start, len }));
+                    Ok(())
+                }));
+                Ok(())
+            });
+            (Cow::Owned(selector), handler)
+        })
+        .collect();
+    let rewriter = HtmlRewriter::new(settings(handlers, vec![]), |_: &[u8]| {});
+    pass.run(rewriter, html)?;
+    Ok(found.iter().map(|found| found.get()).collect())
 }
 
 fn apply(el: &mut Element, op: EditOp) -> Result<(), HtmlError> {

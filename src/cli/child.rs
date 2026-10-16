@@ -1,9 +1,10 @@
-//! Arguments for Kiki's hidden child-process subcommands,
-//! `kiki __feed-fetcher` and `kiki __script-host`.
+//! Arguments for Kiki's hidden child-process subcommands, such as
+//! `kiki __feed-fetcher`, `kiki __script-host` and `kiki __process-zygote`.
 //!
 //! Not part of Kiki's user-facing interface: `kiki serve` re-execs itself
 //! with these subcommands to create the sandboxed children described in
-//! [`crate::process`]. They are useless when run by hand, because they
+//! [`crate::process`], or has the zygote fork children that run what they
+//! run. They are useless when run by hand, because they
 //! expect an already-connected socket on
 //! [`CHILD_FD`](crate::process::CHILD_FD).
 

@@ -36,9 +36,13 @@ use std::io;
 
 /// Which of Kiki's processes a process belongs to.
 ///
-/// A process counts towards the role of the child of the server it
-/// descends from, so the feed fetcher's worker, parser and resolver count
-/// towards [`Role::FeedFetcher`] along with their supervisor.
+/// A process counts towards the role its subcommand names, so the feed
+/// fetcher's worker, parser and resolver count towards
+/// [`Role::FeedFetcher`] along with their supervisor, whether the
+/// supervisor started them or the zygote forked them (see
+/// [`super::zygote`]). A process whose subcommand names no role counts
+/// towards its parent's, or, if its parent is the server, towards
+/// [`Role::Other`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
     /// The server itself.
@@ -53,16 +57,20 @@ pub enum Role {
     Web,
     /// The script host.
     ScriptHost,
+    /// The zygote, which forks the server's other children; see
+    /// [`super::zygote`].
+    Zygote,
     /// Any other descendant of the server.
     Other,
 }
 
 impl Role {
     /// Every role, in the order [`sample`] reports them.
-    pub const ALL: [Role; 5] = [
+    pub const ALL: [Role; 6] = [
         Role::Server,
         Role::FeedFetcher,
         Role::ScriptHost,
+        Role::Zygote,
         Role::Web,
         Role::Other,
     ];
@@ -74,19 +82,31 @@ impl Role {
             Role::FeedFetcher => "feed_fetcher",
             Role::Web => "web",
             Role::ScriptHost => "script_host",
+            Role::Zygote => "zygote",
             Role::Other => "other",
         }
     }
 
-    /// The role of a child of the server whose first argument is `arg`.
-    fn of_child(arg: &[u8]) -> Self {
-        if arg == super::feed_fetcher::SUBCOMMAND.as_bytes() {
-            return Role::FeedFetcher;
+    /// The role of a process whose first argument, its subcommand, is
+    /// `arg`, if it names one.
+    fn of_subcommand(arg: &[u8]) -> Option<Self> {
+        use super::feed_fetcher as f;
+        let fetcher = [
+            f::SUBCOMMAND,
+            f::WORKER_SUBCOMMAND,
+            f::PARSER_SUBCOMMAND,
+            f::RESOLVER_SUBCOMMAND,
+        ];
+        if fetcher.iter().any(|s| s.as_bytes() == arg) {
+            return Some(Role::FeedFetcher);
         }
         if arg == super::script_host::SUBCOMMAND.as_bytes() {
-            return Role::ScriptHost;
+            return Some(Role::ScriptHost);
         }
-        Role::Other
+        if arg == super::zygote::SUBCOMMAND.as_bytes() {
+            return Some(Role::Zygote);
+        }
+        None
     }
 }
 
@@ -209,24 +229,29 @@ pub fn sample() -> io::Result<HashMap<Role, Usage>> {
             u.processes += 1;
         }
         for &child in children.get(&pid).into_iter().flatten() {
-            let child_role = if role == Role::Server {
-                child_role(child)
+            let child_role = subcommand_role(child).unwrap_or(if role == Role::Server {
+                Role::Other
             } else {
                 role
-            };
+            });
             pending.push((child, child_role));
         }
     }
     Ok(usage)
 }
 
-/// The role of `pid`, a direct child of the server, going by the
-/// subcommand it was started with.
-fn child_role(pid: u32) -> Role {
+/// The role of `pid` going by the subcommand it runs, if that names one.
+/// A child the zygote forked writes its subcommand over the zygote's own,
+/// so it reads as the subcommand it runs, too.
+fn subcommand_role(pid: u32) -> Option<Role> {
     fs::read(format!("/proc/{pid}/cmdline"))
         .ok()
-        .and_then(|cmdline| cmdline.split(|&b| b == 0).nth(1).map(Role::of_child))
-        .unwrap_or(Role::Other)
+        .and_then(|cmdline| {
+            cmdline
+                .split(|&b| b == 0)
+                .nth(1)
+                .and_then(Role::of_subcommand)
+        })
 }
 
 /// Add one process's `value` to a role's running `total`.
@@ -370,10 +395,24 @@ mod tests {
     }
 
     #[test]
-    fn subcommands_name_the_role_of_the_servers_children() {
-        assert_eq!(Role::of_child(b"__feed-fetcher"), Role::FeedFetcher);
-        assert_eq!(Role::of_child(b"__script-host"), Role::ScriptHost);
-        assert_eq!(Role::of_child(b"serve"), Role::Other);
+    fn subcommands_name_roles() {
+        assert_eq!(
+            Role::of_subcommand(b"__feed-fetcher"),
+            Some(Role::FeedFetcher)
+        );
+        for helper in [
+            b"__feed-worker".as_slice(),
+            b"__feed-parser",
+            b"__feed-resolver",
+        ] {
+            assert_eq!(Role::of_subcommand(helper), Some(Role::FeedFetcher));
+        }
+        assert_eq!(
+            Role::of_subcommand(b"__script-host"),
+            Some(Role::ScriptHost)
+        );
+        assert_eq!(Role::of_subcommand(b"__process-zygote"), Some(Role::Zygote));
+        assert_eq!(Role::of_subcommand(b"serve"), None);
     }
 
     #[test]

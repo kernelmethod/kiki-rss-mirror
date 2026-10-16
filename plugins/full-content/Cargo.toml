@@ -1,6 +1,6 @@
 [package]
 name = "kiki-full-content"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 publish = false
 description = "Kiki's full-content plugin, installed as plugins/full-content/plugin.wasm"

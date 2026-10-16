@@ -1,5 +1,5 @@
 name = "full-content"
-version = "1.0.1"
+version = "1.0.2"
 engine = "wasm"
 entrypoint = "plugin.wasm"
 description = "Fetch the whole article for entries whose feed gives only a short summary of it"

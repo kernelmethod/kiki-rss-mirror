@@ -755,6 +755,20 @@ impl html_host::Host for State {
         let content = super::html::inner(&html, &selector, max_bytes, &|| budget.expired());
         Self::html_result("html.inner", content)
     }
+
+    fn inner_each(
+        &mut self,
+        html: String,
+        selectors: Vec<String>,
+    ) -> wasmtime::Result<Result<Vec<Option<html_host::Span>>, String>> {
+        self.check_budget("html.inner-each")?;
+        let budget = &self.budget;
+        let spans = super::html::inner_each(&html, &selectors, &|| budget.expired());
+        Self::html_result(
+            "html.inner-each",
+            spans.map(|spans| spans.into_iter().map(|s| s.map(span_to_wit)).collect()),
+        )
+    }
 }
 
 fn unexpected<T>(name: &str, reply: ServiceReply) -> wasmtime::Result<Result<T, String>> {

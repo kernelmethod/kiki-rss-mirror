@@ -59,7 +59,7 @@ with a sandbox fitted to its own job:
 <figure class="diagram-figure">
 <svg class="diagram" viewBox="0 0 800 800" role="img" aria-labelledby="pm-title pm-desc" xmlns="http://www.w3.org/2000/svg">
   <title id="pm-title">Kiki's process model</title>
-  <desc id="pm-desc">The server owns the data directory and listens on the API's Unix socket, which the web UI and other API clients connect to. The server starts the script host and the feed fetcher's supervisor, and talks to each over a socket pair. The supervisor starts the worker, the parser and the resolver, and relays messages between them and the server. Only the worker and the resolver reach the internet.</desc>
+  <desc id="pm-desc">The server owns the data directory and listens on the API's Unix socket, which the web UI and other API clients connect to. The server has the script host and the feed fetcher's supervisor started, and talks to each over a socket pair. The supervisor has the worker, the parser and the resolver started, and relays messages between them and the server. Only the worker and the resolver reach the internet.</desc>
   <defs>
     <marker id="pm-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path class="arrowhead" d="M0,0 L10,5 L0,10 z"/>
@@ -116,7 +116,7 @@ with a sandbox fitted to its own job:
   <rect class="proc" x="360" y="370" width="320" height="90" rx="6"/>
   <text class="title" x="376" y="394">supervisor</text>
   <text x="376" y="414">ro: TLS trust stores, resolver config</text>
-  <text x="376" y="430">may execve only the kiki executable</text>
+  <text x="376" y="430">may not execve</text>
   <text x="376" y="446">relays frames; parses nothing</text>
   <line class="link" x1="420" y1="460" x2="335" y2="510" marker-start="url(#pm-arrow)" marker-end="url(#pm-arrow)"/>
   <line class="link" x1="517" y1="460" x2="517" y2="510" marker-start="url(#pm-arrow)" marker-end="url(#pm-arrow)"/>
@@ -166,24 +166,40 @@ its own.</figcaption>
 | Process | Started by | Files | Network | Its job |
 | --- | --- | --- | --- | --- |
 | server | `kiki serve`, or `kiki web` | read-write: the data directory, the socket's directory, SQLite's temp directory | listens on the API's Unix socket; connects to nothing | Owns the database and the asset cache, serves the API, schedules fetches and dispatches plugin events |
-| script host | the server | none | none | Runs plugins |
-| supervisor | the server | read-only: the TLS trust stores and the resolver's configuration | none of its own | Starts the three processes below, relays messages between them and the server, and replaces any that die |
-| worker | the supervisor | read-only: the TLS trust stores | outbound TCP; may not bind or listen | Downloads feeds, images, enclosures and favicons |
-| parser | the supervisor | none | none | Parses feeds, web pages, SVG and entries' HTML |
-| resolver | the supervisor | read-only: the resolver's configuration | DNS only: UDP, and TCP to port 53 | Looks hostnames up for the worker |
+| zygote | the server | read-only: the TLS trust stores and the resolver's configuration | none of its own | Starts the processes below, when the server or the supervisor asks it to |
+| script host | the zygote, for the server | none | none | Runs plugins |
+| supervisor | the zygote, for the server | read-only: the TLS trust stores and the resolver's configuration | none of its own | Has the three processes below started, relays messages between them and the server, and replaces any that die |
+| worker | the zygote, for the supervisor | read-only: the TLS trust stores | outbound TCP; may not bind or listen | Downloads feeds, images, enclosures and favicons |
+| parser | the zygote, for the supervisor | none | none | Parses feeds, web pages, SVG and entries' HTML |
+| resolver | the zygote, for the supervisor | read-only: the resolver's configuration | DNS only: UDP, and TCP to port 53 | Looks hostnames up for the worker |
 | web UI | `kiki web` | none | accepts connections on the listener it bound at startup; connects only to Unix sockets | Serves the [web UI](web-ui.md), as a client of the API |
 
 `kiki web` starts its server before installing its own sandbox, so the
 server runs under its own sandbox alone, not inside the web UI's. Every
-other child starts out inside its parent's sandbox and adds its own on top,
-so it can never have more than its parent.
+other process starts out inside the sandbox of the process that started it
+and adds its own on top, so it can never have more than that process.
+
+The zygote is how Kiki's processes share memory without sharing secrets.
+The server starts it before it opens the database, and it never reads
+anything but requests to start or stop a process, from the server or the
+supervisor. Each process it starts is a copy of it (it *forks*), and so
+shares with it, and with the others, the memory that every copy of the kiki
+executable would otherwise hold a copy of, about a MiB per process, and
+knows nothing the zygote doesn't: nothing of the database, the API's
+tokens, or what the server has decrypted. The server may only ask it for
+the supervisor and the script host, and the supervisor only for its own
+three processes. On systems other than Linux there is no zygote, and each
+process is started by running the kiki executable again, by the process
+that the table says asked for it; the supervisor may then run the kiki
+executable, and nothing else.
 
 ### How they talk
 
-Each child is the kiki executable run again with a hidden subcommand. It
-inherits one end of a Unix socket pair, which its parent created for it, and
-no other file descriptor but its standard streams: no database handle and no
-open files. Inside the feed fetcher, only the worker is given the
+Each child runs the kiki executable's code for a hidden subcommand. It
+inherits one end of a Unix socket pair, created for it as it was started,
+and no other file descriptor but its standard streams (and, for the
+supervisor, a connection to the zygote): no database handle and no open
+files. Inside the feed fetcher, only the worker is given the
 environment, which may hold a proxy's password; the parser and the resolver
 get just the few variables they read.
 
@@ -227,13 +243,15 @@ every process it starts:
   the fetcher's parser and the web UI) are also refused every system call
   that reaches a file by its path. This holds even where the kernel lacks
   Landlock, and it covers what Landlock does not restrict, such as changing
-  a file's permissions or owner. Only the supervisor may `execve`, and then
-  only the kiki executable.
+  a file's permissions or owner. No process may `execve` once its sandbox is
+  up, but, where there is no zygote, the supervisor, and then only the kiki
+  executable.
 - **`PR_SET_MDWE`** refuses memory that is both writable and executable,
   so injected code can't be written into memory and then run. Every
   process gets it but the script host, which compiles WebAssembly plugins
   to native code, and so must write code and then run it (and the server,
-  when `--no-script-isolation` has it run plugins itself). For the same
+  when `--no-script-isolation` has it run plugins itself), and the zygote,
+  since the script host it starts would inherit it. For the same
   reason, the systemd units Kiki ships don't set
   `MemoryDenyWriteExecute=`, which every process would inherit.
 
