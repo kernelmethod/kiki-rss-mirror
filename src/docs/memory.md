@@ -208,14 +208,39 @@ entries, over either limit.
   traps or plugins reload. Starting a plugin afresh once its memory passes
   a threshold would give it back, at the cost of what plugins keep in
   memory between calls, such as `full-content`'s list of pages that failed.
-* **Relocated data.** Each process keeps a private copy of the pages of
+* **Relocated data.** Each process kept a private copy of the pages of
   the executable that are relocated when it starts (its `.data.rel.ro`),
   972 KiB each, about 6.8 MiB across seven processes. A static executable
   that is not position-independent would share them, but would give up
   address-space randomization of the executable in the very processes that
-  parse untrusted input.
+  parse untrusted input. The zygote, below, shares them instead.
 * **The server's heap** is about 4 MiB at rest and peaked at 11 MiB, most
   of it SQLite's page caches.
+
+## The zygote
+
+Every process started by running the kiki executable again relocates its
+own copy of the executable's data. Since the zygote
+([`crate::process::zygote`]), the server starts one process that way, the
+zygote, before it opens the database, and has it fork the supervisor and
+the script host, and the supervisor's worker, parser and resolver: a
+forked process shares the zygote's relocated pages, which nothing writes
+again, rather than holding a copy of its own.
+
+Measured as in the quiet load above (the stress harness in web mode, 48
+feeds, nixdev's plugin rules, no clients), on the static musl build, two
+runs each, the mean of twelve samples over two minutes:
+
+| | Total | Supervisor | Worker | Parser | Script host | Zygote |
+|---|---|---|---|---|---|---|
+| Started by running kiki again | 46.6, 46.9 | 2.2 | 7.0 | 3.1 | 14.2 | — |
+| Forked by the zygote | 42.7, 43.6 | 0.9 | 5.0 | 1.9 | 12.9 | 1.5 |
+
+The per-process figures are of one sample. Each forked child holds about
+1.2–2 MiB less, and the zygote costs 1.5 MiB, most of it its share of
+the code it ran. The stress harness's feeds are named by IP address, so no
+resolver ran; a deployment whose feeds are named by hostname has one more
+forked child, and saves about 1 MiB more.
 
 ## Measuring again
 
